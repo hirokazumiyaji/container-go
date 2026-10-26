@@ -3,7 +3,9 @@
 package container
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -53,7 +55,57 @@ exit 0
 
 func (p *reaperProbe) deletedTargets(t *testing.T) []string {
 	t.Helper()
-	data, err := os.ReadFile(p.log())
+	return readLogLines(t, p.log())
+}
+
+func dockerID(prefix byte) string {
+	return string(prefix) + strings.Repeat("a", 63)
+}
+
+// runReaperScript feeds entries to the real reaper script as stdin and
+// waits for it, exactly as the spawned /bin/sh child would be driven.
+func runReaperScript(t *testing.T, binary, subcommand, key string, entries []string, env ...string) (string, error) {
+	t.Helper()
+	stdout, stderr, err := runReaperScriptStreams(t, binary, subcommand, key, entries, env...)
+	return stdout + stderr, err
+}
+
+// runReaperScriptStreams is runReaperScript with stdout and stderr kept
+// apart, so a test can pin which stream carries a diagnostic.
+func runReaperScriptStreams(t *testing.T, binary, subcommand, key string, entries []string, env ...string) (string, string, error) {
+	t.Helper()
+	return runReaperScriptWithOptions(t, binary, subcommand, key, 30, entries, env...)
+}
+
+func runReaperScriptWithOptions(t *testing.T, binary, subcommand, key string, timeoutSeconds int, entries []string, env ...string) (string, string, error) {
+	t.Helper()
+	requirePOSIXShell(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", reaperScript, "containergo-reaper",
+		binary, subcommand, breQuote(key), strconv.Itoa(timeoutSeconds), "1")
+	cmd.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
+	cmd.Env = append(os.Environ(), env...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+// lockedEntry is a completed-entry event for a name-addressed container
+// carrying the shared name-lock path that the Go registration path always
+// supplies. Passing it keeps tests focused on reaping behavior instead of
+// the no-lock skip.
+func lockedEntry(id, creation, lockPath string) string {
+	return "+\t" + id + "\t" + creation + "\t" + lockPath
+}
+
+// readLogLines returns the non-empty lines of a reaper test log.
+func readLogLines(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -67,34 +119,6 @@ func (p *reaperProbe) deletedTargets(t *testing.T) []string {
 		}
 	}
 	return out
-}
-
-func dockerID(prefix byte) string {
-	return string(prefix) + strings.Repeat("a", 63)
-}
-
-// runReaperScript feeds entries to the real reaper script as stdin and
-// waits for it, exactly as the spawned /bin/sh child would be driven.
-func runReaperScript(t *testing.T, binary, subcommand, key string, entries []string, env ...string) (string, error) {
-	t.Helper()
-	return runReaperScriptWithTimeout(t, binary, subcommand, key, 30, entries, env...)
-}
-
-// runReaperScriptWithTimeout is runReaperScript with an explicit
-// per-entry backend timeout. The script arms one `sleep <timeout>` timer
-// per entry, so the timeout argument also determines the timer's argv.
-func runReaperScriptWithTimeout(t *testing.T, binary, subcommand, key string, timeoutSeconds int, entries []string, env ...string) (string, error) {
-	t.Helper()
-	requirePOSIXShell(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", reaperScript, "containergo-reaper",
-		binary, subcommand, breQuote(key), strconv.Itoa(timeoutSeconds), "1")
-	cmd.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
-	cmd.Env = append(os.Environ(), env...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
 }
 
 // TestReaperScriptDeletesEveryRegisteredEntry is the baseline: the
@@ -112,7 +136,7 @@ func TestReaperScriptDeletesEveryRegisteredEntry(t *testing.T) {
 		// A generation entry makes the script inspect first. The probe
 		// returns an empty inspect, so the generation cannot match and
 		// this entry must be skipped rather than deleted.
-		"guarded " + strings.Repeat("a", 16),
+		lockedEntry("guarded", strings.Repeat("a", 16), filepath.Join(probe.dir, "guarded.lock")),
 	}
 	out, err := runReaperScript(t, probe.script(), "rm", creationLabel, entries)
 	if err != nil {
@@ -155,7 +179,8 @@ exit 0
 		t.Fatal(err)
 	}
 
-	out, err := runReaperScript(t, script, "rm", creationLabel, []string{"guarded " + creation})
+	out, err := runReaperScript(t, script, "rm", creationLabel,
+		[]string{lockedEntry("guarded", creation, filepath.Join(dir, "guarded.lock"))})
 	if err != nil {
 		t.Fatalf("reaper script: %v (output: %s)", err, out)
 	}
@@ -197,7 +222,7 @@ func TestReaperScriptLeavesNoSleepBehind(t *testing.T) {
 	// count is not drifting upward with each completed call.
 	for pass := range 2 {
 		before := countSleepProcesses(t, sleepArg)
-		if _, err := runReaperScriptWithTimeout(t, probe.script(), "rm", creationLabel, timeoutSeconds, entries); err != nil {
+		if _, _, err := runReaperScriptWithOptions(t, probe.script(), "rm", creationLabel, timeoutSeconds, entries); err != nil {
 			t.Fatalf("pass %d: reaper script: %v", pass, err)
 		}
 		// An orphan outlives the reaper; give the process table a moment
@@ -300,9 +325,10 @@ exit 0
 	// the loop pays the 10s inspect timeout per entry: ~40s. With the 1s
 	// budget it stops after the first.
 	const entries = 4
+	lockPath := filepath.Join(dir, "names.lock")
 	var list []string
 	for i := range entries {
-		list = append(list, "ctr-"+string(rune('a'+i))+" "+strings.Repeat("a", 16))
+		list = append(list, lockedEntry("ctr-"+string(rune('a'+i)), strings.Repeat("a", 16), lockPath))
 	}
 
 	start := time.Now()
@@ -397,6 +423,268 @@ exit 0
 	}
 }
 
+// TestReaperScriptStartsNextEntryWhenAnyWorkerFinishes pins the worker
+// pool rather than a batch wait: slow entries spread one per four-entry
+// batch must overlap, so the reap takes roughly one slow entry rather than
+// four. The backend logs each delete and sleeps only for the slow IDs.
+func TestReaperScriptStartsNextEntryWhenAnyWorkerFinishes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing-based")
+	}
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "started.log")
+	rankDir := filepath.Join(dir, "rank.lock")
+	rankPath := filepath.Join(dir, "rank")
+	script := filepath.Join(dir, "backend")
+	body := `#!/bin/sh
+sub="$1"
+shift
+[ "$sub" = inspect ] && exit 0
+for arg in "$@"; do target="$arg"; done
+
+# Allocate a start rank under a mkdir mutex. The first, fifth, ninth, and
+# thirteenth starts sleep. Those ranks fall in four different batches under
+# the old loop but can overlap in a worker pool. awk emits entries in an
+# unspecified order, so the sleep is keyed to start order, not to an ID.
+while ! mkdir "` + rankDir + `" 2>/dev/null; do sleep 0.01 2>/dev/null || :; done
+rank=0
+[ -f "` + rankPath + `" ] && rank=$(cat "` + rankPath + `")
+rank=$((rank + 1))
+printf '%s\n' "$rank" > "` + rankPath + `"
+rmdir "` + rankDir + `"
+
+printf '%s %s\n' "$rank" "$target" >> "` + logPath + `"
+case "$rank" in
+  1|5|9|13) sleep 2 ;;
+esac
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var entries []string
+	for i := 1; i <= 16; i++ {
+		entries = append(entries, fmt.Sprintf("%064x", i))
+	}
+
+	start := time.Now()
+	out, err := runReaperScript(t, script, "rm", creationLabel, entries,
+		"REAPER_BUDGET_SECONDS=60", "REAPER_PARALLEL=4")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("reaper script: %v (output: %s)", err, out)
+	}
+	// Four batches of one 2s slow entry each take about 8s. A worker pool
+	// runs all four slow entries at once and finishes with the slowest.
+	if elapsed > 5*time.Second {
+		t.Errorf("16 entries with four 2s slow ones took %v; workers waited in batches", elapsed)
+	}
+	if elapsed < 2*time.Second {
+		t.Errorf("reap finished in %v, before the slowest entry could finish", elapsed)
+	}
+
+	lines := readLogLines(t, logPath)
+	if len(lines) != len(entries) {
+		t.Fatalf("start log has %d lines, want %d", len(lines), len(entries))
+	}
+	var ranks, targets []string
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("start log line = %q, want rank and target", line)
+		}
+		ranks = append(ranks, fields[0])
+		targets = append(targets, fields[1])
+	}
+	wantRanks := make([]string, 0, len(entries))
+	for i := 1; i <= len(entries); i++ {
+		wantRanks = append(wantRanks, fmt.Sprint(i))
+	}
+	slices.Sort(wantRanks)
+	slices.Sort(ranks)
+	if !slices.Equal(ranks, wantRanks) {
+		t.Fatalf("start ranks = %v, want one of each of %v", ranks, wantRanks)
+	}
+	slices.Sort(targets)
+	wantTargets := append([]string(nil), entries...)
+	slices.Sort(wantTargets)
+	if !slices.Equal(targets, wantTargets) {
+		t.Fatalf("started %v, want all %d entries", targets, len(entries))
+	}
+}
+
+// TestReaperScriptReportsEntriesDroppedAtTheBudget pins the budget
+// diagnostic: when the overall budget expires with entries still queued,
+// the script must say how many remain on stderr without naming IDs, and the
+// started plus reported count must cover every registered entry.
+func TestReaperScriptReportsEntriesDroppedAtTheBudget(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "deleted.log")
+	script := filepath.Join(dir, "backend")
+	body := `#!/bin/sh
+sub="$1"
+shift
+[ "$sub" = inspect ] && exit 0
+for arg in "$@"; do target="$arg"; done
+printf '%s\n' "$target" >> "` + logPath + `"
+sleep 1
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	const entries = 20
+	var list []string
+	for i := 1; i <= entries; i++ {
+		list = append(list, fmt.Sprintf("%064x", i))
+	}
+
+	stdout, stderr, err := runReaperScriptStreams(t, script, "rm", creationLabel, list,
+		"REAPER_BUDGET_SECONDS=2", "REAPER_PARALLEL=4")
+	if err != nil {
+		t.Fatalf("reaper script: %v (stdout: %s, stderr: %s)", err, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty", stdout)
+	}
+	lines := strings.Split(strings.TrimSpace(stderr), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stderr = %q, want one budget line", stderr)
+	}
+	const prefix = "container-go: reaper budget expired with "
+	if !strings.HasPrefix(lines[0], prefix) {
+		t.Fatalf("stderr = %q, want a budget diagnostic", lines[0])
+	}
+	var remaining int
+	if _, err := fmt.Sscanf(strings.TrimPrefix(lines[0], prefix), "%d", &remaining); err != nil {
+		t.Fatalf("stderr = %q: %v", lines[0], err)
+	}
+	processed := len(readLogLines(t, logPath))
+	if remaining <= 0 {
+		t.Fatalf("remaining = %d, want a positive count", remaining)
+	}
+	if processed == 0 {
+		t.Fatal("no deletes ran before the budget expired")
+	}
+	if processed+remaining != entries {
+		t.Fatalf("processed %d + remaining %d != %d; the report lost entries", processed, remaining, entries)
+	}
+}
+
+// TestReaperScriptCountsTheEntryReadWhenTheBudgetExpires pins the count
+// boundary: the entry the loop already read but could not start when the
+// budget expired counts as remaining. One worker runs three entries and
+// blocks on the third past the budget, so the already-read fourth and the
+// queued fifth are both reported.
+func TestReaperScriptCountsTheEntryReadWhenTheBudgetExpires(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "deleted.log")
+	counterPath := filepath.Join(dir, "calls")
+	script := filepath.Join(dir, "backend")
+	body := `#!/bin/sh
+sub="$1"
+shift
+[ "$sub" = inspect ] && exit 0
+for arg in "$@"; do target="$arg"; done
+calls=0
+[ -f "` + counterPath + `" ] && calls=$(cat "` + counterPath + `")
+calls=$((calls + 1))
+printf '%s\n' "$calls" > "` + counterPath + `"
+printf '%s\n' "$target" >> "` + logPath + `"
+if [ "$calls" -eq 3 ]; then sleep 4; fi
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	const entries = 5
+	var list []string
+	for i := 1; i <= entries; i++ {
+		list = append(list, fmt.Sprintf("%064x", i))
+	}
+
+	stdout, stderr, err := runReaperScriptStreams(t, script, "rm", creationLabel, list,
+		"REAPER_BUDGET_SECONDS=3", "REAPER_PARALLEL=1")
+	if err != nil {
+		t.Fatalf("reaper script: %v (stdout: %s, stderr: %s)", err, stdout, stderr)
+	}
+	lines := strings.Split(strings.TrimSpace(stderr), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stderr = %q, want one budget line", stderr)
+	}
+	const prefix = "container-go: reaper budget expired with "
+	if !strings.HasPrefix(lines[0], prefix) {
+		t.Fatalf("stderr = %q, want a budget diagnostic", lines[0])
+	}
+	var remaining int
+	if _, err := fmt.Sscanf(strings.TrimPrefix(lines[0], prefix), "%d", &remaining); err != nil {
+		t.Fatalf("stderr = %q: %v", lines[0], err)
+	}
+	if processed := len(readLogLines(t, logPath)); processed != 3 {
+		t.Fatalf("processed = %d, want 3 started before the budget expired", processed)
+	}
+	if remaining != 2 {
+		t.Fatalf("remaining = %d, want 2 (the already-read fourth plus the fifth)", remaining)
+	}
+}
+
+// TestReaperScriptDoesNotFabricateNameLock pins the removal of the old
+// TMPDIR fallback: a name-addressed entry with no lock path must be skipped
+// rather than locking a path the Go name lock does not share.
+func TestReaperScriptDoesNotFabricateNameLock(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	backendLog := filepath.Join(dir, "backend.log")
+	lockLog := filepath.Join(dir, "lock.log")
+	binDir := filepath.Join(dir, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A fake flock makes fallback use observable on hosts without flock,
+	// where the old script would otherwise silently skip the entry.
+	fakeFlock := filepath.Join(binDir, "flock")
+	fakeBody := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + lockLog + "\"\nexit 0\n"
+	if err := os.WriteFile(fakeFlock, []byte(fakeBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tmpDir := filepath.Join(dir, "tmp")
+	if err := os.Mkdir(tmpDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", tmpDir)
+
+	backend := filepath.Join(dir, "backend")
+	body := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + backendLog + "\"\nexit 0\n"
+	if err := os.WriteFile(backend, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	const name = "guarded-name"
+	out, err := runReaperScript(t, backend, "rm", creationLabel,
+		[]string{"+\t" + name + "\t" + strings.Repeat("b", 16)})
+	if err != nil {
+		t.Fatalf("reaper script: %v (output: %s)", err, out)
+	}
+	if got := readLogLines(t, backendLog); len(got) != 0 {
+		t.Errorf("backend calls = %v, want none for an entry without a lock", got)
+	}
+	if got := readLogLines(t, lockLog); len(got) != 0 {
+		t.Errorf("lock helper calls = %v, want none; the script fabricated a lock", got)
+	}
+	fallback := filepath.Join(tmpDir, "containergo-"+name+".lock")
+	if _, err := os.Stat(fallback); err == nil {
+		t.Errorf("fallback lock %s was created", fallback)
+	}
+}
+
 // TestReaperScriptKeepsTheGenerationGuard covers the property the
 // generation check exists for, which the restructure must preserve: an
 // entry whose generation no longer matches is not deleted, so a
@@ -420,7 +708,7 @@ exit 0
 	}
 
 	out, err := runReaperScript(t, script, "delete", creationLabel,
-		[]string{"mine " + strings.Repeat("a", 16)})
+		[]string{lockedEntry("mine", strings.Repeat("a", 16), filepath.Join(dir, "mine.lock"))})
 	if err != nil {
 		t.Fatalf("reaper script: %v (output: %s)", err, out)
 	}

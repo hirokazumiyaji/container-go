@@ -440,6 +440,16 @@ Apple の場合は generation を保存し、JSON の行頭にある `"key": "va
 補助 executable は固定したシステムパスから解決し、出力(file-size limit)、helper 実行時間(1 秒)、1 entry あたり helper 回数(通常 8 回と `pgrep`・列挙用の予備各 2 回)を制限する。budget 切れなら追加 cleanup を行わない。monitor mode が使えない場合も、可靠的 helper の列挙で子孫を kill して回収する。
 登録は reaper 子プロセスあたり最大 1024 件を保持・再生する。shell は上限を超える入力も読み捨て続けるため、pipe が満杯で writer が block しない。Go 側の上限超過は明示的な capacity error として返し、`Run` は新規コンテナを rollback する。
 
+**残骸の回収**：watchdog は Windows では使えず、CI のキャンセルや
+`go test -timeout` などでローカルの process tree や runner VM が破棄された
+後、または remote Docker daemon 上でローカル環境より長く残るコンテナには
+動作できません。対応策は `TestMain` の前後で `Prune(ctx)` を呼ぶことです。
+`Prune` は session に関係なく停止済みの managed コンテナを削除し、running と
+created は残します。`WithPruneOlderThan(d)` は backend が報告する作成時刻が
+now-d より前の candidate だけに絞り、作成時刻が不明な candidate も残します。
+これにより共有 daemon や remote daemon で他の job が最近停止したコンテナを
+保護できます。これは watchdog の代替ではなく、回収のための運用パターンです。
+
 reaper は実 CLI コンテナを非 reuse 経路で登録したときに遅延起動する。
 Apple Container には別の不変 ID がないため、entry はコンテナ名と creation
 generation を使う。reaper は名前で削除する前に creation label を検査するが、

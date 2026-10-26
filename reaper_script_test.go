@@ -188,13 +188,9 @@ func TestReaperScriptLeavesNoSleepBehind(t *testing.T) {
 		entries = append(entries, dockerID(byte('a'+i)))
 	}
 
-	// A per-entry timeout no other test uses. The reaper's timer is
-	// exactly `sleep <timeout>`, so `ps -o args=` reports "sleep 37"
-	// only for timers this test armed. That identifier stays stable
-	// even while unrelated host tools arm sub-second sleeps: those have
-	// different argv and never match. A real orphan leak still adds one
-	// matching process per entry.
-	const timeoutSeconds = 37
+	// Separate concurrent test binaries' timers as well as unrelated host
+	// sleeps so one process cannot report another process's timer as a leak.
+	timeoutSeconds := 37 + os.Getpid()
 	sleepArg := "sleep " + strconv.Itoa(timeoutSeconds)
 
 	// A reap with an entry list twice over: the second pass proves the
@@ -208,8 +204,7 @@ func TestReaperScriptLeavesNoSleepBehind(t *testing.T) {
 		// to settle before counting.
 		time.Sleep(300 * time.Millisecond)
 		after := countSleepProcesses(t, sleepArg)
-		// Any increase is a leak: only this test asks for a 37s timer,
-		// so no unrelated process can match the argv.
+		// Any increase indicates a timer this test left behind.
 		if after > before {
 			t.Fatalf("pass %d: reaper-owned sleep processes went %d -> %d; the timeout left orphan helpers behind",
 				pass, before, after)

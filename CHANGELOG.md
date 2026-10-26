@@ -7,11 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This section describes development after the tagged `v0.2.0` release.
-The APIs listed under this section are not part of `v0.2.0` unless a
-release note explicitly says otherwise. The root checkout requires Go
-1.26 or later; the nested `bench/` module requires Go 1.26 or later;
-the tagged `v0.2.0` module requires Go 1.27 or later.
+## [0.3.0] - 2026-10-26
+
+This section describes only the tagged `v0.3.0` release. The root
+module requires Go 1.26 or later; the nested `bench/` module requires
+Go 1.26 or later. The previous release, `v0.2.0`, requires Go 1.27 or
+later.
+
+### Security
+
+Users of `v0.2.0` should upgrade to `v0.3.0`. This release contains
+secret-redaction, env-file, reaper, image-identity, and copy hardening
+fixes that are not in `v0.2.0`: CLI and wait errors redact secrets and
+control characters, env files no longer stage secrets in a shared
+temporary location, the reaper no longer leaves inspect output on disk,
+image identity is verified so a mutable tag cannot be swapped between
+inspection and run, and container copy operations fail closed on unsafe
+file types and host APIs. No GitHub Security Advisory has been published
+for these fixes; the entries below list the changes.
 
 ### Added
 
@@ -87,9 +100,9 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   accept verified unprefixed Docker image IDs in canonical `sha256:`
   form.
 - Add `LogsOptions` and `LogsWithOptions` for requesting a snapshot
-  window with `Tail` and `Since`. Docker supports both options; the
-  Apple-specific mapping and unsupported `Since` behavior are tracked by
-  issue #82 and are not backend-neutral in this checkout.
+  window with `Tail` and `Since`. Docker supports both options. Apple
+  Container maps `Tail` to `-n` and rejects `Since` with
+  `ErrUnsupportedCapability` because its CLI has no `--since` option.
 - Add `wait.ForHTTP` header, basic-auth, TLS, TLS-config, and custom
   HTTP-client setters.
 - Add `wait.ForHealthcheck()` for Docker's `HEALTHCHECK` status, with
@@ -188,32 +201,6 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   tag already exists, and a failing run means a maintainer must delete it
   and retag.
 
-### Fixed
-
-- Populate the Docker inspect name so `InspectInfo.Name()` returns the
-  container name and `Prune`/`PruneReuseGroup` unregister the name-based
-  reaper record after deleting a container (#239).
-- Include Docker `status=dead` in `Prune` daemon-side listing so stopped
-  containers the daemon can no longer reap are deleted alongside
-  `exited` ones (#113).
-- Classify `Exec` cancellation and timeout independently of local exit
-  status, including exit code `1` used by Windows `Process.Kill` (#116).
-- Remove anonymous Docker volumes from every managed deletion path while
-  preserving named volumes (#81).
-- Cleanup failures are no longer discarded. A failed-create, reuse
-  inspect/copy rollback, or public `Cleanup` that could not remove the
-  container now joins the cleanup failure onto the operation error, so
-  `errors.Is` still matches the operation error and `errors.As` reaches the
-  new exported `CleanupError` to learn that a container was left behind. An
-  already-absent container and a name conflict remain idempotent successes,
-  and a successful inspect that lists no container is treated as proof of
-  absence rather than reported as a leak (#86).
-- The Docker integration CI job can no longer report success with zero tests
-  run: a missing backend, a misconfigured backend, or a `-run` pattern that
-  selects nothing all fail the job (#106).
-
-### Changed
-
 - Reject invalid UTF-8 and Unicode control/line-separator characters in env
   values, and invalid Unicode whitespace/control characters in keys. This is
   an intentional compatibility tightening; printable Unicode, spaces, and
@@ -283,35 +270,34 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `CopyFileFromContainer`; older or unverifiable versions fail closed before
   temporary-directory creation or `docker cp`.
 
-### Cross-issue prerequisites
+### Fixed
 
-- The current base's reaper registration still accepts only Apple-style
-  names. Docker's full immutable ID cannot be registered until issue #73
-  is stacked. The current README and design document call out this
-  prerequisite; the normal Docker handle/rollback path is separate.
-- Apple `LogsWithOptions` needs issue #82 before `Tail` and `Since` can be
-  documented as backend-specific capabilities.
-- Dynamic endpoint cache refresh is tracked by issue #85; the current
-  first-inspect cache can expose stale IP or binding data.
-- Reuse ownership and final generation verification are tracked by issues
-  #83 and #84; #94 tracks ignored WithFiles/PullAlways side effects on
-  reuse attach; #98 tracks the Apple Prune list-to-delete race and
-  missing fresh revalidation. This base still has missing-generation,
-  post-wait, and prune fail-open paths.
-- Docker deletion uses an immutable ID on this base, but other operations
-  still address the logical name; #74 tracks the stale-handle fix.
-- Windows and remote bind-source handling is qualified by issue #76;
-  `ForListeningPort`/`ForExposedPort` remain TCP-only until #77.
-- `Stop` timeout validation/rounding is pending #89; wait error-chain
-  normalization is pending #92; reaper staging exposure and mitigation are
-  tracked by #111.
-- Successful missing inspect classification is pending #103; liveness
-  error-chain flattening is tracked by #104.
+- Populate the Docker inspect name so `InspectInfo.Name()` returns the
+  container name and `Prune`/`PruneReuseGroup` unregister the name-based
+  reaper record after deleting a container (#239).
+- Include Docker `status=dead` in `Prune` daemon-side listing so stopped
+  containers the daemon can no longer reap are deleted alongside
+  `exited` ones (#113).
+- Classify `Exec` cancellation and timeout independently of local exit
+  status, including exit code `1` used by Windows `Process.Kill` (#116).
+- Remove anonymous Docker volumes from every managed deletion path while
+  preserving named volumes (#81).
+- Cleanup failures are no longer discarded. A failed-create, reuse
+  inspect/copy rollback, or public `Cleanup` that could not remove the
+  container now joins the cleanup failure onto the operation error, so
+  `errors.Is` still matches the operation error and `errors.As` reaches the
+  new exported `CleanupError` to learn that a container was left behind. An
+  already-absent container and a name conflict remain idempotent successes,
+  and a successful inspect that lists no container is treated as proof of
+  absence rather than reported as a leak (#86).
+- The Docker integration CI job can no longer report success with zero tests
+  run: a missing backend, a misconfigured backend, or a `-run` pattern that
+  selects nothing all fail the job (#106).
 
 ## [0.2.0] - 2026-09-02
 
 This section describes only the tagged `v0.2.0` release. The
-`Unreleased` APIs above are not available from that tag. The release
+`0.3.0` APIs above are not available from that tag. The release
 module requires Go 1.27 or later.
 
 First tagged release. Covers the Apple Container backend (v0.1 development)

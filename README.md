@@ -11,27 +11,15 @@ rest of the implementation uses the standard library.
 
 ## Version scope
 
-The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
-development after that tag. The install command below is for the released
-API; it does not install the development-only APIs documented below.
+The latest tagged release is `v0.3.0` (2026-10-26). This checkout is
+development after that tag. The install command below installs the
+released API; `v0.3.0` includes the APIs and fixes documented in the
+`0.3.0` section of [CHANGELOG.md](CHANGELOG.md).
 
 The root library checkout requires Go 1.26 or later. The nested
 `bench/` module used by `make bench-integration` requires Go 1.26 or
-later. The `v0.2.0` module requires Go 1.27 or later.
+later. The `v0.3.0` module requires Go 1.26 or later.
 
-| API or behavior | `v0.2.0` | Current development checkout |
-|---|---|---|
-| `Run`, core options, lifecycle, endpoints, `Exec`, `Logs`, `FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and the original wait strategies | Available | Available |
-| `LogsOptions` and `LogsWithOptions` | Not available | Available |
-| `wait.ForHTTP` header, authentication, TLS, and custom-client setters | Not available | Available |
-| `wait.ForHealthcheck` and `HTTPStrategy.WithResponseMatcher` | Not available | Available |
-| Exported `wait.AllStrategy` / `AnyStrategy` and composite `WithStartupTimeout` | Not available | Available |
-| Root `CLIError`, `ErrContainerNotFound`, and `ErrGenerationReplaced` | Not available | Available |
-| Fractional `WithCPUs(float64)`, `WithShmSize`, `WithPrivileged`, `WithCapAdd`/`WithCapDrop`, `WithUlimit`, `WithExtraHost`, and `WithHostname` | Not available | Available |
-| Generation-safe deletion, post-`v0.2.0` endpoint hardening, and the current reaper hardening | Not part of the `v0.2.0` contract | Available |
-
-Unless a section explicitly says “current development”, descriptions of
-behavior describe this checkout rather than the tagged `v0.2.0` release.
 The code examples are standalone files and are compile-checked by the
 repository's documentation test.
 
@@ -147,19 +135,20 @@ after a pull.
 
 ## Installation
 
-For the released `v0.2.0` API:
+To install the latest tagged release:
 
 ```text
-go get github.com/hirokazumiyaji/container-go@v0.2.0
+go get github.com/hirokazumiyaji/container-go@v0.3.0
 ```
 
-The current development checkout is not a release. Do not assume that
-`@v0.2.0` contains the development-only APIs listed in the version table.
+This installs the released API from `v0.3.0`. This checkout may contain
+changes after that tag; pin the module version as above for reproducible
+builds.
 
 ## API stability
 
 Pre-1.0: minor releases (0.x) may include breaking API changes. Pin an
-explicit module version (`go get ...@v0.2.0`) for reproducible builds.
+explicit module version (`go get ...@v0.3.0`) for reproducible builds.
 
 The root `container` package (`Run`, options, lifecycle helpers) is the
 primary integration surface and is kept reasonably stable within a minor
@@ -168,9 +157,9 @@ custom strategies — especially [`wait.Target`](wait/wait.go) — may evolve
 as backends and probing needs change; prefer the built-in strategies when
 possible.
 
-See [CHANGELOG.md](CHANGELOG.md) for release notes. Its `v0.2.0` section
-describes only the tagged release; its `Unreleased` section describes the
-current development API.
+See [CHANGELOG.md](CHANGELOG.md) for release notes. Its `0.3.0` section
+describes the tagged release; its `Unreleased` section describes changes
+after that tag.
 
 ## Copy-out backend capability
 

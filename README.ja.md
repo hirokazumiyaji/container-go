@@ -8,28 +8,15 @@ Go のテストから使い捨てコンテナを起動できます。コンテ�
 
 ## バージョンの適用範囲
 
-最新のタグ付きリリースは `v0.2.0`（2026-09-02）です。
+最新のタグ付きリリースは `v0.3.0`（2026-10-26）です。
 このチェックアウトは、そのタグより後の開発版です。
-下記のインストールコマンドはリリース版 API のものです。
-このコマンドで、後述の開発版 API が入るわけではありません。
+下記のインストールコマンドはリリース版 API を導入します。
+`v0.3.0` には [CHANGELOG.md](CHANGELOG.md) の `0.3.0` 節に記載した API と修正が含まれます。
 
 root ライブラリのチェックアウトには Go 1.26 以降が必要です。
 `make bench-integration` が使う nested `bench/` モジュールには
-Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が必要です。
+Go 1.26 以降が必要です。`v0.3.0` モジュールにも Go 1.26 以降が必要です。
 
-| API または動作 | `v0.2.0` | 現在の開発チェックアウト |
-|---|---|---|
-| `Run`、基本オプション、ライフサイクル、エンドポイント、`Exec`、`Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、バックエンド選択、元の wait 戦略 | あり | あり |
-| `LogsOptions` と `LogsWithOptions` | なし | あり |
-| `wait.ForHTTP` のヘッダー、認証、TLS、独自クライアント設定 | なし | あり |
-| `wait.ForHealthcheck` と `HTTPStrategy.WithResponseMatcher` | なし | あり |
-| 公開型 `wait.AllStrategy` / `AnyStrategy` と合成 strategy の `WithStartupTimeout` | なし | あり |
-| root の `CLIError`、`ErrContainerNotFound`、`ErrGenerationReplaced` | なし | あり |
-| 小数の `WithCPUs(float64)`、`WithShmSize`、`WithPrivileged`、`WithCapAdd`/`WithCapDrop`、`WithUlimit`、`WithExtraHost`、`WithHostname` | なし | あり |
-| 世代安全な削除、`v0.2.0` 以降の endpoint 強化、現在のリーパー強化 | `v0.2.0` の契約には含まれない | あり |
-
-以下の説明で「現在の開発」と記した節以外は、現行チェックアウトの動作を説明します。
-タグ付き `v0.2.0` の API については、バージョン表を確認してください。
 コード例は単独ファイルとしてリポジトリのドキュメントテストがコンパイルします。
 
 現在のチェックアウトには、次の意図的な制約があります。
@@ -166,20 +153,21 @@ Windows での実際の Docker copy-out は、Go 1.26 以上と Docker client/se
 
 ## インストール
 
-リリース版 `v0.2.0` の API を使う場合:
+最新のタグ付きリリースを導入する場合:
 
 ```text
-go get github.com/hirokazumiyaji/container-go@v0.2.0
+go get github.com/hirokazumiyaji/container-go@v0.3.0
 ```
 
-現在の開発チェックアウトはリリースではありません。
-`@v0.2.0` にバージョンテーブルの開発版 API が入っていると仮定しないでください。
+`v0.3.0` のリリース版 API が導入されます。
+このチェックアウトにはタグ以降の変更が含まれることがあるため、
+再現可能なビルドには上記のようにモジュールバージョンを明示してください。
 
 ## API の安定性
 
 1.0 未満では、マイナーリリース（0.x）に破壊的変更が含まれる場合があります。
 再現可能なビルドにはモジュールバージョンを明示して pin してください
-(`go get ...@v0.2.0`)。
+(`go get ...@v0.3.0`)。
 
 ルートの `container` パッケージ（`Run`、オプション、ライフサイクルヘルパー）が
 主な統合面で、マイナーシリーズ内では比較的安定を目指します。
@@ -188,8 +176,8 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 変更される可能性があります。可能なら組み込み strategy を使ってください。
 
 [CHANGELOG.md](CHANGELOG.md) も参照してください。
-`v0.2.0` の節はタグ付きリリースだけ、`Unreleased` の節は現在の開発 API を
-説明します。
+`0.3.0` の節はタグ付きリリースを説明し、`Unreleased` の節は
+そのタグより後の変更を説明します。
 
 ## 出力の契約
 

@@ -64,20 +64,48 @@ func startProxyOnlyListener(t *testing.T) net.Listener {
 	return ln
 }
 
+type cancelingPortListenTarget struct {
+	*portListenTarget
+	cancel context.CancelFunc
+}
+
+func (t *cancelingPortListenTarget) ContainerPortStatus(ctx context.Context, port string) (PortListenStatus, error) {
+	status, err := t.portListenTarget.ContainerPortStatus(ctx, port)
+	if status == PortListenClosed && t.calls == 2 {
+		t.cancel()
+	}
+	return status, err
+}
+
 func TestForListeningPortRejectsProxyOnlyConnection(t *testing.T) {
 	ln := startProxyOnlyListener(t)
-	target := &portListenTarget{fakeTarget: newFakeTarget(), statuses: []PortListenStatus{PortListenClosed}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	target := &cancelingPortListenTarget{
+		portListenTarget: &portListenTarget{fakeTarget: newFakeTarget(), statuses: []PortListenStatus{PortListenClosed}},
+		cancel:           cancel,
+	}
 	target.endpoint = ln.Addr().String()
 
-	err := ForListeningPort("6379/tcp").
-		WithStartupTimeout(200*time.Millisecond).
-		WithPollInterval(5*time.Millisecond).
-		WaitUntilReady(context.Background(), target)
+	done := make(chan error, 1)
+	go func() {
+		done <- ForListeningPort("6379/tcp").
+			WithPollInterval(5*time.Millisecond).
+			WaitUntilReady(ctx, target)
+	}()
+	watchdog := time.NewTimer(5 * time.Second)
+	defer watchdog.Stop()
+	var err error
+	select {
+	case err = <-done:
+	case <-watchdog.C:
+		t.Fatal("wait did not finish after two closed container-listen checks")
+	}
 	if err == nil {
 		t.Fatal("host connection alone must not report readiness")
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error = %v, want deadline exceeded", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want caller cancellation", err)
 	}
 	if !strings.Contains(err.Error(), "not listening") {
 		t.Errorf("error = %v, want a container-side listen diagnostic", err)

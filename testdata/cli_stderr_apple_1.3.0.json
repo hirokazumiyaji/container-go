@@ -222,5 +222,50 @@
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": false
+  },
+  {
+    "name": "container_missing_cp",
+    "operation": "cp",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to copy into container myctr\" (cause: \"notFound: \\\"container with ID myctr not found\\\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_cp_copy_out",
+    "operation": "cp",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to copy from container myctr\" (cause: \"notFound: \\\"container with ID myctr not found\\\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_cp_direct_not_found",
+    "operation": "cp",
+    "target": "myctr",
+    "stderr": "Error: notFound: \"container not found: myctr\"",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_cp_wrong_target",
+    "operation": "cp",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to copy into container myctr\" (cause: \"notFound: \\\"container with ID other not found\\\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_not_found_on_cp",
+    "operation": "cp",
+    "target": "myctr",
+    "stderr": "Error: notFound: \"source path does not exist: /host/source\"",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
   }
 ]

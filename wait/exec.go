@@ -188,5 +188,3 @@ func (e *execAttemptTimeoutError) Error() string {
 	}
 	return message
 }
-
-func (e *execAttemptTimeoutError) Unwrap() error { return context.DeadlineExceeded }

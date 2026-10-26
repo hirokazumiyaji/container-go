@@ -66,9 +66,17 @@ type imageIdentity struct {
 
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
-	state  State
-	name   string
-	labels map[string]string
+	state State
+	// health is Docker's HEALTHCHECK status: "starting", "healthy", or
+	// "unhealthy". It is empty when the image defines no HEALTHCHECK or
+	// the backend does not report one.
+	health string
+	// observedAt is when the backend inspect that produced this info
+	// completed. Health waits accept the snapshot only while it is within
+	// the lifecycle probe interval; older data must be re-inspected.
+	observedAt time.Time
+	name       string
+	labels     map[string]string
 	// uid is the backend-assigned immutable identity (Docker's 64-hex
 	// Id). Empty when the backend addresses containers by name only
 	// (Apple Container), where operations remain name-based.
@@ -100,6 +108,10 @@ type engineInfo struct {
 	// Docker. It resolves the API's special "default" mode to the daemon's
 	// concrete default network (bridge on Linux, nat on Windows).
 	networkNames []string
+	// networkAliases contains the network-scoped DNS aliases and DNS names
+	// Docker reports for the container's configured network. Docker is the
+	// only backend with network aliases.
+	networkAliases []string
 	// defaultNetwork is the authoritative Docker daemon default identity
 	// (bridge on Linux, nat on Windows). It is daemon metadata rather than
 	// container identity, so it is not cached with the immutable fields.

@@ -45,11 +45,13 @@ type File struct {
 	ContainerPath string
 }
 
-// WithFiles copies regular files into the container after it starts. Directory
-// sources are rejected at copy time. Copy failures fail Run; an ordinary newly
-// created container is rolled back. WithReuse applies the copy to every caller,
-// including callers that attach to an existing shared container; an attach copy
-// failure returns an error without deleting that shared container.
+// WithFiles copies regular files into the container after it starts. Each host
+// path is resolved and checked without following a final link when the option
+// is applied; a directory, symlink, or special file is rejected with a
+// ValidationError before any backend call. Copy failures fail Run; an ordinary
+// newly created container is rolled back. WithReuse applies the copy to every
+// caller, including callers that attach to an existing shared container; an
+// attach copy failure returns an error without deleting that shared container.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		validated := make([]File, len(files))
@@ -95,15 +97,22 @@ func resolveHostPath(hostPath string) (string, error) {
 	return abs, nil
 }
 
-// validateHostPath resolves a host path and checks that the resulting
-// absolute path can be statted.
+// validateHostPath resolves a host path and verifies that it is a regular
+// file. WithFiles must reject a directory, symlink, or special file when the
+// option is applied so a bad source cannot surface only after the container
+// starts. Lstat matches the copy path's O_NOFOLLOW open by refusing to follow
+// a final link here.
 func validateHostPath(hostPath string) (string, error) {
 	abs, err := resolveHostPath(hostPath)
 	if err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(abs); err != nil {
+	info, err := os.Lstat(abs)
+	if err != nil {
 		return "", fmt.Errorf("host path %q: %w", hostPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("host path %q is not a regular file (mode %s)", hostPath, info.Mode().Type())
 	}
 	return abs, nil
 }
@@ -246,9 +255,11 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 	if err != nil {
 		return newValidationErrorWithField("CopyToContainer", "hostPath", hostPath, err)
 	}
-	// Unlike validateHostPath this must not follow a final link: the
-	// snapshot rejects it as unsupported, and a source that vanishes is
-	// ErrCopySourceChanged rather than a validation error.
+	// CopyToContainer, unlike WithFiles, accepts a directory. It also defers
+	// a final link or special file to the snapshot, where it is
+	// ErrCopySourceUnsupported, and a vanished source is
+	// ErrCopySourceChanged rather than a validation error. Check only
+	// existence here, without following a final link.
 	if err := copySourcePathPresent(abs); err != nil {
 		return err
 	}
@@ -751,10 +762,11 @@ func cleanupCopyStagingDir(dir string) error {
 }
 
 // checkCopyFileFromContainerVersion verifies the Docker client/server copy-out
-// version once per handle. The handle is bound to one target, so a successful
-// answer cannot describe a different daemon. Failures are not recorded and a
-// later copy retries them. Concurrent copies share the check through
-// copyVersionMu; a waiting caller's context still bounds the wait.
+// version once per handle and, through the Client metadata cache, once per
+// target. The handle is bound to one target, so a successful answer cannot
+// describe a different daemon. Failures are not recorded and a later copy
+// retries them. Concurrent copies share the check through copyVersionMu; a
+// waiting caller's context still bounds the wait.
 func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error {
 	if c.eng.name() != "docker" {
 		return c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()})
@@ -770,7 +782,7 @@ func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error
 	if p.copyVersionOK.Load() {
 		return nil
 	}
-	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
+	if err := dockerCopyFileFromContainerVersionCached(ctx, c.dockerMeta, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
 		return err
 	}
 	p.copyVersionOK.Store(true)

@@ -22,6 +22,7 @@ Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
 | `Run`、基本オプション、ライフサイクル、エンドポイント、`Exec`、`Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、バックエンド選択、元の wait 戦略 | あり | あり |
 | `LogsOptions` と `LogsWithOptions` | なし | あり |
 | `wait.ForHTTP` のヘッダー、認証、TLS、独自クライアント設定 | なし | あり |
+| `wait.ForHealthcheck` と `HTTPStrategy.WithResponseMatcher` | なし | あり |
 | 公開型 `wait.AllStrategy` / `AnyStrategy` と合成 strategy の `WithStartupTimeout` | なし | あり |
 | root の `CLIError`、`ErrContainerNotFound`、`ErrGenerationReplaced` | なし | あり |
 | 世代安全な削除、`v0.2.0` 以降の endpoint 強化、現在のリーパー強化 | `v0.2.0` の契約には含まれない | 一部実装済み。以下の後続 issue の制約を参照 |
@@ -338,6 +339,17 @@ endpoint、Host、lifecycle、reuse の inspect はその ID を対象にしま�
 network、IP、binding などの dynamic データは毎回更新され、古い snapshot
 は再利用されません。
 
+並列テストで同じ論理名を使いたい場合は、テストごとに user-defined
+network を作成し（`docker network create` など）、`t.Cleanup` で削除した
+うえで、その `WithNetwork` と `WithNetworkAliases("db")` を渡します。
+各コンテナは自分の network 内だけで `db` として解決され、他のテストや
+container 名と衝突しません。network alias には明示的な user-defined
+network が必要です。Docker の default bridge、`host`、`none`、`nat` は
+alias を解決しないため、`Run` は backend 呼び出し前に `*ConfigError` で
+拒否します。alias は reuse の互換性判定にも含まれるため、alias を持たない
+既存コンテナへは attach しません。ライブラリは既存 network へ接続するだけで、
+network の作成・削除は行いません。
+
 `DOCKER_HOST` のみを host reachability の判定に使用します。
 `docker context` 経由のリモート daemon は endpoint host の書き換えには
 使用しません。
@@ -434,6 +446,12 @@ func ReleasedWaitStrategies() {
 `ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間です。
 `ForAll` と `ForAny` は既定では合成全体のタイムアウトを持ちません。正の `WithStartupTimeout` を指定すると合成全体を制限し、0 または負の値では制限せず各子の戦略のタイムアウトを適用します。
 
+現在の開発チェックアウトは、Docker の `HEALTHCHECK` 状態を待つ
+`wait.ForHealthcheck()` と、上限付きでレスポンスボディを判定する
+`HTTPStrategy.WithResponseMatcher` も追加しています。
+ヘルスチェック戦略は Docker 専用であり、Apple バックエンドはコンテナを
+作成する前にこの戦略を拒否します。
+
 コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
 created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF は再-open します。終了コードを伴うログストリームエラーは返却します。
 成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理されます。`ForLog` はワンショットジョブではなく、長時間稼働するサービス向けです。
@@ -443,6 +461,22 @@ created、restarting、unknown と一時的な inspect エラーはタイムア�
 カスタム戦略向けの `wait.Target` は従来の `Running` メソッドを維持します。
 起動中の一時状態を区別できるターゲットでは、任意の `wait.StateTarget` インターフェースも実装してください。
 組み込み戦略は `StateTarget` を自動利用し、互換性のため `Running` にフォールバックします。
+Docker のヘルスチェック待機では、任意の `wait.HealthTarget` インターフェースも使います。
+`ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返します。
+
+Docker では、公開ポートへの TCP 接続が成功してもコンテナ内のプロセスが
+listen しているとは限りません。`docker-proxy` や Docker Desktop の port
+forwarder が先に handshake を完了するためです。そのため
+`ForListeningPort` と `ForExposedPort` は、host 側の接続成功後に、宣言した
+コンテナ側ポートが `LISTEN` 状態であることを確認します。この確認は
+`exec` 経由で `/proc/net/tcp` と `/proc/net/tcp6` を読み取ります。確認を
+実行できない場合（Apple Container は VM の endpoint に直接接続するため
+不要です。distroless など `cat` を持たないイメージや、その他の未対応
+ターゲットも同様です）は、host 側の接続確認だけにフォールバックします。
+このフォールバックは best-effort です。コンテナ側の確認が利用できない
+ために従来の host 側だけの判定に戻るのであり、ポートが ready であることを
+確認したわけではありません。コンテナ側の確認を明示的に省略するには
+`WithHostOnly()` を使います。
 
 `ForListeningPort` と `ForExposedPort` は TCP 専用の readiness probe です。
 UDP は endpoint 設定には宣言できますが、現在の実装は probe 前に `/udp` を
@@ -1068,8 +1102,9 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   値でも env ファイルには書かないという意図的な互換性変更です。
 - `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
   開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
-  `WithFiles` は通常ファイル専用です。
-  シンボリックリンク、reparse point、特殊ファイルは拒否します。
+  `WithFiles` は通常ファイル専用で、option 評価時にディレクトリ、
+  シンボリックリンク、reparse point、特殊ファイルを backend 呼び出し前に拒否します。
+  コピー経路はシンボリックリンク、reparse point、特殊ファイルを拒否します。
   スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
   保持するメタデータは名前、バイト列、Unix パーミッションだけです。
   タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。
@@ -1104,7 +1139,7 @@ watchdog プロセスを停止し、実効 `TMPDIR`(`/tmp` と決めつけませ
 
 | testcontainers-go | 本 library |
 |---|---|
-| `wait.ForHealthCheck` | 相当機能なし。`ForLog` / `ForExec` / `ForHTTP` を使用 |
+| `wait.ForHealthCheck` | Docker 専用（`wait.ForHealthcheck`）。Apple Container にはヘルスチェックがない |
 | Dockerfile からの build | スコープ外（`container build` / `docker build` を直接使用） |
 | Ryuk reaper container | ローカルの watchdog reaper process で代替。ただし上記の制限がある |
 | random host port mapping | Apple はコンテナ IP へ直接接続。Docker はランダム loopback port へ自動公開 |

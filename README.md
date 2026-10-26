@@ -24,6 +24,7 @@ later. The `v0.2.0` module requires Go 1.27 or later.
 | `Run`, core options, lifecycle, endpoints, `Exec`, `Logs`, `FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and the original wait strategies | Available | Available |
 | `LogsOptions` and `LogsWithOptions` | Not available | Available |
 | `wait.ForHTTP` header, authentication, TLS, and custom-client setters | Not available | Available |
+| `wait.ForHealthcheck` and `HTTPStrategy.WithResponseMatcher` | Not available | Available |
 | Exported `wait.AllStrategy` / `AnyStrategy` and composite `WithStartupTimeout` | Not available | Available |
 | Root `CLIError`, `ErrContainerNotFound`, and `ErrGenerationReplaced` | Not available | Available |
 | Generation-safe deletion, post-`v0.2.0` endpoint hardening, and the current reaper hardening | Not part of the `v0.2.0` contract | Partially implemented; see the follow-up issue boundaries below |
@@ -360,6 +361,19 @@ and reuse operations inspect that ID; dynamic network, IP, and binding
 data are refreshed on every operation rather than served from a stale
 snapshot.
 
+For parallel tests that need the same logical name on separate networks,
+create a user-defined network per test (for example with `docker network
+create`), remove it in `t.Cleanup`, and pass `WithNetworkAliases("db")`
+with that `WithNetwork`. Each container then resolves as `db` inside its
+own network without colliding with other tests or with container names.
+Network aliases require an explicitly selected user-defined network:
+Docker's default bridge, `host`, `none`, and `nat` networks do not
+resolve them, so `Run` rejects those combinations with a `*ConfigError`
+before any backend call. The aliases are part of the reuse compatibility
+check, so a reused container that does not carry them is not adopted.
+The library attaches to existing networks; it does not create or delete
+them.
+
 Both `DOCKER_HOST` and Docker contexts are honored for host reachability;
 endpoint hosts resolve to the detected remote endpoint.
 
@@ -459,6 +473,11 @@ no composition-wide timeout by default; a positive `WithStartupTimeout`
 bounds the whole composition, while zero or a negative value leaves it
 unbounded and lets each child strategy's timeout apply.
 
+The current development checkout also adds `wait.ForHealthcheck()` for
+Docker's `HEALTHCHECK` status and `HTTPStrategy.WithResponseMatcher` for
+bounded response-body checks. The healthcheck strategy is Docker-only; the
+Apple backend rejects it before creating a container.
+
 Waiting fails fast when the container is stopping, stopped, or paused.
 Created, restarting, unknown, and transient inspect states retry under the
 timeout; transient log stream open/EOF failures are reopened, while a
@@ -471,7 +490,22 @@ the container back with a tail of its logs attached to the error.
 For custom strategies, `wait.Target` retains its original `Running` method.
 Implement the optional `wait.StateTarget` interface when the target can
 distinguish transient startup states; built-in strategies use it automatically
-and fall back to `Running` for compatibility.
+and fall back to `Running` for compatibility. Docker healthcheck waits also
+use the optional `wait.HealthTarget` interface; `ForHealthcheck` returns a
+`*wait.ConfigError` for targets that do not implement it.
+
+On Docker, a successful TCP connection to a published port does not prove
+that the container process listens: `docker-proxy` or Docker Desktop's port
+forwarder completes the handshake first. `ForListeningPort` and
+`ForExposedPort` therefore follow a successful host connection with a
+container-side check that the declared container port is in `LISTEN` state,
+read from `/proc/net/tcp` and `/proc/net/tcp6` through `exec`. When that check
+cannot run — Apple Container (which reaches the VM endpoint directly), an
+image without `cat` such as distroless, or another unsupported target — the
+strategy falls back to the host connection alone. That fallback is
+best-effort: it restores the historical host-only behavior because the
+container-side check is unavailable, not because the port is known to be
+ready. Use `WithHostOnly()` to skip the container-side check explicitly.
 
 `ForListeningPort` and `ForExposedPort` are TCP-only readiness probes.
 UDP may be declared for endpoint configuration, but the current
@@ -1126,8 +1160,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Every CLI call is an argv vector; no shell is involved. The one shell
 - `CopyToContainer` opens regular files and directories without following
   final links, then snapshots the opened handles into a per-user private
-  staging path before invoking the backend. `WithFiles` is regular-file-only.
-  Symlinks/reparse points and special files are rejected. Snapshots are
+  staging path before invoking the backend. `WithFiles` is regular-file-only
+  and rejects directories, symlinks/reparse points, and special files when the
+  option is applied, before any backend call. Snapshots are
   bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
   `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
   (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source
@@ -1201,7 +1236,7 @@ Not supported (Apple Container has no equivalent, or out of scope):
 
 | testcontainers-go | Here |
 |---|---|
-| `wait.ForHealthCheck` | No equivalent; use `ForLog`/`ForExec`/`ForHTTP` |
+| `wait.ForHealthCheck` | Docker only (`wait.ForHealthcheck`); Apple Container has no healthcheck |
 | Building from a Dockerfile | Out of scope (use `container build` / `docker build` yourself) |
 | Ryuk reaper container | Replaced by the local watchdog reaper process, with the limitations described above |
 | Random host port mapping | Apple backend connects to the container IP directly; Docker backend auto-publishes to random loopback ports |

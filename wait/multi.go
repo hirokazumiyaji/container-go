@@ -242,6 +242,7 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			default:
 			}
 			if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline); terminal != nil {
+				errs = append(errs, err)
 				cancel()
 				childErrs := drainCompositeResults(results, remaining)
 				return errors.Join(append([]error{terminal}, append(errs, childErrs...)...)...)

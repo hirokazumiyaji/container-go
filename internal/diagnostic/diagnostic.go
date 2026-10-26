@@ -212,9 +212,6 @@ func ComposeRedactors(redactors ...*Redactor) *Redactor {
 	return redactors[0].Compose(redactors[1:]...)
 }
 
-// Compose is a short alias for ComposeRedactors.
-func Compose(redactors ...*Redactor) *Redactor { return ComposeRedactors(redactors...) }
-
 // Text redacts known values, applies structural secret rules, and escapes
 // control characters. The returned text is safe to write to a terminal or a CI
 // log.
@@ -328,6 +325,8 @@ func commandPayloadStart(args []string) int {
 			"--publish": true, "-p": true, "--mount": true, "--volume": true, "--volume-driver": true, "-v": true, "--filter": true, "--filter-file": true, "-f": true,
 			"--cpus": true, "--memory": true, "--user": true, "--workdir": true, "--network": true, "--platform": true,
 			"--entrypoint": true, "--pull": true,
+			"--shm-size": true, "--cap-add": true, "--cap-drop": true, "--ulimit": true,
+			"--add-host": true, "--hostname": true,
 		}
 	case "exec":
 		consumesNext = map[string]bool{
@@ -1043,6 +1042,75 @@ func hex8(v uint32) string {
 	})
 }
 
+// RedactedAsFunc fills target with a redacted clone of err and reports
+// whether it matched. It lets a package register support for a public error
+// type whose redaction method is intentionally unexported, because an
+// unexported method cannot satisfy an interface in another package.
+type RedactedAsFunc func(err error, target any, r *Redactor) bool
+
+var redactedAsFuncs []RedactedAsFunc
+
+// RegisterRedactedAs registers an additional redaction provider. It must be
+// called during package initialization, before diagnostics are wrapped.
+func RegisterRedactedAs(provider RedactedAsFunc) {
+	if provider != nil {
+		redactedAsFuncs = append(redactedAsFuncs, provider)
+	}
+}
+
+// RedactedAs reports whether target was populated with a redacted clone. It
+// consults registered providers first and then an AsRedacted method, which
+// remains available to internal safe wrappers and unexported error types.
+func RedactedAs(err error, target any, r *Redactor) bool {
+	if err == nil {
+		return false
+	}
+	for _, provider := range redactedAsFuncs {
+		if provider(err, target, r) {
+			return true
+		}
+	}
+	if provider, ok := err.(interface {
+		AsRedacted(any, *Redactor) bool
+	}); ok {
+		return provider.AsRedacted(target, r)
+	}
+	return false
+}
+
+// DiagnosticRedactorFunc returns the redactor attached to err, if any. It
+// serves the same purpose as RedactedAsFunc for public error types whose
+// diagnostic context accessor is intentionally unexported.
+type DiagnosticRedactorFunc func(err error) *Redactor
+
+var diagnosticRedactorFuncs []DiagnosticRedactorFunc
+
+// RegisterDiagnosticRedactor registers an additional redactor provider. It
+// must be called during package initialization.
+func RegisterDiagnosticRedactor(provider DiagnosticRedactorFunc) {
+	if provider != nil {
+		diagnosticRedactorFuncs = append(diagnosticRedactorFuncs, provider)
+	}
+}
+
+// DiagnosticRedactorOf returns the redactor carried by err, if any. Registered
+// providers run before the DiagnosticRedactor method, which remains available
+// to internal types because its return type names an internal Redactor.
+func DiagnosticRedactorOf(err error) *Redactor {
+	if err == nil {
+		return nil
+	}
+	for _, provider := range diagnosticRedactorFuncs {
+		if r := provider(err); r != nil {
+			return r
+		}
+	}
+	if provider, ok := err.(interface{ DiagnosticRedactor() *Redactor }); ok {
+		return provider.DiagnosticRedactor()
+	}
+	return nil
+}
+
 // safeError is kept in this package for the small generic wrapper used by
 // callers that only need structural redaction. CLI-specific wrappers live in
 // internal/cli so they can intercept errors.As for *CLIError.
@@ -1070,11 +1138,8 @@ func (e *safeError) UnwrapRaw() error {
 	return e.err
 }
 
-// Wrap returns an error whose Error method is safe for terminal and log
-// output while retaining source identity for errors.Is and explicit UnwrapRaw.
-func Wrap(err error) error { return WithRedactor(err, NewRedactor()) }
-
-// WithRedactor is the configurable form of Wrap.
+// WithRedactor returns err with a safe diagnostic rendering while retaining
+// source identity for errors.Is and explicit UnwrapRaw.
 func WithRedactor(err error, r *Redactor) error {
 	if err == nil {
 		return nil
@@ -1106,10 +1171,8 @@ func redactorsIn(err error) []*Redactor {
 			}
 			return
 		}
-		if provider, ok := current.(interface{ DiagnosticRedactor() *Redactor }); ok {
-			if redactor := provider.DiagnosticRedactor(); redactor != nil {
-				redactors = append(redactors, redactor)
-			}
+		if provider := DiagnosticRedactorOf(current); provider != nil {
+			redactors = append(redactors, provider)
 		}
 		for _, child := range rawChildren(current) {
 			walk(child)
@@ -1192,9 +1255,7 @@ func (e *safeError) as(target any, r *Redactor) bool {
 		if current == nil {
 			return false
 		}
-		if provider, ok := current.(interface {
-			AsRedacted(any, *Redactor) bool
-		}); ok && provider.AsRedacted(target, r) {
+		if RedactedAs(current, target, r) {
 			return true
 		}
 		if _, safe := current.(interface{ DiagnosticSafe() }); safe && errors.As(current, target) {

@@ -12,6 +12,7 @@
 - `make test` runs the full default test suite (`go test ./...`) without requiring a container backend.
 - `make vet` runs `go vet ./...`.
 - `make lint` runs `golangci-lint run ./...` (also enforced in CI).
+- `make deadcode` reports functions unreachable from any main or test binary; it runs in CI and `make release-check`, and fails on findings outside the exported API allowlist in the Makefile.
 - `make integration` runs tagged integration tests against the available default backend (skips pull-heavy bench/singleflight cases); `make integration-docker` limits them to Docker; `make bench-integration` runs the pull-heavy scenarios. These require the relevant CLI and daemon/service. Integration images use the AWS public ECR Docker Hub mirror to avoid anonymous pull rate limits. Set `CONTAINERGO_BACKEND` to skip the other backend's tests.
 - `go fmt ./...` formats all packages.
 
@@ -37,5 +38,5 @@ Never commit credentials or environment files. Configure backend selection with 
 
 ## Cursor Cloud specific instructions
 
-- `mise install` reads `mise.toml` (Go 1.27 and golangci-lint 2.13.0). Non-interactive login shells do not source `~/.bashrc`, so the environment links `go` and `golangci-lint` onto `/usr/local/bin`.
+- `mise install` reads `mise.toml` (Go 1.27 and golangci-lint 2.14.0). Non-interactive login shells do not source `~/.bashrc`, so the environment links `go` and `golangci-lint` onto `/usr/local/bin`.
 - Docker Engine 29.7.2 is the CLI this repository checks. systemd is not running in the VM, so the environment `start` script launches `containerd` and `dockerd` (fuse-overlayfs). Wait until `docker info` succeeds before `make integration` or `make integration-docker`. Apple Container is not available here; use the Docker backend.

@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -320,6 +322,11 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 	if !cfg.networkExplicit {
 		network = ""
 	}
+	if len(cfg.networkAliases) > 0 {
+		if err := dockerNetworkAliasConfigError(network); err != nil {
+			return err
+		}
+	}
 	if !dockerNetworkAllowsPublish(network) {
 		if len(cfg.published) > 0 {
 			return dockerPublishOptionError(network, "WithPublishedPort")
@@ -479,6 +486,36 @@ func dockerPublishOptionError(mode, option string) error {
 		Option:  option,
 		Detail:  detail,
 	}
+}
+
+// dockerNetworkAliasConfigError reports network modes that cannot resolve
+// network-scoped aliases. Docker registers --network-alias entries only for
+// user-defined networks; the default bridge (bridge on Linux, nat on native
+// Windows), host, and none modes all lack the embedded DNS resolver.
+func dockerNetworkAliasConfigError(network string) error {
+	switch network {
+	case "", dockerNetworkDefault, dockerNetworkBridge, dockerNetworkNAT, dockerNetworkHost, dockerNetworkNone:
+		return &ConfigError{
+			Backend: "docker",
+			Network: network,
+			Option:  "WithNetworkAliases",
+			Detail:  "network-scoped aliases require an explicitly selected user-defined network",
+		}
+	}
+	return nil
+}
+
+// dockerReuseNetworkAliasesError verifies that an existing container would
+// resolve every alias this caller asked for. Extra reported aliases are
+// expected: Docker automatically adds the container name, short ID, and
+// hostname to the endpoint's DNS names.
+func dockerReuseNetworkAliasesError(cfg *config, info *engineInfo) error {
+	for _, alias := range cfg.networkAliases {
+		if !slices.Contains(info.networkAliases, alias) {
+			return fmt.Errorf("%w: requested network alias %q is missing from the existing container", ErrNetworkMismatch, alias)
+		}
+	}
+	return nil
 }
 
 // dockerNetworkAllowsPublish reports whether Docker can create a
@@ -1247,13 +1284,29 @@ type dockerInspect struct {
 		ExitCode   int    `json:"ExitCode"`
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
+		// Health is null when the image defines no HEALTHCHECK.
+		Health *struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
 	} `json:"State"`
 	HostConfig struct {
-		NetworkMode string `json:"NetworkMode"`
+		NetworkMode string   `json:"NetworkMode"`
+		NanoCpus    float64  `json:"NanoCpus"`
+		ShmSize     int64    `json:"ShmSize"`
+		Privileged  bool     `json:"Privileged"`
+		CapAdd      []string `json:"CapAdd"`
+		CapDrop     []string `json:"CapDrop"`
+		Ulimits     []struct {
+			Name string `json:"Name"`
+			Soft int64  `json:"Soft"`
+			Hard int64  `json:"Hard"`
+		} `json:"Ulimits"`
+		ExtraHosts []string `json:"ExtraHosts"`
 	} `json:"HostConfig"`
 	Config struct {
-		Image  string            `json:"Image"`
-		Labels map[string]string `json:"Labels"`
+		Image    string            `json:"Image"`
+		Hostname string            `json:"Hostname"`
+		Labels   map[string]string `json:"Labels"`
 	} `json:"Config"`
 	NetworkSettings struct {
 		IPAddress string `json:"IPAddress"`
@@ -1262,7 +1315,9 @@ type dockerInspect struct {
 			HostPort string `json:"HostPort"`
 		} `json:"Ports"`
 		Networks map[string]struct {
-			IPAddress string `json:"IPAddress"`
+			IPAddress string   `json:"IPAddress"`
+			Aliases   []string `json:"Aliases"`
+			DNSNames  []string `json:"DNSNames"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
 }
@@ -1296,6 +1351,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	match := -1
 	var malformedID string
+	var malformedIDSeen bool
 	var candidateMissingState bool
 	if dockerIDRE.MatchString(target) {
 		for i, c := range containers {
@@ -1310,25 +1366,36 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	} else {
 		for i, c := range containers {
-			if target != "" && c.Name == "/"+target {
-				if c.ID != "" && !dockerIDRE.MatchString(c.ID) {
-					if malformedID == "" {
-						malformedID = c.ID
-					}
-					continue
-				}
-				if c.State != nil && dockerIDRE.MatchString(c.ID) {
-					match = i
-					break
-				}
+			if target == "" || c.Name != "/"+target {
+				continue
 			}
+			// A name-matched entry without a container ID is unreadable,
+			// not absent: skipping it would report a container that exists
+			// as missing. An empty ID is as invalid as any other
+			// non-canonical one.
+			if !dockerIDRE.MatchString(c.ID) {
+				if !malformedIDSeen {
+					malformedID = c.ID
+					malformedIDSeen = true
+				}
+				continue
+			}
+			// Apply the same State/Status validation as ID addressing.
+			// Otherwise a target-naming entry whose state cannot be read
+			// would be accepted as a match or reported as absent.
+			if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
+				candidateMissingState = true
+				continue
+			}
+			match = i
+			break
 		}
 	}
 	if match < 0 {
 		if candidateMissingState {
 			return nil, fmt.Errorf("decode docker inspect output: container State.Status is required")
 		}
-		if malformedID != "" {
+		if malformedIDSeen {
 			return nil, fmt.Errorf("decode docker inspect output: container %s has invalid ID %q", target, malformedID)
 		}
 		return nil, newInspectTargetNotFound(target, "inspect output did not contain the requested target")
@@ -1341,25 +1408,54 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	sort.Strings(networkNames)
 
+	endpoint := c.NetworkSettings.Networks[c.HostConfig.NetworkMode]
+	networkAliases := append([]string(nil), endpoint.Aliases...)
+	networkAliases = append(networkAliases, endpoint.DNSNames...)
+	sort.Strings(networkAliases)
+
 	info := &engineInfo{
-		state:        dockerState(c.State.Status),
-		name:         strings.TrimPrefix(c.Name, "/"),
-		labels:       c.Config.Labels,
-		uid:          c.ID,
-		image:        c.Config.Image,
-		imageID:      c.Image,
-		imageDigest:  imageDigest(c.Config.Image),
-		platform:     c.Platform,
-		platformMeta: platformMetadataFromString(c.Platform),
-		ip:           c.NetworkSettings.IPAddress,
-		networkMode:  c.HostConfig.NetworkMode,
-		networkNames: networkNames,
+		state:          dockerState(c.State.Status),
+		name:           strings.TrimPrefix(c.Name, "/"),
+		labels:         c.Config.Labels,
+		uid:            c.ID,
+		image:          c.Config.Image,
+		imageID:        c.Image,
+		imageDigest:    imageDigest(c.Config.Image),
+		platform:       c.Platform,
+		platformMeta:   platformMetadataFromString(c.Platform),
+		ip:             c.NetworkSettings.IPAddress,
+		networkMode:    c.HostConfig.NetworkMode,
+		networkNames:   networkNames,
+		networkAliases: networkAliases,
 	}
+	info.runOptions = engineRunOptions{
+		cpus:         c.HostConfig.NanoCpus / 1e9,
+		cpusReported: c.HostConfig.NanoCpus != 0,
+		privileged:   c.HostConfig.Privileged,
+		capAdd:       c.HostConfig.CapAdd,
+		capDrop:      c.HostConfig.CapDrop,
+		hostname:     c.Config.Hostname,
+	}
+	if c.HostConfig.ShmSize > 0 {
+		info.runOptions.shmSizeBytes = uint64(c.HostConfig.ShmSize)
+		info.runOptions.shmSizeReported = true
+	}
+	for _, limit := range c.HostConfig.Ulimits {
+		info.runOptions.ulimits = append(info.runOptions.ulimits, ulimitSpec{
+			name: strings.ToLower(limit.Name),
+			soft: limit.Soft,
+			hard: limit.Hard,
+		})
+	}
+	info.runOptions.extraHosts = parseDockerExtraHosts(c.HostConfig.ExtraHosts)
 	info.createdAt = parseInspectTime(c.Created)
 	if c.State != nil {
 		info.exitCode = c.State.ExitCode
 		info.startedAt = parseInspectTime(c.State.StartedAt)
 		info.finishedAt = parseInspectTime(c.State.FinishedAt)
+		if c.State.Health != nil {
+			info.health = c.State.Health.Status
+		}
 	}
 	if info.networkMode == "" {
 		// HostConfig.NetworkMode is present in current Docker inspect
@@ -1403,6 +1499,33 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	}
 	return info, nil
+}
+
+// parseDockerExtraHosts converts Docker's inspect form (host:ip, host=ip, or a
+// bracketed IPv6 address) into the backend-neutral extraHostSpec so reuse can
+// compare requested and reported entries. strings.Cut splits only at the first
+// separator and returns the whole remainder, so an unbracketed IPv6 address
+// such as "host:2001:db8::1" keeps its remaining colons. Bracketed and
+// unbracketed spellings are both normalized to net.IP's canonical form; Docker
+// inspect itself reports the unbracketed form.
+func parseDockerExtraHosts(entries []string) []extraHostSpec {
+	hosts := make([]extraHostSpec, 0, len(entries))
+	for _, entry := range entries {
+		host, ip, ok := strings.Cut(entry, "=")
+		if !ok {
+			host, ip, ok = strings.Cut(entry, ":")
+		}
+		if !ok || host == "" || ip == "" {
+			continue
+		}
+		if ip != "host-gateway" {
+			if parsed := net.ParseIP(strings.Trim(ip, "[]")); parsed != nil {
+				ip = parsed.String()
+			}
+		}
+		hosts = append(hosts, extraHostSpec{host: host, ip: ip})
+	}
+	return hosts
 }
 
 // dockerState maps Docker's status vocabulary onto State.
@@ -1629,13 +1752,17 @@ func (dockerEngine) logsFollowResumeArgs(id string, since time.Time) []string {
 	return []string{"logs", "--follow", "--since", since.UTC().Format(time.RFC3339Nano), id}
 }
 
+// logsArgsWithOptions builds the snapshot argv. --since uses the same UTC
+// RFC3339Nano spelling as logsFollowResumeArgs: a coarse timestamp would
+// replay entries from the same second that an earlier snapshot already
+// delivered, which misleads incremental readers such as ForLog counting.
 func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
 	args := []string{"logs"}
 	if opts.Tail > 0 {
 		args = append(args, "--tail", strconv.Itoa(opts.Tail))
 	}
 	if !opts.Since.IsZero() {
-		args = append(args, "--since", opts.Since.Format(time.RFC3339))
+		args = append(args, "--since", opts.Since.UTC().Format(time.RFC3339Nano))
 	}
 	return append(args, id), nil
 }

@@ -28,9 +28,9 @@ pull other Hub images locally. The root module supports Go 1.26+; the nested
 `bench/` benchmark module requires Go 1.26+ and is documented in
 `bench/README.md`.
 
-Windows-specific copy tests use Windows build constraints and are cross-built
-with the package. Issue #119 does not add a live Windows CI runner; execute
-`go test ./...` on Windows separately when changing Windows-specific behavior.
+Windows-specific copy tests use Windows build constraints and run in the
+`windows-latest` unit job. Real Docker copy-out on Windows requires separate
+integration testing with Docker client/server 29.7.0 or newer.
 
 ## Pull requests
 
@@ -58,7 +58,7 @@ To cut a release:
    the pinning prose — and the `SECURITY.md` support matrix to cover `X.Y.x`.
    `internal/releasecheck` names each one it checks if you miss any.
 3. Run `make release-check` from a clean checkout: build, vet (including the
-   `integration`-tagged files), `golangci-lint`, `go test -race`,
+   `integration`-tagged files), `golangci-lint`, `deadcode`, `go test -race`,
    `go mod verify`, a `go mod tidy -diff` no-op check, `govulncheck`, and
    `actionlint`, then the same for the separate `bench` module. This is the
    pre-tag gate — the same target the workflow runs — so a green local run

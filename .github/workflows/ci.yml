@@ -73,6 +73,15 @@ jobs:
       - run: go build ./...
       - run: go vet -tags integration ./...
       - run: go test ./...
+      # Race detection for the OS-specific lock, process, and reaper paths.
+      # The Linux race job cannot exercise the Windows and Darwin
+      # implementations, and rerunning the whole suite under -race on both
+      # hosted runners would double the job time for little extra signal.
+      # NameLock and EnvFile cover the file locks; EnvLock is kept in the
+      # filter for the env-lock name even though the current tests spell it
+      # EnvFile. Reaper covers the watchdog and process groups; Process covers
+      # internal/cli's process handling.
+      - run: go test -race -run 'NameLock|EnvLock|EnvFile|Reaper|Process' . ./internal/cli
 
   # Unit tests run against a fake CLI runner, so the cheaper Linux
   # runner is enough; integration tests need real Apple Container and
@@ -93,7 +102,15 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
-      - run: go test ./...
+      # Shuffle the test order so an implicit dependency on global state or
+      # environment cleanup surfaces here instead of on a later change.
+      # The profile is uploaded below; do not add a coverage service.
+      - run: go test -shuffle=on -coverprofile=coverage.out ./...
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-${{ matrix.go-version }}
+          path: coverage.out
+          if-no-files-found: error
       - run: go mod verify
       - run: go mod tidy -diff
 
@@ -129,6 +146,12 @@ jobs:
         with:
           # v2.13.0 cannot decode Go 1.27 export data (version 5).
           version: v2.14.0
+      # golangci-lint's unused check stops at package boundaries and treats
+      # every reference as a use, so it cannot see a forwarding wrapper that
+      # another only-test-reachable wrapper calls. deadcode builds the call
+      # graph from main and test binaries instead; the Makefile target pins the
+      # tool through tools/go.mod and filters the documented exported API.
+      - run: make deadcode
 
   # The tagged vet runs in three places, and TestTaggedVetMatchesMakefileCommand
   # plus TestGolangciBuildTagsMatchMakefileCommand keep the copies of the tag

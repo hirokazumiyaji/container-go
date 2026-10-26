@@ -15,6 +15,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/internal/inspect"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // appleEngine drives Apple Container's `container` CLI.
@@ -79,8 +80,26 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 	if err := resolveEffectivePlatform(cfg); err != nil {
 		return err
 	}
+	if wait.RequiresHealthcheck(cfg.waitStrategy) {
+		return fmt.Errorf("%w: Apple Container has no HEALTHCHECK; wait.ForHealthcheck requires the Docker backend", ErrUnsupportedCapability)
+	}
+	if len(cfg.networkAliases) > 0 {
+		return fmt.Errorf("%w: apple backend does not support network aliases", ErrUnsupportedCapability)
+	}
 	if cfg.pullPolicy == PullNever {
 		return fmt.Errorf("%w: Apple Container's run command always resolves images; use PullMissing or PullAlways", ErrPullNeverUnsupported)
+	}
+	if cfg.privileged {
+		return fmt.Errorf("%w: apple backend does not support WithPrivileged", ErrUnsupportedCapability)
+	}
+	if len(cfg.extraHosts) > 0 {
+		return fmt.Errorf("%w: apple backend does not support WithExtraHost", ErrUnsupportedCapability)
+	}
+	if cfg.hostname != "" {
+		return fmt.Errorf("%w: apple backend does not support WithHostname", ErrUnsupportedCapability)
+	}
+	if cfg.cpus > 0 && cfg.cpus != math.Trunc(cfg.cpus) {
+		return fmt.Errorf("%w: apple backend requires a whole-number CPU count, got %s", ErrUnsupportedCapability, formatCPUs(cfg.cpus))
 	}
 	if cfg.platform != "" {
 		if err := validateApplePlatform(cfg.platform); err != nil {
@@ -502,6 +521,23 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			image:              image,
 			imageDigest:        imageDigest,
 			imageVariantDigest: c.Configuration.Image.VariantDigest,
+			runOptions: engineRunOptions{
+				cpus:         float64(c.Configuration.Resources.CPUS),
+				cpusReported: c.Configuration.Resources.CPUS != 0,
+				capAdd:       c.Configuration.CapAdd,
+				capDrop:      c.Configuration.CapDrop,
+			},
+		}
+		if c.Configuration.ShmSize != nil {
+			info.runOptions.shmSizeBytes = *c.Configuration.ShmSize
+			info.runOptions.shmSizeReported = true
+		}
+		for _, limit := range c.Configuration.InitProcess.Rlimits {
+			info.runOptions.ulimits = append(info.runOptions.ulimits, ulimitSpec{
+				name: appleRlimitName(limit.Limit),
+				soft: int64(limit.Soft),
+				hard: int64(limit.Hard),
+			})
 		}
 		pConfig := c.Configuration.Platform
 		platformMeta := platformMetadataFromParts(
@@ -553,6 +589,12 @@ func appleInspectTargetMatches(c inspect.Container, target string) bool {
 		return false
 	}
 	return strings.TrimPrefix(strings.TrimSpace(c.ID), "/") == target
+}
+
+// appleRlimitName maps Apple's inspected RLIMIT_* spelling to the lowercase
+// name the public WithUlimit option uses.
+func appleRlimitName(limit string) string {
+	return strings.TrimPrefix(strings.ToLower(limit), "rlimit_")
 }
 
 func appleState(state string) State {
@@ -1277,7 +1319,7 @@ func (appleEngine) containerMissing(err error) bool {
 		return false
 	}
 	switch ctx.operation {
-	case "inspect", "exec", "stop", "delete", "rm", "logs", "start", "kill":
+	case "inspect", "exec", "stop", "delete", "rm", "logs", "start", "kill", "cp":
 		return hasCLIErrorLine(err, func(line string) bool {
 			return appleContainerMissingLine(line, ctx.target, ctx.operation)
 		})
@@ -1315,6 +1357,11 @@ func appleContainerMissingLine(line, target, command string) bool {
 			return true
 		}
 		return appleLogsMissingLine(line, target) || appleExecMissingLine(line, target)
+	case "cp":
+		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
+			return true
+		}
+		return appleCopyMissingLine(line, target)
 	default:
 		return false
 	}
@@ -1445,6 +1492,8 @@ func appleContainerNotFoundMessage(line, message, target, command string) bool {
 		// output, not a backend delete absence.
 		return strings.Contains(lowerLine, "failed to delete container") &&
 			appleIDMessageMatches(message, target)
+	case "cp":
+		return appleCopyNotFoundMessage(line, message, target)
 	case "logs":
 		// A get-logs root that names another container must not be accepted
 		// just because a nested open-logs cause mentions the argv target.
@@ -1481,6 +1530,75 @@ func appleContainerNotFoundMessage(line, message, target, command string) bool {
 
 func appleIDMessageMatches(message, target string) bool {
 	return appleIDMissingLine(strings.TrimSpace(strings.Trim(message, `"'`)), target)
+}
+
+// appleCopyWrapperPrefixes are the client-side messages that wrap a failed
+// cp. They name the container between the fixed phrase and either the
+// closing quote of the typed envelope or the colon that separates a flat
+// wrapper from its cause.
+var appleCopyWrapperPrefixes = []string{
+	"failed to copy into container ",
+	"failed to copy from container ",
+}
+
+// appleCopyWrapperMessage returns the container named by a cp wrapper and
+// the text after it. A malformed or space-bearing ID is rejected so the
+// argv target cannot match text that is not a container reference.
+func appleCopyWrapperMessage(line string) (containerID, message string, ok bool) {
+	for _, prefix := range appleCopyWrapperPrefixes {
+		index := strings.Index(line, prefix)
+		if index < 0 {
+			continue
+		}
+		rest := line[index+len(prefix):]
+		if end := strings.IndexAny(rest, `"':`); end >= 0 {
+			containerID = strings.TrimSpace(rest[:end])
+			message = strings.TrimSpace(rest[end+1:])
+		} else {
+			containerID = strings.TrimSpace(rest)
+		}
+		if containerID == "" || strings.ContainsAny(containerID, " \t\r\n") {
+			return "", "", false
+		}
+		return containerID, message, true
+	}
+	return "", "", false
+}
+
+// appleCopyMissingLine matches a flat cp wrapper around one of the accepted
+// absence leaves, such as
+// "failed to copy into container myctr: container with ID myctr not found".
+func appleCopyMissingLine(line, target string) bool {
+	containerID, message, ok := appleCopyWrapperMessage(line)
+	if !ok || !sameCLITarget(containerID, target) {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(message, "container not found:"); ok &&
+		cliTargetListMatches(rest, target) {
+		return true
+	}
+	return appleIDMessageMatches(message, target) || appleExecMissingLine(message, target)
+}
+
+// appleCopyNotFoundMessage matches the typed notFound leaves a cp reports.
+// The CLI wraps the server's absence inside
+// internalError: "failed to copy into container <id>" (cause: notFound: ...),
+// so an internalError root must carry a cp wrapper naming the argv target.
+// A top-level notFound (no internalError root) is accepted through its own
+// anchored leaf.
+func appleCopyNotFoundMessage(line, message, target string) bool {
+	containerID, _, hasWrapper := appleCopyWrapperMessage(line)
+	if hasWrapper && !sameCLITarget(containerID, target) {
+		return false
+	}
+	if strings.HasPrefix(line, "internalerror:") && !hasWrapper {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(message, "container not found:"); ok &&
+		cliTargetListMatches(rest, target) {
+		return true
+	}
+	return appleIDMessageMatches(message, target) || appleExecMissingLine(message, target)
 }
 
 func appleExecMissingLine(line, target string) bool {

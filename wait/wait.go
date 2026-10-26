@@ -5,21 +5,13 @@ package wait
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/url"
-	"os"
-	"os/exec"
 	"reflect"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -74,6 +66,24 @@ type StateTarget interface {
 	State(ctx context.Context) (State, error)
 }
 
+// Health is a Docker HEALTHCHECK status reported by Target. Its zero value
+// means the image defines no HEALTHCHECK.
+type Health string
+
+const (
+	HealthNone      Health = ""
+	HealthStarting  Health = "starting"
+	HealthHealthy   Health = "healthy"
+	HealthUnhealthy Health = "unhealthy"
+)
+
+// HealthTarget is an optional extension to Target for targets that can
+// report Docker HEALTHCHECK status. ForHealthcheck returns a ConfigError for
+// targets that do not implement it.
+type HealthTarget interface {
+	Health(ctx context.Context) (Health, error)
+}
+
 // Strategy waits until a started container is ready for use.
 // Implementations must return when ctx is done so composite strategies can
 // collect their final causes without extending the caller's budget.
@@ -84,6 +94,10 @@ type Strategy interface {
 type options struct {
 	startupTimeout time.Duration
 	pollInterval   time.Duration
+	// stateFirst runs the lifecycle probe before the readiness check when
+	// it is due. Healthcheck waits use it so the 1 Hz inspect that refreshes
+	// the health snapshot happens before the check reads that snapshot.
+	stateFirst bool
 }
 
 func (o options) effective() (timeout, interval time.Duration) {
@@ -97,26 +111,110 @@ func (o options) effective() (timeout, interval time.Duration) {
 	return timeout, interval
 }
 
-// waitError keeps a conventional single context cause for errors.Unwrap
-// while exposing additional transient causes through errors.Is/As.
+// waitReason identifies how a wait ended. The reason selects the diagnostic
+// wording; the causes themselves are never rewritten.
+type waitReason uint8
+
+const (
+	waitReasonMessage waitReason = iota
+	waitReasonCause
+	waitReasonContext
+	waitReasonTimeout
+	waitReasonState
+)
+
+// waitError reports a wait failure from structured parts: the operation
+// name, the termination reason, the last check error, the last state probe
+// error, and any terminal cause. Error() renders those parts once; Is/As
+// walk the retained causes directly. A context sentinel is kept only as the
+// termination reason, so a backend cause can never make the wait appear
+// canceled.
 type waitError struct {
-	message string
-	primary error
-	causes  []error
+	reason     waitReason
+	what       string
+	message    string
+	timeout    time.Duration
+	state      State
+	contextErr error
+	checkErr   error
+	probeErr   error
+	cause      error
+	causes     []error
 }
 
-func (e *waitError) Error() string { return e.message }
-func (e *waitError) Unwrap() error { return e.primary }
+func (e *waitError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	switch e.reason {
+	case waitReasonContext:
+		return appendLastError(fmt.Sprintf("%s: %v", e.what, e.contextErr), e.lastDiagnostic())
+	case waitReasonTimeout:
+		return appendLastError(fmt.Sprintf("%s: timed out after %v", e.what, e.timeout), e.lastDiagnostic())
+	case waitReasonState:
+		return appendLastError(fmt.Sprintf("%s: container %s while waiting", e.what, e.state), e.lastDiagnostic())
+	case waitReasonCause:
+		if e.cause == nil {
+			return e.message
+		}
+		if e.what == "" {
+			return e.cause.Error()
+		}
+		return fmt.Sprintf("%s: %v", e.what, e.cause)
+	default:
+		return e.message
+	}
+}
+
+func appendLastError(message string, last error) string {
+	if last == nil || last.Error() == "" {
+		return message
+	}
+	return message + fmt.Sprintf(" (last error: %v)", last)
+}
+
+func (e *waitError) lastDiagnostic() error {
+	return joinNonNil(e.checkErr, e.probeErr)
+}
+
+// lookupCauses returns the retained causes in diagnostic order. The context
+// termination reason is deliberately absent: it terminated the wait, it is
+// not a failure cause.
+func (e *waitError) lookupCauses() []error {
+	causes := make([]error, 0, 3+len(e.causes))
+	if e.checkErr != nil {
+		causes = append(causes, e.checkErr)
+	}
+	if e.probeErr != nil {
+		causes = append(causes, e.probeErr)
+	}
+	if e.cause != nil {
+		causes = append(causes, e.cause)
+	}
+	causes = append(causes, e.causes...)
+	return causes
+}
+
 func (e *waitError) Is(target error) bool {
-	for _, cause := range e.causes {
+	if e == nil || target == nil {
+		return false
+	}
+	if e.contextErr != nil && errors.Is(e.contextErr, target) {
+		return true
+	}
+	for _, cause := range e.lookupCauses() {
 		if errors.Is(cause, target) {
 			return true
 		}
 	}
 	return false
 }
+
 func (e *waitError) As(target any) bool {
-	for _, cause := range e.causes {
+	if e == nil || target == nil {
+		return false
+	}
+	for _, cause := range e.lookupCauses() {
 		if errors.As(cause, target) {
 			return true
 		}
@@ -128,7 +226,7 @@ func (e *waitError) AsRedacted(target any, redactor *cli.Redactor) bool {
 	if e == nil {
 		return false
 	}
-	for _, cause := range e.causes {
+	for _, cause := range e.lookupCauses() {
 		if errors.As(cli.WithRedactor(cause, redactor), target) {
 			return true
 		}
@@ -136,6 +234,31 @@ func (e *waitError) AsRedacted(target any, redactor *cli.Redactor) bool {
 	return false
 }
 
+func (e *waitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	if e.contextErr != nil {
+		return e.contextErr
+	}
+	if e.reason == waitReasonCause && e.cause != nil {
+		return e.cause
+	}
+	if e.checkErr != nil {
+		return e.checkErr
+	}
+	if e.probeErr != nil {
+		return e.probeErr
+	}
+	if len(e.causes) > 0 {
+		return e.causes[0]
+	}
+	return nil
+}
+
+// newWaitError builds a message-first error for composite strategies, whose
+// diagnostics combine several already-classified termination reasons. It is
+// not used for per-probe causes; those use the structured constructors below.
 func newWaitError(message string, causes ...error) error {
 	filtered := make([]error, 0, len(causes))
 	for _, cause := range causes {
@@ -143,39 +266,42 @@ func newWaitError(message string, causes ...error) error {
 			filtered = append(filtered, cause)
 		}
 	}
-	var primary error
-	if len(filtered) > 0 {
-		primary = filtered[0]
-	}
-	return &waitError{message: message, primary: primary, causes: filtered}
+	return &waitError{reason: waitReasonMessage, message: message, causes: filtered}
 }
 
-func waitContextError(what string, contextErr, lastErr error) error {
-	message := fmt.Sprintf("%s: %s", what, contextErr)
-	if lastErr != nil {
-		message += fmt.Sprintf(" (last error: %v)", lastErr)
+func waitContextError(what string, contextErr, checkErr, probeErr error) error {
+	return &waitError{
+		reason:     waitReasonContext,
+		what:       what,
+		contextErr: contextErr,
+		checkErr:   checkErr,
+		probeErr:   probeErr,
 	}
-	return newWaitError(message, contextErr, lastErr)
 }
 
-func waitTimeoutError(what string, timeout time.Duration, lastErr error) error {
-	message := fmt.Sprintf("%s: timed out after %v", what, timeout)
-	if lastErr != nil {
-		message += fmt.Sprintf(" (last error: %v)", lastErr)
+func waitTimeoutError(what string, timeout time.Duration, checkErr, probeErr error) error {
+	return &waitError{
+		reason:     waitReasonTimeout,
+		what:       what,
+		timeout:    timeout,
+		contextErr: context.DeadlineExceeded,
+		checkErr:   checkErr,
+		probeErr:   probeErr,
 	}
-	return newWaitError(message, context.DeadlineExceeded, lastErr)
 }
 
-func waitStoppedStateError(what string, state State, lastErr error) error {
-	message := fmt.Sprintf("%s: container %s while waiting", what, state)
-	if lastErr != nil {
-		message += fmt.Sprintf(" (last error: %v)", lastErr)
+func waitStoppedStateError(what string, state State, checkErr, probeErr error) error {
+	return &waitError{
+		reason:   waitReasonState,
+		what:     what,
+		state:    state,
+		checkErr: checkErr,
+		probeErr: probeErr,
 	}
-	return newWaitError(message, lastErr)
 }
 
 func stateFailure(what string, state State, checkErr, stateErr error) error {
-	return waitStoppedStateError(what, state, joinNonNil(checkErr, stateErr))
+	return waitStoppedStateError(what, state, checkErr, stateErr)
 }
 
 // targetState uses the richer optional interface when available. Running is a
@@ -227,15 +353,15 @@ func terminalWaitState(state State) bool {
 	return state == StateStopping || state == StateStopped || state == StatePaused
 }
 
-func waitContextTerminationError(callerCtx, waitCtx context.Context, what string, timeout time.Duration, lastErr error) error {
+func waitContextTerminationError(callerCtx, waitCtx context.Context, what string, timeout time.Duration, checkErr, probeErr error) error {
 	if err := callerCtx.Err(); err != nil {
-		return waitContextError(what, err, lastErr)
+		return waitContextError(what, err, checkErr, probeErr)
 	}
 	if err := waitCtx.Err(); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return waitTimeoutError(what, timeout, lastErr)
+			return waitTimeoutError(what, timeout, checkErr, probeErr)
 		}
-		return waitContextError(what, err, lastErr)
+		return waitContextError(what, err, checkErr, probeErr)
 	}
 	return nil
 }
@@ -245,7 +371,7 @@ func finalLifecycleError(
 	target Target,
 	what string,
 	timeout, interval time.Duration,
-	lastErr error,
+	checkErr, probeErr error,
 ) error {
 	// A successful endpoint/exec/log check can race a short-lived daemon
 	// hiccup. The lifecycle check is still a fail-fast guard for a stopped
@@ -254,18 +380,15 @@ func finalLifecycleError(
 	// interval so a transient daemon failure cannot turn into a faster
 	// probe loop than the check it follows, and only the latest probe cause
 	// is retained so retries cannot grow an error tree.
-	var lastProbeErr error
+	lastProbeErr := probeErr
 	for {
 		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
 		if err := probeCtx.Err(); err != nil {
 			probeCancel()
-			return waitContextTerminationError(
-				callerCtx,
-				waitCtx,
-				what,
-				timeout,
-				joinNonNil(lastErr, lastProbeErr, err),
-			)
+			// The probe context is derived from waitCtx, so a done probe
+			// context means the caller or startup budget ended. probeCtx.Err()
+			// itself is not a cause and is deliberately not retained.
+			return waitContextTerminationError(callerCtx, waitCtx, what, timeout, checkErr, lastProbeErr)
 		}
 		state, probeErr := targetState(probeCtx, target)
 		probeCtxErr := probeCtx.Err()
@@ -279,20 +402,14 @@ func finalLifecycleError(
 		if filtered := nonContextCause(probeErr); filtered != nil {
 			lastProbeErr = filtered
 		}
-		if terminalErr := waitContextTerminationError(
-			callerCtx,
-			waitCtx,
-			what,
-			timeout,
-			joinNonNil(lastErr, lastProbeErr),
-		); terminalErr != nil {
+		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, checkErr, lastProbeErr); terminalErr != nil {
 			return terminalErr
 		}
 		if probeErr != nil {
 			if isPermanentCheckError(probeErr) {
 				cause := permanentCause(probeErr)
-				if filtered := retainedNonContextCause(cause); filtered != nil {
-					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
+				if filtered := nonContextCause(cause); filtered != nil {
+					return wrapWaitCause(what, filtered, checkErr, lastProbeErr)
 				}
 				// Context-only permanent wrapper while the wait is still
 				// active: always retry. A prior transient lastProbeErr is
@@ -300,18 +417,12 @@ func finalLifecycleError(
 				// immediate failure of an otherwise ready target.
 			}
 			if err := waitForReconnect(waitCtx, interval); err != nil {
-				return waitContextTerminationError(
-					callerCtx,
-					waitCtx,
-					what,
-					timeout,
-					joinNonNil(lastErr, lastProbeErr),
-				)
+				return waitContextTerminationError(callerCtx, waitCtx, what, timeout, checkErr, lastProbeErr)
 			}
 			continue
 		}
 		if terminalWaitState(state) {
-			return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+			return waitStoppedStateError(what, state, checkErr, lastProbeErr)
 		}
 		if state != StateRunning {
 			return fmt.Errorf("%s: final lifecycle state %s; want running", what, state)
@@ -336,235 +447,173 @@ func joinNonNil(errs ...error) error {
 	return errors.Join(filtered...)
 }
 
-// nonContextCause drops cancellation and deadline errors so a diagnostic
-// settle that races the wait budget cannot hide an already-observed
-// success. Joined non-context causes, such as a terminal CLIError, remain.
+// nonContextCause returns a diagnostic view of err that retains every
+// non-context cause and suppresses context cancellation. It returns err
+// unchanged when no context cause is present, so ordinary backend failures
+// keep their concrete wrapper types and As surface.
+//
+// The view renders only causes that are already non-context values. It never
+// edits a rendered message: context wording is dropped by not retaining the
+// branch, not by rewriting text.
 func nonContextCause(err error) error {
-	filtered, _ := filterNonContext(err)
-	return filtered
-}
-
-// retainedNonContextCause is like nonContextCause but treats fully stripped
-// diagnostic facades as absent for permanent-failure and terminal-stream
-// control flow. Nested contextStrippedCause layers whose only remaining
-// cause is another empty facade (for example fmt wrapping a custom wrapper
-// around context-only *exec.Error) must also retry, not stop on the first
-// check. Permanent or terminal classifications on any facade in that chain
-// still fail fast: an outer Is(ErrTargetNotFound) wrapper, or an opaque
-// As(*cli.CLIError) facade that also matches cancellation, over an empty
-// inner stripped cause must not be treated as context-only.
-func retainedNonContextCause(err error) error {
-	filtered := nonContextCause(err)
-	if filtered == nil {
-		return nil
-	}
-	cur := filtered
-	for {
-		stripped, ok := cur.(*contextStrippedCause)
-		if !ok {
-			// cli.WithRedactor hides the filtered child behind UnwrapRaw, and
-			// cloned transport wrappers such as *os.PathError hide it behind
-			// ordinary Unwrap. Peeling both is required so an empty stripped
-			// leaf under those carriers is not treated as a retained cause.
-			if permanentProbeError(cur) || isPermanentCheckError(cur) || isTerminalStreamError(cur) {
-				return filtered
-			}
-			if multi, ok := cur.(interface{ Unwrap() []error }); ok {
-				// errors.Join of only empty stripped facades must retry; keep
-				// the aggregate only when at least one branch still retains a
-				// non-context cause.
-				for _, inner := range multi.Unwrap() {
-					if retainedNonContextCause(inner) != nil {
-						return filtered
-					}
-				}
-				return nil
-			}
-			if raw, ok := cur.(interface{ UnwrapRaw() error }); ok {
-				next := raw.UnwrapRaw()
-				if next == nil {
-					// Leaf with no further child (for example a retained
-					// *net.DNSError whose UnwrapErr was context-only).
-					return filtered
-				}
-				cur = next
-				continue
-			}
-			if u, ok := cur.(interface{ Unwrap() error }); ok {
-				next := u.Unwrap()
-				if next == nil {
-					// Same as UnwrapRaw: a nil child means this node is the
-					// retained leaf, not an empty carrier to discard.
-					return filtered
-				}
-				cur = next
-				continue
-			}
-			return filtered
-		}
-		// Opaque and nested facades may keep permanent or terminal
-		// classifications via Is/As on original after context matches are
-		// stripped from the Is surface. Check every facade, not only the
-		// leaf whose cause is nil.
-		if permanentProbeError(stripped) || isPermanentCheckError(stripped) || isTerminalStreamError(stripped) {
-			return filtered
-		}
-		if stripped.cause == nil {
-			return nil
-		}
-		cur = stripped.cause
-	}
-}
-
-// filterNonContext is the implementation of nonContextCause. The changed
-// flag reports whether any context branch was stripped, so multi-wrappers
-// with non-comparable children are not treated as rewritten merely because
-// equality cannot prove the child identical.
-func filterNonContext(err error) (filtered error, changed bool) {
 	if err == nil {
-		return nil, false
-	}
-	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
-		inners := unwrapper.Unwrap()
-		kept := make([]error, 0, len(inners))
-		for _, inner := range inners {
-			cause, childChanged := filterNonContext(inner)
-			if cause == nil {
-				if inner != nil {
-					changed = true
-				}
-				continue
-			}
-			if childChanged {
-				changed = true
-			}
-			kept = append(kept, cause)
-		}
-		if len(kept) == 0 {
-			if !changed {
-				// Empty Unwrap with nothing removed: keep the original so
-				// callers retain errors.As on the concrete multi-wrapper.
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return preserveEmptyContextWrapper(err), true
-				}
-				return err, false
-			}
-			return preserveEmptyContextWrapper(err), true
-		}
-		joined := joinNonNil(kept...)
-		if !changed {
-			// Children are unchanged, but the wrapper itself may still
-			// contribute a context match via its own Is method.
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return replaceUnwrappedCause(err, joined), true
-			}
-			return err, false
-		}
-		// Custom wrappers and fmt multi-%w errors keep framing via
-		// contextStrippedCause. Plain errors.Join trees are rebuilt from the
-		// filtered children so Error() no longer mentions stripped sentinels.
-		if keepsClassificationWithoutChildren(err) || errorPkgPath(err) == "fmt" {
-			return replaceUnwrappedCause(err, joined), true
-		}
-		return joined, true
-	}
-	// Only unwrap a single-error wrapper when the tree contains a context
-	// branch that must be stripped. Otherwise keep wrappers such as
-	// *net.OpError so callers retain errors.As and operation diagnostics.
-	if unwrapper, ok := err.(interface{ Unwrap() error }); ok &&
-		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		inner := unwrapper.Unwrap()
-		if inner == nil {
-			return preserveEmptyContextWrapper(err), true
-		}
-		filtered, _ := filterNonContext(inner)
-		if filtered == nil {
-			return preserveEmptyContextWrapper(err), true
-		}
-		// Even when the inner value is unchanged, the wrapper may still
-		// contribute a context match via its own Is method.
-		return replaceUnwrappedCause(err, filtered), true
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		// Pure context sentinels have nothing else to retain.
-		if err == context.Canceled || err == context.DeadlineExceeded {
-			return nil, true
-		}
-		// Opaque facades (Is/As without Unwrap), such as cli.WithRedactor,
-		// expose the source tree only via UnwrapRaw. Filter that tree so a
-		// context-only facade is dropped while a mixed join keeps its
-		// non-context surface under the original facade diagnostics.
-		if raw, ok := err.(interface{ UnwrapRaw() error }); ok {
-			filtered, _ := filterNonContext(raw.UnwrapRaw())
-			if filtered == nil {
-				return nil, true
-			}
-			filtered = retainDiagnosticFacade(err, filtered)
-			return &contextStrippedCause{original: err, cause: filtered}, true
-		}
-		// Custom Is/As facades with no unwrap surface still need their
-		// non-context classifications retained after context matches are
-		// stripped.
-		if keepsClassificationWithoutChildren(err) {
-			return &contextStrippedCause{original: err, cause: nil}, true
-		}
-		return nil, true
-	}
-	return err, false
-}
-
-// retainDiagnosticFacade reapplies an opaque facade's redactor onto the
-// filtered cause so Error/As cannot expose secrets that only that redactor
-// knew how to protect.
-func retainDiagnosticFacade(facade, filtered error) error {
-	type redactorProvider interface {
-		DiagnosticRedactor() *cli.Redactor
-	}
-	if provider, ok := facade.(redactorProvider); ok {
-		if r := provider.DiagnosticRedactor(); r != nil {
-			return cli.WithRedactor(filtered, r)
-		}
-	}
-	return filtered
-}
-
-// preserveEmptyContextWrapper keeps a custom wrapper's type and Is surface
-// after every child was a context sentinel. Stdlib join/wrap errors and
-// transport wrappers exist only to carry children, so they are dropped once
-// nothing remains. *net.DNSError is an exception when Err or DNS flags still
-// describe an independent lookup failure after UnwrapErr is discarded.
-func preserveEmptyContextWrapper(err error) error {
-	if retained := retainDNSErrorWithoutContextChild(err); retained != nil {
-		return retained
-	}
-	if !keepsClassificationWithoutChildren(err) {
 		return nil
 	}
-	if isStdlibTransportWrapper(err) {
+	if !carriesContextCause(err) {
+		return err
+	}
+	var set causeSet
+	collectNonContext(err, &set)
+	if len(set.diagnostics) == 0 && len(set.classifiers) == 0 {
 		return nil
 	}
-	return &contextStrippedCause{original: err, cause: nil}
+	if len(set.classifiers) == 0 && len(set.diagnostics) == 1 {
+		return set.diagnostics[0]
+	}
+	if len(set.diagnostics) == 0 {
+		set.diagnostics = append(set.diagnostics, staticError(safeOpaqueText(err)))
+	}
+	return &retainedCause{diagnostics: set.diagnostics, classifiers: set.classifiers}
 }
 
-// retainDNSErrorWithoutContextChild keeps a *net.DNSError whose UnwrapErr was
-// only a context sentinel but whose Err text or DNS result flags still report
-// an independent lookup failure (for example Err "no such host").
-func retainDNSErrorWithoutContextChild(err error) error {
-	dns, ok := err.(*net.DNSError)
-	if !ok || dns == nil {
+func carriesContextCause(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isContextSentinel(err error) bool {
+	return err == context.Canceled || err == context.DeadlineExceeded
+}
+
+// causeSet separates what a retained cause renders from what it classifies.
+// A facade can contribute an Is/As classification without contributing
+// context or ambiguous text to the diagnostic.
+type causeSet struct {
+	diagnostics []error
+	classifiers []error
+}
+
+// collectNonContext walks err and keeps only non-context information.
+//
+// Wrappers whose Error() renders their children are transparent: their
+// retained children are safe to render. A wrapper that hides its children is
+// kept as an opaque classifier, and only its own message is used when that
+// message does not itself carry a context phrase. This is a containment
+// check, not a rewrite: a hidden child is never exposed and a context-bearing
+// message is dropped whole rather than edited.
+func collectNonContext(err error, set *causeSet) {
+	if err == nil || isContextSentinel(err) {
+		return
+	}
+	// A subtree without a context branch is already safe: keep the whole
+	// wrapper so concrete types such as *exec.Error stay available through
+	// errors.As, and so sanitizing wrappers keep their rendering.
+	if !carriesContextCause(err) {
+		set.diagnostics = append(set.diagnostics, err)
+		return
+	}
+	if raw, ok := err.(interface{ UnwrapRaw() error }); ok {
+		if redactor := cli.DiagnosticRedactor(err); redactor != nil {
+			collectRedactedFacade(err, raw, redactor, set)
+			return
+		}
+	}
+	if dns, ok := err.(*net.DNSError); ok {
+		if retained := retainDNSErrorCause(dns); retained != nil {
+			set.diagnostics = append(set.diagnostics, retained)
+			return
+		}
+	}
+	children := unwrapChildren(err)
+	if len(children) == 0 {
+		if carriesContextCause(err) {
+			if hasNonContextClassification(err) {
+				set.classifiers = append(set.classifiers, &classifiedCause{original: err})
+			}
+			return
+		}
+		set.diagnostics = append(set.diagnostics, err)
+		return
+	}
+	childSet := causeSet{}
+	for _, child := range children {
+		collectNonContext(child, &childSet)
+	}
+	if hasCustomClassification(err) {
+		set.classifiers = append(set.classifiers, &classifiedCause{original: err})
+	}
+	if len(childSet.diagnostics) > 0 {
+		// A wrapper that does not render its children's text is treated as a
+		// sanitizing boundary: its own message is the safe diagnostic.
+		if rendersChildren(err, children) {
+			set.diagnostics = append(set.diagnostics, childSet.diagnostics...)
+		} else {
+			set.diagnostics = append(set.diagnostics, staticError(safeOpaqueText(err)))
+			set.classifiers = append(set.classifiers, childSet.diagnostics...)
+		}
+		set.classifiers = append(set.classifiers, childSet.classifiers...)
+		return
+	}
+	// Only context was found below this wrapper. Retain it only when its own
+	// classification still describes a non-context failure (for example an
+	// ErrTargetNotFound wrapper over a canceled child).
+	if carriesContextCause(err) {
+		if hasNonContextClassification(err) {
+			set.classifiers = append(set.classifiers, &classifiedCause{original: err})
+		}
+		return
+	}
+	if text := safeOpaqueText(err); text != "" {
+		set.diagnostics = append(set.diagnostics, staticError(text))
+	}
+	set.classifiers = append(set.classifiers, err)
+}
+
+// collectRedactedFacade rebuilds a redacted diagnostic from the facade's raw
+// child while keeping the redactor on every cause that is rendered or
+// classified. A facade whose raw tree is context-only is not retained: its
+// context match must not turn a still-running wait into a cancellation.
+func collectRedactedFacade(
+	facade error,
+	raw interface{ UnwrapRaw() error },
+	redactor *cli.Redactor,
+	set *causeSet,
+) {
+	child := raw.UnwrapRaw()
+	if child == nil {
+		return
+	}
+	childSet := causeSet{}
+	collectNonContext(child, &childSet)
+	if len(childSet.diagnostics) == 0 && len(childSet.classifiers) == 0 {
+		return
+	}
+	for _, diagnostic := range childSet.diagnostics {
+		set.diagnostics = append(set.diagnostics, cli.WithRedactor(diagnostic, redactor))
+	}
+	for _, classifier := range childSet.classifiers {
+		set.classifiers = append(set.classifiers, cli.WithRedactor(classifier, redactor))
+	}
+	// The facade itself carries the redacted As surface (for example a
+	// *cli.CLIError clone); its Is surface is filtered by classifiedCause.
+	set.classifiers = append(set.classifiers, &classifiedCause{original: facade})
+}
+
+// retainDNSErrorCause keeps a *net.DNSError that has an independent lookup
+// failure after its context-only child is removed. The clone nils UnwrapErr
+// structurally; it never rewrites the cached DNS reason. An Err field that
+// repeats a context phrase is cleared rather than edited so the retained
+// diagnostic cannot include cancellation text.
+func retainDNSErrorCause(dns *net.DNSError) error {
+	if dns == nil || dns.UnwrapErr == nil || !carriesContextCause(dns.UnwrapErr) {
 		return nil
 	}
 	clone := *dns
-	clone.UnwrapErr = nil
-	if dns.UnwrapErr != nil {
-		if old := dns.UnwrapErr.Error(); old != "" && clone.Err != "" {
-			switch {
-			case clone.Err == old:
-				clone.Err = ""
-			case strings.Contains(clone.Err, old):
-				clone.Err = strings.TrimSpace(strings.ReplaceAll(clone.Err, old, ""))
-			}
-		}
+	clone.UnwrapErr = nonContextCause(dns.UnwrapErr)
+	if containsContextText(clone.Err) {
+		clone.Err = ""
 	}
 	if clone.Err == "" && !clone.IsNotFound && !clone.IsTimeout && !clone.IsTemporary {
 		return nil
@@ -572,1361 +621,207 @@ func retainDNSErrorWithoutContextChild(err error) error {
 	return &clone
 }
 
-func keepsClassificationWithoutChildren(err error) bool {
-	path := errorPkgPath(err)
-	switch path {
-	case "", "errors", "fmt":
-		return false
+func unwrapChildren(err error) []error {
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		return multi.Unwrap()
 	}
-	// Standard-library package paths never contain a dot. Carrier-only
-	// wrappers such as os/exec.Error or strconv.NumError exist only to wrap
-	// children, so once those are gone nothing independent remains.
-	if isStdlibPackagePath(path) {
-		return false
-	}
-	return true
-}
-
-func isStdlibTransportWrapper(err error) bool {
-	return isStdlibPackagePath(errorPkgPath(err))
-}
-
-// stdlibPackagePaths are exact public standard-library import paths
-// (from `go list std`, excluding internal/vendor). Exact membership only:
-// prefix matching on roots such as "net/" would treat consumer modules like
-// net/corp or text/errors as stdlib and drop their concrete As surface.
-var stdlibPackagePaths = map[string]struct{}{
-	"archive/tar":                       {},
-	"archive/zip":                       {},
-	"bufio":                             {},
-	"bytes":                             {},
-	"cmp":                               {},
-	"compress/bzip2":                    {},
-	"compress/flate":                    {},
-	"compress/gzip":                     {},
-	"compress/lzw":                      {},
-	"compress/zlib":                     {},
-	"container/heap":                    {},
-	"container/list":                    {},
-	"container/ring":                    {},
-	"context":                           {},
-	"crypto":                            {},
-	"crypto/aes":                        {},
-	"crypto/cipher":                     {},
-	"crypto/des":                        {},
-	"crypto/dsa":                        {},
-	"crypto/ecdh":                       {},
-	"crypto/ecdsa":                      {},
-	"crypto/ed25519":                    {},
-	"crypto/elliptic":                   {},
-	"crypto/fips140":                    {},
-	"crypto/hkdf":                       {},
-	"crypto/hmac":                       {},
-	"crypto/hpke":                       {},
-	"crypto/md5":                        {},
-	"crypto/mldsa":                      {},
-	"crypto/mlkem":                      {},
-	"crypto/mlkem/mlkemtest":            {},
-	"crypto/pbkdf2":                     {},
-	"crypto/rand":                       {},
-	"crypto/rc4":                        {},
-	"crypto/rsa":                        {},
-	"crypto/sha1":                       {},
-	"crypto/sha256":                     {},
-	"crypto/sha3":                       {},
-	"crypto/sha512":                     {},
-	"crypto/subtle":                     {},
-	"crypto/tls":                        {},
-	"crypto/x509":                       {},
-	"crypto/x509/pkix":                  {},
-	"database/sql":                      {},
-	"database/sql/driver":               {},
-	"debug/buildinfo":                   {},
-	"debug/dwarf":                       {},
-	"debug/elf":                         {},
-	"debug/gosym":                       {},
-	"debug/macho":                       {},
-	"debug/pe":                          {},
-	"debug/plan9obj":                    {},
-	"embed":                             {},
-	"encoding":                          {},
-	"encoding/ascii85":                  {},
-	"encoding/asn1":                     {},
-	"encoding/base32":                   {},
-	"encoding/base64":                   {},
-	"encoding/binary":                   {},
-	"encoding/csv":                      {},
-	"encoding/gob":                      {},
-	"encoding/hex":                      {},
-	"encoding/json":                     {},
-	"encoding/json/jsontext":            {},
-	"encoding/json/v2":                  {},
-	"encoding/pem":                      {},
-	"encoding/xml":                      {},
-	"errors":                            {},
-	"expvar":                            {},
-	"flag":                              {},
-	"fmt":                               {},
-	"go/ast":                            {},
-	"go/build":                          {},
-	"go/build/constraint":               {},
-	"go/constant":                       {},
-	"go/doc":                            {},
-	"go/doc/comment":                    {},
-	"go/format":                         {},
-	"go/importer":                       {},
-	"go/parser":                         {},
-	"go/printer":                        {},
-	"go/scanner":                        {},
-	"go/token":                          {},
-	"go/types":                          {},
-	"go/version":                        {},
-	"hash":                              {},
-	"hash/adler32":                      {},
-	"hash/crc32":                        {},
-	"hash/crc64":                        {},
-	"hash/fnv":                          {},
-	"hash/maphash":                      {},
-	"html":                              {},
-	"html/template":                     {},
-	"image":                             {},
-	"image/color":                       {},
-	"image/color/palette":               {},
-	"image/draw":                        {},
-	"image/gif":                         {},
-	"image/jpeg":                        {},
-	"image/png":                         {},
-	"index/suffixarray":                 {},
-	"internal/abi":                      {},
-	"internal/asan":                     {},
-	"internal/bisect":                   {},
-	"internal/buildcfg":                 {},
-	"internal/bytealg":                  {},
-	"internal/byteorder":                {},
-	"internal/cfg":                      {},
-	"internal/chacha8rand":              {},
-	"internal/copyright":                {},
-	"internal/coverage":                 {},
-	"internal/coverage/calloc":          {},
-	"internal/coverage/cfile":           {},
-	"internal/coverage/cformat":         {},
-	"internal/coverage/cmerge":          {},
-	"internal/coverage/decodecounter":   {},
-	"internal/coverage/decodemeta":      {},
-	"internal/coverage/encodecounter":   {},
-	"internal/coverage/encodemeta":      {},
-	"internal/coverage/pods":            {},
-	"internal/coverage/rtcov":           {},
-	"internal/coverage/slicereader":     {},
-	"internal/coverage/slicewriter":     {},
-	"internal/coverage/stringtab":       {},
-	"internal/coverage/test":            {},
-	"internal/coverage/uleb128":         {},
-	"internal/cpu":                      {},
-	"internal/dag":                      {},
-	"internal/diff":                     {},
-	"internal/exportdata":               {},
-	"internal/filepathlite":             {},
-	"internal/fmtsort":                  {},
-	"internal/fuzz":                     {},
-	"internal/gate":                     {},
-	"internal/goarch":                   {},
-	"internal/godebug":                  {},
-	"internal/godebugs":                 {},
-	"internal/goexperiment":             {},
-	"internal/goos":                     {},
-	"internal/goroot":                   {},
-	"internal/gover":                    {},
-	"internal/goversion":                {},
-	"internal/lazyregexp":               {},
-	"internal/lazytemplate":             {},
-	"internal/msan":                     {},
-	"internal/nettest":                  {},
-	"internal/nettrace":                 {},
-	"internal/obscuretestdata":          {},
-	"internal/oserror":                  {},
-	"internal/pkgbits":                  {},
-	"internal/platform":                 {},
-	"internal/poll":                     {},
-	"internal/profile":                  {},
-	"internal/profilerecord":            {},
-	"internal/race":                     {},
-	"internal/reflectlite":              {},
-	"internal/routebsd":                 {},
-	"internal/runtime/atomic":           {},
-	"internal/runtime/cgobench":         {},
-	"internal/runtime/cgroup":           {},
-	"internal/runtime/exithook":         {},
-	"internal/runtime/gc":               {},
-	"internal/runtime/gc/scan":          {},
-	"internal/runtime/maps":             {},
-	"internal/runtime/math":             {},
-	"internal/runtime/pprof/label":      {},
-	"internal/runtime/sys":              {},
-	"internal/runtime/wasitest":         {},
-	"internal/saferio":                  {},
-	"internal/singleflight":             {},
-	"internal/strconv":                  {},
-	"internal/stringslite":              {},
-	"internal/sync":                     {},
-	"internal/synctest":                 {},
-	"internal/syscall/execenv":          {},
-	"internal/syscall/unix":             {},
-	"internal/sysinfo":                  {},
-	"internal/syslist":                  {},
-	"internal/testenv":                  {},
-	"internal/testhash":                 {},
-	"internal/testlog":                  {},
-	"internal/testpty":                  {},
-	"internal/trace":                    {},
-	"internal/trace/raw":                {},
-	"internal/trace/testtrace":          {},
-	"internal/trace/tracev2":            {},
-	"internal/trace/traceviewer":        {},
-	"internal/trace/traceviewer/format": {},
-	"internal/trace/version":            {},
-	"internal/txtar":                    {},
-	"internal/types/errors":             {},
-	"internal/unsafeheader":             {},
-	"internal/xcoff":                    {},
-	"internal/zstd":                     {},
-	"io":                                {},
-	"io/fs":                             {},
-	"io/ioutil":                         {},
-	"iter":                              {},
-	"log":                               {},
-	"log/slog":                          {},
-	"log/syslog":                        {},
-	"maps":                              {},
-	"math":                              {},
-	"math/big":                          {},
-	"math/bits":                         {},
-	"math/cmplx":                        {},
-	"math/rand":                         {},
-	"math/rand/v2":                      {},
-	"mime":                              {},
-	"mime/multipart":                    {},
-	"mime/quotedprintable":              {},
-	"net":                               {},
-	"net/http":                          {},
-	"net/http/cgi":                      {},
-	"net/http/cookiejar":                {},
-	"net/http/fcgi":                     {},
-	"net/http/httptest":                 {},
-	"net/http/httptrace":                {},
-	"net/http/httputil":                 {},
-	"net/http/pprof":                    {},
-	"net/mail":                          {},
-	"net/netip":                         {},
-	"net/rpc":                           {},
-	"net/rpc/jsonrpc":                   {},
-	"net/smtp":                          {},
-	"net/textproto":                     {},
-	"net/url":                           {},
-	"os":                                {},
-	"os/exec":                           {},
-	"os/signal":                         {},
-	"os/user":                           {},
-	"path":                              {},
-	"path/filepath":                     {},
-	"plugin":                            {},
-	"reflect":                           {},
-	"regexp":                            {},
-	"regexp/syntax":                     {},
-	"runtime":                           {},
-	"runtime/cgo":                       {},
-	"runtime/coverage":                  {},
-	"runtime/debug":                     {},
-	"runtime/metrics":                   {},
-	"runtime/pprof":                     {},
-	"runtime/race":                      {},
-	"runtime/trace":                     {},
-	"slices":                            {},
-	"sort":                              {},
-	"strconv":                           {},
-	"strings":                           {},
-	"structs":                           {},
-	"sync":                              {},
-	"sync/atomic":                       {},
-	"syscall":                           {},
-	"testing":                           {},
-	"testing/cryptotest":                {},
-	"testing/fstest":                    {},
-	"testing/iotest":                    {},
-	"testing/quick":                     {},
-	"testing/slogtest":                  {},
-	"testing/synctest":                  {},
-	"text/scanner":                      {},
-	"text/tabwriter":                    {},
-	"text/template":                     {},
-	"text/template/parse":               {},
-	"time":                              {},
-	"time/tzdata":                       {},
-	"unicode":                           {},
-	"unicode/utf16":                     {},
-	"unicode/utf8":                      {},
-	"unique":                            {},
-	"unsafe":                            {},
-	"uuid":                              {},
-	"weak":                              {},
-}
-
-func isStdlibPackagePath(path string) bool {
-	if path == "" {
-		return true
-	}
-	_, ok := stdlibPackagePaths[path]
-	return ok
-}
-
-func errorPkgPath(err error) string {
-	t := reflect.TypeOf(err)
-	if t == nil {
-		return ""
-	}
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	return t.PkgPath()
-}
-
-// replaceUnwrappedCause keeps wrapper diagnostics after a nested context
-// branch was stripped. Typed net.OpError values are cloned; other wrappers
-// keep their Error() text and As/classification surface while suppressing
-// context sentinel matches.
-func replaceUnwrappedCause(err, filtered error) error {
-	// Match only the current node. Nested transport wrappers are rebuilt by
-	// recursion so outer wrappers keep their diagnostics.
-	switch typed := err.(type) {
-	case *net.OpError:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *os.PathError:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *os.SyscallError:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *os.LinkError:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *url.Error:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *net.DNSConfigError:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *net.DNSError:
-		clone := *typed
-		clone.UnwrapErr = filtered
-		// Err is the cached rendering used by Error(). Refresh it only when it
-		// embeds the old UnwrapErr text; otherwise it is an independent DNS
-		// reason such as "no such host" and must be preserved.
-		if filtered != nil && typed.UnwrapErr != nil {
-			if old := typed.UnwrapErr.Error(); old != "" && strings.Contains(clone.Err, old) {
-				clone.Err = strings.ReplaceAll(clone.Err, old, filtered.Error())
-			}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		if child := single.Unwrap(); child != nil {
+			return []error{child}
 		}
-		return &clone
-	case *strconv.NumError:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *exec.Error:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	case *json.MarshalerError:
-		clone := *typed
-		clone.Err = filtered
-		return &clone
-	}
-	// Generic fallback for other stdlib carriers with an exported Err error
-	// field so As keeps the concrete type with the filtered child.
-	if cloned, ok := cloneExportedErrField(err, filtered); ok {
-		return cloned
-	}
-	return &contextStrippedCause{original: err, cause: filtered}
-}
-
-// cloneExportedErrField rebuilds a standard-library error whose exported Err
-// field holds the wrapped cause, preserving whether the original was a pointer
-// or value type (for example template.ExecError vs *os.PathError).
-func cloneExportedErrField(err, filtered error) (error, bool) {
-	if !isStdlibPackagePath(errorPkgPath(err)) {
-		return nil, false
-	}
-	v := reflect.ValueOf(err)
-	wasPointer := false
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return nil, false
-		}
-		wasPointer = true
-		v = v.Elem()
-	}
-	if v.Kind() != reflect.Struct {
-		return nil, false
-	}
-	errorType := reflect.TypeOf((*error)(nil)).Elem()
-	field := v.FieldByName("Err")
-	if !field.IsValid() || field.Type() != errorType {
-		return nil, false
-	}
-	clone := reflect.New(v.Type()).Elem()
-	clone.Set(v)
-	errField := clone.FieldByName("Err")
-	if !errField.CanSet() {
-		return nil, false
-	}
-	if filtered == nil {
-		errField.Set(reflect.Zero(errorType))
-	} else {
-		errField.Set(reflect.ValueOf(filtered))
-	}
-	if wasPointer {
-		ptr := reflect.New(v.Type())
-		ptr.Elem().Set(clone)
-		cloned, ok := ptr.Interface().(error)
-		return cloned, ok
-	}
-	cloned, ok := clone.Interface().(error)
-	return cloned, ok
-}
-
-// contextStrippedCause retains an original wrapper's diagnostics and As
-// surface after nested context branches were removed from the cause chain.
-type contextStrippedCause struct {
-	original error
-	cause    error
-}
-
-func (e *contextStrippedCause) Error() string {
-	if e == nil || e.original == nil {
-		return "<nil>"
-	}
-	orig := e.original.Error()
-	if e.cause == nil {
-		// Context-only wrappers still need their discarded child text removed
-		// so retained diagnostics do not contradict the filtered Is surface.
-		if inners := multiUnwrap(e.original); len(inners) > 0 {
-			if cleaned := replaceDiscardedErrorText(orig, inners, nil); cleaned != "" {
-				return cleaned
-			}
-			// Duplicate identical context children make framed reconstruction
-			// ambiguous; with nothing retained, treat the rewrite as empty
-			// rather than restoring the original context-only text.
-			if allDiscardedContextChildren(inners) {
-				return ""
-			}
-		}
-		if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
-			if cleaned, ok := rewriteInnerErrorText(orig, innerText, ""); ok {
-				return cleaned
-			}
-			// Multiple copies of the child text are ambiguous (diagnostic prose
-			// vs the actual unwrap rendering); keep the original safe message.
-			if strings.Count(orig, innerText) > 1 {
-				return orig
-			}
-		}
-		return stripContextSentinelPhrases(orig)
-	}
-	causeText := e.cause.Error()
-	// Preserve wrapper framing (for example "follow logs: " or "follow %w failed")
-	// while replacing the unfiltered inner rendering so stripped context
-	// sentinels do not remain in user-facing diagnostics.
-	if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
-		if cleaned, ok := rewriteInnerErrorText(orig, innerText, causeText); ok {
-			return cleaned
-		}
-		// Repeated copies of the same inner text are ambiguous; fall through
-		// so multi-child framing or the filtered cause text is preferred over
-		// ReplaceAll corruption of independent diagnostic prose.
-	}
-	if inners := multiUnwrap(e.original); len(inners) > 0 {
-		if cleaned := replaceDiscardedErrorText(orig, inners, e.cause); cleaned != "" {
-			return cleaned
-		}
-		// When Error() omits any child rendering (full or partial sanitization),
-		// keep the safe text but still remove discarded context spans that are
-		// present, without synthesizing omitted child text.
-		if !allChildTextAppearsIn(orig, inners) {
-			return stripVerifiedDiscardedChildText(orig, inners)
-		}
-		// Ambiguous multi-child framing: prefer filtered cause text.
-		return causeText
-	}
-	// Single-error wrapper whose Error() omits the inner text: prefer the
-	// sanitized original rendering, except diagnostic-redactor facades whose
-	// cause was already re-redacted and must not keep mixed context wording.
-	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && !strings.Contains(orig, innerText) {
-		type redactorProvider interface {
-			DiagnosticRedactor() *cli.Redactor
-		}
-		if _, ok := e.original.(redactorProvider); ok {
-			return causeText
-		}
-		return orig
-	}
-	return causeText
-}
-
-// rewriteInnerErrorText replaces the sole rendering of the unfiltered inner
-// text. When the same phrase appears more than once, the copy may be
-// independent diagnostic prose rather than the unwrap rendering (for example
-// "peer reported context canceled; context canceled"); callers must treat that
-// as ambiguous instead of ReplaceAll-corrupting the retained wording.
-// ok is true when the unique occurrence was rewritten, even if the result is
-// empty (fully stripped context-only wrappers must not restore orig).
-func rewriteInnerErrorText(orig, innerText, repl string) (string, bool) {
-	if innerText == "" || !strings.Contains(orig, innerText) {
-		return "", false
-	}
-	if strings.Count(orig, innerText) != 1 {
-		return "", false
-	}
-	cleaned := strings.Replace(orig, innerText, repl, 1)
-	if cleaned == orig {
-		// Unique child text already matches the filtered rendering; still a
-		// successful reconstruction so callers keep wrapper framing instead of
-		// falling back to cause-only text.
-		if repl == innerText {
-			return orig, true
-		}
-		return "", false
-	}
-	// Do not TrimSpace: retained diagnostics may intentionally begin or end
-	// with whitespace (for example " backend: context canceled "). Only the
-	// child phrase itself is removed; adjacent framing stays with the caller.
-	return cleaned, true
-}
-
-func multiUnwrap(err error) []error {
-	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
-		return unwrapper.Unwrap()
 	}
 	return nil
 }
 
-func allDiscardedContextChildren(inners []error) bool {
-	saw := false
-	for _, inner := range inners {
-		if inner == nil {
-			continue
-		}
-		saw = true
-		if nonContextCause(inner) != nil {
-			return false
-		}
+func hasCustomClassification(err error) bool {
+	if _, ok := err.(interface{ Is(error) bool }); ok {
+		return true
 	}
-	return saw
+	_, ok := err.(interface{ As(any) bool })
+	return ok
 }
 
-func allChildTextAppearsIn(orig string, inners []error) bool {
-	// Each child needs its own occurrence. A coalesced rendering such as
-	// "context canceled; public" must not count as fully rendering two
-	// identical "public" children.
-	occupied := make([]bool, len(orig))
-	claim := func(phrase string) bool {
-		for i := 0; i+len(phrase) <= len(orig); i++ {
-			if orig[i:i+len(phrase)] != phrase {
-				continue
-			}
-			overlap := false
-			for j := i; j < i+len(phrase); j++ {
-				if occupied[j] {
-					overlap = true
-					break
-				}
-			}
-			if overlap {
-				continue
-			}
-			for j := i; j < i+len(phrase); j++ {
-				occupied[j] = true
-			}
-			return true
-		}
-		return false
-	}
-	for _, inner := range inners {
-		if inner == nil {
-			continue
-		}
-		phrase := inner.Error()
-		if phrase == "" {
-			continue
-		}
-		if !claim(phrase) {
-			return false
-		}
-	}
-	return true
-}
-
-// stripVerifiedDiscardedChildText removes discarded child renderings that are
-// present in orig and rewrites retained children to their filtered text,
-// without inventing text for omitted (sanitized) children. Retained child
-// spans are claimed first so a discarded sentinel is not taken from inside a
-// legitimate diagnostic such as "peer reported context canceled".
-func stripVerifiedDiscardedChildText(orig string, inners []error) string {
-	type edit struct {
-		start, end int
-		repl       string
-	}
-	occupied := make([]bool, len(orig))
-	claim := func(phrase string) (int, bool) {
-		for i := 0; i+len(phrase) <= len(orig); i++ {
-			if orig[i:i+len(phrase)] != phrase {
-				continue
-			}
-			overlap := false
-			for j := i; j < i+len(phrase); j++ {
-				if occupied[j] {
-					overlap = true
-					break
-				}
-			}
-			if overlap {
-				continue
-			}
-			for j := i; j < i+len(phrase); j++ {
-				occupied[j] = true
-			}
-			return i, true
-		}
-		return 0, false
-	}
-
-	type item struct {
-		inner   error
-		phrase  string
-		removal bool
-		order   int
-	}
-	items := make([]item, 0, len(inners))
-	for i, inner := range inners {
-		if inner == nil {
-			continue
-		}
-		phrase := inner.Error()
-		if phrase == "" {
-			continue
-		}
-		items = append(items, item{
-			inner:   inner,
-			phrase:  phrase,
-			removal: nonContextCause(inner) == nil,
-			order:   i,
-		})
-	}
-	// Phrases shared by, or nested inside, retained and discarded children
-	// cannot be attributed safely without the format string (for example
-	// discarded "context canceled" vs retained "canceled"); keep the original
-	// safe text rather than letting the longer discarded claim erase the
-	// retained diagnostic.
-	retainedPhrase := make(map[string]struct{})
-	discardedPhrase := make(map[string]struct{})
-	for _, it := range items {
-		if it.removal {
-			discardedPhrase[it.phrase] = struct{}{}
-		} else {
-			retainedPhrase[it.phrase] = struct{}{}
-		}
-	}
-	for d := range discardedPhrase {
-		for r := range retainedPhrase {
-			if d == r || strings.Contains(d, r) || strings.Contains(r, d) {
-				return orig
-			}
-		}
-	}
-	sort.SliceStable(items, func(i, j int) bool {
-		if len(items[i].phrase) != len(items[j].phrase) {
-			return len(items[i].phrase) > len(items[j].phrase)
-		}
-		return items[i].order < items[j].order
-	})
-
-	// Claim every child span before expanding removals so separators that
-	// belong to a retained phrase (for example the leading space of
-	// " backend ") stay occupied and are not absorbed into a discarded span.
-	type claimed struct {
-		inner      error
-		start, end int
-		removal    bool
-	}
-	claimedSpans := make([]claimed, 0, len(items))
-	for _, it := range items {
-		start, ok := claim(it.phrase)
-		if !ok {
-			// Discarded or omitted (sanitized) child text may be absent;
-			// continue so verified discarded spans can still be removed.
-			continue
-		}
-		claimedSpans = append(claimedSpans, claimed{
-			inner:   it.inner,
-			start:   start,
-			end:     start + len(it.phrase),
-			removal: it.removal,
-		})
-	}
-	edits := make([]edit, 0, len(claimedSpans))
-	changed := false
-	for _, c := range claimedSpans {
-		if c.removal {
-			rs, re := expandRemovalSeparators(orig, c.start, c.end, occupied)
-			// Mark the expanded region so a later adjacent discarded child cannot
-			// claim the same separator and produce overlapping original offsets.
-			for j := rs; j < re; j++ {
-				occupied[j] = true
-			}
-			edits = append(edits, edit{start: rs, end: re, repl: ""})
-			changed = true
-			continue
-		}
-		filtered := nonContextCause(c.inner)
-		repl := filtered.Error()
-		edits = append(edits, edit{start: c.start, end: c.end, repl: repl})
-		if repl != orig[c.start:c.end] {
-			changed = true
-		}
-	}
-	// Ambiguous framing copies of a discarded phrase, or extra copies of a
-	// changed retained phrase, are unsafe to rewrite (one filtered + one stale).
-	for _, it := range items {
-		phrase := it.phrase
-		if !it.removal {
-			filtered := nonContextCause(it.inner)
-			if filtered == nil || filtered.Error() == phrase {
-				continue
-			}
-		}
-		for i := 0; i+len(phrase) <= len(orig); i++ {
-			if orig[i:i+len(phrase)] != phrase {
-				continue
-			}
-			free := true
-			for j := i; j < i+len(phrase); j++ {
-				if occupied[j] {
-					free = false
-					break
-				}
-			}
-			if free {
-				return orig
-			}
-		}
-	}
-	if !changed {
-		return orig
-	}
-	// Merge overlapping or abutting removals (empty replacements) so applying
-	// original offsets cannot shift a later span into retained text.
-	sort.Slice(edits, func(i, j int) bool {
-		if edits[i].start != edits[j].start {
-			return edits[i].start < edits[j].start
-		}
-		return edits[i].end < edits[j].end
-	})
-	merged := make([]edit, 0, len(edits))
-	for _, e := range edits {
-		if e.repl == "" && len(merged) > 0 && merged[len(merged)-1].repl == "" && e.start <= merged[len(merged)-1].end {
-			if e.end > merged[len(merged)-1].end {
-				merged[len(merged)-1].end = e.end
-			}
-			continue
-		}
-		merged = append(merged, e)
-	}
-	sort.Slice(merged, func(i, j int) bool {
-		if merged[i].start != merged[j].start {
-			return merged[i].start > merged[j].start
-		}
-		return merged[i].end > merged[j].end
-	})
-	for i := 1; i < len(merged); i++ {
-		if merged[i].end > merged[i-1].start {
-			return orig
-		}
-	}
-	cleaned := orig
-	for _, e := range merged {
-		if e.start < 0 || e.end > len(cleaned) || e.start > e.end {
-			return orig
-		}
-		cleaned = cleaned[:e.start] + e.repl + cleaned[e.end:]
-	}
-	return cleaned
-}
-
-// replaceDiscardedErrorText removes or rewrites child renderings independently
-// of Unwrap order so indexed %w verbs that reorder children still strip the
-// discarded sentinel occurrence and emit each retained child's filtered text.
-// When multiple children share identical Error text, or a shorter discarded
-// phrase can only be placed inside a longer retained child's rendering,
-// positions cannot be associated safely without the format string; return ""
-// so callers fall back to the filtered cause text.
-func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
-	phraseCount := make(map[string]int)
-	for _, inner := range inners {
-		if inner == nil {
-			continue
-		}
-		if phrase := inner.Error(); phrase != "" {
-			phraseCount[phrase]++
-		}
-	}
-	for _, n := range phraseCount {
-		if n > 1 {
-			return ""
-		}
-	}
-
-	type item struct {
-		inner  error
-		phrase string
-		order  int
-	}
-	items := make([]item, 0, len(inners))
-	for i, inner := range inners {
-		if inner == nil {
-			continue
-		}
-		phrase := inner.Error()
-		if phrase == "" {
-			continue
-		}
-		items = append(items, item{inner: inner, phrase: phrase, order: i})
-	}
-	// Claim longer phrases first so a discarded sentinel such as
-	// "context canceled" is not taken from inside a retained diagnostic like
-	// "peer reported context canceled".
-	sort.SliceStable(items, func(i, j int) bool {
-		if len(items[i].phrase) != len(items[j].phrase) {
-			return len(items[i].phrase) > len(items[j].phrase)
-		}
-		return items[i].order < items[j].order
-	})
-
-	type edit struct {
-		start, end int
-		repl       string
-	}
-	occupied := make([]bool, len(orig))
-	claim := func(phrase string) (int, bool) {
-		for i := 0; i+len(phrase) <= len(orig); i++ {
-			if orig[i:i+len(phrase)] != phrase {
-				continue
-			}
-			overlap := false
-			for j := i; j < i+len(phrase); j++ {
-				if occupied[j] {
-					overlap = true
-					break
-				}
-			}
-			if overlap {
-				continue
-			}
-			for j := i; j < i+len(phrase); j++ {
-				occupied[j] = true
-			}
-			return i, true
-		}
-		return 0, false
-	}
-
-	type pendingEdit struct {
-		inner      error
-		start, end int
-		removal    bool
-	}
-	pending := make([]pendingEdit, 0, len(items))
-	for _, it := range items {
-		start, ok := claim(it.phrase)
-		if !ok {
-			// A child rendering could not be placed without overlapping another
-			// claimed span; framed rewrite would mis-associate occurrences.
-			return ""
-		}
-		pending = append(pending, pendingEdit{
-			inner:   it.inner,
-			start:   start,
-			end:     start + len(it.phrase),
-			removal: nonContextCause(it.inner) == nil,
-		})
-	}
-	// If a child phrase still occurs outside every claimed span, the message
-	// has ambiguous framing copies (for example a literal "context canceled"
-	// beside a %w of the same text). Fall back rather than rewriting the
-	// wrong occurrence.
-	for _, it := range items {
-		phrase := it.phrase
-		for i := 0; i+len(phrase) <= len(orig); i++ {
-			if orig[i:i+len(phrase)] != phrase {
-				continue
-			}
-			free := true
-			for j := i; j < i+len(phrase); j++ {
-				if occupied[j] {
-					free = false
-					break
-				}
-			}
-			if free {
-				return ""
-			}
-		}
-	}
-	// Expand removals only after every child span is claimed so separator
-	// absorption cannot walk into a retained cause's trailing spaces.
-	var edits []edit
-	changed := false
-	for _, p := range pending {
-		start, end := p.start, p.end
-		if p.removal {
-			start, end = expandRemovalSeparators(orig, start, end, occupied)
-			// Mark the expanded region so a later adjacent discarded child
-			// cannot claim the same separator and produce overlapping offsets.
-			for j := start; j < end; j++ {
-				occupied[j] = true
-			}
-			edits = append(edits, edit{start: start, end: end, repl: ""})
-			changed = true
-			continue
-		}
-		repl := nonContextCause(p.inner).Error()
-		edits = append(edits, edit{start: start, end: end, repl: repl})
-		if repl != orig[start:end] {
-			changed = true
-		}
-	}
-	if !changed {
-		return ""
-	}
-	// Merge overlapping or abutting empty removals (adjacent context-only
-	// children that both expanded across a shared separator) so framed
-	// reconstruction is not abandoned.
-	sort.Slice(edits, func(i, j int) bool {
-		if edits[i].start != edits[j].start {
-			return edits[i].start < edits[j].start
-		}
-		return edits[i].end < edits[j].end
-	})
-	merged := make([]edit, 0, len(edits))
-	for _, e := range edits {
-		if e.repl == "" && len(merged) > 0 && merged[len(merged)-1].repl == "" && e.start <= merged[len(merged)-1].end {
-			if e.end > merged[len(merged)-1].end {
-				merged[len(merged)-1].end = e.end
-			}
-			continue
-		}
-		merged = append(merged, e)
-	}
-	sort.Slice(merged, func(i, j int) bool {
-		if merged[i].start != merged[j].start {
-			return merged[i].start > merged[j].start
-		}
-		return merged[i].end > merged[j].end
-	})
-	for i := 1; i < len(merged); i++ {
-		// Non-empty overlapping edits remain unsafe to apply from original offsets.
-		if merged[i].end > merged[i-1].start {
-			return ""
-		}
-	}
-	masked := orig
-	for _, e := range merged {
-		if e.start < 0 || e.end > len(masked) || e.start > e.end {
-			return ""
-		}
-		masked = masked[:e.start] + e.repl + masked[e.end:]
-	}
-	// Do not TrimSpace or strip :/; here: retained causes may intentionally
-	// begin/end with whitespace or punctuation (for example " backend ").
-	// Separator cleanup for discarded children happens in
-	// expandRemovalSeparators before edits apply.
-	return masked
-}
-
-// expandRemovalSeparators absorbs unoccupied separators adjacent to a discarded
-// child. Rightward expansion always cleans framing before the next claimed
-// child (or end). Leftward expansion runs only when the entire region back to
-// the previous claimed child is separators, so wrapper labels such as
-// "follow logs:" or "cancellation:" are not consumed. Expansion never enters
-// spans already claimed by another child.
-func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int, int) {
-	for {
-		n := separatorExtentAt(orig, end, occupied)
-		if n == 0 {
-			break
-		}
-		end += n
-	}
-	prevEnd := -1
-	for i := start - 1; i >= 0; i-- {
-		if occupied[i] {
-			prevEnd = i + 1
-			break
-		}
-	}
-	if prevEnd >= 0 && regionOnlySeparators(orig, prevEnd, start, occupied) {
-		start = prevEnd
-	}
-	start, end = expandPairedDelimiters(orig, start, end, occupied)
-	start, end = expandArrowJunctions(orig, start, end, occupied)
-	// Absorb separators left beside a removed pair or arrow, then recognize
-	// arrows again so forms like "(%w) -> %w" do not leave a dangling ">".
-	for {
-		n := separatorExtentAt(orig, end, occupied)
-		if n == 0 {
-			break
-		}
-		end += n
-	}
-	start, end = expandArrowJunctions(orig, start, end, occupied)
-	for {
-		n := separatorExtentAt(orig, end, occupied)
-		if n == 0 {
-			break
-		}
-		end += n
-	}
-	if prevEnd >= 0 && regionOnlySeparators(orig, prevEnd, start, occupied) {
-		start = prevEnd
-	}
-	return start, end
-}
-
-// expandArrowJunctions absorbs ->, =>, <-, and <= junctions that frame a
-// discarded child. Angle brackets are not treated as independent separators
-// so retained forms like "<%w>" stay intact.
-func expandArrowJunctions(orig string, start, end int, occupied []bool) (int, int) {
-	if end+1 < len(orig) && !occupied[end] && !occupied[end+1] &&
-		orig[end] == '<' && (orig[end+1] == '-' || orig[end+1] == '=') {
-		end += 2
-	} else if end < len(orig) && !occupied[end] && orig[end] == '>' &&
-		end > start && (orig[end-1] == '-' || orig[end-1] == '=') {
-		end++
-	}
-	if start > 0 && !occupied[start-1] {
-		i := start
-		for {
-			n := separatorExtentBefore(orig, i, occupied)
-			if n == 0 {
-				break
-			}
-			i -= n
-		}
-		if i > 0 && !occupied[i-1] {
-			switch {
-			case orig[i-1] == '>' && i > 1 && !occupied[i-2] &&
-				(orig[i-2] == '-' || orig[i-2] == '='):
-				start = i - 2
-			case orig[i-1] == '<':
-				hasShaft := false
-				for j := i; j < start; j++ {
-					if orig[j] == '-' || orig[j] == '=' {
-						hasShaft = true
-						break
-					}
-				}
-				if hasShaft {
-					start = i - 1
-				}
-			}
-		}
-	}
-	return start, end
-}
-
-// expandPairedDelimiters absorbs a balanced (), [], {}, <>, or quote/backtick
-// pair (including common Unicode smart quotes) that wraps only the discarded
-// span (after separator expansion). Internal whitespace between the delimiters
-// and the span is included so "[ canceled ]" does not leave "[ ]". Pairs around
-// retained children stay intact because those spans remain occupied and block
-// walking out to the closer.
-func expandPairedDelimiters(orig string, start, end int, occupied []bool) (int, int) {
-	pairs := [][2]rune{
-		{'(', ')'}, {'[', ']'}, {'{', '}'}, {'<', '>'},
-		{'"', '"'}, {'\'', '\''}, {'`', '`'},
-		{'\u201c', '\u201d'}, // “ ”
-		{'\u2018', '\u2019'}, // ‘ ’
-		{'\u00ab', '\u00bb'}, // « »
-		{'\u2039', '\u203a'}, // ‹ ›
-	}
-	for {
-		expanded := false
-		for _, pair := range pairs {
-			openEnd := start
-			for {
-				n := separatorExtentBefore(orig, openEnd, occupied)
-				if n == 0 {
-					break
-				}
-				openEnd -= n
-			}
-			if openEnd <= 0 {
-				continue
-			}
-			openRune, openSize := utf8.DecodeLastRuneInString(orig[:openEnd])
-			openStart := openEnd - openSize
-			if openRune != pair[0] || spanOccupied(occupied, openStart, openEnd) {
-				continue
-			}
-
-			closeStart := end
-			for {
-				n := separatorExtentAt(orig, closeStart, occupied)
-				if n == 0 {
-					break
-				}
-				closeStart += n
-			}
-			if closeStart >= len(orig) {
-				continue
-			}
-			closeRune, closeSize := utf8.DecodeRuneInString(orig[closeStart:])
-			closeEnd := closeStart + closeSize
-			if closeRune != pair[1] || spanOccupied(occupied, closeStart, closeEnd) {
-				continue
-			}
-
-			start, end = openStart, closeEnd
-			expanded = true
-			break
-		}
-		if !expanded {
-			return start, end
-		}
-	}
-}
-
-func spanOccupied(occupied []bool, start, end int) bool {
-	for i := start; i < end; i++ {
-		if occupied[i] {
+func hasNonContextClassification(err error) bool {
+	for _, target := range []error{
+		ErrTargetNotFound,
+		ErrContainerNotFound,
+		ErrPortNotExposed,
+		ErrLogStreamSetup,
+		ErrInvalidConfiguration,
+	} {
+		if errors.Is(err, target) {
 			return true
 		}
 	}
 	return false
 }
 
-func isErrorSeparator(b byte) bool {
-	return isErrorSeparatorRune(rune(b))
-}
-
-func isErrorSeparatorRune(r rune) bool {
-	// Treat whitespace and unpaired framing punctuation as separators so
-	// compact multi-wraps (%w - %w, %w — %w, etc.) do not leave leading junk.
-	// Paired delimiters such as ()[]{}<> are not absorbed independently; that
-	// would leave a dangling closer around a retained child.
-	if r <= ' ' || unicode.IsSpace(r) {
-		return true
-	}
-	switch r {
-	case ';', ':', ',', '|', '-', '/', '\\', '=', '+', '~', '.', '!', '?', '#', '@', '&', '*', '%', '^',
-		'\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015', '\u2212',
-		'\u2190', '\u2192', '\u2194', // ← → ↔
-		'\u21d0', '\u21d2', '\u21d4': // ⇐ ⇒ ⇔
-		return true
-	default:
-		return false
-	}
-}
-
-// separatorExtentAt returns the byte length of a separator rune starting at i,
-// or 0 if i is not a free separator.
-func separatorExtentAt(orig string, i int, occupied []bool) int {
-	if i < 0 || i >= len(orig) || occupied[i] {
-		return 0
-	}
-	r, size := utf8.DecodeRuneInString(orig[i:])
-	if r == utf8.RuneError && size == 1 {
-		if isErrorSeparator(orig[i]) {
-			return 1
+func rendersChildren(err error, children []error) bool {
+	text := err.Error()
+	for _, child := range children {
+		if child == nil {
+			continue
 		}
-		return 0
-	}
-	if !isErrorSeparatorRune(r) {
-		return 0
-	}
-	for j := i; j < i+size; j++ {
-		if occupied[j] {
-			return 0
-		}
-	}
-	return size
-}
-
-// separatorExtentBefore returns the byte length of a separator rune ending at
-// end, or 0 if that position is not a free separator.
-func separatorExtentBefore(orig string, end int, occupied []bool) int {
-	if end <= 0 || end > len(orig) || occupied[end-1] {
-		return 0
-	}
-	r, size := utf8.DecodeLastRuneInString(orig[:end])
-	if r == utf8.RuneError && size == 1 {
-		if isErrorSeparator(orig[end-1]) {
-			return 1
-		}
-		return 0
-	}
-	start := end - size
-	if !isErrorSeparatorRune(r) {
-		return 0
-	}
-	for j := start; j < end; j++ {
-		if occupied[j] {
-			return 0
-		}
-	}
-	return size
-}
-
-func regionOnlySeparators(orig string, from, to int, occupied []bool) bool {
-	for i := from; i < to; {
-		n := separatorExtentAt(orig, i, occupied)
-		if n == 0 {
+		childText := child.Error()
+		if childText != "" && !strings.Contains(text, childText) {
 			return false
 		}
-		i += n
 	}
 	return true
 }
 
-// stripContextSentinelPhrases removes canceled/deadline wording from a
-// context-only wrapper's Error text when framed reconstruction is unavailable.
-// Only a clear classification prefix is stripped; any other occurrence is
-// treated as ambiguous and yields a neutral empty message.
-func stripContextSentinelPhrases(orig string) string {
-	cleaned := orig
-	for _, phrase := range []string{"context canceled", "context deadline exceeded"} {
-		if strings.HasPrefix(cleaned, phrase) {
-			cleaned = strings.TrimPrefix(cleaned, phrase)
-			cleaned = strings.TrimSpace(cleaned)
-			cleaned = strings.TrimLeft(cleaned, ":;")
-			cleaned = strings.TrimSpace(cleaned)
-			continue
-		}
-		if strings.Contains(cleaned, phrase) {
-			return ""
-		}
+func safeOpaqueText(err error) string {
+	if err == nil {
+		return ""
 	}
-	return cleaned
+	text := err.Error()
+	if text == "" {
+		return fmt.Sprintf("%T", err)
+	}
+	if containsContextText(text) {
+		// Drop the whole rendering rather than editing the message. The type
+		// name still identifies the failing wrapper.
+		return fmt.Sprintf("%T", err)
+	}
+	return text
 }
-func (e *contextStrippedCause) Unwrap() error { return e.cause }
 
-func (e *contextStrippedCause) Is(target error) bool {
-	if errors.Is(e.cause, target) {
-		return true
+func containsContextText(text string) bool {
+	return strings.Contains(text, context.Canceled.Error()) ||
+		strings.Contains(text, context.DeadlineExceeded.Error())
+}
+
+// classifiedCause keeps a wrapper's Is/As classification while suppressing
+// any context match. It has no Unwrap, so errors.Is cannot reach a discarded
+// context child through it.
+type classifiedCause struct {
+	original error
+}
+
+func (e *classifiedCause) Error() string {
+	if e == nil {
+		return "<nil>"
 	}
-	if errors.Is(target, context.Canceled) || errors.Is(target, context.DeadlineExceeded) {
+	return safeOpaqueText(e.original)
+}
+
+func (e *classifiedCause) Is(target error) bool {
+	if e == nil || e.original == nil || target == nil || carriesContextCause(target) {
 		return false
 	}
 	return errors.Is(e.original, target)
 }
 
-func (e *contextStrippedCause) As(target any) bool {
-	// Match errors.As depth-first order: probe the wrapper's own As surface
-	// before traversing the filtered cause, so a virtual classification on
-	// the wrapper wins over the same type on a retained child.
-	if as, ok := e.original.(interface{ As(any) bool }); ok {
-		if matchOriginalAsWithoutDiscardedContext(as, target, e.cause) {
-			return true
-		}
-	}
-	if errors.As(e.cause, target) {
-		return true
-	}
-	// Do not expose unfiltered wrappers that still Unwrap to discarded context
-	// children. Opaque facades without Unwrap may keep their concrete As type.
-	if _, ok := e.original.(interface{ Unwrap() error }); ok {
+func (e *classifiedCause) As(target any) bool {
+	if e == nil || e.original == nil {
 		return false
 	}
-	if _, ok := e.original.(interface{ Unwrap() []error }); ok {
-		return false
-	}
-	return asExactType(e.original, target)
+	return asWithoutContext(e.original, target)
 }
 
-// matchOriginalAsWithoutDiscardedContext runs original.As into a temporary
-// slot and copies the result only when it does not reintroduce a context
-// sentinel that the filtered cause suppressed.
-func matchOriginalAsWithoutDiscardedContext(as interface{ As(any) bool }, target any, filteredCause error) bool {
-	val := reflect.ValueOf(target)
-	if val.Kind() != reflect.Pointer || val.IsNil() {
-		return false
-	}
-	tmp := reflect.New(val.Elem().Type())
-	if !as.As(tmp.Interface()) {
-		return false
-	}
-	matched := tmp.Elem().Interface()
-	if errMatched, ok := matched.(error); ok {
-		carriesContext := errors.Is(errMatched, context.Canceled) ||
-			errors.Is(errMatched, context.DeadlineExceeded)
-		filteredCarriesContext := errors.Is(filteredCause, context.Canceled) ||
-			errors.Is(filteredCause, context.DeadlineExceeded)
-		if carriesContext && !filteredCarriesContext {
-			return false
-		}
-	}
-	val.Elem().Set(tmp.Elem())
-	return true
-}
-
-func asExactType(err error, target any) bool {
+// asWithoutContext runs errors.As on a facade and rejects a matched value
+// that would reintroduce a context cause through a discarded child.
+func asWithoutContext(err error, target any) bool {
 	if err == nil || target == nil {
 		return false
 	}
-	val := reflect.ValueOf(target)
-	if val.Kind() != reflect.Pointer || val.IsNil() {
+	value := reflect.ValueOf(target)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
 		return false
 	}
-	dest := val.Elem()
-	errVal := reflect.ValueOf(err)
-	if !errVal.IsValid() || !errVal.Type().AssignableTo(dest.Type()) {
+	temporary := reflect.New(value.Elem().Type())
+	if !errors.As(err, temporary.Interface()) {
 		return false
 	}
-	dest.Set(errVal)
+	matched := temporary.Elem().Interface()
+	if matchedErr, ok := matched.(error); ok && carriesContextCause(matchedErr) {
+		return false
+	}
+	value.Elem().Set(temporary.Elem())
 	return true
 }
 
-func unfilteredInnerErrorText(err error) string {
-	if unwrapper, ok := err.(interface{ Unwrap() error }); ok {
-		if inner := unwrapper.Unwrap(); inner != nil {
-			return inner.Error()
-		}
-	}
-	if unwrapper, ok := err.(interface{ UnwrapRaw() error }); ok {
-		if inner := unwrapper.UnwrapRaw(); inner != nil {
-			return inner.Error()
-		}
-	}
-	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
-		if inners := unwrapper.Unwrap(); len(inners) > 0 {
-			return errors.Join(inners...).Error()
-		}
-	}
-	return ""
+// retainedCause is the structured non-context view of a mixed error.
+type retainedCause struct {
+	diagnostics []error
+	classifiers []error
 }
 
+func (e *retainedCause) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	switch len(e.diagnostics) {
+	case 0:
+		return ""
+	case 1:
+		return e.diagnostics[0].Error()
+	default:
+		return errors.Join(e.diagnostics...).Error()
+	}
+}
+
+func (e *retainedCause) Is(target error) bool {
+	if e == nil || target == nil || carriesContextCause(target) {
+		return false
+	}
+	for _, classifier := range e.classifiers {
+		if errors.Is(classifier, target) {
+			return true
+		}
+	}
+	for _, diagnostic := range e.diagnostics {
+		if errors.Is(diagnostic, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *retainedCause) As(target any) bool {
+	if e == nil || target == nil {
+		return false
+	}
+	for _, classifier := range e.classifiers {
+		if errors.As(classifier, target) {
+			return true
+		}
+	}
+	for _, diagnostic := range e.diagnostics {
+		if errors.As(diagnostic, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// Unwrap exposes only rendered non-context diagnostics. Classifications that
+// need the original wrapper are reached through Is/As above.
+func (e *retainedCause) Unwrap() []error {
+	return e.diagnostics
+}
+
+type staticError string
+
+func (e staticError) Error() string { return string(e) }
+
 func wrapWaitCause(what string, cause error, previous ...error) error {
-	if cause == nil {
+	retained := nonContextCause(cause)
+	if retained == nil {
 		return nil
 	}
-	causes := make([]error, 0, len(previous)+1)
-	causes = append(causes, cause)
-	causes = append(causes, previous...)
-	return newWaitError(fmt.Sprintf("%s: %v", what, cause), causes...)
+	causes := make([]error, 0, len(previous))
+	for _, prior := range previous {
+		if filtered := nonContextCause(prior); filtered != nil {
+			causes = append(causes, filtered)
+		}
+	}
+	return &waitError{
+		reason: waitReasonCause,
+		what:   what,
+		cause:  retained,
+		causes: causes,
+	}
 }
 
 // poll runs check until it succeeds, the container enters a state from
@@ -1942,10 +837,13 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// lastErr and lastProbeErr hold structured non-context views. A newer
+	// context-only observation never erases an already retained backend
+	// cause, and a backend cause never contributes a context match.
 	var lastErr, lastProbeErr error
 	var lastStateCheck time.Time
 	terminationErr := func() error {
-		return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, lastProbeErr))
+		return waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastErr, lastProbeErr)
 	}
 
 	if err := terminationErr(); err != nil {
@@ -1959,7 +857,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 	if err != nil {
 		if permanentProbeError(err) || isPermanentCheckError(err) {
 			cause := permanentCause(err)
-			if filtered := retainedNonContextCause(cause); filtered != nil {
+			if filtered := nonContextCause(cause); filtered != nil {
 				return wrapWaitCause(what, filtered, lastProbeErr)
 			}
 			// Context-only permanent wrapper: continue polling rather than
@@ -1968,20 +866,58 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			lastProbeErr = filtered
 		}
 	} else if terminalWaitState(state) {
-		return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+		return waitStoppedStateError(what, state, lastErr, lastProbeErr)
 	}
 	lastStateCheck = time.Now()
+
+	probeState := func() error {
+		if time.Since(lastStateCheck) < stateCheckInterval || waitCtx.Err() != nil {
+			return nil
+		}
+		lastStateCheck = time.Now()
+		state, err := targetState(waitCtx, target)
+		if err != nil {
+			if terminalErr := terminationErr(); terminalErr != nil {
+				if filtered := nonContextCause(err); filtered != nil {
+					lastProbeErr = filtered
+				}
+				return waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastErr, lastProbeErr)
+			}
+			if isPermanentCheckError(err) || permanentProbeError(err) {
+				cause := permanentCause(err)
+				if filtered := nonContextCause(cause); filtered != nil {
+					return wrapWaitCause(what, filtered, lastErr, lastProbeErr)
+				}
+				// Context-only permanent wrapper: keep polling.
+			} else if filtered := nonContextCause(err); filtered != nil {
+				lastProbeErr = filtered
+			}
+			return nil
+		}
+		if terminalErr := terminationErr(); terminalErr != nil {
+			return terminalErr
+		}
+		if terminalWaitState(state) {
+			return waitStoppedStateError(what, state, lastErr, lastProbeErr)
+		}
+		return nil
+	}
 
 	for {
 		if err := terminationErr(); err != nil {
 			return err
 		}
+		if o.stateFirst {
+			if err := probeState(); err != nil {
+				return err
+			}
+		}
 
 		if err := check(waitCtx); err != nil {
 			// Keep the latest non-context check cause even when it races with
 			// the context becoming done; the terminal classification must not
-			// erase a typed backend error, and mixed Join(context, cause)
-			// must not keep the stale context half for later timeouts.
+			// erase a typed backend error, and a mixed context branch must
+			// not survive in a later timeout diagnostic.
 			if filtered := nonContextCause(err); filtered != nil {
 				lastErr = filtered
 			}
@@ -1990,8 +926,8 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			}
 			if isPermanentCheckError(err) {
 				cause := permanentCause(err)
-				if filtered := retainedNonContextCause(cause); filtered != nil {
-					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
+				if filtered := nonContextCause(cause); filtered != nil {
+					return wrapWaitCause(what, filtered, lastErr, lastProbeErr)
 				}
 				// Context-only permanent wrapper while the wait is still
 				// active: treat as transient and keep polling.
@@ -2000,8 +936,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			if terminalErr := terminationErr(); terminalErr != nil {
 				return terminalErr
 			}
-			causes := joinNonNil(lastErr, lastProbeErr)
-			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, causes); err != nil {
+			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, lastErr, lastProbeErr); err != nil {
 				return err
 			}
 			return terminationErr()
@@ -2010,29 +945,9 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		if err := terminationErr(); err != nil {
 			return err
 		}
-		if time.Since(lastStateCheck) >= stateCheckInterval && waitCtx.Err() == nil {
-			lastStateCheck = time.Now()
-			state, err := targetState(waitCtx, target)
-			if err != nil {
-				if terminalErr := terminationErr(); terminalErr != nil {
-					if filtered := nonContextCause(err); filtered != nil {
-						lastProbeErr = filtered
-					}
-					return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, lastProbeErr))
-				}
-				if isPermanentCheckError(err) || permanentProbeError(err) {
-					cause := permanentCause(err)
-					if filtered := retainedNonContextCause(cause); filtered != nil {
-						return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
-					}
-					// Context-only permanent wrapper: keep polling.
-				} else if filtered := nonContextCause(err); filtered != nil {
-					lastProbeErr = filtered
-				}
-			} else if terminalErr := terminationErr(); terminalErr != nil {
-				return terminalErr
-			} else if terminalWaitState(state) {
-				return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+		if !o.stateFirst {
+			if err := probeState(); err != nil {
+				return err
 			}
 		}
 
@@ -2042,17 +957,17 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			timer.Stop()
 			// No post-deadline probe is started. The caller and startup
 			// deadlines are the hard budget for every target call.
-			return terminationErrOrTimeout(terminationErr(), what, timeout, joinNonNil(lastErr, lastProbeErr))
+			return terminationErrOrTimeout(terminationErr(), what, timeout, lastErr, lastProbeErr)
 		case <-timer.C:
 		}
 	}
 }
 
-func terminationErrOrTimeout(err error, what string, timeout time.Duration, lastErr error) error {
+func terminationErrOrTimeout(err error, what string, timeout time.Duration, checkErr, probeErr error) error {
 	if err != nil {
 		return err
 	}
-	return waitTimeoutError(what, timeout, lastErr)
+	return waitTimeoutError(what, timeout, checkErr, probeErr)
 }
 
 func permanentCause(err error) error {

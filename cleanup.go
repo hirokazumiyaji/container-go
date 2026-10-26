@@ -23,14 +23,12 @@ func keepContainers() bool {
 // TerminateContainer removes the container. It is nil-safe so it can be
 // deferred before the error check on Run. Shared WithReuse handles are
 // left alone; call ctr.Terminate explicitly to remove a reused container.
-// The complete operation, including the Apple name-lock wait, is bounded
-// by terminateTimeout so a stuck peer cannot stall test cleanup forever.
-func TerminateContainer(ctr *Container) error {
+// The caller's context bounds the complete operation, including the Apple
+// name-lock wait. Cleanup and StrictCleanup apply terminateTimeout by default.
+func TerminateContainer(ctx context.Context, ctr *Container) error {
 	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
-	defer cancel()
 	return ctr.Terminate(ctx)
 }
 
@@ -44,7 +42,11 @@ type cleanupTB interface {
 func registerCleanup(tb cleanupTB, ctr *Container, strict bool) {
 	tb.Helper()
 	tb.Cleanup(func() {
-		if err := TerminateContainer(ctr); err != nil {
+		// Bound the complete teardown, including waiting for another
+		// process' name lock, so a stuck peer cannot stall test cleanup.
+		ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
+		defer cancel()
+		if err := TerminateContainer(ctx, ctr); err != nil {
 			if strict {
 				tb.Errorf("container-go: cleanup %s left the container behind: %v", ctr.ID(), err)
 				return
@@ -83,6 +85,8 @@ type pruneConfig struct {
 	parallelism int
 	runner      Runner
 	binary      string
+	olderThan   time.Duration
+	now         func() time.Time
 }
 
 const defaultPruneParallelism = 4
@@ -98,6 +102,21 @@ func WithPruneTimeout(d time.Duration) PruneOption {
 			return validationErrorf("WithPruneTimeout", d, "timeout must be positive")
 		}
 		c.timeout = d
+		return nil
+	}
+}
+
+// WithPruneOlderThan limits Prune and PruneReuseGroup to candidates the
+// backend reports as created before now-d. A non-positive duration is
+// rejected. Candidates whose creation time is unknown are retained rather
+// than treated as old enough. Ordinary Prune still removes only stopped
+// managed containers, so a running leftover remains in place.
+func WithPruneOlderThan(d time.Duration) PruneOption {
+	return func(c *pruneConfig) error {
+		if d <= 0 {
+			return validationErrorf("WithPruneOlderThan", d, "age must be positive")
+		}
+		c.olderThan = d
 		return nil
 	}
 }
@@ -155,6 +174,7 @@ func parsePruneOptions(name string, opts []PruneOption) (pruneConfig, error) {
 	cfg := pruneConfig{
 		timeout:     defaultPruneTimeout,
 		parallelism: defaultPruneParallelism,
+		now:         time.Now,
 	}
 	for i, opt := range opts {
 		if opt == nil {
@@ -168,7 +188,10 @@ func parsePruneOptions(name string, opts []PruneOption) (pruneConfig, error) {
 }
 
 // Prune removes stopped containers created by this library, from any
-// session. It returns the IDs it removed.
+// session. PruneOption values such as WithPruneTimeout and WithPruneOlderThan
+// apply. It returns the IDs it removed. The package-level function uses the
+// process backend and has no Docker target options; use Client.Prune with
+// WithClientDockerHost or WithClientDockerContext to select a target.
 func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	cfg, err := parsePruneOptions("Prune", opts)
 	if err != nil {
@@ -197,10 +220,38 @@ type pruneCandidate struct {
 	id         string
 	labels     map[string]string
 	creation   string
+	createdAt  time.Time
 	state      State
 	managed    bool
 	reuse      bool
 	reuseGroup string
+}
+
+// pruneAgeFilter limits a prune run to candidates whose backend creation
+// time is strictly before cutoff. A zero creation time is unknown and is
+// never admitted: a missing timestamp is not evidence that a container is
+// old enough to delete.
+type pruneAgeFilter struct {
+	active bool
+	cutoff time.Time
+}
+
+func newPruneAgeFilter(cfg pruneConfig) pruneAgeFilter {
+	if cfg.olderThan <= 0 {
+		return pruneAgeFilter{}
+	}
+	now := cfg.now
+	if now == nil {
+		now = time.Now
+	}
+	return pruneAgeFilter{active: true, cutoff: now().Add(-cfg.olderThan)}
+}
+
+func (f pruneAgeFilter) admits(createdAt time.Time) bool {
+	if !f.active {
+		return true
+	}
+	return !createdAt.IsZero() && createdAt.Before(f.cutoff)
 }
 
 // pruneListed lists candidates and removes each still-current candidate.
@@ -224,6 +275,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	if cfg.timeout <= 0 {
 		cfg.timeout = defaultPruneTimeout
 	}
+	ages := newPruneAgeFilter(cfg)
 
 	redactor := cli.NewHashedContextRedactor(reuseGroup)
 	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
@@ -299,10 +351,10 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 					if !ok {
 						opErr = fmt.Errorf("%s %s: list candidate metadata missing", errKind, job.id)
 					} else {
-						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup)
+						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, ages)
 					}
 				} else {
-					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup)
+					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages)
 				}
 				mu.Lock()
 				attemptedAt[job.index] = true
@@ -345,7 +397,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	return removed, cli.WithRedactor(errors.Join(errs...), redactor)
 }
 
-func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
+func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter) (bool, error) {
 	if !dockerIDRE.MatchString(id) {
 		return false, nil
 	}
@@ -372,12 +424,13 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 		id:         id,
 		labels:     fresh.labels,
 		creation:   fresh.labels[creationLabel],
+		createdAt:  fresh.createdAt,
 		state:      fresh.state,
 		managed:    fresh.labels[managedLabel] == "true",
 		reuse:      fresh.labels[reuseLabel] == "true",
 		reuseGroup: fresh.labels[reuseGroupLabel],
 	}
-	if !pruneCandidateEligible(candidate, reuseGroup) {
+	if !pruneCandidateEligible(candidate, reuseGroup) || !ages.admits(candidate.createdAt) {
 		// In particular, ordinary prune never force-deletes a candidate
 		// that became running after the daemon-side list.
 		return false, nil
@@ -409,6 +462,7 @@ func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
 			id:         c.ID,
 			labels:     labels,
 			creation:   labels[creationLabel],
+			createdAt:  parseInspectTime(c.Configuration.CreationDate),
 			state:      State(c.Status.State),
 			managed:    labels[managedLabel] == "true",
 			reuse:      labels[reuseLabel] == "true",
@@ -460,8 +514,14 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 	return true
 }
 
-func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string) (bool, error) {
+func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string, ages pruneAgeFilter) (bool, error) {
 	if eng.name() != "apple" || !pruneCandidateEligible(candidate, reuseGroup) {
+		return false, nil
+	}
+	// The list-time timestamp can keep a known-recent candidate from taking
+	// the name lock at all. Unknown list metadata is checked again against
+	// the fresh inspect below.
+	if ages.active && !candidate.createdAt.IsZero() && !ages.admits(candidate.createdAt) {
 		return false, nil
 	}
 	guardCtx, guardCancel := context.WithTimeout(ctx, queryTimeout)
@@ -483,7 +543,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if err != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
 	}
-	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) || fresh.uid != "" {
+	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) || fresh.uid != "" || !ages.admits(fresh.createdAt) {
 		return false, nil
 	}
 	deleteArgs := eng.deleteArgs(candidate.id)

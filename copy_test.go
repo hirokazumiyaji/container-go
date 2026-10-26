@@ -1130,7 +1130,7 @@ func TestSnapshotCopySourceClassifiesPostOpenDisappearance(t *testing.T) {
 		return file, reparse, nil
 	}
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if !errors.Is(err, ErrCopySourceChanged) {
 		t.Fatalf("error = %v, want ErrCopySourceChanged", err)
 	}
@@ -1138,25 +1138,81 @@ func TestSnapshotCopySourceClassifiesPostOpenDisappearance(t *testing.T) {
 		t.Fatalf("error = %v, want preserved fs.ErrNotExist cause", err)
 	}
 }
-func TestWithFilesRejectsDirectory(t *testing.T) {
+func TestWithFilesRejectsDirectoryBeforeBackend(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "tree")
 	if err := os.Mkdir(source, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runner := &cpRunner{fakeRunner: newTestRunner()}
+	runner := newCountingRunner(newTestRunner())
 
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
 		WithFiles(File{HostPath: source, ContainerPath: "/tmp/tree"}))
-	if !errors.Is(err, ErrCopySourceUnsupported) {
-		t.Fatalf("error = %v, want ErrCopySourceUnsupported", err)
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
 	}
-	if call := runner.callWith("cp"); call != nil {
-		t.Errorf("CLI was called for a file-only WithFiles source: %v", call)
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" {
+		t.Fatalf("error = %v, want ValidationError for WithFiles/hostPath", err)
 	}
-	if runner.callWith("delete") == nil {
-		t.Error("failed WithFiles copy did not roll back the container")
+	if !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("error = %v, want regular-file rejection", err)
 	}
+	if got := runner.count(); got != 0 {
+		t.Fatalf("backend CLI calls = %d, want 0: %v", got, runner.args)
+	}
+}
+
+func TestWithFilesRejectsSymlinkBeforeBackend(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, source); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	runner := newCountingRunner(newTestRunner())
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: source, ContainerPath: "/tmp/link.txt"}))
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" {
+		t.Fatalf("error = %v, want ValidationError for WithFiles/hostPath", err)
+	}
+	if !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("error = %v, want regular-file rejection", err)
+	}
+	if got := runner.count(); got != 0 {
+		t.Fatalf("backend CLI calls = %d, want 0: %v", got, runner.args)
+	}
+}
+
+func TestWithFilesAcceptsRegularFile(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(source, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := newCountingRunner(newTestRunner())
+
+	runTestContainer(t, runner, WithFiles(File{HostPath: source, ContainerPath: "/tmp/input.txt"}))
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.calls.Load() == 0 {
+		t.Fatal("backend CLI was not invoked for a regular file")
+	}
+	for _, args := range runner.args {
+		if len(args) == 3 && args[0] == "cp" && args[2] == "myctr:/tmp/input.txt" {
+			return
+		}
+	}
+	t.Fatalf("no cp call for the regular file: %v", runner.args)
 }
 func TestCopyToContainerCleansNonEmptyReadOnlyDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -1207,7 +1263,7 @@ func TestSnapshotCopySourceUsesOpenedRootAfterSameMetadataReplacement(t *testing
 		return file, reparse, nil
 	}
 
-	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if err != nil {
 		t.Fatalf("snapshotCopySourceWith: %v", err)
 	}
@@ -1252,7 +1308,7 @@ func TestSnapshotCopyDirectoryUsesOpenedChildAfterSameMetadataReplacement(t *tes
 		return file, reparse, nil
 	}
 
-	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if err != nil {
 		t.Fatalf("snapshotCopySourceWith: %v", err)
 	}
@@ -1310,7 +1366,7 @@ func TestSnapshotCopySourceRejectsTooManyEmptyEntries(t *testing.T) {
 	limits := defaultCopySnapshotLimits
 	limits.maxEntries = 3 // source root plus two empty entries
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, limits, defaultCopySourceOpeners)
 	if !errors.Is(err, ErrCopySourceTooManyEntries) {
 		t.Fatalf("error = %v, want ErrCopySourceTooManyEntries", err)
 	}
@@ -1323,7 +1379,7 @@ func TestSnapshotCopySourceRejectsTreeBeyondDepthLimit(t *testing.T) {
 	limits := defaultCopySnapshotLimits
 	limits.maxDepth = 3
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, limits, defaultCopySourceOpeners)
 	if !errors.Is(err, ErrCopySourceTooDeep) {
 		t.Fatalf("error = %v, want ErrCopySourceTooDeep", err)
 	}
@@ -1336,7 +1392,7 @@ func TestSnapshotCopySourceRejectsMetadataBudget(t *testing.T) {
 	limits := defaultCopySnapshotLimits
 	limits.maxMetadataBytes = int64(len(source)) // admits only the source root path
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, limits, defaultCopySourceOpeners)
 	if !errors.Is(err, ErrCopySourceMetadataTooLarge) {
 		t.Fatalf("error = %v, want ErrCopySourceMetadataTooLarge", err)
 	}
@@ -1351,7 +1407,7 @@ func TestSnapshotCopyDirectoryClassifiesChildDisappearance(t *testing.T) {
 		return nil, false, fs.ErrNotExist
 	}
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if !errors.Is(err, ErrCopySourceChanged) || !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("error = %v, want ErrCopySourceChanged and fs.ErrNotExist", err)
 	}

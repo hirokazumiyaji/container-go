@@ -28,6 +28,27 @@ for these fixes; the entries below list the changes.
 
 ### Added
 
+- Add `WithShmSize`, `WithPrivileged`, `WithCapAdd` / `WithCapDrop`,
+  `WithUlimit`, `WithExtraHost`, and `WithHostname` run options. Values are
+  validated while options are evaluated, emitted as Docker's `--shm-size`,
+  `--privileged`, `--cap-add` / `--cap-drop`, `--ulimit`, `--add-host`, and
+  `--hostname` flags, and included in the `WithReuse` compatibility
+  identity. Reuse only requires requested capabilities to be present in the
+  inspected configuration, so an empty capability request accepts any
+  inspected set. Apple Container accepts the shm, capability, and ulimit flags
+  and rejects `WithPrivileged`, `WithExtraHost`, and `WithHostname` with
+  `ErrUnsupportedCapability`.
+- Add in-memory copy sources. `File.Content` and `File.Mode` extend
+  `WithFiles`, and `CopyContentToContainer` copies bytes into a running
+  handle. Content uses the existing per-user private staging tree at `0600`
+  by default, never appears in argv, errors, or diagnostics, and is removed
+  with the staging directory. `HostPath` and `Content` are mutually exclusive,
+  and non-permission mode bits are rejected (#263).
+- Add `WithNetworkAliases` to expose Docker's network-scoped DNS aliases
+  (`--network-alias`). Aliases require an explicitly selected user-defined
+  network, participate in reuse compatibility, and fail before any backend
+  call when combined with the default bridge, `host`, `none`, or `nat`;
+  Apple Container returns `ErrUnsupportedCapability` (#261).
 - Add `InspectInfo.ContainerID()` for the backend's immutable container ID
   (Docker's 64-character hexadecimal ID). `InspectInfo.ID()` keeps returning
   the logical container name and `Name()` returns the backend-reported name,
@@ -38,6 +59,10 @@ for these fixes; the entries below list the changes.
   `PullOption` values, `Client.Prune` and `Client.PruneReuseGroup` accept
   `PruneOption` values, and Client option validation returns typed
   `ErrInvalidOption` errors (#243).
+- Add `WithPruneOlderThan` so `Prune` and `PruneReuseGroup` can restrict
+  deletion to containers the backend reports as created before a cutoff.
+  Document the missing Windows watchdog reaper and the recommended
+  `TestMain` `Prune` sweep for Windows and remote daemons (#267).
 - Validate Apple Container's platform, name, network, port, and memory
   capabilities before image resolution; reject unsupported `PullNever` with
   `ErrPullNeverUnsupported` and document `PullMissing`/`PullAlways` fallbacks.
@@ -75,11 +100,16 @@ for these fixes; the entries below list the changes.
   accept verified unprefixed Docker image IDs in canonical `sha256:`
   form.
 - Add `LogsOptions` and `LogsWithOptions` for requesting a snapshot
-  window with `Tail` and `Since`. Docker supports both options; the
-  Apple-specific mapping and unsupported `Since` behavior are tracked by
-  issue #82 and are not backend-neutral in this checkout.
+  window with `Tail` and `Since`. Docker supports both options. Apple
+  Container maps `Tail` to `-n` and rejects `Since` with
+  `ErrUnsupportedCapability` because its CLI has no `--since` option.
 - Add `wait.ForHTTP` header, basic-auth, TLS, TLS-config, and custom
   HTTP-client setters.
+- Add `wait.ForHealthcheck()` for Docker's `HEALTHCHECK` status, with
+  `wait.HealthTarget` as the optional target extension; the Apple backend
+  rejects the strategy before creating a container. Add
+  `wait.HTTPStrategy.WithResponseMatcher` for up to 64KiB of response-body
+  matching after the status matcher accepts (#260).
 - Export `wait.AllStrategy` and `wait.AnyStrategy` and add
   `WithStartupTimeout` to bound a composite wait.
 - Expose the root `CLIError` alias and add `ErrContainerNotFound` and
@@ -99,6 +129,29 @@ for these fixes; the entries below list the changes.
 
 ### Changed
 
+- **Breaking:** align public signatures before v1.0. Redaction methods on
+  `ConfigError`, `ValidationError`, `ExecTerminationError`, `CleanupError`,
+  `wait.ConfigError`, `CLIError`, and `SystemNotRunningError` are now
+  unexported, so neither godoc nor API tooling exposes
+  `internal/cli.Redactor`; `errors.As` still returns redacted clones.
+  `TerminateContainer` now takes a `context.Context` first; `Cleanup` and
+  `StrictCleanup` retain the previous 30-second default by passing a
+  `terminateTimeout`-bounded context. `Container.Kill` takes one
+  `signal string` instead of a variadic argument; the empty string keeps the
+  SIGKILL default. Calls using `Kill(ctx)` must now pass `""`, and multiple
+  signals no longer compile. An explicit empty signal now selects SIGKILL
+  instead of returning a validation error. Remove the
+  `wait.DiagnosticSecrets` and `wait.SecretValues` aliases in favor of
+  `wait.DiagnosticValues`. Package-level `Prune` intentionally has no Docker
+  target options; use a `Client` configured with `WithClientDockerHost` or
+  `WithClientDockerContext` and call `Client.Prune`. `Pull` keeps its
+  pull-specific target options (`WithPullDockerHost`,
+  `WithPullDockerContext`) (#265).
+- `WithCPUs` now takes a `float64` and Docker receives the value through
+  `strconv.FormatFloat(..., 'f', -1, 64)`, so fractional quotas such as
+  `0.5` are supported. Non-positive and non-finite values are rejected.
+  Apple Container requires a whole number and rejects a fractional value
+  with `ErrUnsupportedCapability`; integer values remain accepted.
 - `Client.Pull`, `Client.Prune`, and `Client.PruneReuseGroup` are variadic.
   Existing calls remain source-compatible, but method values and interface
   implementations that use the old fixed signatures must be updated. Docker

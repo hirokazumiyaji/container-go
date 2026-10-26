@@ -48,6 +48,13 @@ func isPermanentCheckError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A per-attempt timeout describes one try, not the strategy, so it
+	// stays retryable even when the canceled command failed in a way that
+	// normally ends the poll.
+	var attemptTimeout *execAttemptTimeoutError
+	if errors.As(err, &attemptTimeout) {
+		return false
+	}
 	var fatal fatalCheckError
 	if errors.As(err, &fatal) {
 		return true

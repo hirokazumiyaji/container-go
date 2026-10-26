@@ -37,10 +37,12 @@ import (
 //
 // The event stream is accumulated until stdin EOF before any delete
 // runs, so registration while the parent lives cannot force-delete a
-// live container. After EOF the reap is bounded overall and entries are
-// processed a few at a time: the reaper is insurance and must finish
-// even when the backend answers nothing, rather than paying the
-// container count times the per-entry timeout.
+// live container. After EOF the reap is bounded overall and a bounded
+// worker pool starts the next entry as soon as any running entry ends:
+// the reaper is insurance and must finish even when the backend answers
+// nothing, rather than paying the container count times the per-entry
+// timeout. If the overall budget expires with entries still queued, the
+// number left unstarted is reported on stderr without naming IDs.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
@@ -195,7 +197,7 @@ process_entry() {
 process_entry "$@"
 REAPER_ENTRY
 
-run_entry() {
+reap_entry() {
   entry_state="$1"
   entry_id="$2"
   entry_creation="$3"
@@ -209,24 +211,18 @@ run_entry() {
 
   # Every name-addressed operation must share the Go name lock. An
   # immutable Docker ID is the only operation that may run unlocked.
+  # A name-addressed entry with no lock path is skipped: inventing a
+  # lock here would use a namespace the Go name lock does not share.
   case "$entry_id" in
     *[!A-Za-z0-9_.-]*) [ -n "$entry_lock" ] || return 0 ;;
-  esac
-  case "$sub" in
-    delete)
+    *)
       if [ -z "$entry_lock" ]; then
-        entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"
+        [ "$sub" = rm ] || return 0
+        case "$entry_id" in
+          *[!0-9a-f]*) return 0 ;;
+          *) [ "${#entry_id}" -eq 64 ] || return 0 ;;
+        esac
       fi
-      ;;
-    rm)
-      case "$entry_id" in
-        *[!0-9a-f]*)
-          if [ -z "$entry_lock" ]; then entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"; fi
-          ;;
-        *)
-          if [ "${#entry_id}" -ne 64 ] && [ -z "$entry_lock" ]; then entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"; fi
-          ;;
-      esac
       ;;
   esac
   if [ -n "$entry_lock" ]; then
@@ -261,6 +257,19 @@ run_entry() {
   REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
   REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
     sh -c "$entry_script" reaper-entry "$entry_id" "$entry_creation" "$pending" "$@"
+}
+
+# The consumer backgrounds this function. Returning a completion token
+# after the entry finishes is the worker-pool semaphore: the consumer can
+# start the next entry as soon as any running entry is done, without
+# relying on wait -n, which POSIX sh does not provide.
+run_entry() {
+  reap_entry "$@"
+  entry_rc=$?
+  if [ -n "$done_fifo" ]; then
+    printf 'x\n' >&3
+  fi
+  return "$entry_rc"
 }
 
 # The input is a small event stream. P marks a create that is still
@@ -303,21 +312,74 @@ END {
   # The consumer starts with the pipeline, but awk's END only prints
   # after EOF. Arm the budget on the first entry so a long-lived parent
   # does not spend it before cleanup begins.
-  batch=0
+  #
+  # A completion FIFO is the bounded worker-pool semaphore. The consumer
+  # starts at most $parallel entries and reads one token whenever every
+  # slot is busy; run_entry writes a token when it finishes. That starts
+  # the next entry as soon as any earlier one ends, without the head-of-
+  # line blocking of a batch wait and without wait -n. The FIFO is
+  # unlinked after opening; fd 3 keeps the inode alive and is inherited
+  # by the background jobs.
+  running=0
+  done_fifo=
+  fifo_dir="${TMPDIR:-/tmp}/containergo-reaper.$$"
+  umask 077
+  if mkdir "$fifo_dir" 2>/dev/null; then
+    if mkfifo "$fifo_dir/done" 2>/dev/null; then
+      if exec 3<>"$fifo_dir/done"; then
+        done_fifo=1
+      fi
+      rm -f "$fifo_dir/done"
+    fi
+    rmdir "$fifo_dir" 2>/dev/null || true
+  fi
+  if [ -z "$done_fifo" ]; then
+    # Without a completion channel the loop cannot observe a free slot,
+    # so fall back to a sequential reap rather than oversubscribing.
+    parallel=1
+  fi
+  leftover=0
+  count_leftovers() {
+    # The entry the loop just read has not started; count it along with
+    # every entry still queued after it.
+    leftover=1
+    while IFS="$tab" read -r _state _entry_id _entry_creation _entry_lock; do
+      [ -n "$_entry_id" ] || continue
+      leftover=$((leftover + 1))
+    done
+  }
   while IFS="$tab" read -r state entry_id entry_creation entry_lock; do
     [ -n "$entry_id" ] || continue
     if [ "$started" -eq 0 ]; then
       started=$(( $(date +%s 2>/dev/null || echo 1) ))
       [ "$started" -gt 0 ] 2>/dev/null || started=1
     fi
-    [ "$(remaining)" -gt 0 ] || break
-    run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &
-    batch=$((batch + 1))
-    if [ "$batch" -ge "$parallel" ]; then
-      wait
-      batch=0
+    if [ "$(remaining)" -le 0 ]; then
+      count_leftovers
+      break
     fi
+    if [ "$running" -ge "$parallel" ]; then
+      if [ -n "$done_fifo" ]; then
+        IFS= read -r done_token <&3
+      else
+        wait
+      fi
+      running=$((running - 1))
+      # Waiting for a slot can consume the rest of the budget.
+      if [ "$(remaining)" -le 0 ]; then
+        count_leftovers
+        break
+      fi
+    fi
+    run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &
+    running=$((running + 1))
   done
+  if [ "$leftover" -gt 0 ]; then
+    printf 'container-go: reaper budget expired with %d entries remaining\n' "$leftover" >&2
+  fi
+  if [ -n "$done_fifo" ]; then
+    exec 3<&-
+  fi
   wait
 }
 `

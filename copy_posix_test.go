@@ -30,6 +30,28 @@ func TestCopyToContainerRejectsFIFO(t *testing.T) {
 	}
 }
 
+func TestWithFilesRejectsFIFOBeforeBackend(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "pipe")
+	if err := syscall.Mkfifo(source, 0o600); err != nil {
+		t.Skipf("FIFO unavailable: %v", err)
+	}
+	runner := newCountingRunner(newTestRunner())
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: source, ContainerPath: "/tmp/pipe"}))
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" {
+		t.Fatalf("error = %v, want ValidationError for WithFiles/hostPath", err)
+	}
+	if got := runner.count(); got != 0 {
+		t.Fatalf("backend CLI calls = %d, want 0: %v", got, runner.args)
+	}
+}
+
 func TestCopyToContainerRejectsUnixSocket(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "socket")
 	listener, err := net.Listen("unix", source)

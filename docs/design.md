@@ -739,10 +739,12 @@ resolved endpoint, which is the right abstraction for both direct-IP
 Apple Container and published-port Docker. `Target` keeps its original `Running`
 method for custom-strategy compatibility. Targets that distinguish startup
 transitions also implement the optional `StateTarget` interface; built-in
-strategies prefer `State` and fall back to `Running`. Docker healthcheck
+strategies prefer `State` and fall back to `Running`. Port strategies use
+optional `PortListenTarget` checks to confirm the container-side LISTEN
+state; unsupported targets use the host connection alone. Docker healthcheck
 waits use the optional `HealthTarget` interface; `ForHealthcheck` returns a
 `*wait.ConfigError` for targets that do not implement it. `container.Run`
-adapts `*container.Container` to all three surfaces. The dependency points
+adapts `*container.Container` to these interfaces. The dependency points
 from `container` to `wait`, never back, avoiding an import cycle.
 
 ## Cleanup

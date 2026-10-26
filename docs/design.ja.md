@@ -371,7 +371,16 @@ type Strategy interface {
 }
 ```
 
-`Target` は `Endpoint`、`Running`、`FollowLogs`、`ExecCommand` を公開する小さなインターフェースである。`Target` は `ContainerIP` を公開しない。接続 strategy は解決済み endpoint を使う。この抽象化は Apple Container の direct IP と Docker の published port の両方に適合する。`Target` は従来の `Running` メソッドをカスタム戦略との互換性のために維持する。起動中の一時状態を区別できるターゲットは、任意の `StateTarget` インターフェースも実装する。組み込み戦略は `State` を優先し、互換性のため `Running` にフォールバックする。Docker のヘルスチェック待機では、任意の `HealthTarget` インターフェースも実装する。`ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返す。`container.Run` が `*container.Container` をこれらのインターフェースへ適合させる。依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避ける。
+`Target` は `Endpoint`、`Running`、`FollowLogs`、`ExecCommand` を公開する小さなインターフェースである。
+接続 strategy は `ContainerIP` ではなく解決済み endpoint を使い、Apple Container の direct IP と Docker の published port に対応する。
+`Target` は従来の `Running` メソッドをカスタム戦略との互換性のために維持する。
+起動中の一時状態を区別できるターゲットは、任意の `StateTarget` インターフェースも実装する。
+組み込み戦略は `State` を優先し、互換性のため `Running` にフォールバックする。
+port strategy は任意の `PortListenTarget` を使ってコンテナ側の LISTEN 状態を確認し、未対応の target では host 側の接続だけで判定する。
+Docker のヘルスチェック待機では、任意の `HealthTarget` インターフェースも実装する。
+`ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返す。
+`container.Run` が `*container.Container` をこれらのインターフェースへ適合させる。
+依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避ける。
 
 ## クリーンアップ
 

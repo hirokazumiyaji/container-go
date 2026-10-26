@@ -1640,7 +1640,11 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 				}
 			}
 		case <-time.After(attachStopWait):
-			if c.recordAttachError(done, streamDone, errors.New("logs: previous attached stream is still writing to the output; not starting a replacement")) {
+			// Failing to attach a replacement is an output-delivery failure,
+			// not expected teardown noise: a successful teardown must not
+			// hide that the writer could not be served.
+			err := fmt.Errorf("%w: logs: previous attached stream is still writing to the output; not starting a replacement", ErrOutputDelivery)
+			if c.recordAttachError(done, streamDone, err) {
 				deferred = true
 			}
 		}

@@ -797,6 +797,80 @@ func (r *releasedErrorReader) Read([]byte) (int, error) {
 
 func (r *releasedErrorReader) Close() error { return nil }
 
+// killBlockingRunner holds a terminating kill in the backend so a
+// replacement stream can time out waiting for the output gate.
+type killBlockingRunner struct {
+	*recordingStreamerRunner
+	killStarted chan struct{}
+	releaseKill chan struct{}
+}
+
+func (r *killBlockingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "kill" {
+		close(r.killStarted)
+		<-r.releaseKill
+	}
+	return r.recordingStreamerRunner.Run(ctx, args...)
+}
+
+func TestSuccessfulTeardownKeepsReplacementGateFailure(t *testing.T) {
+	f := &killBlockingRunner{
+		recordingStreamerRunner: &recordingStreamerRunner{inner: newTestRunner(), data: "attached line\n"},
+		killStarted:             make(chan struct{}),
+		releaseKill:             make(chan struct{}),
+	}
+	sink := &blockingSink{entered: make(chan struct{}), released: make(chan struct{})}
+	ctr := runTestContainer(t, f, WithAttachOutput(sink))
+	t.Cleanup(func() { close(sink.released) })
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach stream never wrote to the sink")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- ctr.Stop(context.Background(), nil) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for attachCancelForTest(t, ctr) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Stop did not mark the wedged stream inactive")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := ctr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	killDone := make(chan error, 1)
+	go func() { killDone <- ctr.Kill(context.Background(), "") }()
+	select {
+	case <-f.killStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Kill never reached the backend")
+	}
+
+	// The replacement cannot take the gate from the wedged stream. The Kill
+	// still owns its teardown, but the successful teardown must not discard
+	// the delivery failure.
+	select {
+	case <-ctr.AttachedDone():
+	case <-time.After(3 * time.Second):
+		t.Fatal("replacement stream did not time out on the wedged sink")
+	}
+	if err := ctr.AttachedError(); !errors.Is(err, ErrOutputDelivery) {
+		t.Fatalf("AttachedError() = %v, want ErrOutputDelivery for the gate timeout", err)
+	}
+
+	close(f.releaseKill)
+	if err := <-killDone; err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestFailedKillOfReplacementDoesNotSuppressItsFailure(t *testing.T) {
 	firstErr := errors.New("first stream reset")
 	secondErr := errors.New("replacement stream reset")

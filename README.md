@@ -27,6 +27,7 @@ later. The `v0.2.0` module requires Go 1.27 or later.
 | `wait.ForHealthcheck` and `HTTPStrategy.WithResponseMatcher` | Not available | Available |
 | Exported `wait.AllStrategy` / `AnyStrategy` and composite `WithStartupTimeout` | Not available | Available |
 | Root `CLIError`, `ErrContainerNotFound`, and `ErrGenerationReplaced` | Not available | Available |
+| Fractional `WithCPUs(float64)`, `WithShmSize`, `WithPrivileged`, `WithCapAdd`/`WithCapDrop`, `WithUlimit`, `WithExtraHost`, and `WithHostname` | Not available | Available |
 | Generation-safe deletion, post-`v0.2.0` endpoint hardening, and the current reaper hardening | Not part of the `v0.2.0` contract | Available |
 
 Unless a section explicitly says “current development”, descriptions of
@@ -797,6 +798,44 @@ who need certainty on every `Run` should leave it off. On Docker,
 `PullNever` always inspects regardless, since its contract is to fail when
 the image is absent.
 
+## Run options
+
+`WithCPUs(v float64)` accepts a fractional CPU quota such as `0.5` or
+`1.25` and passes it to Docker as `--cpus`. Non-positive and non-finite
+values are rejected while options are evaluated. Apple Container's
+`--cpus` takes an integer, so a fractional value is rejected with
+`ErrUnsupportedCapability` while whole numbers keep working.
+
+`WithMemory(size string)` and `WithShmSize(size string)` share the same
+integer with an optional `K`/`M`/`G`/`T`/`P` suffix grammar and reject
+zero, malformed, and overflowing values before any backend call.
+`WithShmSize` passes Docker and Apple Container `--shm-size`.
+
+The other options map directly to run flags: `WithPrivileged`
+(`--privileged`), `WithCapAdd` / `WithCapDrop` (`--cap-add` /
+`--cap-drop`; names are uppercase with an optional `CAP_` prefix or
+`ALL`, the caller's spelling is passed through, and duplicates are
+ignored regardless of prefix),
+`WithUlimit(name, soft, hard)` (`--ulimit name=soft:hard` with Docker's
+lowercase name set; `-1` means unlimited), `WithExtraHost(host, ip)` (`--add-host host:ip`,
+with `host-gateway` accepted and duplicate or conflicting hosts
+rejected), and `WithHostname` (`--hostname`, an RFC 1123 hostname of at
+most 63 bytes). String values that start with `-` or contain control characters
+are rejected.
+
+Apple Container supports `--shm-size`, `--cap-add`, `--cap-drop`, and
+`--ulimit` and receives the same flags. It has no equivalent for
+privileged containers, extra hosts, or `--hostname`, so `WithPrivileged`,
+`WithExtraHost`, and `WithHostname` return `ErrUnsupportedCapability`
+before any image or container command.
+
+These options are part of the `WithReuse` compatibility identity: a
+reused container must report matching CPU, shm, privilege, ulimit,
+extra-host, and hostname settings. Capabilities use a requested-subset
+rule: every capability the caller asked to add or drop must be present,
+while a caller that requests no capability changes accepts any inspected
+set. `Run` refuses to attach when these checks fail.
+
 ### Apple capability validation
 
 The Apple backend checks the CLI's static limits before it resolves an image or
@@ -827,6 +866,13 @@ suffix as `WithMemory`; invalid units and overflow are rejected. Published
 ports must be 2–65535, and Apple accepts at most 64 published-port descriptors.
 `WithExposedPorts` remains a library-side declaration and is not turned into an
 Apple `--publish` flag.
+
+Apple supports `--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`, and
+integer `--cpus`, so `WithShmSize`, `WithCapAdd`, `WithCapDrop`,
+`WithUlimit`, and whole-number `WithCPUs` values are passed through.
+`WithPrivileged`, `WithExtraHost`, `WithHostname`, and a fractional
+`WithCPUs` value are rejected with `ErrUnsupportedCapability` before the
+CLI runs.
 
 ## Image resolution and pinning
 

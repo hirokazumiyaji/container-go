@@ -191,6 +191,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithHostname(name string)`：Docker の `--hostname`。RFC 1123 の hostname grammar と 63 byte の UTS nodename 上限で検証する。Apple Container に `--hostname` flag はなく、`ErrUnsupportedCapability` で拒否する。
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリを指定する。
 - `WithNetwork(name string)`：既存の名前付きネットワークへ接続する。
+- `WithNetworkAliases(aliases ...string)`：Docker の `--network-alias` として network-scoped DNS alias を追加する。明示的な user-defined `WithNetwork` が必要で、default bridge（`bridge`/`nat`）、`host`、`none` は `*ConfigError`、Apple は `ErrUnsupportedCapability` で拒否する。alias は DNS label として検証し、reuse の互換性比較にも含める。
 - `WithPlatform(p string)`：`linux/amd64` のようなイメージプラットフォームを指定する（Apple Container では Rosetta を含む）。
 - `WithExposedPorts(ports ...string)`：接続対象のコンテナポート(`"6379/tcp"` 形式)を宣言する
 - `WithEnv(env map[string]string)`：環境変数
@@ -199,7 +200,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithName(name string)`：コンテナ名(省略時は `containergo-<乱数16進>` を採番)
 - `WithLabels(labels map[string]string)`：追加ラベル
 - `WithMounts(mounts ...Mount)`：bind、volume、tmpfs マウント
-- `WithFiles(files ...File)`：起動後にコンテナへコピーするファイル
+- `WithFiles(files ...File)`：起動後にコンテナへコピーする通常ファイル。option 評価時にディレクトリ、シンボリックリンク、特殊ファイルを拒否する
 - `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
 - `WithCPUs(v float64)` / `WithMemory(size string)`：リソース制限。`WithCPUs` は小数を受け付ける
 - `WithShmSize(size string)`：`/dev/shm` のサイズ
@@ -264,7 +265,8 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 各 source entry は、最終要素のリンクを追わずに一度だけ開く。
 ディレクトリ内の child は、既に開いた親ハンドルからの相対 open で取得する。
 そのハンドルを、backend CLI の実行前に現在のユーザー専用の staging root へコピーする。
-`WithFiles` も同じ経路を使うが、ディレクトリを拒否する。
+`WithFiles` も同じ経路を使うが、option 評価時に通常ファイル以外
+（ディレクトリ、シンボリックリンク、特殊ファイル）を `ValidationError` で拒否する。
 staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
 ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
 スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
@@ -449,6 +451,16 @@ Apple の場合は generation を保存し、JSON の行頭にある `"key": "va
 `pgrep` は任意で、利用できない場合は固定した `ps` の process table で子孫を列挙する。
 補助 executable は固定したシステムパスから解決し、出力(file-size limit)、helper 実行時間(1 秒)、1 entry あたり helper 回数(通常 8 回と `pgrep`・列挙用の予備各 2 回)を制限する。budget 切れなら追加 cleanup を行わない。monitor mode が使えない場合も、可靠的 helper の列挙で子孫を kill して回収する。
 登録は reaper 子プロセスあたり最大 1024 件を保持・再生する。shell は上限を超える入力も読み捨て続けるため、pipe が満杯で writer が block しない。Go 側の上限超過は明示的な capacity error として返し、`Run` は新規コンテナを rollback する。
+
+**残骸の回収**：watchdog は Windows では使えず、CI のキャンセルや
+`go test -timeout` などでローカルの process tree や runner VM が破棄された
+後、または remote Docker daemon 上でローカル環境より長く残るコンテナには
+動作できません。対応策は `TestMain` の前後で `Prune(ctx)` を呼ぶことです。
+`Prune` は session に関係なく停止済みの managed コンテナを削除し、running と
+created は残します。`WithPruneOlderThan(d)` は backend が報告する作成時刻が
+now-d より前の candidate だけに絞り、作成時刻が不明な candidate も残します。
+これにより共有 daemon や remote daemon で他の job が最近停止したコンテナを
+保護できます。これは watchdog の代替ではなく、回収のための運用パターンです。
 
 reaper は実 CLI コンテナを非 reuse 経路で登録したときに遅延起動する。
 Apple Container には別の不変 ID がないため、entry はコンテナ名と creation

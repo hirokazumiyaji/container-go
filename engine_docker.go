@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -321,6 +322,11 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 	if !cfg.networkExplicit {
 		network = ""
 	}
+	if len(cfg.networkAliases) > 0 {
+		if err := dockerNetworkAliasConfigError(network); err != nil {
+			return err
+		}
+	}
 	if !dockerNetworkAllowsPublish(network) {
 		if len(cfg.published) > 0 {
 			return dockerPublishOptionError(network, "WithPublishedPort")
@@ -480,6 +486,36 @@ func dockerPublishOptionError(mode, option string) error {
 		Option:  option,
 		Detail:  detail,
 	}
+}
+
+// dockerNetworkAliasConfigError reports network modes that cannot resolve
+// network-scoped aliases. Docker registers --network-alias entries only for
+// user-defined networks; the default bridge (bridge on Linux, nat on native
+// Windows), host, and none modes all lack the embedded DNS resolver.
+func dockerNetworkAliasConfigError(network string) error {
+	switch network {
+	case "", dockerNetworkDefault, dockerNetworkBridge, dockerNetworkNAT, dockerNetworkHost, dockerNetworkNone:
+		return &ConfigError{
+			Backend: "docker",
+			Network: network,
+			Option:  "WithNetworkAliases",
+			Detail:  "network-scoped aliases require an explicitly selected user-defined network",
+		}
+	}
+	return nil
+}
+
+// dockerReuseNetworkAliasesError verifies that an existing container would
+// resolve every alias this caller asked for. Extra reported aliases are
+// expected: Docker automatically adds the container name, short ID, and
+// hostname to the endpoint's DNS names.
+func dockerReuseNetworkAliasesError(cfg *config, info *engineInfo) error {
+	for _, alias := range cfg.networkAliases {
+		if !slices.Contains(info.networkAliases, alias) {
+			return fmt.Errorf("%w: requested network alias %q is missing from the existing container", ErrNetworkMismatch, alias)
+		}
+	}
+	return nil
 }
 
 // dockerNetworkAllowsPublish reports whether Docker can create a
@@ -1275,7 +1311,9 @@ type dockerInspect struct {
 			HostPort string `json:"HostPort"`
 		} `json:"Ports"`
 		Networks map[string]struct {
-			IPAddress string `json:"IPAddress"`
+			IPAddress string   `json:"IPAddress"`
+			Aliases   []string `json:"Aliases"`
+			DNSNames  []string `json:"DNSNames"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
 }
@@ -1309,6 +1347,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	match := -1
 	var malformedID string
+	var malformedIDSeen bool
 	var candidateMissingState bool
 	if dockerIDRE.MatchString(target) {
 		for i, c := range containers {
@@ -1323,25 +1362,36 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	} else {
 		for i, c := range containers {
-			if target != "" && c.Name == "/"+target {
-				if c.ID != "" && !dockerIDRE.MatchString(c.ID) {
-					if malformedID == "" {
-						malformedID = c.ID
-					}
-					continue
-				}
-				if c.State != nil && dockerIDRE.MatchString(c.ID) {
-					match = i
-					break
-				}
+			if target == "" || c.Name != "/"+target {
+				continue
 			}
+			// A name-matched entry without a container ID is unreadable,
+			// not absent: skipping it would report a container that exists
+			// as missing. An empty ID is as invalid as any other
+			// non-canonical one.
+			if !dockerIDRE.MatchString(c.ID) {
+				if !malformedIDSeen {
+					malformedID = c.ID
+					malformedIDSeen = true
+				}
+				continue
+			}
+			// Apply the same State/Status validation as ID addressing.
+			// Otherwise a target-naming entry whose state cannot be read
+			// would be accepted as a match or reported as absent.
+			if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
+				candidateMissingState = true
+				continue
+			}
+			match = i
+			break
 		}
 	}
 	if match < 0 {
 		if candidateMissingState {
 			return nil, fmt.Errorf("decode docker inspect output: container State.Status is required")
 		}
-		if malformedID != "" {
+		if malformedIDSeen {
 			return nil, fmt.Errorf("decode docker inspect output: container %s has invalid ID %q", target, malformedID)
 		}
 		return nil, newInspectTargetNotFound(target, "inspect output did not contain the requested target")
@@ -1354,19 +1404,25 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	sort.Strings(networkNames)
 
+	endpoint := c.NetworkSettings.Networks[c.HostConfig.NetworkMode]
+	networkAliases := append([]string(nil), endpoint.Aliases...)
+	networkAliases = append(networkAliases, endpoint.DNSNames...)
+	sort.Strings(networkAliases)
+
 	info := &engineInfo{
-		state:        dockerState(c.State.Status),
-		name:         strings.TrimPrefix(c.Name, "/"),
-		labels:       c.Config.Labels,
-		uid:          c.ID,
-		image:        c.Config.Image,
-		imageID:      c.Image,
-		imageDigest:  imageDigest(c.Config.Image),
-		platform:     c.Platform,
-		platformMeta: platformMetadataFromString(c.Platform),
-		ip:           c.NetworkSettings.IPAddress,
-		networkMode:  c.HostConfig.NetworkMode,
-		networkNames: networkNames,
+		state:          dockerState(c.State.Status),
+		name:           strings.TrimPrefix(c.Name, "/"),
+		labels:         c.Config.Labels,
+		uid:            c.ID,
+		image:          c.Config.Image,
+		imageID:        c.Image,
+		imageDigest:    imageDigest(c.Config.Image),
+		platform:       c.Platform,
+		platformMeta:   platformMetadataFromString(c.Platform),
+		ip:             c.NetworkSettings.IPAddress,
+		networkMode:    c.HostConfig.NetworkMode,
+		networkNames:   networkNames,
+		networkAliases: networkAliases,
 	}
 	info.runOptions = engineRunOptions{
 		cpus:         c.HostConfig.NanoCpus / 1e9,
@@ -1689,13 +1745,17 @@ func (dockerEngine) logsFollowResumeArgs(id string, since time.Time) []string {
 	return []string{"logs", "--follow", "--since", since.UTC().Format(time.RFC3339Nano), id}
 }
 
+// logsArgsWithOptions builds the snapshot argv. --since uses the same UTC
+// RFC3339Nano spelling as logsFollowResumeArgs: a coarse timestamp would
+// replay entries from the same second that an earlier snapshot already
+// delivered, which misleads incremental readers such as ForLog counting.
 func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
 	args := []string{"logs"}
 	if opts.Tail > 0 {
 		args = append(args, "--tail", strconv.Itoa(opts.Tail))
 	}
 	if !opts.Since.IsZero() {
-		args = append(args, "--since", opts.Since.Format(time.RFC3339))
+		args = append(args, "--since", opts.Since.UTC().Format(time.RFC3339Nano))
 	}
 	return append(args, id), nil
 }

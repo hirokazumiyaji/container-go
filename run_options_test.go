@@ -733,3 +733,17 @@ func TestWithUlimitUnlimited(t *testing.T) {
 		})
 	}
 }
+
+func TestReuseFlightKeyIncludesAliasesWithRunOptions(t *testing.T) {
+	cfg := dockerTestConfig(t, WithNetwork("test-net"), WithNetworkAliases("db"), WithCPUs(0.5))
+	original := reuseFlightKey(cfg)
+	cfg.networkAliases = []string{"cache"}
+	if reuseFlightKey(cfg) == original {
+		t.Fatal("run options hid a different alias request")
+	}
+	cfg.networkAliases = []string{"db"}
+	cfg.cpus = 0.75
+	if reuseFlightKey(cfg) == original {
+		t.Fatal("aliases hid a different CPU request")
+	}
+}

@@ -107,7 +107,7 @@ func isReuseIncompleteSetupError(err error) bool {
 // reuseFlightKey identifies one get-or-create request. Creation-time resource
 // and security options are part of the identity: callers that ask for the same
 // name with different settings must not share a leader's result. The order of
-// capabilities, ulimits, and extra hosts is irrelevant.
+// capabilities, ulimits, extra hosts, and network aliases is irrelevant.
 func reuseFlightKey(cfg *config) string {
 	key := cfg.eng.name() + "\x00" + cfg.eng.targetID() + "\x00" + cfg.name
 	if options := cfg.runOptionsKey(); options != "" {
@@ -143,6 +143,9 @@ func (c *config) runOptionsKey() string {
 	}
 	if c.hostname != "" {
 		parts = append(parts, "hostname="+c.hostname)
+	}
+	for _, alias := range c.networkAliases {
+		parts = append(parts, "network-alias="+alias)
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\x00")
@@ -1016,6 +1019,9 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 		if err := dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork); err != nil {
 			return fmt.Errorf("reuse %s: %w", cfg.name, err)
 		}
+		if err := dockerReuseNetworkAliasesError(cfg, info); err != nil {
+			return fmt.Errorf("reuse %s: %w", cfg.name, err)
+		}
 		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {
 			if err := dockerNetworkEndpointError(info.networkMode); err != nil {
 				return fmt.Errorf("reuse %s: %w", cfg.name, err)
@@ -1386,6 +1392,7 @@ func stripImageDigest(ref string) string {
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. Use it as a CI teardown
 // step; ordinary Prune still only removes stopped managed containers.
+// PruneOption values such as WithPruneOlderThan apply.
 func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err

@@ -54,6 +54,8 @@ func fixtureArgs(operation string) []string {
 		return []string{"run", "--name", "myctr"}
 	case "rm":
 		return []string{"rm", "--force", "myctr"}
+	case "cp":
+		return []string{"cp", "/host/source", "myctr:/tmp/destination"}
 	default:
 		return []string{operation, "myctr"}
 	}

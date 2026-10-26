@@ -398,6 +398,107 @@ func TestDockerParseInspectSelectsRequestedID(t *testing.T) {
 	}
 }
 
+// The same entry must be classified the same way whether the caller
+// addressed it by ID or by name. The name branch used to accept an empty
+// State.Status and to report a missing State as ErrContainerNotFound,
+// while the ID branch reported a schema error.
+func TestDockerParseInspectClassifiesMalformedTargetsByIDAndName(t *testing.T) {
+	otherID := strings.Repeat("a", 64)
+	targets := []struct {
+		name   string
+		target string
+	}{
+		{name: "ID", target: dockerFixtureID},
+		{name: "name", target: "myctr"},
+	}
+	cases := []struct {
+		name         string
+		entry        string
+		wantSchema   string
+		wantNotFound bool
+	}{
+		{
+			name:  "valid target",
+			entry: `{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}`,
+		},
+		{
+			name:       "missing State",
+			entry:      `{"Id":"` + dockerFixtureID + `","Name":"/myctr"}`,
+			wantSchema: "container State.Status is required",
+		},
+		{
+			name:       "missing State.Status",
+			entry:      `{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{}}`,
+			wantSchema: "container State.Status is required",
+		},
+		{
+			name:       "blank State.Status",
+			entry:      `{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"  "}}`,
+			wantSchema: "container State.Status is required",
+		},
+		{
+			name:         "other target",
+			entry:        `{"Id":"` + otherID + `","Name":"/other","State":{"Status":"running"}}`,
+			wantNotFound: true,
+		},
+	}
+	for _, target := range targets {
+		for _, tc := range cases {
+			t.Run(target.name+"/"+tc.name, func(t *testing.T) {
+				info, err := (dockerEngine{}).parseInspect([]byte("["+tc.entry+"]"), target.target)
+				if tc.wantNotFound {
+					if !errors.Is(err, ErrContainerNotFound) {
+						t.Fatalf("error = %v, want ErrContainerNotFound", err)
+					}
+					return
+				}
+				if tc.wantSchema != "" {
+					if err == nil || errors.Is(err, ErrContainerNotFound) {
+						t.Fatalf("parseInspect = %+v/%v, want a schema error", info, err)
+					}
+					if !strings.Contains(err.Error(), tc.wantSchema) {
+						t.Fatalf("error = %v, want it to contain %q", err, tc.wantSchema)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("parseInspect: %v", err)
+				}
+				if info.uid != dockerFixtureID || info.state != StateRunning {
+					t.Fatalf("info = %+v, want the requested running container", info)
+				}
+			})
+		}
+	}
+}
+
+// A name-matched entry with no container ID used to be skipped and
+// classified as an absent target. It is unreadable output like any other
+// non-canonical ID.
+func TestDockerParseInspectRejectsNameMatchedEmptyID(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry string
+	}{
+		{name: "empty Id", entry: `{"Id":"","Name":"/myctr","State":{"Status":"running"}}`},
+		{name: "absent Id", entry: `{"Name":"/myctr","State":{"Status":"running"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := (dockerEngine{}).parseInspect([]byte("["+tc.entry+"]"), "myctr")
+			if err == nil {
+				t.Fatalf("parseInspect = %+v, want a schema error", info)
+			}
+			if errors.Is(err, ErrContainerNotFound) {
+				t.Fatalf("error = %v, want a schema error, not ErrContainerNotFound", err)
+			}
+			if !strings.Contains(err.Error(), `invalid ID ""`) {
+				t.Fatalf("error = %v, want it to report the empty ID", err)
+			}
+		})
+	}
+}
+
 func TestDockerParseInspectNameSkipsMalformedIDAndNonmatchingName(t *testing.T) {
 	data := []byte(`[{"Id":"myctr","Name":"/other","State":{"Status":"exited"}},` +
 		`{"Id":"malicious","Name":"/myctr","State":{"Status":"exited"}},` +
@@ -478,16 +579,16 @@ func TestDockerParseInspectRejectsNullIdentityFields(t *testing.T) {
 	}
 }
 
-// A field that is absent is not a schema violation: a network or volume
-// inspect entry carries no container State, and the matcher must keep
-// skipping it in favor of the exact container entry that follows.
-func TestDockerParseInspectSkipsNonContainerObjectsWithoutState(t *testing.T) {
+// A target-naming entry that carries no container State is unreadable as a
+// container entry, so it must not be classified as absence. A complete
+// container entry alongside non-container objects still resolves exactly.
+func TestDockerParseInspectNameMatchedEntriesRequireContainerState(t *testing.T) {
 	networkID := strings.Repeat("b", 64)
 	// The name and ID would match, so only the absent State keeps this
 	// entry from being taken for the requested container.
 	data := []byte(`[{"Id":"` + networkID + `","Name":"/myctr","Driver":"bridge"}]`)
-	if _, err := (dockerEngine{}).parseInspect(data, "myctr"); !errors.Is(err, ErrContainerNotFound) {
-		t.Fatalf("error = %v, want ErrContainerNotFound for a non-container entry", err)
+	if _, err := (dockerEngine{}).parseInspect(data, "myctr"); err == nil || errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("error = %v, want a schema error for a name-matched entry without State", err)
 	}
 	// A volume-shaped entry alongside the real one still resolves exactly.
 	data = []byte(`[{"Id":"` + networkID + `","Name":"vol","Mountpoint":"/var/lib/volumes/vol"},` +

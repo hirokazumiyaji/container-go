@@ -25,6 +25,10 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `PullOption` values, `Client.Prune` and `Client.PruneReuseGroup` accept
   `PruneOption` values, and Client option validation returns typed
   `ErrInvalidOption` errors (#243).
+- Add `WithPruneOlderThan` so `Prune` and `PruneReuseGroup` can restrict
+  deletion to containers the backend reports as created before a cutoff.
+  Document the missing Windows watchdog reaper and the recommended
+  `TestMain` `Prune` sweep for Windows and remote daemons (#267).
 - Validate Apple Container's platform, name, network, port, and memory
   capabilities before image resolution; reject unsupported `PullNever` with
   `ErrPullNeverUnsupported` and document `PullMissing`/`PullAlways` fallbacks.

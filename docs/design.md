@@ -756,6 +756,18 @@ the whole reap has an overall budget past which no new backend calls
 are issued. Entries are processed a few at a time so the cost is not
 strictly proportional to the container count.
 
+**Recovering leftovers**: the watchdog cannot help on Windows, after the
+local process tree or runner VM is destroyed (for example on CI
+cancellation or `go test -timeout`), or for containers that outlive the
+local environment on a remote Docker daemon. The supported recovery
+pattern is to call `Prune(ctx)` from `TestMain` before and after the
+suite. `Prune` removes stopped managed containers from any session;
+running and created containers remain. `WithPruneOlderThan(d)` restricts
+a sweep to candidates the backend reports as created before now-d and
+leaves candidates whose creation time is unknown, so a shared or remote
+daemon does not lose another job's recent containers. This is recovery,
+not a replacement watchdog.
+
 The reaper is started lazily for a real CLI container on the non-reuse
 path. Apple Container has no separate immutable ID, so its entries use
 the container name and creation generation. The reaper checks the

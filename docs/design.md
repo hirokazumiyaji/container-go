@@ -859,6 +859,14 @@ specific Docker daemon or context creates a `Client` with
 (`WithPullDockerHost`, `WithPullDockerContext`); `Client.Pull` rejects them
 because the Client already pins its target.
 
+Package-level `Prune` intentionally accepts only backend-neutral
+`PruneOption` values and no Docker target options. A caller that needs a
+specific Docker daemon or context creates a `Client` with
+`WithClientDockerHost` or `WithClientDockerContext` and uses
+`Client.Prune`. `Pull` keeps its pull-specific target options
+(`WithPullDockerHost`, `WithPullDockerContext`); `Client.Pull` rejects them
+because the Client already pins its target.
+
 Setting `CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
 automatic deletion by `Cleanup` and `TerminateContainer`, skips reaper
 registration, and suppresses automatic rollback on failed creates, `WithFiles`

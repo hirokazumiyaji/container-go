@@ -922,6 +922,42 @@ func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
 }
 ```
 
+package レベルの `Prune` は backend 中立の `PruneOption` だけを受け付け、
+Docker target の option を持ちません。特定の Docker daemon や context を
+対象にする場合は、`WithClientDockerHost` または
+`WithClientDockerContext` で `Client` を作り、`Client.Prune` を呼びます。
+`Pull` は異なり、package レベルの `Pull` は 1 回の fetch 用に
+`WithPullDockerHost` と `WithPullDockerContext` を持ちます。
+`Client.Pull` は Client が target を固定するため、これらの上書きを
+拒否します。
+
+`Container.Kill(ctx, signal string)` は signal を 1 つだけ取ります。
+空文字列は既定の SIGKILL です。空でない signal は backend へそのまま
+渡され、複数 signal はコンパイル時に拒否されます。
+
+```go
+package docexample
+
+import (
+    "context"
+    "testing"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
+    // caller の context が TerminateContainer の上限になる。
+    defer container.TerminateContainer(ctx, ctr)
+
+    if err := ctr.Kill(ctx, "SIGTERM"); err != nil {
+        t.Fatal(err)
+    }
+    if err := ctr.Kill(ctx, ""); err != nil { // 空文字列は SIGKILL。
+        t.Fatal(err)
+    }
+}
+```
+
 `container.WithPruneOlderThan(d)` は、backend が報告する作成時刻が
 now-d より前の candidate だけに対象を絞ります。共有 daemon や remote
 daemon で掃除するとき、並行して動く job が最近停止したコンテナを

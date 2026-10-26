@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -73,12 +74,17 @@ func runReaperScript(t *testing.T, binary, subcommand, key string, entries []str
 // apart, so a test can pin which stream carries a diagnostic.
 func runReaperScriptStreams(t *testing.T, binary, subcommand, key string, entries []string, env ...string) (string, string, error) {
 	t.Helper()
+	return runReaperScriptWithOptions(t, binary, subcommand, key, 30, entries, env...)
+}
+
+func runReaperScriptWithOptions(t *testing.T, binary, subcommand, key string, timeoutSeconds int, entries []string, env ...string) (string, string, error) {
+	t.Helper()
 	requirePOSIXShell(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", reaperScript, "containergo-reaper",
-		binary, subcommand, breQuote(key), "30", "1")
+		binary, subcommand, breQuote(key), strconv.Itoa(timeoutSeconds), "1")
 	cmd.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
 	cmd.Env = append(os.Environ(), env...)
 	var stdout, stderr bytes.Buffer
@@ -207,39 +213,44 @@ func TestReaperScriptLeavesNoSleepBehind(t *testing.T) {
 		entries = append(entries, dockerID(byte('a'+i)))
 	}
 
+	// Separate concurrent test binaries' timers as well as unrelated host
+	// sleeps so one process cannot report another process's timer as a leak.
+	timeoutSeconds := 37 + os.Getpid()
+	sleepArg := "sleep " + strconv.Itoa(timeoutSeconds)
+
 	// A reap with an entry list twice over: the second pass proves the
 	// count is not drifting upward with each completed call.
 	for pass := range 2 {
-		before := countSleepProcesses(t)
-		if _, err := runReaperScript(t, probe.script(), "rm", creationLabel, entries); err != nil {
+		before := countSleepProcesses(t, sleepArg)
+		if _, _, err := runReaperScriptWithOptions(t, probe.script(), "rm", creationLabel, timeoutSeconds, entries); err != nil {
 			t.Fatalf("pass %d: reaper script: %v", pass, err)
 		}
-		// The old sleeps were 30s; give the count a moment to settle.
+		// An orphan outlives the reaper; give the process table a moment
+		// to settle before counting.
 		time.Sleep(300 * time.Millisecond)
-		after := countSleepProcesses(t)
-		// Allow a few unrelated host sleeps (other package tests may arm
-		// short sleeps while this oracle runs). A per-entry leak would
-		// still raise the count by roughly len(entries).
-		if after > before+3 {
-			t.Fatalf("pass %d: sleep processes went %d -> %d; the timeout left orphan helpers behind",
+		after := countSleepProcesses(t, sleepArg)
+		// Any increase indicates a timer this test left behind.
+		if after > before {
+			t.Fatalf("pass %d: reaper-owned sleep processes went %d -> %d; the timeout left orphan helpers behind",
 				pass, before, after)
 		}
 	}
 }
 
-// countSleepProcesses counts live `sleep` processes on the host. The
-// oracle is deliberately about the system rather than about the script's
-// internals, because the defect being pinned is an orphan process, not
-// a return value.
-func countSleepProcesses(t *testing.T) int {
+// countSleepProcesses counts live processes whose argument list is
+// exactly sleepArg, for example "sleep 37". Scoping the oracle to argv
+// rather than every `sleep` on the host keeps unrelated workloads (some
+// tools arm `sleep 0.05` continuously) out of the count while still
+// seeing a leaked reaper timer.
+func countSleepProcesses(t *testing.T, sleepArg string) int {
 	t.Helper()
-	out, err := exec.Command("ps", "-o", "comm=", "-ax").Output()
+	out, err := exec.Command("ps", "-o", "args=", "-ax").Output()
 	if err != nil {
 		t.Skipf("ps failed: %v", err)
 	}
 	n := 0
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.TrimSpace(line) == "sleep" {
+		if strings.TrimSpace(line) == sleepArg {
 			n++
 		}
 	}

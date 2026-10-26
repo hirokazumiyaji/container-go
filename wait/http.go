@@ -23,18 +23,19 @@ const maxDrainBytes = 64 * 1024
 // returns an acceptable status code.
 type HTTPStrategy struct {
 	options
-	path          string
-	port          string
-	portSet       bool
-	method        string
-	statusMatcher func(int) bool
-	headers       map[string]string
-	username      string
-	password      string
-	basicAuth     bool
-	useTLS        bool
-	tlsConfig     *tls.Config
-	httpClient    *http.Client
+	path            string
+	port            string
+	portSet         bool
+	method          string
+	statusMatcher   func(int) bool
+	responseMatcher func(io.Reader) bool
+	headers         map[string]string
+	username        string
+	password        string
+	basicAuth       bool
+	useTLS          bool
+	tlsConfig       *tls.Config
+	httpClient      *http.Client
 }
 
 // ForHTTP waits for a plain-HTTP endpoint at path (on the first declared
@@ -61,6 +62,16 @@ func (s *HTTPStrategy) WithMethod(method string) *HTTPStrategy {
 // WithStatusCodeMatcher replaces the default 2xx acceptance check.
 func (s *HTTPStrategy) WithStatusCodeMatcher(matcher func(status int) bool) *HTTPStrategy {
 	s.statusMatcher = matcher
+	return s
+}
+
+// WithResponseMatcher accepts an HTTP response only when matcher reports
+// true for its body. The matcher sees at most maxDrainBytes of the body and
+// runs only after the status matcher accepts. A false result is a retryable
+// failed check. Without a matcher an accepted status ends the wait without
+// reading the body.
+func (s *HTTPStrategy) WithResponseMatcher(matcher func(io.Reader) bool) *HTTPStrategy {
+	s.responseMatcher = matcher
 	return s
 }
 
@@ -207,6 +218,13 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 			return fatalCheckError{err: invalidConfigf("invalid HTTP request: %v", err)}
 		}
 		for k, v := range s.headers {
+			// net/http ignores a "Host" entry in req.Header and derives
+			// the wire header from req.Host, so a virtual-host probe
+			// has to set that field directly.
+			if strings.EqualFold(k, "Host") {
+				req.Host = v
+				continue
+			}
 			req.Header.Set(k, v)
 		}
 		if s.basicAuth {
@@ -219,18 +237,27 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 		defer resp.Body.Close()
 		// Check status before draining. An accepted response ends the
 		// wait, so a stalled body must not delay success past the
-		// startup deadline. Only rejected responses need another poll
-		// iteration, and those need a drained body so net/http can
-		// return the connection to the idle pool instead of paying a
-		// fresh TCP (and, under WithTLSConfig, a fresh handshake) on
-		// every retry. The drain is bounded because readiness bodies
-		// are small and an endpoint that streams an unbounded body
-		// must not be able to grow the wait's memory usage. A drain
-		// error is not the probe's verdict: the response already
-		// arrived, so the status decides the outcome either way.
+		// startup deadline unless a response matcher has to read it.
+		// Only rejected responses need another poll iteration, and
+		// those need a drained body so net/http can return the
+		// connection to the idle pool instead of paying a fresh TCP
+		// (and, under WithTLSConfig, a fresh handshake) on every retry.
+		// The drain is bounded because readiness bodies are small and
+		// an endpoint that streams an unbounded body must not be able
+		// to grow the wait's memory usage. A drain error is not the
+		// probe's verdict: the response already arrived, so the status
+		// decides the outcome either way.
 		if !matcher(resp.StatusCode) {
 			_, _ = io.CopyN(io.Discard, resp.Body, maxDrainBytes)
 			return fmt.Errorf("status %d not accepted", resp.StatusCode)
+		}
+		if s.responseMatcher == nil {
+			return nil
+		}
+		body := io.LimitReader(resp.Body, maxDrainBytes)
+		if !s.responseMatcher(body) {
+			_, _ = io.Copy(io.Discard, body)
+			return fmt.Errorf("status %d accepted but response body rejected", resp.StatusCode)
 		}
 		return nil
 	})

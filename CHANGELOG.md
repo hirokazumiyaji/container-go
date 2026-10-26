@@ -15,6 +15,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add `WithNetworkAliases` to expose Docker's network-scoped DNS aliases
+  (`--network-alias`). Aliases require an explicitly selected user-defined
+  network, participate in reuse compatibility, and fail before any backend
+  call when combined with the default bridge, `host`, `none`, or `nat`;
+  Apple Container returns `ErrUnsupportedCapability` (#261).
 - Add `InspectInfo.ContainerID()` for the backend's immutable container ID
   (Docker's 64-character hexadecimal ID). `InspectInfo.ID()` keeps returning
   the logical container name and `Name()` returns the backend-reported name,
@@ -25,6 +30,10 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `PullOption` values, `Client.Prune` and `Client.PruneReuseGroup` accept
   `PruneOption` values, and Client option validation returns typed
   `ErrInvalidOption` errors (#243).
+- Add `WithPruneOlderThan` so `Prune` and `PruneReuseGroup` can restrict
+  deletion to containers the backend reports as created before a cutoff.
+  Document the missing Windows watchdog reaper and the recommended
+  `TestMain` `Prune` sweep for Windows and remote daemons (#267).
 - Validate Apple Container's platform, name, network, port, and memory
   capabilities before image resolution; reject unsupported `PullNever` with
   `ErrPullNeverUnsupported` and document `PullMissing`/`PullAlways` fallbacks.
@@ -67,6 +76,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   issue #82 and are not backend-neutral in this checkout.
 - Add `wait.ForHTTP` header, basic-auth, TLS, TLS-config, and custom
   HTTP-client setters.
+- Add `wait.ForHealthcheck()` for Docker's `HEALTHCHECK` status, with
+  `wait.HealthTarget` as the optional target extension; the Apple backend
+  rejects the strategy before creating a container. Add
+  `wait.HTTPStrategy.WithResponseMatcher` for up to 64KiB of response-body
+  matching after the status matcher accepts (#260).
 - Export `wait.AllStrategy` and `wait.AnyStrategy` and add
   `WithStartupTimeout` to bound a composite wait.
 - Expose the root `CLIError` alias and add `ErrContainerNotFound` and

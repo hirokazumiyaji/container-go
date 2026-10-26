@@ -159,8 +159,10 @@ type lockPack struct {
 	// attachOutput is the WithAttachOutput destination of the current
 	// stream. It is retained so a restart can re-attach the same writer.
 	attachOutput io.Writer
-	// attachErr is the terminal failure of the current attach stream, kept
-	// for AttachedError.
+	// attachErr accumulates the terminal failures across the attach streams
+	// of this handle, kept for AttachedError. Reattaching does not clear it so
+	// a caller that retained the previous stream's AttachedDone can still
+	// observe why that stream ended; later failures are joined to it.
 	attachErr error
 	// attachGate carries the right to write to the attach destination. It is
 	// a channel rather than a mutex so a replacement stream can give up when
@@ -1452,7 +1454,9 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	}
 	gate := p.attachGate
 	p.attachOutput = output
-	p.attachErr = nil
+	// Keep the previous stream's terminal failure: AttachedError promises a
+	// caller that observed AttachedDone closed that the failure is still
+	// readable after Start or Restart reattaches. Later failures are joined.
 	p.attachCancel = cancel
 	p.attachDone = done
 	p.attachMu.Unlock()
@@ -1477,15 +1481,25 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	}()
 }
 
-// recordAttachError stores a terminal stream failure for AttachedError.
+// recordAttachError accumulates a terminal stream failure for AttachedError.
+// A later failure is joined with the earlier ones so a caller holding an older
+// AttachedDone keeps matching its stream's failure; a failure that already
+// matches the accumulated value is ignored instead of growing the join.
 func (c *Container) recordAttachError(err error) {
 	if err == nil {
 		return
 	}
 	p := c.pack()
 	p.attachMu.Lock()
-	p.attachErr = err
-	p.attachMu.Unlock()
+	defer p.attachMu.Unlock()
+	if p.attachErr == nil {
+		p.attachErr = err
+		return
+	}
+	if errors.Is(p.attachErr, err) {
+		return
+	}
+	p.attachErr = errors.Join(p.attachErr, err)
 }
 
 // attachedOutput returns the destination of the background stream, or nil when
@@ -1529,10 +1543,14 @@ func (c *Container) AttachedDone() <-chan struct{} {
 	return p.attachDone
 }
 
-// AttachedError returns the terminal failure of the background attached log
-// stream, or nil if it ended normally. A stream ended by StopAttached or by
-// container teardown is not a failure. The value is stable once AttachedDone is
-// closed.
+// AttachedError returns the terminal failures accumulated across the attach
+// streams this handle has followed, or nil if no stream has failed. A stream
+// cancelled by StopAttached or by container teardown does not record a
+// failure. Reattaching with Start or Restart does not clear earlier failures,
+// so a caller that retained a previous stream's AttachedDone channel still
+// observes its failure after the channel closes. Failures are accumulated with
+// errors.Join, which keeps the latest stream's failure included, so errors.Is
+// matches every failure the streams recorded.
 func (c *Container) AttachedError() error {
 	p := c.pack()
 	p.attachMu.Lock()
@@ -1873,6 +1891,42 @@ func (c *Container) cachedDynamic() *engineInfo {
 	return info
 }
 
+// cachedInspectSnapshot returns the most recent lifecycle/network snapshot
+// even when it carries no endpoint data. Health waits reuse the 1 Hz
+// lifecycle probe's inspect through it instead of spawning another CLI
+// process for every check.
+func (c *Container) cachedInspectSnapshot() *engineInfo {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return cloneEngineInfo(p.dynamic)
+}
+
+// healthStatus reports the Docker HEALTHCHECK status from a lifecycle
+// snapshot observed within the wait probe interval. A stale snapshot is
+// re-inspected through the normal query-timeout path so a cached healthy
+// result cannot mask a later unhealthy transition.
+func (c *Container) healthStatus(ctx context.Context) (string, error) {
+	p := c.pack()
+	now := p.currentTime()
+	if info := c.cachedInspectSnapshot(); info != nil {
+		if !info.observedAt.IsZero() && now.Sub(info.observedAt) <= dynamicInspectTTL {
+			return info.health, nil
+		}
+	}
+	// Re-observe through the normal identity-checked inspect, bounded by
+	// the same query timeout as other inspect-backed reads.
+	// inspectDynamicFresh stores the result through the generation-checked
+	// dynamic cache, so later polls reuse this observation until it ages out.
+	inspectCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
+	defer cancel()
+	info, err := c.inspectDynamicFresh(inspectCtx)
+	if err != nil {
+		return "", err
+	}
+	return info.health, nil
+}
+
 func (c *Container) refreshDynamic(ctx context.Context) (*engineInfo, error) {
 	gen := c.dynamicGeneration()
 	info, err := c.inspectFresh(ctx)
@@ -1954,6 +2008,9 @@ func cloneEngineInfo(info *engineInfo) *engineInfo {
 	}
 	if info.networkNames != nil {
 		out.networkNames = append([]string(nil), info.networkNames...)
+	}
+	if info.networkAliases != nil {
+		out.networkAliases = append([]string(nil), info.networkAliases...)
 	}
 	if info.bound != nil {
 		out.bound = append([]boundPort(nil), info.bound...)
@@ -2308,6 +2365,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	// A name-addressed discovery deliberately returns the inspected UID to
 	// its caller as data only. It is never published into the handle UID here; the
 	// caller must first validate managed/reuse/session ownership.
+	info.observedAt = c.pack().currentTime()
 	return info, nil
 }
 

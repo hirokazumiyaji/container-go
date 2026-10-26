@@ -171,7 +171,7 @@ func TestTerminateContainerStillSkipsSharedHandles(t *testing.T) {
 	ctr := sharedHandle(t, r)
 	unguarded := ctr.Shared()
 
-	if err := TerminateContainer(unguarded); err != nil {
+	if err := TerminateContainer(context.Background(), unguarded); err != nil {
 		t.Errorf("TerminateContainer: %v", err)
 	}
 	if len(r.calls) != 0 {

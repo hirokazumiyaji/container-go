@@ -154,7 +154,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithName(name string)`：コンテナ名を指定する（省略時は `containergo-<ランダムな 16 進数>`）。共有の 1～63 文字 guard を使う。Apple のより厳密な 2～63 文字 rule は Apple バックエンドの preflight が image 解決前に強制する。
 - `WithLabels(labels map[string]string)`：追加ラベルを指定する。ライブラリが管理するラベルは予約済みである。
 - `WithMounts(mounts ...Mount)`：bind、名前付きボリューム、tmpfs のマウントを指定する。bind source は host OS の path 構文を使うため、ローカル Docker daemon では Windows の host path も受け付ける。remote Docker daemon への bind mount は、daemon が source path を自分の host で解決するため `ErrUnsupportedCapability` で拒否する。
-- `WithFiles(files ...File)`：起動後のコンテナへ通常ファイルをコピーする。option 評価時にディレクトリ、シンボリックリンク、特殊ファイルを拒否する。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
+- `WithFiles(files ...File)`：起動後のコンテナへ regular file をコピーする。各 `File` は `HostPath` と `Content` のどちらか一方だけを設定し、`Mode` で非公開ステージング上の Unix permission bits を上書きできる。option 評価時に host directory、symlink、特殊ファイルを拒否する。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
 - `WithPublishedPort(spec string)`：ホスト側ポートの明示的な公開を指定する。Apple Container は通常コンテナへ直接接続し、Docker は `WithExposedPorts` で宣言したポートを daemon が host port へ自動公開する。特定の host port が必要な場合だけ明示的な binding を使う。
 - `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever`（Docker のみ。Apple は `ErrPullNeverUnsupported`）を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
 - `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。CPU、shm、capability、ulimit、extra host、hostname の option は reuse の互換性 identity に含まれ、既存コンテナと一致しなければならない。capability は requested-subset rule で、要求した `--cap-add`/`--cap-drop` のすべてが存在する必要があり、空の要求は inspect された任意の capability set を受け入れる。それ以外の作成専用 option は attach 時に無視される。
@@ -199,6 +199,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
+func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
@@ -231,6 +232,14 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
 ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
 スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
+
+`File.Content` と `CopyContentToContainer` は、メモリ上のバイト列を 1 つの regular file として同じ現在ユーザー専用 staging root へ書き込む。
+ステージングファイルは `0600` で作成し、`File.Mode`（または `mode` 引数）が非 0 ならその値へ変更する。
+0 は host file の permission を保持し、Content では `0600` を既定値にする。
+permission bits 以外の bit は拒否するため、0 で mode `0000` を要求することはできない。
+Content は `MaxCopyToContainerSize` の上限を共有し、container path から導出しない固定のステージング名を使う。
+Content は argv、error、診断に含めない。
+staging は成功、失敗、キャンセルのいずれでも削除し、backend copy 中の失敗も同様である。
 
 ### 出力の契約
 

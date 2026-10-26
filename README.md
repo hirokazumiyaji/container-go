@@ -1202,6 +1202,16 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   permission bits only; timestamps, ownership, setuid/setgid bits, ACLs,
   extended attributes, alternate data streams, sparse layout, and hardlink
   identity are not preserved.
+- `WithFiles` accepts exactly one of `HostPath` or a non-nil `Content` byte
+  slice; setting both or neither is a `ValidationError` when the option is
+  applied. An empty non-nil slice copies an empty file. `File.Mode` overrides
+  the Unix permission bits on the private staged copy: zero preserves host
+  permissions and defaults content to `0600`, while a non-zero value must
+  contain only permission bits (type, setuid, setgid, and sticky bits are
+  rejected). `CopyContentToContainer` applies the same staging and mode rules
+  to an existing handle. Content never appears in argv, errors, or
+  diagnostics, and its staging file is removed with the staging directory on
+  success, failure, and cancellation.
 - On Unix, environment variables are passed through a `0600` file in a
   validated, current-user-owned `0700` directory under the canonical
   `os.UserCacheDir()` path. The library resolves existing symlinked ancestors

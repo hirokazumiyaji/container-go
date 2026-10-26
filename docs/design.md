@@ -244,9 +244,11 @@ described below are not.
   for a local Docker daemon; a bind mount against a remote Docker daemon is
   rejected with `ErrUnsupportedCapability` because the daemon resolves the
   source path on its own host.
-- `WithFiles(files ...File)`: regular files copied into the running container
-  after start; a directory, symlink, or special source is rejected at option
-  evaluation, and a copy failure rolls back `Run`. On `WithReuse`, files
+- `WithFiles(files ...File)`: regular files copied into the running
+  container after start; a copy failure rolls back `Run`. Each `File` sets
+  exactly one of `HostPath` or `Content`; `Mode` optionally overrides the
+  Unix permission bits on the private staged copy. Host directories,
+  symlinks, and special files are rejected at option evaluation. On `WithReuse`, files
   are copied for every caller, including attach callers; an attach copy
   failure returns an error without deleting the shared container.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
@@ -333,12 +335,14 @@ they are rejected.
 `ValidationError.Err` is the source of truth for the rendered message and
 unwrap chain. The exported `Message` field remains for source compatibility
 but does not override `Err`. `Run` validates its image before invoking any
-`Option`; `WithFiles` resolves each host path and rejects anything that is
-not a regular file before image or container work; Docker applies its
-complete local-volume-name grammar in
-`checkConfig` while Apple keeps its backend-specific name rules. Copy paths
-are interpreted as POSIX paths with the `path` package, and a negative
-`Container.Stop` timeout is rejected before the CLI is called.
+`Option`; `WithFiles` rejects a file that sets both or neither of `HostPath`
+and `Content`, rejects non-permission `Mode` bits, and resolves and checks each
+host path is a regular file before image or container work. A `Content` slice
+is bounded by `MaxCopyToContainerSize` at option evaluation. Docker applies its
+complete local-volume-name grammar in `checkConfig` while Apple keeps its
+backend-specific name rules. Copy paths are interpreted as POSIX paths with
+the `path` package, and a negative `Container.Stop` timeout is rejected before
+the CLI is called.
 
 ### The Container handle
 
@@ -363,6 +367,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
+func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
@@ -541,6 +546,17 @@ source-path metadata. They intentionally preserve only names, bytes, and
 Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
 extended attributes, alternate data streams, sparse layout, and hardlink
 identity are not preserved.
+
+`File.Content` and `CopyContentToContainer` write in-memory bytes as one
+regular file through the same current-user-only staging root. The staged file
+is created at `0600`, then changed to `File.Mode` (or the `mode` argument)
+when that is non-zero; zero preserves a host file's permissions and defaults
+content to `0600`. Non-permission bits are rejected, and zero therefore
+cannot request mode `0000`. Content has the same `MaxCopyToContainerSize`
+bound, uses a fixed staging name that is not derived from the container path,
+and is never included in argv, errors, or diagnostics. Staging is removed on
+success, failure, and cancellation, including a failure during the backend
+copy.
 
 ## Connection endpoints
 

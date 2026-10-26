@@ -1130,7 +1130,7 @@ func TestSnapshotCopySourceClassifiesPostOpenDisappearance(t *testing.T) {
 		return file, reparse, nil
 	}
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if !errors.Is(err, ErrCopySourceChanged) {
 		t.Fatalf("error = %v, want ErrCopySourceChanged", err)
 	}
@@ -1263,7 +1263,7 @@ func TestSnapshotCopySourceUsesOpenedRootAfterSameMetadataReplacement(t *testing
 		return file, reparse, nil
 	}
 
-	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if err != nil {
 		t.Fatalf("snapshotCopySourceWith: %v", err)
 	}
@@ -1308,7 +1308,7 @@ func TestSnapshotCopyDirectoryUsesOpenedChildAfterSameMetadataReplacement(t *tes
 		return file, reparse, nil
 	}
 
-	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if err != nil {
 		t.Fatalf("snapshotCopySourceWith: %v", err)
 	}
@@ -1366,7 +1366,7 @@ func TestSnapshotCopySourceRejectsTooManyEmptyEntries(t *testing.T) {
 	limits := defaultCopySnapshotLimits
 	limits.maxEntries = 3 // source root plus two empty entries
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, limits, defaultCopySourceOpeners)
 	if !errors.Is(err, ErrCopySourceTooManyEntries) {
 		t.Fatalf("error = %v, want ErrCopySourceTooManyEntries", err)
 	}
@@ -1379,7 +1379,7 @@ func TestSnapshotCopySourceRejectsTreeBeyondDepthLimit(t *testing.T) {
 	limits := defaultCopySnapshotLimits
 	limits.maxDepth = 3
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, limits, defaultCopySourceOpeners)
 	if !errors.Is(err, ErrCopySourceTooDeep) {
 		t.Fatalf("error = %v, want ErrCopySourceTooDeep", err)
 	}
@@ -1392,7 +1392,7 @@ func TestSnapshotCopySourceRejectsMetadataBudget(t *testing.T) {
 	limits := defaultCopySnapshotLimits
 	limits.maxMetadataBytes = int64(len(source)) // admits only the source root path
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, limits, defaultCopySourceOpeners)
 	if !errors.Is(err, ErrCopySourceMetadataTooLarge) {
 		t.Fatalf("error = %v, want ErrCopySourceMetadataTooLarge", err)
 	}
@@ -1407,7 +1407,7 @@ func TestSnapshotCopyDirectoryClassifiesChildDisappearance(t *testing.T) {
 		return nil, false, fs.ErrNotExist
 	}
 
-	_, _, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	_, _, err := snapshotCopySourceWith(context.Background(), source, copySourceOptions{allowDirectory: true}, defaultCopySnapshotLimits, openers)
 	if !errors.Is(err, ErrCopySourceChanged) || !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("error = %v, want ErrCopySourceChanged and fs.ErrNotExist", err)
 	}

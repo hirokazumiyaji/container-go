@@ -25,6 +25,12 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   inspected set. Apple Container accepts the shm, capability, and ulimit flags
   and rejects `WithPrivileged`, `WithExtraHost`, and `WithHostname` with
   `ErrUnsupportedCapability`.
+- Add in-memory copy sources. `File.Content` and `File.Mode` extend
+  `WithFiles`, and `CopyContentToContainer` copies bytes into a running
+  handle. Content uses the existing per-user private staging tree at `0600`
+  by default, never appears in argv, errors, or diagnostics, and is removed
+  with the staging directory. `HostPath` and `Content` are mutually exclusive,
+  and non-permission mode bits are rejected (#263).
 - Add `WithNetworkAliases` to expose Docker's network-scoped DNS aliases
   (`--network-alias`). Aliases require an explicitly selected user-defined
   network, participate in reuse compatibility, and fail before any backend

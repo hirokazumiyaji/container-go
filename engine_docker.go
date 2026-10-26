@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -1289,11 +1290,23 @@ type dockerInspect struct {
 		} `json:"Health"`
 	} `json:"State"`
 	HostConfig struct {
-		NetworkMode string `json:"NetworkMode"`
+		NetworkMode string   `json:"NetworkMode"`
+		NanoCpus    float64  `json:"NanoCpus"`
+		ShmSize     int64    `json:"ShmSize"`
+		Privileged  bool     `json:"Privileged"`
+		CapAdd      []string `json:"CapAdd"`
+		CapDrop     []string `json:"CapDrop"`
+		Ulimits     []struct {
+			Name string `json:"Name"`
+			Soft int64  `json:"Soft"`
+			Hard int64  `json:"Hard"`
+		} `json:"Ulimits"`
+		ExtraHosts []string `json:"ExtraHosts"`
 	} `json:"HostConfig"`
 	Config struct {
-		Image  string            `json:"Image"`
-		Labels map[string]string `json:"Labels"`
+		Image    string            `json:"Image"`
+		Hostname string            `json:"Hostname"`
+		Labels   map[string]string `json:"Labels"`
 	} `json:"Config"`
 	NetworkSettings struct {
 		IPAddress string `json:"IPAddress"`
@@ -1415,6 +1428,26 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		networkNames:   networkNames,
 		networkAliases: networkAliases,
 	}
+	info.runOptions = engineRunOptions{
+		cpus:         c.HostConfig.NanoCpus / 1e9,
+		cpusReported: c.HostConfig.NanoCpus != 0,
+		privileged:   c.HostConfig.Privileged,
+		capAdd:       c.HostConfig.CapAdd,
+		capDrop:      c.HostConfig.CapDrop,
+		hostname:     c.Config.Hostname,
+	}
+	if c.HostConfig.ShmSize > 0 {
+		info.runOptions.shmSizeBytes = uint64(c.HostConfig.ShmSize)
+		info.runOptions.shmSizeReported = true
+	}
+	for _, limit := range c.HostConfig.Ulimits {
+		info.runOptions.ulimits = append(info.runOptions.ulimits, ulimitSpec{
+			name: strings.ToLower(limit.Name),
+			soft: limit.Soft,
+			hard: limit.Hard,
+		})
+	}
+	info.runOptions.extraHosts = parseDockerExtraHosts(c.HostConfig.ExtraHosts)
 	info.createdAt = parseInspectTime(c.Created)
 	if c.State != nil {
 		info.exitCode = c.State.ExitCode
@@ -1466,6 +1499,33 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	}
 	return info, nil
+}
+
+// parseDockerExtraHosts converts Docker's inspect form (host:ip, host=ip, or a
+// bracketed IPv6 address) into the backend-neutral extraHostSpec so reuse can
+// compare requested and reported entries. strings.Cut splits only at the first
+// separator and returns the whole remainder, so an unbracketed IPv6 address
+// such as "host:2001:db8::1" keeps its remaining colons. Bracketed and
+// unbracketed spellings are both normalized to net.IP's canonical form; Docker
+// inspect itself reports the unbracketed form.
+func parseDockerExtraHosts(entries []string) []extraHostSpec {
+	hosts := make([]extraHostSpec, 0, len(entries))
+	for _, entry := range entries {
+		host, ip, ok := strings.Cut(entry, "=")
+		if !ok {
+			host, ip, ok = strings.Cut(entry, ":")
+		}
+		if !ok || host == "" || ip == "" {
+			continue
+		}
+		if ip != "host-gateway" {
+			if parsed := net.ParseIP(strings.Trim(ip, "[]")); parsed != nil {
+				ip = parsed.String()
+			}
+		}
+		hosts = append(hosts, extraHostSpec{host: host, ip: ip})
+	}
+	return hosts
 }
 
 // dockerState maps Docker's status vocabulary onto State.

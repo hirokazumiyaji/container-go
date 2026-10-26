@@ -180,9 +180,15 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithFiles(files ...File)`：起動後のコンテナへ regular file をコピーする。各 `File` は `HostPath` と `Content` のどちらか一方だけを設定し、`Mode` で非公開ステージング上の Unix permission bits を上書きできる。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
 - `WithPublishedPort(spec string)`：ホスト側ポートの明示的な公開を指定する。Apple Container は通常コンテナへ直接接続し、Docker は `WithExposedPorts` で宣言したポートを daemon が host port へ自動公開する。特定の host port が必要な場合だけ明示的な binding を使う。
 - `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever`（Docker のみ。Apple は `ErrPullNeverUnsupported`）を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
-- `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。作成専用 option は attach 時に無視される。
+- `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。CPU、shm、capability、ulimit、extra host、hostname の option は reuse の互換性 identity に含まれ、既存コンテナと一致しなければならない。capability は requested-subset rule で、要求した `--cap-add`/`--cap-drop` のすべてが存在する必要があり、空の要求は inspect された任意の capability set を受け入れる。それ以外の作成専用 option は attach 時に無視される。
 - `WithReuseGroup(group string)`：再利用するコンテナにラベルを付け、`PruneReuseGroup` の対象にする。`WithReuse` が必要で、再利用キーには含まれない。`PruneReuseGroup` の validation grammar は現在より弱い（#102）。
-- `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限を指定する。`WithMemory` は現在 zero を受け付け、backend capability limit を強制しない（#102）。
+- `WithCPUs(v float64)` / `WithMemory(size string)`：リソース制限を指定する。`WithCPUs` は `0.5` のような小数を受け付け、zero 以下と非有限値を拒否する。Apple Container は整数のみを受け付けるため、小数は `ErrUnsupportedCapability` で拒否する。`WithMemory` と `WithShmSize` は整数と任意の `K`/`M`/`G`/`T`/`P` suffix の同じ文法を使い、zero と overflow を拒否する。
+- `WithShmSize(size string)`：`/dev/shm` のサイズ（例: `64M`）を指定する。Docker と Apple Container はどちらも `--shm-size` として渡す。
+- `WithPrivileged()`：Docker の `--privileged`。Apple Container に相当する capability はなく、`ErrUnsupportedCapability` で拒否する。
+- `WithCapAdd(caps ...string)` / `WithCapDrop(caps ...string)`：Linux capability を追加・削除する。名前は optional な `CAP_` prefix 付きの大文字（または `ALL`）で、重複は prefix に関係なく無視し、caller の表記をそのまま渡す。両 backend が `--cap-add` / `--cap-drop` をどちらの形式でも受け付ける。
+- `WithUlimit(name string, soft, hard int64)`：Docker の `name=soft:hard` 形式で resource limit を指定する。名前は Docker の小文字集合（`nofile`、`memlock`、`nproc` など）。`-1` は無制限を表す。`-1` 未満、有限の hard を超える soft、同名の重複を拒否する。
+- `WithExtraHost(host, ip string)`：Docker の `--add-host host:ip`。IP には `host-gateway` を指定できる。同名または衝突する entry は拒否する。Apple Container に extra host の capability はなく、`ErrUnsupportedCapability` で拒否する。
+- `WithHostname(name string)`：Docker の `--hostname`。RFC 1123 の hostname grammar と 63 byte の UTS nodename 上限で検証する。Apple Container に `--hostname` flag はなく、`ErrUnsupportedCapability` で拒否する。
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリを指定する。
 - `WithNetwork(name string)`：既存の名前付きネットワークへ接続する。
 - `WithNetworkAliases(aliases ...string)`：Docker の `--network-alias` として network-scoped DNS alias を追加する。明示的な user-defined `WithNetwork` が必要で、default bridge（`bridge`/`nat`）、`host`、`none` は `*ConfigError`、Apple は `ErrUnsupportedCapability` で拒否する。alias は DNS label として検証し、reuse の互換性比較にも含める。
@@ -196,7 +202,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithMounts(mounts ...Mount)`：bind、volume、tmpfs マウント
 - `WithFiles(files ...File)`：起動後にコンテナへコピーする通常ファイル。`HostPath` または `Content` の一方と任意の `Mode` を指定する。host path は option 評価時に検証し、ディレクトリ、シンボリックリンク、特殊ファイルを拒否する
 - `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
-- `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限
+- `WithCPUs(v float64)` / `WithMemory(size string)`：リソース制限。`WithCPUs` は小数を受け付ける
+- `WithShmSize(size string)`：`/dev/shm` のサイズ
+- `WithPrivileged()` / `WithCapAdd(caps ...string)` / `WithCapDrop(caps ...string)`：特権と Linux capability（Apple は `WithPrivileged` を拒否）
+- `WithUlimit(name string, soft, hard int64)`：resource limit
+- `WithExtraHost(host, ip string)` / `WithHostname(name string)`：`/etc/hosts` の追加 entry と hostname（Apple はどちらも拒否）
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリ
 - `WithNetwork(name string)`：接続先ネットワーク。Docker で省略した場合は daemon が選ぶ既定 network (Linux では `bridge`、native Windows では `nat`)
 - `WithPlatform(p string)`：`linux/amd64` 指定(Rosetta 利用)など
@@ -246,7 +256,7 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 `WithExecEnv`、`WithExecUser`、`WithExecWorkDir` は個別の exec 呼び出しを設定する。環境変数の値は `WithEnv` と同じ一時ファイル方式を使う。
 `Logs` と、成功する `LogsWithOptions` 呼び出しは backend command が終了するため有限のスナップショットを返すが、単体で byte 上限は課さない。`Logs` は全出力を要求する。`LogsOptions` は backend 固有で、Docker は `Tail` と `Since` の両方を受け付ける。確認した Apple Container CLI の各 version は tail に `-n` を使い、`--since` option を持たない。このチェックアウトは Apple にも Docker 形式の `--tail` と `--since` を渡すため、`LogsWithOptions` は backend 中立ではない。Apple の機能として文書化する前に #82 を適用する必要がある。#82 の変更は `Tail` を Apple の `-n` に対応させ、`Since` を unsupported として拒否する予定である。範囲を指定しても大きさはコンテナ出力に依存する。`FollowLogs` は意図的に上限のない stream で、リーダーを閉じるか context をキャンセルするまで続く。`LogsOptions` と `LogsWithOptions` は `v0.2.0` にはない現在の開発 API である。generation を持つ handle では `Terminate` は世代ガードを持つが、現在の reuse と空 generation の経路には #83 と #84 が扱う制限がある（後述の Reuse を参照）。
 
-現在のチェックアウトでは validation は一様ではありません（#102）。negative な `LogsOptions.Tail` は 0/all として扱われ、`WithMemory("0")` は現在の parser に受理され、unknown な `MountType` は `WithMounts` で reject されず、`PruneReuseGroup` は `WithReuseGroup` より弱い grammar を使います。これらは現在の動作であり、backend がその設定を受け付ける保証ではありません。
+現在のチェックアウトでは validation は一様ではありません（#102）。negative な `LogsOptions.Tail` は 0/all として扱われ、unknown な `MountType` は `WithMounts` で reject されず、`PruneReuseGroup` は `WithReuseGroup` より弱い grammar を使います。`WithMemory` と `WithShmSize` は zero と不正なサイズを拒否します。これらは現在の動作であり、backend がその設定を受け付ける保証ではありません。
 
 `Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。backend が認識した not-found CLI failure または delete 成功だけを成功として扱うため、冪等性の主張はその範囲に限られる。empty または malformed な inspect output を not-found に変換せず、現在の Docker parser は要求した target と ID や name が異なる valid object を no-match として拒否しない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctx, ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。`TerminateContainer` は caller の context を使い、`Cleanup` と `StrictCleanup` は `terminateTimeout`（既定 30 秒）の context を渡して従来の teardown 予算を維持する。
 
@@ -760,7 +770,7 @@ v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ 
 
 **Image 処理**：両バックエンドとも、明示的な image inspect と pull コマンドで pull policy を実装する。Docker の run argv は `--pull=never` を追加し、Apple Container も同じ明示的な policy 経路を使う。並行 pull は同一プロセス内で、backend、image、platform、操作が同じ場合だけ集約する。
 
-**Apple capability の違い**：`appleEngine.checkConfig` は、CLI 呼び出し前に non-Linux または不正な Apple platform(bare `linux` と invalid variant を含む)、Apple 規格外の container/network name、200 MiB 未満の memory と overflow、publish port 1、publish の overlap、64 個を超える publish descriptor を拒否する。`WithExposedPorts` は library 側の宣言で、Apple の `--publish` flag には変換しない。Apple には run 時の no-fetch スイッチがないため `PullNever` も拒否し、`ErrPullNeverUnsupported` と明示的な fallback(`PullMissing`/`PullAlways`)を契約とする。公開 `Pull` にも同じ platform/capability 検証を適用する。
+**Apple capability の違い**：`appleEngine.checkConfig` は、CLI 呼び出し前に non-Linux または不正な Apple platform(bare `linux` と invalid variant を含む)、Apple 規格外の container/network name、200 MiB 未満の memory と overflow、publish port 1、publish の overlap、64 個を超える publish descriptor を拒否する。`WithPrivileged`、`WithExtraHost`、`WithHostname` は `ErrUnsupportedCapability` で拒否し、Apple の `--cpus` が整数のみを受け付けるため小数の `WithCPUs` も同じ error で拒否する。`WithShmSize`、`WithCapAdd`、`WithCapDrop`、`WithUlimit`、整数の CPU 値は Apple の `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit`、`--cpus` にそのまま渡す。`WithExposedPorts` は library 側の宣言で、Apple の `--publish` flag には変換しない。Apple には run 時の no-fetch スイッチがないため `PullNever` も拒否し、`ErrPullNeverUnsupported` と明示的な fallback(`PullMissing`/`PullAlways`)を契約とする。公開 `Pull` にも同じ platform/capability 検証を適用する。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
 `WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。

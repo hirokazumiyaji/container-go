@@ -25,6 +25,7 @@ Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
 | `wait.ForHealthcheck` と `HTTPStrategy.WithResponseMatcher` | なし | あり |
 | 公開型 `wait.AllStrategy` / `AnyStrategy` と合成 strategy の `WithStartupTimeout` | なし | あり |
 | root の `CLIError`、`ErrContainerNotFound`、`ErrGenerationReplaced` | なし | あり |
+| 小数の `WithCPUs(float64)`、`WithShmSize`、`WithPrivileged`、`WithCapAdd`/`WithCapDrop`、`WithUlimit`、`WithExtraHost`、`WithHostname` | なし | あり |
 | 世代安全な削除、`v0.2.0` 以降の endpoint 強化、現在のリーパー強化 | `v0.2.0` の契約には含まれない | 一部実装済み。以下の後続 issue の制約を参照 |
 
 以下の説明で「現在の開発」と記した節以外は、現行チェックアウトの動作を説明します。
@@ -71,9 +72,9 @@ Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
   現在の parser は返された object の ID や name が要求値と一致するか検証しない。
   valid だが mismatched な object は信頼できる no-match signal ではない。#103 が
   その classification gap を担当する。
-- public option の validation は部分的です。negative log tail、zero memory、unknown
+- public option の validation は部分的です。negative log tail、unknown
   mount type、reuse-group grammar は一様に reject されません。#102 が typed validation を
-  担当します。
+  担当します。`WithMemory` と `WithShmSize` は zero と不正なサイズを拒否します。
 - reaper は full inspect output を一時 file に staging するため、環境 data が残る
   可能性があります。#111 が staging exposure と cleanup を担当します。
 
@@ -549,10 +550,10 @@ context をキャンセルするとバックエンド CLI を停止します。`
 ありません。
 
 現在のチェックアウトでは validation は一様ではありません（#102）。
-negative な `LogsOptions.Tail` は 0/all として扱われ、`WithMemory("0")` は現在の
-parser に受理され、unknown な `MountType` は `WithMounts` で reject されず、
-`PruneReuseGroup` は `WithReuseGroup` より弱い grammar を使います。これらは
-現在の動作であり、backend がその設定を受け付ける保証ではありません。
+negative な `LogsOptions.Tail` は 0/all として扱われ、unknown な `MountType` は
+`WithMounts` で reject されず、`PruneReuseGroup` は `WithReuseGroup` より弱い
+grammar を使います。`WithMemory` と `WithShmSize` は zero と不正なサイズを拒否します。
+これらは現在の動作であり、backend がその設定を受け付ける保証ではありません。
 
 次の例は Docker 固有です。`v0.2.0` 以降に追加された log stream、exec
 option、公開 error symbol も示しますが、Apple の
@@ -720,6 +721,18 @@ image が消えた場合はエントリ期限まで再 pull されないので�
 呼び出し側はオフのままにする。Docker の `PullNever` は契約上 image 不在で失敗するため、
 キャッシュの有無に関わらず常に inspect する。
 
+## 実行オプション
+
+`WithCPUs(v float64)` は `0.5` や `1.25` のような小数の CPU quota を受け付け、Docker には `--cpus` として渡します。zero 以下と非有限値は option 評価時に拒否します。Apple Container の `--cpus` は整数のみを受け付けるため、小数は `ErrUnsupportedCapability` で拒否し、整数はそのまま動作します。
+
+`WithMemory(size string)` と `WithShmSize(size string)` は、整数と任意の `K`/`M`/`G`/`T`/`P` suffix という同じ文法を使い、zero、不正な値、overflow を backend 呼び出し前に拒否します。`WithShmSize` は Docker と Apple Container の `--shm-size` に渡します。
+
+その他の option は run flag に直接対応します。`WithPrivileged`（`--privileged`）、`WithCapAdd` / `WithCapDrop`（`--cap-add` / `--cap-drop`。名前は optional な `CAP_` prefix 付きの大文字または `ALL` で、caller の表記をそのまま渡し、重複は prefix に関係なく無視する）、`WithUlimit(name, soft, hard)`（`--ulimit name=soft:hard`。Docker の小文字名集合を使い、`-1` は無制限を表す）、`WithExtraHost(host, ip)`（`--add-host host:ip`。IP に `host-gateway` を許可し、同名または衝突する host は拒否する）、`WithHostname`（`--hostname`。63 byte 以下の RFC 1123 hostname）である。先頭が `-` の文字列値や制御文字を含む値は拒否します。
+
+Apple Container は `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit` をサポートするため同じ flag を受け取ります。privileged container、extra host、`--hostname` に相当する機能はないため、`WithPrivileged`、`WithExtraHost`、`WithHostname` は image や container の command を実行する前に `ErrUnsupportedCapability` を返します。
+
+これらの option は `WithReuse` の互換性 identity に含まれます。再利用する container は CPU、shm、privilege、ulimit、extra host、hostname の設定が一致しなければなりません。capability は requested-subset rule で、caller が追加・削除を要求した capability がすべて存在する必要があり、capability の変更を要求しない caller は inspect された任意の set を受け入れます。これらの check に失敗すると `Run` は attach を拒否します。
+
 ### Apple の capability validation
 
 Apple backend は image の解決や container create の前に静的 capability を検証します。
@@ -746,6 +759,8 @@ CONTAINERGO_BACKEND=apple CONTAINERGO_APPLE_LIVE=1 \
 memory は 200 MiB 以上で、`WithMemory` と同じ整数(任意の `K`/`M`/`G`/`T`/`P` suffix)表記を使い、unit 誤りや overflow を拒否します。
 publish port は 2〜65535、publish descriptor は最大 64 個です。
 `WithExposedPorts` は library 側の宣言であり、Apple の `--publish` flag には変換されません。
+
+Apple は `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit`、整数の `--cpus` をサポートするため、`WithShmSize`、`WithCapAdd`、`WithCapDrop`、`WithUlimit`、整数の `WithCPUs` はそのまま渡されます。`WithPrivileged`、`WithExtraHost`、`WithHostname`、小数の `WithCPUs` は CLI 実行前に `ErrUnsupportedCapability` で拒否されます。
 
 ## イメージの解決と固定
 

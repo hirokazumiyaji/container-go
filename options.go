@@ -3,6 +3,8 @@ package container
 import (
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -62,8 +64,15 @@ type config struct {
 	mounts               []Mount
 	files                []File
 	waitStrategy         wait.Strategy
-	cpus                 int
+	cpus                 float64
 	memory               string
+	shmSize              string
+	privileged           bool
+	capAdd               []string
+	capDrop              []string
+	ulimits              []ulimitSpec
+	extraHosts           []extraHostSpec
+	hostname             string
 	user                 string
 	workdir              string
 	network              string
@@ -265,10 +274,31 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 		}
 	}
 	if c.cpus > 0 {
-		args = append(args, "--cpus", strconv.Itoa(c.cpus))
+		args = append(args, "--cpus", strconv.FormatFloat(c.cpus, 'f', -1, 64))
 	}
 	if c.memory != "" {
 		args = append(args, "--memory", c.memory)
+	}
+	if c.shmSize != "" {
+		args = append(args, "--shm-size", c.shmSize)
+	}
+	if c.privileged {
+		args = append(args, "--privileged")
+	}
+	for _, capability := range c.capAdd {
+		args = append(args, "--cap-add", capability)
+	}
+	for _, capability := range c.capDrop {
+		args = append(args, "--cap-drop", capability)
+	}
+	for _, limit := range c.ulimits {
+		args = append(args, "--ulimit", limit.arg())
+	}
+	for _, host := range c.extraHosts {
+		args = append(args, "--add-host", host.arg())
+	}
+	if c.hostname != "" {
+		args = append(args, "--hostname", c.hostname)
 	}
 	if c.user != "" {
 		args = append(args, "--user", c.user)
@@ -296,9 +326,13 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // stable WithName. Concurrent Run calls with the same name share one
 // container; readiness strategies always re-run against it. WithFiles
 // is copied for every caller, and PullAlways is fetched for every
-// caller before attach. Creation-only options are intentionally
-// ignored when attaching; use distinct names when those differences
-// matter. Returned handles are shared: Cleanup, TerminateContainer,
+// caller before attach. CPU, shm, capability, ulimit, extra-host, and
+// hostname options are part of the reuse compatibility identity and
+// must match an existing container. Capabilities follow a requested-subset
+// rule: every requested --cap-add/--cap-drop value must be present, while
+// an empty request accepts any inspected capability set. Other creation-only
+// options are intentionally ignored when attaching; use distinct names when
+// those differences matter. Returned handles are shared: Cleanup, TerminateContainer,
 // and the watchdog reaper do not remove them. Stop, CopyToContainer,
 // CopyContentToContainer, and CopyFileFromContainer refuse with
 // ErrSharedContainer so one process cannot disturb peers; use Shared to
@@ -662,24 +696,38 @@ func WithMounts(mounts ...Mount) Option {
 	}
 }
 
-// WithCPUs sets the number of CPUs for the container's VM.
-func WithCPUs(n int) Option {
+// WithCPUs sets the CPU quota for the container's VM. Fractional values such
+// as 0.5 are passed to Docker as --cpus. Apple Container accepts only whole
+// numbers and rejects a fractional value with ErrUnsupportedCapability before
+// invoking its CLI. Non-positive and non-finite values are rejected.
+func WithCPUs(v float64) Option {
 	return func(c *config) error {
-		if n < 1 {
-			return validationErrorf("WithCPUs", n, "cpus must be >= 1, got %d", n)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return validationErrorf("WithCPUs", v, "cpus must be finite, got %v", v)
 		}
-		c.cpus = n
+		if v <= 0 {
+			return validationErrorf("WithCPUs", v, "cpus must be greater than zero, got %s", formatCPUs(v))
+		}
+		c.cpus = v
 		return nil
 	}
+}
+
+// formatCPUs renders a CPU quota in the form passed to the backend.
+func formatCPUs(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // memoryRE accepts sizes like "512M" or "1G". Unit support beyond
 // this syntax is a backend capability and is checked separately.
 var memoryRE = regexp.MustCompile(`^[0-9]+[KMGTP]?$`)
 
-func validateMemorySize(size string) error {
+// parseSizeBytes parses the integer with an optional K/M/G/T/P suffix used by
+// WithMemory and WithShmSize. option and noun shape the error message so a
+// rejected value names the option the caller must change.
+func parseSizeBytes(option, noun, size string) (uint64, error) {
 	if !memoryRE.MatchString(size) {
-		return validationErrorf("WithMemory", size, "invalid memory size %q", size)
+		return 0, validationErrorf(option, size, "invalid %s size %q", noun, size)
 	}
 
 	digits := size
@@ -701,15 +749,20 @@ func validateMemorySize(size string) error {
 	}
 	value, err := strconv.ParseUint(digits, 10, 64)
 	if err != nil {
-		return newValidationError("WithMemory", size, fmt.Errorf("invalid or overflowing memory size %q: %w", size, err))
+		return 0, newValidationError(option, size, fmt.Errorf("invalid or overflowing %s size %q: %w", noun, size, err))
 	}
 	if value == 0 {
-		return validationErrorf("WithMemory", size, "memory size must be greater than zero: %q", size)
+		return 0, validationErrorf(option, size, "%s size must be greater than zero: %q", noun, size)
 	}
 	if value > maxMemoryBytes/unit {
-		return validationErrorf("WithMemory", size, "memory size overflows the %d-byte maximum: %q", maxMemoryBytes, size)
+		return 0, validationErrorf(option, size, "%s size overflows the %d-byte maximum: %q", noun, maxMemoryBytes, size)
 	}
-	return nil
+	return value * unit, nil
+}
+
+func validateMemorySize(size string) error {
+	_, err := parseSizeBytes("WithMemory", "memory", size)
+	return err
 }
 
 // WithMemory sets the VM memory size, e.g. "512M" or "1G".
@@ -719,6 +772,250 @@ func WithMemory(size string) Option {
 			return err
 		}
 		c.memory = size
+		return nil
+	}
+}
+
+// WithShmSize sets the size of /dev/shm, e.g. "64M" or "1G". It uses the same
+// integer with an optional K/M/G/T/P suffix grammar as WithMemory. Apple
+// Container's --shm-size and Docker's --shm-size accept the value directly.
+func WithShmSize(size string) Option {
+	return func(c *config) error {
+		if _, err := parseSizeBytes("WithShmSize", "shm", size); err != nil {
+			return err
+		}
+		c.shmSize = size
+		return nil
+	}
+}
+
+// WithPrivileged runs the container with extended privileges (Docker's
+// --privileged). Apple Container has no equivalent capability and rejects it
+// with ErrUnsupportedCapability before invoking its CLI.
+func WithPrivileged() Option {
+	return func(c *config) error {
+		c.privileged = true
+		return nil
+	}
+}
+
+// capabilityRE is Docker's and Apple Container's accepted capability spelling:
+// uppercase letters, digits, and underscores with an optional CAP_ prefix. The
+// special value ALL adds or drops every capability.
+var capabilityRE = regexp.MustCompile(`^(?:CAP_)?[A-Z][A-Z0-9_]*$`)
+
+// validateCapability accepts Docker's capability spelling. The CAP_ prefix is
+// optional; the caller's spelling is preserved in argv because both Docker and
+// Apple Container accept either form.
+func validateCapability(option, capability string) error {
+	invalid := func(format string, args ...any) error {
+		return newValidationErrorWithField(option, "capability", capability, fmt.Errorf(format, args...))
+	}
+	if capability == "" {
+		return invalid("capability must not be empty")
+	}
+	if capability == "ALL" {
+		return nil
+	}
+	if capability == "CAP_ALL" {
+		return invalid("invalid capability %q: use ALL without the CAP_ prefix", capability)
+	}
+	if capability == "CAP_" || !capabilityRE.MatchString(capability) {
+		return invalid("invalid capability %q: use uppercase letters, digits, and underscores with an optional CAP_ prefix", capability)
+	}
+	return nil
+}
+
+// capabilityKey is the prefixed spelling used to detect duplicates and to
+// compare requested capabilities with inspected ones.
+func capabilityKey(capability string) string {
+	if capability == "ALL" || strings.HasPrefix(capability, "CAP_") {
+		return capability
+	}
+	return "CAP_" + capability
+}
+
+// WithCapAdd adds Linux capabilities (for example NET_ADMIN or CAP_NET_ADMIN).
+// The CAP_ prefix is optional and the caller's spelling is passed to the
+// backend. Duplicates are ignored regardless of prefix, so repeated options are
+// idempotent. Apple Container supports --cap-add with the same forms.
+func WithCapAdd(caps ...string) Option {
+	return func(c *config) error {
+		added, err := appendCapabilities("WithCapAdd", c.capAdd, caps)
+		if err != nil {
+			return err
+		}
+		c.capAdd = added
+		return nil
+	}
+}
+
+// WithCapDrop drops Linux capabilities. Names follow WithCapAdd's rules.
+func WithCapDrop(caps ...string) Option {
+	return func(c *config) error {
+		dropped, err := appendCapabilities("WithCapDrop", c.capDrop, caps)
+		if err != nil {
+			return err
+		}
+		c.capDrop = dropped
+		return nil
+	}
+}
+
+func appendCapabilities(option string, existing, caps []string) ([]string, error) {
+	normalized := append([]string(nil), existing...)
+	seen := make(map[string]struct{}, len(existing)+len(caps))
+	for _, capability := range existing {
+		seen[capabilityKey(capability)] = struct{}{}
+	}
+	for _, capability := range caps {
+		if err := validateCapability(option, capability); err != nil {
+			return nil, err
+		}
+		key := capabilityKey(capability)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, capability)
+	}
+	return normalized, nil
+}
+
+// ulimitNames is the resource-name set both Docker and Apple Container parse
+// in their --ulimit flag. Names are lowercase and have no RLIMIT_ prefix.
+var ulimitNames = map[string]struct{}{
+	"core": {}, "cpu": {}, "data": {}, "fsize": {}, "locks": {},
+	"memlock": {}, "msgqueue": {}, "nice": {}, "nofile": {}, "nproc": {},
+	"rss": {}, "rtprio": {}, "rttime": {}, "sigpending": {}, "stack": {},
+}
+
+// ulimitSpec is one --ulimit entry in backend-neutral form.
+type ulimitSpec struct {
+	name       string
+	soft, hard int64
+}
+
+func (u ulimitSpec) arg() string {
+	return fmt.Sprintf("%s=%d:%d", u.name, u.soft, u.hard)
+}
+
+// WithUlimit sets a resource limit using Docker's name=soft:hard syntax.
+// Supported names are core, cpu, data, fsize, locks, memlock, msgqueue, nice,
+// nofile, nproc, rss, rtprio, rttime, sigpending, and stack. The value -1 means
+// unlimited. Values below -1 and a soft limit above the hard limit are rejected,
+// as is a duplicate name.
+// Apple Container parses the same names and syntax.
+func WithUlimit(name string, soft, hard int64) Option {
+	return func(c *config) error {
+		if _, ok := ulimitNames[name]; !ok {
+			return newValidationErrorWithField("WithUlimit", "name", name,
+				fmt.Errorf("invalid ulimit name %q", name))
+		}
+		if soft < -1 {
+			return newValidationErrorWithField("WithUlimit", "soft", soft,
+				fmt.Errorf("ulimit %q soft limit must be -1 (unlimited) or non-negative: %d", name, soft))
+		}
+		if hard < -1 {
+			return newValidationErrorWithField("WithUlimit", "hard", hard,
+				fmt.Errorf("ulimit %q hard limit must be -1 (unlimited) or non-negative: %d", name, hard))
+		}
+		if hard != -1 && (soft == -1 || soft > hard) {
+			return newValidationErrorWithField("WithUlimit", "soft", soft,
+				fmt.Errorf("ulimit %q soft limit %d must not exceed hard limit %d", name, soft, hard))
+		}
+		for _, existing := range c.ulimits {
+			if existing.name == name {
+				return newValidationErrorWithField("WithUlimit", "name", name,
+					fmt.Errorf("duplicate ulimit %q", name))
+			}
+		}
+		c.ulimits = append(c.ulimits, ulimitSpec{name: name, soft: soft, hard: hard})
+		return nil
+	}
+}
+
+// hostnameRE is RFC 1123's DNS-name grammar: dot-separated labels of letters,
+// digits, and interior hyphens. A leading dash is rejected so a value can never
+// be parsed as a CLI flag.
+var hostnameRE = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`)
+
+const (
+	maxHostnameBytes = 253
+	// maxContainerHostnameBytes follows Linux's UTS nodename limit (64
+	// bytes including the terminator).
+	maxContainerHostnameBytes = 63
+)
+
+func validateHostname(option, field, name string, limit int) error {
+	if name == "" {
+		return newValidationErrorWithField(option, field, name, fmt.Errorf("hostname must not be empty"))
+	}
+	if len(name) > limit {
+		return newValidationErrorWithField(option, field, name,
+			fmt.Errorf("hostname %q exceeds the %d-byte maximum", name, limit))
+	}
+	if !hostnameRE.MatchString(name) {
+		return newValidationErrorWithField(option, field, name, fmt.Errorf("invalid hostname %q", name))
+	}
+	return nil
+}
+
+// extraHostSpec is one --add-host entry.
+type extraHostSpec struct {
+	host string
+	ip   string
+}
+
+func (h extraHostSpec) arg() string {
+	return h.host + ":" + h.ip
+}
+
+// WithExtraHost adds an /etc/hosts entry mapping host to ip (Docker's
+// --add-host). The IP may be the literal host-gateway. Host names use the
+// RFC 1123 hostname grammar, and a duplicate or conflicting host is rejected.
+// Apple Container has no extra-host capability and rejects it with
+// ErrUnsupportedCapability before invoking its CLI.
+func WithExtraHost(host, ip string) Option {
+	return func(c *config) error {
+		if err := validateHostname("WithExtraHost", "host", host, maxHostnameBytes); err != nil {
+			return err
+		}
+		canonical := ip
+		if ip != "host-gateway" {
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				return newValidationErrorWithField("WithExtraHost", "ip", ip,
+					fmt.Errorf("invalid IP address %q", ip))
+			}
+			canonical = parsed.String()
+		}
+		for _, existing := range c.extraHosts {
+			if !strings.EqualFold(existing.host, host) {
+				continue
+			}
+			if existing.ip == canonical {
+				return newValidationErrorWithField("WithExtraHost", "host", host,
+					fmt.Errorf("duplicate extra host %q", host))
+			}
+			return newValidationErrorWithField("WithExtraHost", "host", host,
+				fmt.Errorf("conflicting extra host %q: %q and %q", host, existing.ip, canonical))
+		}
+		c.extraHosts = append(c.extraHosts, extraHostSpec{host: host, ip: canonical})
+		return nil
+	}
+}
+
+// WithHostname sets the container hostname (Docker's --hostname). The name uses
+// RFC 1123's hostname grammar and must fit Linux's 63-byte UTS nodename limit.
+// Apple Container has no --hostname flag and rejects it with
+// ErrUnsupportedCapability before invoking its CLI.
+func WithHostname(name string) Option {
+	return func(c *config) error {
+		if err := validateHostname("WithHostname", "hostname", name, maxContainerHostnameBytes); err != nil {
+			return err
+		}
+		c.hostname = name
 		return nil
 	}
 }

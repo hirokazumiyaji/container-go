@@ -15,6 +15,16 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add `WithShmSize`, `WithPrivileged`, `WithCapAdd` / `WithCapDrop`,
+  `WithUlimit`, `WithExtraHost`, and `WithHostname` run options. Values are
+  validated while options are evaluated, emitted as Docker's `--shm-size`,
+  `--privileged`, `--cap-add` / `--cap-drop`, `--ulimit`, `--add-host`, and
+  `--hostname` flags, and included in the `WithReuse` compatibility
+  identity. Reuse only requires requested capabilities to be present in the
+  inspected configuration, so an empty capability request accepts any
+  inspected set. Apple Container accepts the shm, capability, and ulimit flags
+  and rejects `WithPrivileged`, `WithExtraHost`, and `WithHostname` with
+  `ErrUnsupportedCapability`.
 - Add in-memory copy sources. `File.Content` and `File.Mode` extend
   `WithFiles`, and `CopyContentToContainer` copies bytes into a running
   handle. Content uses the existing per-user private staging tree at `0600`
@@ -106,6 +116,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
+- `WithCPUs` now takes a `float64` and Docker receives the value through
+  `strconv.FormatFloat(..., 'f', -1, 64)`, so fractional quotas such as
+  `0.5` are supported. Non-positive and non-finite values are rejected.
+  Apple Container requires a whole number and rejects a fractional value
+  with `ErrUnsupportedCapability`; integer values remain accepted.
 - **Breaking:** align public signatures before v1.0. Redaction methods on
   `ConfigError`, `ValidationError`, `ExecTerminationError`, `CleanupError`,
   `wait.ConfigError`, `CLIError`, and `SystemNotRunningError` are now

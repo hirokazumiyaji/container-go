@@ -271,15 +271,45 @@ described below are not.
   `ErrPullNeverUnsupported`). `PullAlways` fetches before attach on
   `WithReuse` as well as on create.
 - `WithReuse()`: make a named `Run` a get-or-create operation. Attach
-  callers apply `WithFiles` and `PullAlways`. Other creation-only
-  options are ignored on attach.
+  callers apply `WithFiles` and `PullAlways`. CPU, shm, capability,
+  ulimit, extra-host, and hostname options are part of the reuse
+  compatibility identity and must match an existing container.
+  Capabilities use a requested-subset rule: every requested
+  `--cap-add`/`--cap-drop` value must be present, while an empty request
+  accepts any inspected capability set. Other creation-only options are
+  ignored on attach.
 - `WithReuseGroup(group string)`: label a reused container for
   `PruneReuseGroup`; it requires `WithReuse` and is not part of the
   reuse key. `PruneReuseGroup` currently uses a weaker validation
   grammar (#102).
-- `WithCPUs(n int)` / `WithMemory(size string)`: resource limits.
-  `WithMemory` currently accepts zero and does not enforce backend
-  capability limits (#102).
+- `WithCPUs(v float64)` / `WithMemory(size string)`: resource limits.
+  `WithCPUs` accepts fractional values such as `0.5` and rejects
+  non-positive or non-finite values; Apple Container requires a whole
+  number and rejects a fractional value with `ErrUnsupportedCapability`.
+  `WithMemory` and `WithShmSize` share the integer with an optional
+  `K`/`M`/`G`/`T`/`P` suffix grammar and reject zero and overflow.
+- `WithShmSize(size string)`: set the size of `/dev/shm` (for example
+  `64M`); Docker and Apple Container both pass it as `--shm-size`.
+- `WithPrivileged()`: Docker's `--privileged`. Apple Container has no
+  equivalent capability and rejects it with `ErrUnsupportedCapability`.
+- `WithCapAdd(caps ...string)` / `WithCapDrop(caps ...string)`: add or
+  drop Linux capabilities. Names are uppercase with an optional `CAP_`
+  prefix or the special value `ALL`; duplicates are ignored regardless
+  of prefix, and the caller's spelling is passed through. Both backends
+  accept `--cap-add` / `--cap-drop` in either form.
+- `WithUlimit(name string, soft, hard int64)`: set a resource limit in
+  Docker's `name=soft:hard` form. Names are Docker's lowercase set
+  (`nofile`, `memlock`, `nproc`, and so on). The value `-1` means unlimited;
+  values below `-1`, a soft limit above the hard limit, and duplicate names
+  are rejected.
+- `WithExtraHost(host, ip string)`: Docker's `--add-host host:ip`.
+  `host-gateway` is accepted as the IP, and duplicate or conflicting
+  host entries are rejected. Apple Container has no extra-host
+  capability and rejects it with `ErrUnsupportedCapability`.
+- `WithHostname(name string)`: Docker's `--hostname`, validated as an
+  RFC 1123 hostname within the 63-byte UTS nodename limit. Apple
+  Container has no `--hostname` flag and rejects it with
+  `ErrUnsupportedCapability`.
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory.
 - `WithNetwork(name string)`: attach to an existing named network.
@@ -490,10 +520,10 @@ and empty-generation paths have limitations described under Reuse and
 tracked by #83 and #84.
 
 Validation is not uniform in this checkout (#102): a negative
-`LogsOptions.Tail` is treated as zero/all, `WithMemory("0")` is accepted
-by the current parser, unknown `MountType` values are not rejected by
-`WithMounts`, and `PruneReuseGroup` uses a weaker grammar than
-`WithReuseGroup`. These are current behaviors, not backend acceptance
+`LogsOptions.Tail` is treated as zero/all, unknown `MountType` values are
+not rejected by `WithMounts`, and `PruneReuseGroup` uses a weaker grammar
+than `WithReuseGroup`. `WithMemory` and `WithShmSize` reject zero and
+malformed sizes. These are current behaviors, not backend acceptance
 guarantees.
 
 `Terminate` maps to `container delete --force` on Apple Container and
@@ -1395,7 +1425,13 @@ for the same backend, image, platform, and operation.
 non-Linux or malformed Apple platforms (including bare `linux` and invalid
 variants), Apple-invalid container/network names, memory below 200 MiB
 (including overflow), published port 1, overlapping publishes, and more than
-64 publish descriptors before invoking the CLI. `PullNever` is also rejected
+64 publish descriptors before invoking the CLI. `WithPrivileged`,
+`WithExtraHost`, and `WithHostname` are rejected with
+`ErrUnsupportedCapability`, and a fractional `WithCPUs` is rejected the same
+way because Apple's `--cpus` takes an integer. `WithShmSize`, `WithCapAdd`,
+`WithCapDrop`, `WithUlimit`, and whole-number CPU values are supported and
+passed to Apple's `--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`, and
+`--cpus` flags. `PullNever` is also rejected
 with `ErrPullNeverUnsupported`, because Apple has no run-time no-fetch flag;
 `PullMissing` and `PullAlways` are the explicit documented fallbacks. The
 public `Pull` helper applies the same platform and capability validation.

@@ -1039,41 +1039,6 @@ func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
 }
 ```
 
-Package-level `Prune` intentionally takes only backend-neutral
-`PruneOption` values and has no Docker target options. To prune a specific
-Docker daemon or context, construct a `Client` with `WithClientDockerHost`
-or `WithClientDockerContext` and call `Client.Prune`. `Pull` is different:
-package-level `Pull` accepts its own `WithPullDockerHost` and
-`WithPullDockerContext` options for a single fetch, while `Client.Pull`
-rejects them because the Client pins its target.
-
-`Container.Kill(ctx, signal string)` takes exactly one signal. An empty
-string selects the default SIGKILL. A non-empty signal is passed to the
-backend unchanged; multiple signals are now rejected at compile time.
-
-```go
-package docexample
-
-import (
-    "context"
-    "testing"
-
-    container "github.com/hirokazumiyaji/container-go"
-)
-
-func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
-    // The caller's context bounds TerminateContainer.
-    defer container.TerminateContainer(ctx, ctr)
-
-    if err := ctr.Kill(ctx, "SIGTERM"); err != nil {
-        t.Fatal(err)
-    }
-    if err := ctr.Kill(ctx, ""); err != nil { // empty string means SIGKILL
-        t.Fatal(err)
-    }
-}
-```
-
 `container.WithPruneOlderThan(d)` narrows that selection to candidates the
 backend reports as created before now-d. It is useful for a sweep on a
 shared or remote daemon because a concurrent job's recently stopped

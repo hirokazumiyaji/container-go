@@ -466,8 +466,6 @@ Apple CLI にはラベルフィルタがないため、孤児の掃除は `conta
 
 package レベルの `Prune` は backend 中立の `PruneOption` だけを受け付け、Docker target の option を持たない。特定の Docker daemon や context を対象にする場合は、`WithClientDockerHost` または `WithClientDockerContext` で `Client` を作り、`Client.Prune` を使う。`Pull` は pull 固有の target option (`WithPullDockerHost`、`WithPullDockerContext`) を維持するが、`Client.Pull` は Client が target を固定するためこれらの上書きを拒否する。
 
-package レベルの `Prune` は backend 中立の `PruneOption` だけを受け付け、Docker target の option を持たない。特定の Docker daemon や context を対象にする場合は、`WithClientDockerHost` または `WithClientDockerContext` で `Client` を作り、`Client.Prune` を使う。`Pull` は pull 固有の target option (`WithPullDockerHost`、`WithPullDockerContext`) を維持するが、`Client.Pull` は Client が target を固定するためこれらの上書きを拒否する。
-
 `CONTAINERGO_KEEP=1` はプロセス全体の診断用フラグである。`Cleanup` と
 `TerminateContainer` による自動削除、リーパー登録を省略し、作成失敗、
 `WithFiles` コピー失敗、wait strategy 失敗時の自動 rollback を抑制して、

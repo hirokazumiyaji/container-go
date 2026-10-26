@@ -186,7 +186,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithShmSize(size string)`：`/dev/shm` のサイズ（例: `64M`）を指定する。Docker と Apple Container はどちらも `--shm-size` として渡す。
 - `WithPrivileged()`：Docker の `--privileged`。Apple Container に相当する capability はなく、`ErrUnsupportedCapability` で拒否する。
 - `WithCapAdd(caps ...string)` / `WithCapDrop(caps ...string)`：Linux capability を追加・削除する。名前は optional な `CAP_` prefix 付きの大文字（または `ALL`）で、重複は prefix に関係なく無視し、caller の表記をそのまま渡す。両 backend が `--cap-add` / `--cap-drop` をどちらの形式でも受け付ける。
-- `WithUlimit(name string, soft, hard int64)`：Docker の `name=soft:hard` 形式で resource limit を指定する。名前は Docker の小文字集合（`nofile`、`memlock`、`nproc` など）。負値、soft > hard、同名の重複を拒否する。
+- `WithUlimit(name string, soft, hard int64)`：Docker の `name=soft:hard` 形式で resource limit を指定する。名前は Docker の小文字集合（`nofile`、`memlock`、`nproc` など）。`-1` は無制限を表す。`-1` 未満、有限の hard を超える soft、同名の重複を拒否する。
 - `WithExtraHost(host, ip string)`：Docker の `--add-host host:ip`。IP には `host-gateway` を指定できる。同名または衝突する entry は拒否する。Apple Container に extra host の capability はなく、`ErrUnsupportedCapability` で拒否する。
 - `WithHostname(name string)`：Docker の `--hostname`。RFC 1123 の hostname grammar と 63 byte の UTS nodename 上限で検証する。Apple Container に `--hostname` flag はなく、`ErrUnsupportedCapability` で拒否する。
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリを指定する。

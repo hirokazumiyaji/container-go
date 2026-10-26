@@ -820,10 +820,10 @@ The other options map directly to run flags: `WithPrivileged`
 `ALL`, the caller's spelling is passed through, and duplicates are
 ignored regardless of prefix),
 `WithUlimit(name, soft, hard)` (`--ulimit name=soft:hard` with Docker's
-lowercase name set), `WithExtraHost(host, ip)` (`--add-host host:ip`,
+lowercase name set; `-1` means unlimited), `WithExtraHost(host, ip)` (`--add-host host:ip`,
 with `host-gateway` accepted and duplicate or conflicting hosts
 rejected), and `WithHostname` (`--hostname`, an RFC 1123 hostname of at
-most 63 bytes). Values that start with `-` or contain control characters
+most 63 bytes). String values that start with `-` or contain control characters
 are rejected.
 
 Apple Container supports `--shm-size`, `--cap-add`, `--cap-drop`, and

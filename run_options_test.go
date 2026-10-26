@@ -110,7 +110,8 @@ func TestWithUlimitValidation(t *testing.T) {
 		{name: "NOFILE", soft: 1, hard: 1},
 		{name: "RLIMIT_NOFILE", soft: 1, hard: 1},
 		{name: "nofile", soft: -1, hard: 1},
-		{name: "nofile", soft: 1, hard: -1},
+		{name: "nofile", soft: -2, hard: -1},
+		{name: "nofile", soft: 1, hard: -2},
 		{name: "nofile", soft: 2, hard: 1},
 	} {
 		t.Run("invalid "+tc.name, func(t *testing.T) {
@@ -700,5 +701,35 @@ func TestAppleParseInspectRunOptions(t *testing.T) {
 	}
 	if !slices.Equal(opts.ulimits, []ulimitSpec{{name: "nofile", soft: 1024, hard: 2048}}) {
 		t.Fatalf("ulimits = %v", opts.ulimits)
+	}
+}
+
+func TestWithUlimitUnlimited(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		soft int64
+		hard int64
+		want string
+	}{
+		{name: "both unlimited", soft: -1, hard: -1, want: "memlock=-1:-1"},
+		{name: "hard unlimited", soft: 1024, hard: -1, want: "memlock=1024:-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newConfig()
+			if err := WithUlimit("memlock", tc.soft, tc.hard)(cfg); err != nil {
+				t.Fatalf("WithUlimit: %v", err)
+			}
+			for _, backend := range []engine{dockerEngine{}, appleEngine{}} {
+				if args := backend.runArgs(cfg, "redis:7-alpine", ""); !slices.Contains(args, tc.want) {
+					t.Errorf("%s args = %v, want %q", backend.name(), args, tc.want)
+				}
+			}
+			info := &engineInfo{runOptions: engineRunOptions{
+				ulimits: []ulimitSpec{{name: "memlock", soft: tc.soft, hard: tc.hard}},
+			}}
+			if err := checkReuseRunOptions(info, cfg); err != nil {
+				t.Fatalf("matching unlimited reuse rejected: %v", err)
+			}
+		})
 	}
 }

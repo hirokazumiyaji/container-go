@@ -296,8 +296,9 @@ described below are not.
   accept `--cap-add` / `--cap-drop` in either form.
 - `WithUlimit(name string, soft, hard int64)`: set a resource limit in
   Docker's `name=soft:hard` form. Names are Docker's lowercase set
-  (`nofile`, `memlock`, `nproc`, and so on); negative values, a soft
-  limit above the hard limit, and duplicate names are rejected.
+  (`nofile`, `memlock`, `nproc`, and so on). The value `-1` means unlimited;
+  values below `-1`, a soft limit above the hard limit, and duplicate names
+  are rejected.
 - `WithExtraHost(host, ip string)`: Docker's `--add-host host:ip`.
   `host-gateway` is accepted as the IP, and duplicate or conflicting
   host entries are rejected. Apple Container has no extra-host

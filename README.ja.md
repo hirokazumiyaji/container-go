@@ -688,7 +688,7 @@ image が消えた場合はエントリ期限まで再 pull されないので�
 
 `WithMemory(size string)` と `WithShmSize(size string)` は、整数と任意の `K`/`M`/`G`/`T`/`P` suffix という同じ文法を使い、zero、不正な値、overflow を backend 呼び出し前に拒否します。`WithShmSize` は Docker と Apple Container の `--shm-size` に渡します。
 
-その他の option は run flag に直接対応します。`WithPrivileged`（`--privileged`）、`WithCapAdd` / `WithCapDrop`（`--cap-add` / `--cap-drop`。名前は optional な `CAP_` prefix 付きの大文字または `ALL` で、caller の表記をそのまま渡し、重複は prefix に関係なく無視する）、`WithUlimit(name, soft, hard)`（`--ulimit name=soft:hard`。Docker の小文字名集合を使う）、`WithExtraHost(host, ip)`（`--add-host host:ip`。IP に `host-gateway` を許可し、同名または衝突する host は拒否する）、`WithHostname`（`--hostname`。63 byte 以下の RFC 1123 hostname）である。先頭が `-` の値や制御文字を含む値は拒否します。
+その他の option は run flag に直接対応します。`WithPrivileged`（`--privileged`）、`WithCapAdd` / `WithCapDrop`（`--cap-add` / `--cap-drop`。名前は optional な `CAP_` prefix 付きの大文字または `ALL` で、caller の表記をそのまま渡し、重複は prefix に関係なく無視する）、`WithUlimit(name, soft, hard)`（`--ulimit name=soft:hard`。Docker の小文字名集合を使い、`-1` は無制限を表す）、`WithExtraHost(host, ip)`（`--add-host host:ip`。IP に `host-gateway` を許可し、同名または衝突する host は拒否する）、`WithHostname`（`--hostname`。63 byte 以下の RFC 1123 hostname）である。先頭が `-` の文字列値や制御文字を含む値は拒否します。
 
 Apple Container は `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit` をサポートするため同じ flag を受け取ります。privileged container、extra host、`--hostname` に相当する機能はないため、`WithPrivileged`、`WithExtraHost`、`WithHostname` は image や container の command を実行する前に `ErrUnsupportedCapability` を返します。
 

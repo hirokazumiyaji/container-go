@@ -892,8 +892,9 @@ func (u ulimitSpec) arg() string {
 
 // WithUlimit sets a resource limit using Docker's name=soft:hard syntax.
 // Supported names are core, cpu, data, fsize, locks, memlock, msgqueue, nice,
-// nofile, nproc, rss, rtprio, rttime, sigpending, and stack. Negative values
-// and a soft limit above the hard limit are rejected, as is a duplicate name.
+// nofile, nproc, rss, rtprio, rttime, sigpending, and stack. The value -1 means
+// unlimited. Values below -1 and a soft limit above the hard limit are rejected,
+// as is a duplicate name.
 // Apple Container parses the same names and syntax.
 func WithUlimit(name string, soft, hard int64) Option {
 	return func(c *config) error {
@@ -901,15 +902,15 @@ func WithUlimit(name string, soft, hard int64) Option {
 			return newValidationErrorWithField("WithUlimit", "name", name,
 				fmt.Errorf("invalid ulimit name %q", name))
 		}
-		if soft < 0 {
+		if soft < -1 {
 			return newValidationErrorWithField("WithUlimit", "soft", soft,
-				fmt.Errorf("ulimit %q soft limit must not be negative: %d", name, soft))
+				fmt.Errorf("ulimit %q soft limit must be -1 (unlimited) or non-negative: %d", name, soft))
 		}
-		if hard < 0 {
+		if hard < -1 {
 			return newValidationErrorWithField("WithUlimit", "hard", hard,
-				fmt.Errorf("ulimit %q hard limit must not be negative: %d", name, hard))
+				fmt.Errorf("ulimit %q hard limit must be -1 (unlimited) or non-negative: %d", name, hard))
 		}
-		if soft > hard {
+		if hard != -1 && (soft == -1 || soft > hard) {
 			return newValidationErrorWithField("WithUlimit", "soft", soft,
 				fmt.Errorf("ulimit %q soft limit %d must not exceed hard limit %d", name, soft, hard))
 		}

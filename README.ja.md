@@ -455,6 +455,20 @@ created、restarting、unknown と一時的な inspect エラーはタイムア�
 起動中の一時状態を区別できるターゲットでは、任意の `wait.StateTarget` インターフェースも実装してください。
 組み込み戦略は `StateTarget` を自動利用し、互換性のため `Running` にフォールバックします。
 
+Docker では、公開ポートへの TCP 接続が成功してもコンテナ内のプロセスが
+listen しているとは限りません。`docker-proxy` や Docker Desktop の port
+forwarder が先に handshake を完了するためです。そのため
+`ForListeningPort` と `ForExposedPort` は、host 側の接続成功後に、宣言した
+コンテナ側ポートが `LISTEN` 状態であることを確認します。この確認は
+`exec` 経由で `/proc/net/tcp` と `/proc/net/tcp6` を読み取ります。確認を
+実行できない場合（Apple Container は VM の endpoint に直接接続するため
+不要です。distroless など `cat` を持たないイメージや、その他の未対応
+ターゲットも同様です）は、host 側の接続確認だけにフォールバックします。
+このフォールバックは best-effort です。コンテナ側の確認が利用できない
+ために従来の host 側だけの判定に戻るのであり、ポートが ready であることを
+確認したわけではありません。コンテナ側の確認を明示的に省略するには
+`WithHostOnly()` を使います。
+
 `ForListeningPort` と `ForExposedPort` は TCP 専用の readiness probe です。
 UDP は endpoint 設定には宣言できますが、現在の実装は probe 前に `/udp` を
 reject せず TCP dial に渡します。そのため timeout したりする別の TCP listener に

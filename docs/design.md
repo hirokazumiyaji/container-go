@@ -272,6 +272,12 @@ described below are not.
 - `WithNetwork(name string)`: attach to an existing named network; when
   omitted, Docker keeps its daemon-selected default (`bridge` on Linux,
   `nat` on native Windows).
+- `WithNetworkAliases(aliases ...string)`: add network-scoped DNS aliases
+  for Docker (`--network-alias`). Requires an explicitly selected
+  user-defined `WithNetwork`; the default bridge (`bridge`/`nat`), `host`,
+  and `none` are rejected with `*ConfigError`, and Apple returns
+  `ErrUnsupportedCapability`. Aliases are DNS labels and participate in
+  reuse compatibility.
 - `WithPlatform(p string)`: select an image platform such as
   `linux/amd64` (including Rosetta use on Apple Container).
 
@@ -734,6 +740,18 @@ by a POSIX `sleep`/`kill` timeout that cleans up its timer process, and
 the whole reap has an overall budget past which no new backend calls
 are issued. Entries are processed a few at a time so the cost is not
 strictly proportional to the container count.
+
+**Recovering leftovers**: the watchdog cannot help on Windows, after the
+local process tree or runner VM is destroyed (for example on CI
+cancellation or `go test -timeout`), or for containers that outlive the
+local environment on a remote Docker daemon. The supported recovery
+pattern is to call `Prune(ctx)` from `TestMain` before and after the
+suite. `Prune` removes stopped managed containers from any session;
+running and created containers remain. `WithPruneOlderThan(d)` restricts
+a sweep to candidates the backend reports as created before now-d and
+leaves candidates whose creation time is unknown, so a shared or remote
+daemon does not lose another job's recent containers. This is recovery,
+not a replacement watchdog.
 
 The reaper is started lazily for a real CLI container on the non-reuse
 path. Every created container is pre-registered under its name and

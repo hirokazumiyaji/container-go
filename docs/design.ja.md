@@ -162,6 +162,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限を指定する。`WithMemory` は zero と overflow を拒否し、Apple backend は 200 MiB 未満を拒否する。
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリを指定する。
 - `WithNetwork(name string)`：既存の名前付きネットワークへ接続する。省略時は Docker が daemon の既定 network（Linux では `bridge`、native Windows では `nat`）を使う。
+- `WithNetworkAliases(aliases ...string)`：Docker の `--network-alias` として network-scoped DNS alias を追加する。明示的な user-defined `WithNetwork` が必要で、default bridge（`bridge`/`nat`）、`host`、`none` は `*ConfigError`、Apple は `ErrUnsupportedCapability` で拒否する。alias は DNS label として検証し、reuse の互換性比較にも含める。
 - `WithPlatform(p string)`：`linux/amd64` のようなイメージプラットフォームを指定する（Apple Container では Rosetta を含む）。
 
 バックエンド中立の CLI 面にないオプションは意図的に提供しない。
@@ -397,6 +398,16 @@ error と各 entry の delete error は `Run` に返らない。spawn failure �
 timer process も回収する。reap 全体にも overall budget があり、それを超えると
 新規の backend 呼び出しは発行しない。entry は少数ずつ並行処理するため、
 コストがコンテナ数に厳密比例しない。
+
+**残骸の回収**：watchdog は Windows では使えず、CI のキャンセルや
+`go test -timeout` などでローカルの process tree や runner VM が破棄された
+後、または remote Docker daemon 上でローカル環境より長く残るコンテナには
+動作できません。対応策は `TestMain` の前後で `Prune(ctx)` を呼ぶことです。
+`Prune` は session に関係なく停止済みの managed コンテナを削除し、running と
+created は残します。`WithPruneOlderThan(d)` は backend が報告する作成時刻が
+now-d より前の candidate だけに絞り、作成時刻が不明な candidate も残します。
+これにより共有 daemon や remote daemon で他の job が最近停止したコンテナを
+保護できます。これは watchdog の代替ではなく、回収のための運用パターンです。
 
 reaper は実 CLI コンテナを非 reuse 経路で登録したときに遅延起動する。
 作成するコンテナは backend create の開始前に名前と creation generation で

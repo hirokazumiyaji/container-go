@@ -751,10 +751,11 @@ func cleanupCopyStagingDir(dir string) error {
 }
 
 // checkCopyFileFromContainerVersion verifies the Docker client/server copy-out
-// version once per handle. The handle is bound to one target, so a successful
-// answer cannot describe a different daemon. Failures are not recorded and a
-// later copy retries them. Concurrent copies share the check through
-// copyVersionMu; a waiting caller's context still bounds the wait.
+// version once per handle and, through the Client metadata cache, once per
+// target. The handle is bound to one target, so a successful answer cannot
+// describe a different daemon. Failures are not recorded and a later copy
+// retries them. Concurrent copies share the check through copyVersionMu; a
+// waiting caller's context still bounds the wait.
 func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error {
 	if c.eng.name() != "docker" {
 		return c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()})
@@ -770,7 +771,7 @@ func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error
 	if p.copyVersionOK.Load() {
 		return nil
 	}
-	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
+	if err := dockerCopyFileFromContainerVersionCached(ctx, c.dockerMeta, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
 		return err
 	}
 	p.copyVersionOK.Store(true)

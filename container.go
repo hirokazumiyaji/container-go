@@ -190,9 +190,10 @@ type Container struct {
 	networkExplicit bool
 	// reused marks a WithReuse handle. Cleanup, TerminateContainer,
 	// and the watchdog reaper skip these so shared containers survive
-	// process exit. Stop/CopyToContainer/CopyFileFromContainer also
-	// refuse with ErrSharedContainer unless allowDestructive is set
-	// via Shared. Explicit Terminate still removes them.
+	// process exit. Stop/CopyToContainer/CopyContentToContainer/
+	// CopyFileFromContainer also refuse with ErrSharedContainer unless
+	// allowDestructive is set via Shared. Explicit Terminate still removes
+	// them.
 	reused bool
 	// allowDestructive lifts Stop/Copy refusals on a reused handle
 	// without clearing reused, so Cleanup/TerminateContainer still skip.

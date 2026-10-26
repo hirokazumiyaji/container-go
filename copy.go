@@ -38,20 +38,39 @@ const (
 // so focused tests can use a shorter, separate staging budget.
 var copyStagingTimeout = 2 * time.Minute
 
-// File is a host regular file copied into the container right after start.
-// CopyToContainer may still accept a directory source; WithFiles does not.
+// File is a regular file copied into the container right after start. Set
+// exactly one of HostPath or Content. CopyToContainer may still accept a
+// directory source; WithFiles does not.
 type File struct {
-	HostPath      string
+	// HostPath is a host filesystem path. WithFiles resolves it when the
+	// option is applied.
+	HostPath string
+	// Content is an in-memory regular file. A non-nil empty slice copies an
+	// empty file; nil means Content is not set. Content is never included in
+	// errors, argv, or diagnostics.
+	Content []byte
+	// ContainerPath is the absolute destination path in the container.
 	ContainerPath string
+	// Mode overrides the Unix permission bits of the private staged copy.
+	// Zero preserves a HostPath source's permissions and gives Content a 0600
+	// default, so a zero Mode cannot request mode 0000. Only permission bits
+	// (0777) are accepted; type, setuid, setgid, and sticky bits are rejected.
+	// Windows cannot represent arbitrary Unix bits and maps the read-only
+	// attribute only.
+	Mode fs.FileMode
 }
 
-// WithFiles copies regular files into the container after it starts. Each host
-// path is resolved and checked without following a final link when the option
-// is applied; a directory, symlink, or special file is rejected with a
-// ValidationError before any backend call. Copy failures fail Run; an ordinary
-// newly created container is rolled back. WithReuse applies the copy to every
-// caller, including callers that attach to an existing shared container; an
-// attach copy failure returns an error without deleting that shared container.
+// WithFiles copies regular files into the container after it starts. Each File
+// must set exactly one of HostPath or Content; setting both, or neither, is a
+// ValidationError when the option is applied. Host paths are resolved and
+// checked without following a final link at option evaluation; directories,
+// symlinks, and special files are rejected before any backend call. Content is
+// bounded by MaxCopyToContainerSize at option evaluation and is read when the
+// copy runs, so the caller must not modify it until Run returns. Copy failures
+// fail Run; an ordinary newly created container is rolled back. WithReuse
+// applies the copy to every caller, including callers that attach to an existing
+// shared container; an attach copy failure returns an error without deleting
+// that shared container.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		validated := make([]File, len(files))
@@ -68,16 +87,70 @@ func WithFiles(files ...File) Option {
 				return newValidationErrorWithField("WithFiles", "containerPath", f.ContainerPath, fmt.Errorf("duplicate container path %q", f.ContainerPath))
 			}
 			seen[clean] = struct{}{}
-			abs, err := validateHostPath(f.HostPath)
-			if err != nil {
-				return newValidationErrorWithField("WithFiles", "hostPath", f.HostPath, err)
+			if err := validateWithFilesSource(f); err != nil {
+				return err
 			}
-			f.HostPath = abs
+			if f.Content == nil {
+				abs, err := validateHostPath(f.HostPath)
+				if err != nil {
+					return newValidationErrorWithField("WithFiles", "hostPath", f.HostPath, err)
+				}
+				f.HostPath = abs
+			}
 			validated[i] = f
 		}
 		c.files = append(c.files, validated...)
 		return nil
 	}
+}
+
+// validateWithFilesSource enforces the source invariants that can be checked
+// without touching the host filesystem. It runs before any backend call.
+func validateWithFilesSource(f File) error {
+	switch {
+	case f.HostPath == "" && f.Content == nil:
+		// Keep the legacy message for an empty host path so existing
+		// callers that match it are not broken by the added Content field.
+		return newValidationErrorWithField("WithFiles", "hostPath", f.HostPath,
+			errors.New("host path must not be empty"))
+	case f.HostPath != "" && f.Content != nil:
+		// Content is secret material: never put it in ValidationError.Value.
+		return newValidationErrorWithField("WithFiles", "content", nil,
+			errors.New("hostPath and content are mutually exclusive"))
+	}
+	if err := validateCopyMode("WithFiles", f.Mode); err != nil {
+		return err
+	}
+	if f.Content != nil {
+		return validateCopyContentSize("WithFiles", len(f.Content))
+	}
+	return nil
+}
+
+// validateCopyMode accepts zero (unspecified) or Unix permission bits. Type,
+// setuid, setgid, and sticky bits are not part of the snapshot contract.
+func validateCopyMode(option string, mode fs.FileMode) error {
+	if mode == 0 {
+		return nil
+	}
+	if mode.Perm() != mode {
+		return newValidationErrorWithField(option, "mode", mode,
+			fmt.Errorf("mode %#o contains non-permission bits; only Unix permission bits are accepted", uint32(mode)))
+	}
+	return nil
+}
+
+// validateCopyContentSize keeps an in-memory source within the same aggregate
+// byte limit as a host-path snapshot.
+func validateCopyContentSize(option string, size int) error {
+	if int64(size) <= MaxCopyToContainerSize {
+		return nil
+	}
+	return newValidationErrorWithField(option, "content", nil, contentTooLargeError(size))
+}
+
+func contentTooLargeError(size int) error {
+	return fmt.Errorf("content size %d exceeds MaxCopyToContainerSize (%d): %w", size, MaxCopyToContainerSize, ErrCopySourceTooLarge)
 }
 
 // resolveHostPath rejects inputs that cannot be host filesystem paths and
@@ -127,6 +200,8 @@ func validateHostPath(hostPath string) (string, error) {
 // ACLs, extended attributes, alternate data streams, sparse layout, or hardlink
 // identity. A directory snapshot also does not preserve a concurrent writer's
 // atomicity; the handles bound what each entry can observe.
+//
+// Use CopyContentToContainer for an in-memory regular file.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("copy to container %s: %w", c.id, ErrSharedContainer)
@@ -143,15 +218,58 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	return nil
 }
 
+// CopyContentToContainer copies content into the running container as one
+// regular file. The bytes are written to the same private per-user staging tree
+// used by CopyToContainer before the backend CLI runs, and that tree is removed
+// on success, failure, and cancellation. mode sets the staged file's Unix
+// permission bits; zero selects 0600. A zero mode therefore cannot request mode
+// 0000. Non-permission bits are rejected with a ValidationError. Windows cannot
+// represent arbitrary Unix bits and maps the read-only attribute only.
+//
+// Empty content is valid. Content is never placed in argv, errors, or
+// diagnostics. The source bytes are bounded by MaxCopyToContainerSize, and the
+// caller must not modify content while the call is in progress.
+func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("copy content to container %s: %w", c.id, ErrSharedContainer)
+	}
+	if err := c.copyContentToContainer(ctx, content, containerPath, mode); err != nil {
+		var validation *ValidationError
+		if errors.As(err, &validation) {
+			return err
+		}
+		// Content is deliberately not passed to redactError: the copy path
+		// never renders it into an error, and hashing caller content would
+		// retain a potentially large secret in the matcher.
+		return c.redactError(err, containerPath)
+	}
+	return nil
+}
+
 const defaultCopyFilesParallelism = 4
 
+// fileCopyError intentionally retains only a source label rather than the
+// whole File, so Content cannot leak through an error rendering.
 type fileCopyError struct {
-	File File
-	Err  error
+	Source        string
+	ContainerPath string
+	Err           error
+}
+
+// sourceLabel names the source in diagnostics without ever rendering Content.
+func (f File) sourceLabel() string {
+	if f.Content != nil {
+		return "content"
+	}
+	return f.HostPath
+}
+
+func newFileCopyError(f File, err error) *fileCopyError {
+	return &fileCopyError{Source: f.sourceLabel(), ContainerPath: f.ContainerPath, Err: err}
 }
 
 func (e *fileCopyError) Error() string {
-	return fmt.Sprintf("copy %q to %q: %v", e.File.HostPath, e.File.ContainerPath, e.Err)
+	return fmt.Sprintf("copy %q to %q: %v", e.Source, e.ContainerPath, e.Err)
 }
 
 func (e *fileCopyError) Unwrap() error {
@@ -169,19 +287,16 @@ func (c *Container) copyFiles(ctx context.Context, files []File) error {
 		return err
 	}
 
-	if len(files) == 1 {
-		if err := c.copyFileWithTarget(ctx, target, files[0].HostPath, files[0].ContainerPath, false); err != nil {
-			return &fileCopyError{File: files[0], Err: err}
+	copyOne := func(runCtx context.Context, f File) error {
+		if err := c.copyFileWithTarget(runCtx, target, f, false); err != nil {
+			return newFileCopyError(f, err)
 		}
 		return nil
 	}
-
-	return copyFilesConcurrently(ctx, files, func(runCtx context.Context, f File) error {
-		if err := c.copyFileWithTarget(runCtx, target, f.HostPath, f.ContainerPath, false); err != nil {
-			return &fileCopyError{File: f, Err: err}
-		}
-		return nil
-	})
+	if len(files) == 1 {
+		return copyOne(ctx, files[0])
+	}
+	return copyFilesConcurrently(ctx, files, copyOne)
 }
 
 // copyFilesConcurrently applies copyFile to every file with bounded
@@ -270,20 +385,59 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 	if err != nil {
 		return err
 	}
-	return c.copyFileWithTarget(ctx, target, abs, containerPath, allowDirectory)
+	return c.copyFileWithTarget(ctx, target, File{HostPath: abs, ContainerPath: containerPath}, allowDirectory)
 }
 
-func (c *Container) copyFileWithTarget(ctx context.Context, target, hostPath, containerPath string, allowDirectory bool) (retErr error) {
+func (c *Container) copyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error {
 	if err := validateContainerPath(containerPath); err != nil {
-		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, err)
+		return newValidationErrorWithField("CopyContentToContainer", "containerPath", containerPath, validationCause(err))
 	}
-	abs, err := filepath.Abs(hostPath)
+	if err := validateCopyMode("CopyContentToContainer", mode); err != nil {
+		return err
+	}
+	if err := validateCopyContentSize("CopyContentToContainer", len(content)); err != nil {
+		return err
+	}
+	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	defer cliCancel()
+	target, err := c.verifiedOperationTarget(cliCtx)
 	if err != nil {
-		return fmt.Errorf("copy to container: %w", err)
+		return err
+	}
+	// A nil byte slice is valid empty content for this content-only API;
+	// File uses nil to mean Content is not set, so make the empty source
+	// explicit before it reaches the shared copy path.
+	if content == nil {
+		content = []byte{}
+	}
+	return c.copyFileWithTarget(ctx, target, File{Content: content, ContainerPath: containerPath, Mode: mode}, false)
+}
+
+func (c *Container) copyFileWithTarget(ctx context.Context, target string, f File, allowDirectory bool) (retErr error) {
+	if err := validateContainerPath(f.ContainerPath); err != nil {
+		return newValidationErrorWithField("CopyToContainer", "containerPath", f.ContainerPath, err)
+	}
+
+	var hostPath string
+	if f.Content == nil {
+		abs, err := filepath.Abs(f.HostPath)
+		if err != nil {
+			return fmt.Errorf("copy to container: %w", err)
+		}
+		hostPath = abs
 	}
 
 	stagingCtx, stagingCancel := withDefaultTimeout(ctx, copyStagingTimeout)
-	staged, cleanup, err := snapshotCopySource(stagingCtx, abs, allowDirectory)
+	var (
+		staged  string
+		cleanup func() error
+		err     error
+	)
+	if f.Content != nil {
+		staged, cleanup, err = stageCopyContent(stagingCtx, f.Content, f.Mode)
+	} else {
+		staged, cleanup, err = snapshotCopySource(stagingCtx, hostPath, copySourceOptions{allowDirectory: allowDirectory, mode: f.Mode})
+	}
 	stagingCancel()
 	if err != nil {
 		return err
@@ -294,9 +448,13 @@ func (c *Container) copyFileWithTarget(ctx context.Context, target, hostPath, co
 		}
 	}()
 
+	return c.runCopyCommand(ctx, target, staged, f.ContainerPath)
+}
+
+func (c *Container) runCopyCommand(ctx context.Context, target, staged, containerPath string) error {
 	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
-	_, _, err = c.runner.Run(cliCtx, c.eng.copyToArgs(target, staged, containerPath)...)
+	_, _, err := c.runner.Run(cliCtx, c.eng.copyToArgs(target, staged, containerPath)...)
 	if err != nil {
 		classified := c.classifyOperation(ctx, err, "cp")
 		return wrapNotFoundForOperation(c.eng, classified, "cp", target, c.id)
@@ -351,13 +509,21 @@ type openedCopySource struct {
 	reparse  bool
 }
 
-// snapshotCopySource makes a bounded private copy from one opened source
-// handle. The path returned to the CLI is never the caller's mutable path.
-func snapshotCopySource(ctx context.Context, source string, allowDirectory bool) (string, func() error, error) {
-	return snapshotCopySourceWith(ctx, source, allowDirectory, defaultCopySnapshotLimits, defaultCopySourceOpeners)
+// copySourceOptions selects how a source snapshot is built. A zero mode
+// preserves a regular file's Unix permission bits; a non-zero mode replaces
+// them for the root file only.
+type copySourceOptions struct {
+	allowDirectory bool
+	mode           fs.FileMode
 }
 
-func snapshotCopySourceWith(ctx context.Context, source string, allowDirectory bool, limits copySnapshotLimits, openers copySourceOpeners) (string, func() error, error) {
+// snapshotCopySource makes a bounded private copy from one opened source
+// handle. The path returned to the CLI is never the caller's mutable path.
+func snapshotCopySource(ctx context.Context, source string, opts copySourceOptions) (string, func() error, error) {
+	return snapshotCopySourceWith(ctx, source, opts, defaultCopySnapshotLimits, defaultCopySourceOpeners)
+}
+
+func snapshotCopySourceWith(ctx context.Context, source string, opts copySourceOptions, limits copySnapshotLimits, openers copySourceOpeners) (string, func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, fmt.Errorf("copy to container: %w", err)
 	}
@@ -378,8 +544,54 @@ func snapshotCopySourceWith(ctx context.Context, source string, allowDirectory b
 	cleanup := func() error { return cleanupCopyStagingDir(dir) }
 	staged := filepath.Join(dir, copySourceBase(source))
 	state := copySnapshotState{limits: limits}
-	if err := snapshotCopyEntry(ctx, source, staged, opened, allowDirectory, 0, &state, openers); err != nil {
+	if err := snapshotCopyEntry(ctx, source, staged, opened, opts.allowDirectory, opts.mode, 0, &state, openers); err != nil {
 		return "", nil, errors.Join(err, cleanup())
+	}
+	return staged, cleanup, nil
+}
+
+// stageCopyContent writes one in-memory regular file into the same private
+// per-user staging tree used for host-path snapshots. The staged file starts at
+// 0600 and is changed to the requested permission bits before the CLI runs.
+func stageCopyContent(ctx context.Context, content []byte, mode fs.FileMode) (string, func() error, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, fmt.Errorf("copy to container: %w", err)
+	}
+	if int64(len(content)) > MaxCopyToContainerSize {
+		return "", nil, contentTooLargeError(len(content))
+	}
+	root, err := prepareCopyStagingRoot()
+	if err != nil {
+		return "", nil, err
+	}
+	dir, err := createCopyStagingDir(root)
+	if err != nil {
+		return "", nil, fmt.Errorf("copy to container: create private staging directory: %w", err)
+	}
+	cleanup := func() error { return cleanupCopyStagingDir(dir) }
+
+	staged := filepath.Join(dir, "content")
+	dst, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", nil, errors.Join(fmt.Errorf("copy to container: create staged content file: %w", err), cleanup())
+	}
+	if _, err := dst.Write(content); err != nil {
+		_ = dst.Close()
+		return "", nil, errors.Join(fmt.Errorf("copy to container: write staged content file: %w", err), cleanup())
+	}
+	if err := ctx.Err(); err != nil {
+		_ = dst.Close()
+		return "", nil, errors.Join(fmt.Errorf("copy to container: %w", err), cleanup())
+	}
+	if mode == 0 {
+		mode = 0o600
+	}
+	if err := dst.Chmod(mode); err != nil {
+		_ = dst.Close()
+		return "", nil, errors.Join(fmt.Errorf("copy to container: set staged content file mode: %w", err), cleanup())
+	}
+	if err := dst.Close(); err != nil {
+		return "", nil, errors.Join(fmt.Errorf("copy to container: close staged content file: %w", err), cleanup())
 	}
 	return staged, cleanup, nil
 }
@@ -541,7 +753,7 @@ func (s *copySnapshotState) enter(source string, depth int) error {
 	return nil
 }
 
-func snapshotCopyEntry(ctx context.Context, source, staged string, src *openedCopySource, allowDirectory bool, depth int, state *copySnapshotState, openers copySourceOpeners) error {
+func snapshotCopyEntry(ctx context.Context, source, staged string, src *openedCopySource, allowDirectory bool, override fs.FileMode, depth int, state *copySnapshotState, openers copySourceOpeners) error {
 	defer func() { _ = src.file.Close() }()
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("copy to container: %w", err)
@@ -552,7 +764,7 @@ func snapshotCopyEntry(ctx context.Context, source, staged string, src *openedCo
 	var snapshotErr error
 	switch {
 	case src.info.Mode().IsRegular():
-		snapshotErr = snapshotCopyFile(ctx, source, staged, src, state)
+		snapshotErr = snapshotCopyFile(ctx, source, staged, src, state, override)
 	case src.info.Mode().IsDir():
 		if depth == 0 && !allowDirectory {
 			return unsupportedCopySource(source)
@@ -567,7 +779,7 @@ func snapshotCopyEntry(ctx context.Context, source, staged string, src *openedCo
 	return copySourcePathPresent(src.path)
 }
 
-func snapshotCopyFile(ctx context.Context, source, staged string, src *openedCopySource, state *copySnapshotState) error {
+func snapshotCopyFile(ctx context.Context, source, staged string, src *openedCopySource, state *copySnapshotState, override fs.FileMode) error {
 	remaining := state.limits.maxBytes - state.bytes
 	if src.info.Size() > remaining {
 		return tooLargeCopySource(source)
@@ -601,7 +813,11 @@ func snapshotCopyFile(ctx context.Context, source, staged string, src *openedCop
 		_ = dst.Close()
 		return changedCopySource(source, nil)
 	}
-	if err := dst.Chmod(src.info.Mode().Perm()); err != nil {
+	stagedMode := src.info.Mode().Perm()
+	if override != 0 {
+		stagedMode = override.Perm()
+	}
+	if err := dst.Chmod(stagedMode); err != nil {
 		_ = dst.Close()
 		return fmt.Errorf("copy to container: set staged file mode %q: %w", staged, err)
 	}
@@ -631,7 +847,7 @@ func snapshotCopyDirectory(ctx context.Context, source, staged string, src *open
 			if err != nil {
 				return err
 			}
-			if err := snapshotCopyEntry(ctx, childSource, filepath.Join(staged, name), child, true, depth+1, state, openers); err != nil {
+			if err := snapshotCopyEntry(ctx, childSource, filepath.Join(staged, name), child, true, 0, depth+1, state, openers); err != nil {
 				return err
 			}
 		}

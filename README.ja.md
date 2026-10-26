@@ -115,11 +115,16 @@ func TestRedis(t *testing.T) {
 |---|---|---|
 | macOS | Apple Container | macOS 26+、Apple Silicon、[Apple Container](https://github.com/apple/container) CLI 1.2.2 または 1.3.0、`container system start` 実行済み |
 | Linux | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要 |
-| Windows | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要（watchdog リーパーなし。後述） |
+| Windows | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要（watchdog リーパーなし。`TestMain` で `Prune` を実行。クリーンアップの契約を参照） |
 
 macOS で Docker（Docker Desktop など）を使う場合は
 `CONTAINERGO_BACKEND=docker` を、Apple Container を明示する場合は
 `CONTAINERGO_BACKEND=apple` を設定します。
+
+Windows では watchdog リーパーが使えず、remote daemon はローカルの
+テスト環境より長く残ります。リーパーによる残骸の回収を期待せず、
+クリーンアップの契約に従って `TestMain` の前後で `Prune` を実行して
+ください。
 
 本ライブラリはバックエンドの CLI（`container` / `docker`）を子プロセスとして
 呼び出します。cgo もデーモン API クライアントも使いません。
@@ -872,6 +877,55 @@ reuse container は削除・再作成されます。この変数をグローバ�
 この filter は running または created 状態を選びません。Apple では、各
 candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、
 session、管理対象ラベル、および停止状態が再確認されます。
+
+`container.WithPruneOlderThan(d)` は、backend が報告する作成時刻が
+now-d より前の candidate だけに対象を絞ります。共有 daemon や remote
+daemon で掃除するとき、並行して動く job が最近停止したコンテナを
+残せます。作成時刻を報告しない candidate も残します。通常の `Prune` は
+引き続き停止済みの managed コンテナだけを選ぶため、実行中のまま残った
+コンテナは停止するまで削除されません。
+
+### Windows と remote daemon の cleanup
+
+リーパーはローカルの `/bin/sh` 子プロセスです。Windows では利用できず、
+CI の job cancel や `go test -timeout` でローカルの process tree や
+runner VM が破棄された後にも動作できません。remote Docker daemon 上の
+コンテナもローカル環境より長く残ります。リーパーが動作する場合でも
+登録と削除は best-effort であり、cleanup の成功確認には使えません。
+
+そのような環境では、suite の前後に `TestMain` から停止済みの managed
+コンテナを掃除します。次の helper を `TestMain` から呼び、その戻り値で
+終了してください（`func TestMain(m *testing.M) { os.Exit(pruneAndRun(m)) }`）。
+
+```go
+package docexample
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	container "github.com/hirokazumiyaji/container-go"
+)
+
+func pruneAndRun(m *testing.M) int {
+	ctx := context.Background()
+	// Reap leftovers that are old enough not to belong to a concurrent run.
+	_, _ = container.Prune(ctx, container.WithPruneOlderThan(6*time.Hour))
+	code := m.Run()
+	// Remove this run's stopped containers.
+	_, _ = container.Prune(ctx)
+	return code
+}
+```
+
+`Prune` は本 library が作成した停止済みコンテナだけを、session に
+関係なく削除します。running と created は対象外です。共有 daemon や
+remote daemon では、suite 前の掃除に age filter を残して他の job が
+最近停止したコンテナを保護し、suite 後に通常の `Prune` を使うのは
+その job 専用の daemon のときだけにしてください。これらの呼び出しは、
+process の環境変数経由でも、その daemon に固定した `Client` 経由でも
+remote daemon に対して使えます。
 
 ## Reuse（テスト / process 間でのコンテナ共有）
 

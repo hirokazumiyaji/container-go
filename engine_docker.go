@@ -1338,6 +1338,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	match := -1
 	var malformedID string
+	var malformedIDSeen bool
 	var candidateMissingState bool
 	if dockerIDRE.MatchString(target) {
 		for i, c := range containers {
@@ -1352,25 +1353,36 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	} else {
 		for i, c := range containers {
-			if target != "" && c.Name == "/"+target {
-				if c.ID != "" && !dockerIDRE.MatchString(c.ID) {
-					if malformedID == "" {
-						malformedID = c.ID
-					}
-					continue
-				}
-				if c.State != nil && dockerIDRE.MatchString(c.ID) {
-					match = i
-					break
-				}
+			if target == "" || c.Name != "/"+target {
+				continue
 			}
+			// A name-matched entry without a container ID is unreadable,
+			// not absent: skipping it would report a container that exists
+			// as missing. An empty ID is as invalid as any other
+			// non-canonical one.
+			if !dockerIDRE.MatchString(c.ID) {
+				if !malformedIDSeen {
+					malformedID = c.ID
+					malformedIDSeen = true
+				}
+				continue
+			}
+			// Apply the same State/Status validation as ID addressing.
+			// Otherwise a target-naming entry whose state cannot be read
+			// would be accepted as a match or reported as absent.
+			if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
+				candidateMissingState = true
+				continue
+			}
+			match = i
+			break
 		}
 	}
 	if match < 0 {
 		if candidateMissingState {
 			return nil, fmt.Errorf("decode docker inspect output: container State.Status is required")
 		}
-		if malformedID != "" {
+		if malformedIDSeen {
 			return nil, fmt.Errorf("decode docker inspect output: container %s has invalid ID %q", target, malformedID)
 		}
 		return nil, newInspectTargetNotFound(target, "inspect output did not contain the requested target")

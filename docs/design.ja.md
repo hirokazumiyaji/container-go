@@ -154,7 +154,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithName(name string)`：コンテナ名を指定する（省略時は `containergo-<ランダムな 16 進数>`）。共有の 1～63 文字 guard を使う。Apple のより厳密な 2～63 文字 rule は Apple バックエンドの preflight が image 解決前に強制する。
 - `WithLabels(labels map[string]string)`：追加ラベルを指定する。ライブラリが管理するラベルは予約済みである。
 - `WithMounts(mounts ...Mount)`：bind、名前付きボリューム、tmpfs のマウントを指定する。bind source は host OS の path 構文を使うため、ローカル Docker daemon では Windows の host path も受け付ける。remote Docker daemon への bind mount は、daemon が source path を自分の host で解決するため `ErrUnsupportedCapability` で拒否する。
-- `WithFiles(files ...File)`：起動後のコンテナへファイルをコピーする。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
+- `WithFiles(files ...File)`：起動後のコンテナへ通常ファイルをコピーする。option 評価時にディレクトリ、シンボリックリンク、特殊ファイルを拒否する。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
 - `WithPublishedPort(spec string)`：ホスト側ポートの明示的な公開を指定する。Apple Container は通常コンテナへ直接接続し、Docker は `WithExposedPorts` で宣言したポートを daemon が host port へ自動公開する。特定の host port が必要な場合だけ明示的な binding を使う。
 - `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever`（Docker のみ。Apple は `ErrPullNeverUnsupported`）を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
 - `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。作成専用 option は attach 時に無視される。
@@ -164,6 +164,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithNetwork(name string)`：既存の名前付きネットワークへ接続する。省略時は Docker が daemon の既定 network（Linux では `bridge`、native Windows では `nat`）を使う。
 - `WithNetworkAliases(aliases ...string)`：Docker の `--network-alias` として network-scoped DNS alias を追加する。明示的な user-defined `WithNetwork` が必要で、default bridge（`bridge`/`nat`）、`host`、`none` は `*ConfigError`、Apple は `ErrUnsupportedCapability` で拒否する。alias は DNS label として検証し、reuse の互換性比較にも含める。
 - `WithPlatform(p string)`：`linux/amd64` のようなイメージプラットフォームを指定する（Apple Container では Rosetta を含む）。
+
 
 バックエンド中立の CLI 面にないオプションは意図的に提供しない。
 公開 API にログ注入用のフックはない。
@@ -219,7 +220,8 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 各 source entry は、最終要素のリンクを追わずに一度だけ開く。
 ディレクトリ内の child は、既に開いた親ハンドルからの相対 open で取得する。
 そのハンドルを、backend CLI の実行前に現在のユーザー専用の staging root へコピーする。
-`WithFiles` も同じ経路を使うが、ディレクトリを拒否する。
+`WithFiles` も同じ経路を使うが、option 評価時に通常ファイル以外
+（ディレクトリ、シンボリックリンク、特殊ファイル）を `ValidationError` で拒否する。
 staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
 ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
 スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
@@ -250,11 +252,11 @@ Apple Container では、`Host` は inspect の最初の `status.networks[].ipv4
 ローカルの Docker daemon でクライアントが `localhost` を要求する場合、またはコンテナ IP に到達できない構成では、`WithPublishedPort("127.0.0.1:15432:5432")` のように明示的に公開する。この loopback example は local-only であり、non-loopback の `DOCKER_HOST` では loopback binding を reject する。検出した non-loopback `DOCKER_HOST` デーモンでは remote-safe な binding と endpoint を使う。公開すると `Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。`Host`、`Endpoint`、`MappedPort`、`ContainerIP` の解決は、同一性を検証した動的 inspect を短い（約 1 秒）TTL で `Shared()` handle 間でも共有し、readiness の 100ms ごとの retry で毎回 inspect しないようにする一方、stale なネットワークとポートデータは無期限には保持しない。利用可能な IP（direct-IP）や host binding（published-port）が無い不完全な結果は cache hit にしない。`State` は常に再 inspect し、lifecycle の fail-fast を遅らせない。
 
 `MappedPort` と `Endpoint` は、`WithExposedPorts` で宣言したポートと明示的に公開したポート、または利用できる host binding がないポートを `ErrPortNotExposed` にする。
-宣言は wait strategy にも使われる。`ForExposedPort` は最初に宣言したポートを使い、`Target.Endpoint` の空 port も同じ最初の宣言を選ぶ。
+宣言は wait strategy にも使われる。`ForExposedPort` は最初の exposed TCP port を使い、TCP の exposed 宣言がなければ最初の published TCP port を選ぶ。`Target.Endpoint` の空 port も同じ TCP 宣言を選ぶ。
 
 不変な同一性情報（UID、イメージ、ラベル）は検証後にキャッシュし、動的なネットワーク、IP、ポート束縛は上記の短い TTL で endpoint 読み取りに使い、`State` は呼び出しのたびに再 inspect する。Docker が
-複数 network を報告し top-level address がない場合、現在の network selection は
-決定的な first-network contract ではなく unspecified である。
+複数 network を報告し top-level address がない場合、network 名の辞書順で最初に見つかる
+空でない IP address を使う。
 Docker の `host` と `none` モードは、このライブラリが管理するポート束縛を
 作成できません。
 `Internal: true` または isolated bridge gateway mode の外部遮断
@@ -326,18 +328,10 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 
 - `wait.ForLog(pattern)`：`FollowLogs` のストリームを読み、部分文字列（`AsRegexp` による正規表現も可）が現れるまで待つ。照合は行単位で行い、`WithOccurrence(n)` で出現回数を指定できる。ストリーム方式なので poll 方式ではない。
 - `wait.ForListeningPort(port)`：解決したエンドポイントへの TCP 接続が成功するまで poll する。
-- `wait.ForExposedPort()`：`WithExposedPorts` で最初に宣言したポートを使う。
+- `wait.ForExposedPort()`：最初の exposed TCP port を使い、TCP の exposed 宣言がなければ最初の published TCP port を選ぶ。
 - `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定する。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。
-- `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。
-- `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。
-- `wait.ForLog(s string)`：`container logs --follow` の出力に部分文字列(または `AsRegexp` で正規表現)が現れるまで待つ。`WithOccurrence(n)` で出現回数を指定できる
-- `wait.ForListeningPort(port string)`：コンテナの対象エンドポイントへ TCP 接続できるまで待つ。
-  指定形式は `PORT` または `PORT/tcp` だけ。
-  UDP と不正な形式は `Target.Endpoint` を呼び出す前に `*wait.ConfigError` 型で返す。
-  このエラーは `wait.ErrInvalidConfiguration` と一致する。
-- `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ
-- `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
-- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。各子は自身の `WithStartupTimeout` を持ち、正の合成 `WithStartupTimeout` で合成全体を制限できる。合成のタイムアウトを正の値にしなければ、0 または負の値では合成を無制限にし、各子のタイムアウトを適用する。
+- `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。各試行の timeout は poll interval から 1〜5 秒の範囲で導出し、`WithExecTimeout` で上書きできる。
+- `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。合成 timeout が 0 または負の場合は合成全体を無制限とし、各子の timeout を適用する。
 
 すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を持つ。`ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間である。コンテナが stopping、stopped、paused の状態のいずれかになると、残りのタイムアウトを待たずに失敗する。created、restarting、unknown と一時的な inspect エラーは再試行し、一時的なログストリームの open と EOF は再-open する。終了コードを伴うログストリームエラーは返却する。成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理される。`ForLog` はワンショットジョブではなく長時間稼働するサービス向けである。`ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計する。再利用でない `Run` の待機が失敗した場合はコンテナをロールバックし、上限付き log の取得が成功した場合だけ 1MiB 上限の末尾をエラーに付ける。再利用の待機失敗では共有コンテナを残す。
 
@@ -396,8 +390,9 @@ error と各 entry の delete error は `Run` に返らない。spawn failure �
 上限に達した場合は一度だけ log に残り、delete failure は shell が無視する。
 各 backend 呼び出しには POSIX の `sleep` / `kill` による 10–30 秒の期限があり、
 timer process も回収する。reap 全体にも overall budget があり、それを超えると
-新規の backend 呼び出しは発行しない。entry は少数ずつ並行処理するため、
-コストがコンテナ数に厳密比例しない。
+新規の backend 呼び出しは発行しない。worker pool は並列度を制限し、
+いずれかの worker が終了すると次の entry を開始する。budget が切れて
+未開始の entry が残る場合、container ID を出さず残件数を stderr に報告する。
 
 **残骸の回収**：watchdog は Windows では使えず、CI のキャンセルや
 `go test -timeout` などでローカルの process tree や runner VM が破棄された
@@ -453,7 +448,7 @@ reuse container は削除・再作成される。この変数をグローバル�
 
 `WithReuse` は安定した `WithName` に対する `Run` を get-or-create にする。共有は同じ host の process 間で行う。既存コンテナは managed marker、`WithReuse` marker、有効な creation generation、および Docker では有効な immutable UID を持つ必要があり、各呼び出しは自分の wait strategy を再実行する。停止済みコンテナはこれらの ownership check と image check に合格した場合だけ削除・再作成の対象になる。image 互換性は元の mutable tag ではなく解決済み digest / image ID で判定し、Docker では要求した network identity も一致する必要がある。reuse は互換性 check の前と readiness 後、handle を返す直前に再 inspect する。Docker は immutable UID、Apple は creation generation を再確認するため、wait 中の置き換えは adopt せず error になる。port 互換性は backend ごとに異なる。Docker は `WithExposedPorts` の自動公開 binding と明示的な `WithPublishedPort` binding を比較する。Apple は明示的な published binding を比較するが、library の Apple inspect model に `WithExposedPorts` の宣言が残らないため、その宣言は比較できない。Apple の各呼び出しは自分の exposed-port 宣言を共有コンテナ IP へ使う。宣言を分離したい場合は名前を変える。`WithFiles` は attach caller を含むすべての caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずエラーを返す。`PullAlways` は attach 前にも各 caller で実行される。`env`、`cmd`、`mounts` の差は既存コンテナへ黙って attach する。分離が必要なら異なる名前を使うか、`Exec` で状態を初期化する。`CONTAINERGO_KEEP=1` はこの reuse rule を変えない。条件に一致した stopped reuse container は削除・再作成され、`PruneReuseGroup` はその group を削除できる。
 
-Apple では delete 前に fresh inspect を行い、inspect と delete を一時ディレクトリ内の名前単位 `flock`（`containergo-<name>.lock`）で直列化する。同じ host で本ライブラリの generation-checked `Terminate` と failed-create cleanup、Apple の `Prune` と `PruneReuseGroup`、および名前で address する reaper entry は名前単位 `flock` で保護される。外部ツールによる同じ窓の delete / recreate は保証外である。Docker の handle は `docker run` が出力した、または inspect で検証した完全な不変 `Id` で削除するため、同じ名前の置き換えとは delete target の ID が一致しない。Docker のすべての backend operation はその immutable ID を使い、inspect parser は要求した ID や name に一致しない object を拒否する。これらは別の保護であり、reuse は backend CLI を直接使う信頼できない process に対する一般的な fail-closed 保証ではない。
+Apple では delete 前に fresh inspect を行い、inspect と delete を現在ユーザー専用の永続ディレクトリ内で、コンテナ名のハッシュを使う名前単位 `flock` で直列化する。同じ host で本ライブラリの generation-checked `Terminate` と failed-create cleanup、Apple の `Prune` と `PruneReuseGroup`、および名前で address する reaper entry は名前単位 `flock` で保護される。外部ツールによる同じ窓の delete / recreate は保証外である。Docker の handle は `docker run` が出力した、または inspect で検証した完全な不変 `Id` で削除するため、同じ名前の置き換えとは delete target の ID が一致しない。Docker のすべての backend operation はその immutable ID を使い、inspect parser は要求した ID や name に一致しない object を拒否する。これらは別の保護であり、reuse は backend CLI を直接使う信頼できない process に対する一般的な fail-closed 保証ではない。
 
 pull flight がまとめるのは *並行* 呼び出しだけである。完了するとエントリは
 削除されるため、前の `Run` が終わったあとの `Run` は再び image を inspect

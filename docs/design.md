@@ -244,8 +244,9 @@ described below are not.
   for a local Docker daemon; a bind mount against a remote Docker daemon is
   rejected with `ErrUnsupportedCapability` because the daemon resolves the
   source path on its own host.
-- `WithFiles(files ...File)`: files copied into the running container
-  after start; a copy failure rolls back `Run`. On `WithReuse`, files
+- `WithFiles(files ...File)`: regular files copied into the running container
+  after start; a directory, symlink, or special source is rejected at option
+  evaluation, and a copy failure rolls back `Run`. On `WithReuse`, files
   are copied for every caller, including attach callers; an attach copy
   failure returns an error without deleting the shared container.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
@@ -302,8 +303,9 @@ they are rejected.
 `ValidationError.Err` is the source of truth for the rendered message and
 unwrap chain. The exported `Message` field remains for source compatibility
 but does not override `Err`. `Run` validates its image before invoking any
-`Option`; `WithFiles` resolves and stats each host path before image or
-container work; Docker applies its complete local-volume-name grammar in
+`Option`; `WithFiles` resolves each host path and rejects anything that is
+not a regular file before image or container work; Docker applies its
+complete local-volume-name grammar in
 `checkConfig` while Apple keeps its backend-specific name rules. Copy paths
 are interpreted as POSIX paths with the `path` package, and a negative
 `Container.Stop` timeout is rejected before the CLI is called.
@@ -497,9 +499,10 @@ available on both backends.
 source entry once without following a final link; directory children are
 opened relative to the already-open parent handle. It copies from those
 handles into a current-user-only staging root before invoking either CLI.
-`WithFiles` uses the same snapshot path but rejects directories. Separate
-staging and CLI deadlines prevent filesystem work from consuming the CLI
-budget, while a caller deadline remains authoritative for both. Directory
+`WithFiles` uses the same snapshot path but rejects directories, symlinks,
+and special files when the option is applied, before any backend call.
+Separate staging and CLI deadlines prevent filesystem work from consuming the
+CLI budget, while a caller deadline remains authoritative for both. Directory
 snapshots are bounded by file bytes, entry count, depth, and aggregate
 source-path metadata. They intentionally preserve only names, bytes, and
 Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
@@ -545,14 +548,15 @@ lifecycle fail-fast paths stay immediate.
 `MappedPort` and `Endpoint` return `ErrPortNotExposed` for ports that
 are neither declared via `WithExposedPorts` nor explicitly published, or
 for a declared port with no usable host binding. The declarations also
-feed wait strategies: `ForExposedPort` uses the first declared port, and
-an empty `Target.Endpoint` port selects that same first declaration.
+feed wait strategies: `ForExposedPort` uses the first exposed TCP port,
+falling back to the first published TCP port. An empty `Target.Endpoint`
+port selects the same TCP declaration.
 
 Immutable identity (UID, image, labels) is cached after validation;
 dynamic network, IP, and port-binding data use the short TTL above on
 endpoint reads, while `State` refreshes on every call. For Docker with
-multiple networks and no top-level address, current network selection is
-unspecified rather than a deterministic first-network contract.
+multiple networks and no top-level address, the IP comes from the first
+network with a non-empty address in lexicographic network-name order.
 Docker's `host` and `none` network modes cannot create
 library-managed port bindings.
 Externally isolated networks (`Internal: true` or an isolated bridge
@@ -614,8 +618,8 @@ provides:
   strategy is stream-based rather than poll-based.
 - `wait.ForListeningPort(port)`: poll a TCP connection to the resolved
   endpoint until it succeeds.
-- `wait.ForExposedPort()`: use the first port declared by
-  `WithExposedPorts`.
+- `wait.ForExposedPort()`: use the first exposed TCP port, falling back to
+  the first published TCP port when no exposed TCP port is declared.
 - `wait.ForHTTP(path)`: send an HTTP request to the resolved endpoint
   until its status matches (2xx by default; change it with
   `WithStatusCodeMatcher`). `WithPort` and `WithMethod` select the
@@ -623,34 +627,16 @@ provides:
   `WithHeader`, `WithBasicAuth`, `WithTLS`, `WithTLSConfig`, and
   `WithHTTPClient`; these setters are not in `v0.2.0`.
 - `wait.ForExec(cmd)`: run a command through the backend CLI until it
-  exits with an accepted code (0 by default).
+  exits with an accepted code (0 by default). Each attempt has a timeout
+  derived from the poll interval (1–5s); `WithExecTimeout` overrides it.
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`:
   composition. Child strategies keep their own settings. In the current
   development checkout, the exported `AllStrategy` and `AnyStrategy`
   types expose `WithStartupTimeout` to bound the whole composition;
   they do not expose `WithPollInterval`. The `v0.2.0` functions return
-  an interface without a composite timeout setter.
-- `wait.ForLog(s string)`: wait until a substring (or regexp via
-  `AsRegexp`) appears in `container logs --follow` output;
-  `WithOccurrence(n)` for repeat counts
-- `wait.ForListeningPort(port string)`: wait until a TCP connection to
-  the container endpoint succeeds. The specification may be `PORT` or
-  `PORT/tcp`; UDP and malformed specifications return a typed
-  `*wait.ConfigError` before any target probe. The error matches
-  `wait.ErrInvalidConfiguration`.
-- `wait.ForHTTP(path string)`: wait until an HTTP request via
-  `net/http` matches the status predicate (2xx by default,
-  `WithStatusCodeMatcher` to change). `WithPort` / `WithMethod` select
-  the target; `WithHeaders` / `WithBasicAuth` / `WithTLS` /
-  `WithTLSConfig` / `WithHTTPClient` cover auth, TLS, and custom
-  transports without breaking the default plain-HTTP probe.
-- `wait.ForExec(cmd []string)`: wait until `container exec` exits with
-  an accepted code (0 by default)
-- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
-  composition. Each child keeps its own `WithStartupTimeout`; a positive
-  composition `WithStartupTimeout` bounds the whole sequence/concurrent
-  wait. With no positive composition timeout, zero or a negative value
-  leaves the composition unbounded and the child timeouts apply.
+  an interface without a composite timeout setter. Zero or a negative
+  composition timeout leaves the composition unbounded; child timeouts
+  still apply.
 
 Every leaf strategy carries `WithStartupTimeout` (zero means 60s) and
 `WithPollInterval` (zero means 100ms, except `ForExec`, which defaults to
@@ -738,8 +724,9 @@ repeated spawn failures are logged once after the retry limit, and
 delete failures are ignored by the shell. Each backend call is bounded
 by a POSIX `sleep`/`kill` timeout that cleans up its timer process, and
 the whole reap has an overall budget past which no new backend calls
-are issued. Entries are processed a few at a time so the cost is not
-strictly proportional to the container count.
+are issued. A bounded worker pool starts the next entry as soon as any
+worker finishes. If the budget expires with entries still queued, the
+reaper reports the unstarted count on stderr without naming container IDs.
 
 **Recovering leftovers**: the watchdog cannot help on Windows, after the
 local process tree or runner VM is destroyed (for example on CI
@@ -856,8 +843,9 @@ and compatibility checks, so a replacement during the wait is not adopted.
 reuse container can still be deleted and recreated, and
 `PruneReuseGroup` can still remove the group.
 
-For Apple, inspect plus delete runs under a per-name `flock` in the temp
-directory (`containergo-<name>.lock`). That protects the ordinary
+For Apple, inspect plus delete runs under a per-name `flock` in a persistent,
+user-scoped lock directory, with the container name hashed into the filename.
+That protects the ordinary
 generation-checked `Terminate` and failed-create cleanup paths from
 cooperating library processes on the same host, and the same per-name lock
 covers Apple `Prune` and `PruneReuseGroup` candidate deletion. The reaper

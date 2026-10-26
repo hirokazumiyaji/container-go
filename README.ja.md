@@ -303,8 +303,8 @@ default と誤認しません。identity を取得できない場合や曖昧な
 `host`、`none`、任意の名前付き network の wildcard にはしません。
 Docker の handle は `run` が返した immutable な container ID を保持し、
 endpoint、Host、lifecycle、reuse の inspect はその ID を対象にします。
-network、IP、binding などの dynamic データは毎回更新され、古い snapshot
-は再利用されません。
+endpoint の読み取りは後述の短い TTL の dynamic snapshot を共有し、
+lifecycle と reuse の確認では更新します。
 
 並列テストで同じ論理名を使いたい場合は、テストごとに user-defined
 network を作成し（`docker network create` など）、`t.Cleanup` で削除した
@@ -375,8 +375,8 @@ endpoint 関連メソッドは、同一性を検証した短い（約 1 秒）dy
 スナップショットを `Shared()` handle 間で共有し、readiness の retry ごとに
 backend CLI を起動しないようにします。キャッシュした network、IP、binding は
 TTL で失効し、`State` は常に再 inspect します。Docker が複数 network を
-報告し top-level address がない場合、現在の network selection は
-決定的な first-network contract ではなく unspecified です。
+報告し top-level address がない場合、network 名の辞書順で最初に見つかる
+空でない IP address を使います。
 
 ## 待機戦略
 
@@ -1024,8 +1024,9 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   値でも env ファイルには書かないという意図的な互換性変更です。
 - `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
   開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
-  `WithFiles` は通常ファイル専用です。
-  シンボリックリンク、reparse point、特殊ファイルは拒否します。
+  `WithFiles` は通常ファイル専用で、option 評価時にディレクトリ、
+  シンボリックリンク、reparse point、特殊ファイルを backend 呼び出し前に拒否します。
+  コピー経路はシンボリックリンク、reparse point、特殊ファイルを拒否します。
   スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
   保持するメタデータは名前、バイト列、Unix パーミッションだけです。
   タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。

@@ -325,9 +325,8 @@ identity is unavailable or ambiguous, the operation fails with
 daemon default, but never treats an omitted option as a wildcard for
 `host`, `none`, or an arbitrary named network. Docker handles retain
 the immutable container ID returned by `run`, and endpoint, Host, lifecycle,
-and reuse operations inspect that ID; dynamic network, IP, and binding
-data are refreshed on every operation rather than served from a stale
-snapshot.
+and reuse operations inspect that ID. Endpoint reads can share the short-lived
+dynamic snapshot described below; lifecycle and reuse checks refresh it.
 
 For parallel tests that need the same logical name on separate networks,
 create a user-defined network per test (for example with `docker network
@@ -400,8 +399,8 @@ Endpoint-related methods reuse a short (~1s), identity-checked dynamic
 inspect snapshot shared with `Shared()` handles, so readiness polling does
 not spawn a backend CLI process on every retry. The cached network, IP, and
 binding data expires after that TTL; `State` always re-inspects. If Docker
-reports multiple networks and no top-level address, network selection is
-currently unspecified rather than a deterministic first-network contract.
+reports multiple networks and no top-level address, the IP comes from the
+first network with a non-empty address in lexicographic network-name order.
 
 ## Wait strategies
 
@@ -1088,8 +1087,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   Apple's stricter 2–63-character name check runs before container creation.
 - `CopyToContainer` opens regular files and directories without following
   final links, then snapshots the opened handles into a per-user private
-  staging path before invoking the backend. `WithFiles` is regular-file-only.
-  Symlinks/reparse points and special files are rejected. Snapshots are
+  staging path before invoking the backend. `WithFiles` is regular-file-only
+  and rejects directories, symlinks/reparse points, and special files when the
+  option is applied, before any backend call. Snapshots are
   bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
   `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
   (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source

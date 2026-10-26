@@ -101,7 +101,7 @@ type engineInfo struct {
 	// concrete default network (bridge on Linux, nat on Windows).
 	networkNames []string
 	// networkAliases contains the network-scoped DNS aliases and DNS names
-	// Docker reports for the container's attached networks. Docker is the
+	// Docker reports for the container's configured network. Docker is the
 	// only backend with network aliases.
 	networkAliases []string
 	// defaultNetwork is the authoritative Docker daemon default identity

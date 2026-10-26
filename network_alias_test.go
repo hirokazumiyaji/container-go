@@ -450,3 +450,23 @@ func TestDockerReuseDoesNotAttachWithDifferentNetworkAliases(t *testing.T) {
 		t.Fatalf("second reuse Run created another container: %v", run)
 	}
 }
+
+func TestDockerReuseRejectsAliasOnAnotherNetwork(t *testing.T) {
+	data := fmt.Sprintf(`[{
+		"Id": %q, "Name": "/myctr", "State": {"Status": "running"},
+		"Config": {"Image": "redis:7-alpine"},
+		"HostConfig": {"NetworkMode": "test-net"},
+		"NetworkSettings": {"Networks": {
+			"test-net": {"Aliases": ["myctr"], "DNSNames": ["myctr"]},
+			"other-net": {"Aliases": ["db"], "DNSNames": ["db"]}
+		}}
+	}]`, dockerFixtureID)
+	info, err := (dockerEngine{}).parseInspect([]byte(data), "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	cfg := dockerTestConfig(t, WithNetwork("test-net"), WithNetworkAliases("db"))
+	if err := dockerReuseNetworkAliasesError(cfg, info); !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("alias on another network accepted: %v", err)
+	}
+}

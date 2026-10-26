@@ -1379,12 +1379,9 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	sort.Strings(networkNames)
 
-	var networkAliases []string
-	for _, name := range networkNames {
-		endpoint := c.NetworkSettings.Networks[name]
-		networkAliases = append(networkAliases, endpoint.Aliases...)
-		networkAliases = append(networkAliases, endpoint.DNSNames...)
-	}
+	endpoint := c.NetworkSettings.Networks[c.HostConfig.NetworkMode]
+	networkAliases := append([]string(nil), endpoint.Aliases...)
+	networkAliases = append(networkAliases, endpoint.DNSNames...)
 	sort.Strings(networkAliases)
 
 	info := &engineInfo{

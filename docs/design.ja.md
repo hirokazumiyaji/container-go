@@ -638,10 +638,11 @@ type WriterRunner interface {
 
 **統合テスト**は `integration` build tag を使う。root のテストスイートには Apple Container と Docker のライフサイクル、接続、exec、copy、cleanup、Reuse、watchdog のケースがある。各バックエンドの helper は先に CLI とサービスを確認し、利用できなければ skip する。`make integration` は両バックエンドを実行して pull が重い bench と singleflight を除外し、`make integration-docker` は Docker を選択する。`make bench-integration` は pull が重いシナリオと独立したベンチマークモジュールを実行する（nested `bench/` module は Go 1.26+）。
 
-**CI**：`.github/workflows/ci.yml` は `ubuntu-latest` で Go 1.26.0 と安定版 Go を使い、ユニットテスト、race テスト、lint、`govulncheck` を実行する。同じ runner で Docker 統合テストの行列も実行する。Apple Container 統合テストは意図的にローカル専用である。GitHub の Linux runner には Apple Container サービスと必要なホスト環境がない。ローカルでは `CONTAINERGO_BACKEND=apple` または `CONTAINERGO_BACKEND=docker` でバックエンドを 1 つだけ実行できる。
-**統合テスト**：ビルドタグ `integration` で分離し、実機 backend に対して実行する。Apple test は macOS 26 と起動済みの Apple Container を、Docker test は稼働中の daemon を必要とする。Apple の watchdog test は Darwin 専用で、リポジトリの Linux 限定 CI job では Windows runtime integration を実行しない。最初に backend の利用可否を確認し、daemon/service が停止していれば skip する。起動、接続、exec、コピー、通常のクリーンアップ、Darwin の watchdog を検証する。Windows の copy-out は Go 1.26 以上と Docker client/server 29.7.0 以上を使って手動検証する。
-
-**CI**：unit、race、vet、lint、Docker integration job は Ubuntu で実行する。Apple integration は service と host の条件が満たされないためローカルで実行し、Windows runtime job は設定されていない。
+**CI**：`.github/workflows/ci.yml` は `ubuntu-latest` で Go 1.26.0 と安定版 Go を使い、ユニットテスト、race テスト、lint、`govulncheck`、Docker 統合テストを実行する。
+cross-platform job は `windows-latest` と `macos-latest` でもユニットテストと integration tag 付き vet を実行する。
+Apple Container 統合テストは必要なサービスとホスト環境がないためローカルで実行する。
+Windows の Docker copy-out は Go 1.26 以上と Docker client/server 29.7.0 以上を使って手動で統合テストする。
+ローカルでは `CONTAINERGO_BACKEND=apple` または `CONTAINERGO_BACKEND=docker` でバックエンドを 1 つだけ実行できる。
 
 ## バックエンド（v0.2 と現在の開発版）
 

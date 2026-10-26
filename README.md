@@ -35,9 +35,9 @@ repository's documentation test.
 
 The current checkout still has these deliberate constraints:
 
-- Windows has no watchdog reaper: the reaper needs `/bin/sh`, so only
-  `Cleanup`, `TerminateContainer`, and the rollback paths remove containers
-  there. Operations that need a secret environment file fail with
+- Windows has no watchdog reaper: the reaper needs `/bin/sh`. Explicit
+  `Terminate`, `Cleanup`, `TerminateContainer`, `Prune`, and the rollback
+  paths remain available there. Operations that need a secret environment file fail with
   `ErrEnvFileUnsupported` on Windows, and Docker copy-out requires Go 1.26
   or newer.
 - Network creation and lifecycle management are out of scope;
@@ -185,9 +185,9 @@ backslashes are rejected. Docker copy-out requires both the Docker client
 and server to be version 29.7.0 or newer. The method verifies both versions
 before creating its private temporary directory or invoking `docker cp`, and
 returns `ErrCopyFileFromContainerUnsupported` if the minimum cannot be
-verified. CI unit and Docker integration jobs run on Linux only; Windows
-runtime coverage is manual and requires Go 1.26+ with Docker client/server
-29.7.0+.
+verified. CI unit tests run on Linux, macOS, and Windows; Docker integration
+jobs run on Linux. Real Windows Docker copy-out requires manual integration
+testing with Go 1.26+ and Docker client/server 29.7.0+.
 
 ## Output contract
 
@@ -1121,9 +1121,8 @@ design document, compares paired blocks after removing comments, and
 compiles the Go blocks in a temporary module with a quoted local
 `replace`. The tagged examples under `examples/` exercise a real backend.
 
-The repository CI runs unit and race jobs on Ubuntu. Windows-specific
-environment-file tests are compile-checked during development; this change
-does not claim Windows runtime CI coverage.
+The cross-platform job also runs unit tests and tagged vet on macOS and
+Windows, including Windows-specific environment-file and process tests.
 
 Design document: [docs/design.md](docs/design.md) (日本語版:
 [docs/design.ja.md](docs/design.ja.md)). The implementation phases in that

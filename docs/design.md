@@ -380,9 +380,8 @@ backend-specific cleanup. Callers must read the output reader even when the
 error is non-nil. On Linux the stable identity is a pidfd-backed process
 reference; kernels without pidfd support use the same conservative direct-handle
 fallback as other Unix targets.
-Windows-specific lifecycle tests are build-constrained. This development
-environment cross-compiles and vets Windows packages but cannot execute the
-Windows process-handle runtime tests, including the exit-259 active-child case.
+Windows-specific lifecycle tests are build-constrained and run in the
+`windows-latest` unit job, including the exit-259 active-child case.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers; `MaxBytes` can additionally cap the response. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -1224,7 +1223,7 @@ require macOS 26 with Apple Container running; Docker tests require a
 running Docker daemon. Each backend-specific helper checks its CLI/service
 first and skips cleanly when it is unavailable. The Apple watchdog test is
 Darwin-only, and Windows runtime integration is not run by the repository's
-Linux-only CI jobs; Windows copy-out must be verified manually with Go 1.26+
+Linux-only Docker integration jobs; Windows copy-out must be verified manually with Go 1.26+
 and Docker client/server 29.7.0+. `make integration` runs both backends and
 skips the pull-heavy bench and single-flight scenarios;
 `make integration-docker` selects Docker; `make bench-integration` runs the
@@ -1235,7 +1234,8 @@ module requires Go 1.26+).
 `ubuntu-latest` with Go 1.26.0 and the stable Go release, plus lint,
 `govulncheck`, and the Docker integration matrix. Apple Container
 integration remains local because its service and host requirements are
-not available in those runners. No Windows runtime job is configured.
+not available in those runners. The cross-platform job also runs unit tests
+and tagged vet on `windows-latest` and `macos-latest`.
 `CONTAINERGO_BACKEND=apple` or `CONTAINERGO_BACKEND=docker` can select one
 backend locally.
 

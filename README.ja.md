@@ -32,9 +32,9 @@ Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
 
 現在のチェックアウトには、次の意図的な制約があります。
 
-- Windows には watchdog リーパーがありません。リーパーは `/bin/sh` を必要とする
-  ため、Windows では `Cleanup`、`TerminateContainer`、および rollback 経路だけが
-  コンテナを削除します。秘密情報を含む環境ファイルが必要な操作は Windows では
+- Windows には watchdog リーパーがありません。リーパーは `/bin/sh` を必要とします。
+  Windows でも明示的な `Terminate`、`Cleanup`、`TerminateContainer`、`Prune`、および rollback 経路は利用できます。
+  秘密情報を含む環境ファイルが必要な操作は Windows では
   `ErrEnvFileUnsupported` で失敗し、Docker の copy-out には Go 1.26 以降が必要です。
 - network の作成とライフサイクル管理はスコープ外です。`WithNetwork` は既存の
   network へ接続します。volume の作成とライフサイクル管理もスコープ外で、
@@ -154,9 +154,8 @@ macOS で安全な copy-out が必要な場合は `CONTAINERGO_BACKEND=docker` �
 server の両方がバージョン 29.7.0 以上必要です。メソッドは private な一時
 ディレクトリの作成や `docker cp` の実行前に両方のバージョンを確認し、最低
 バージョンを確認できない場合は `ErrCopyFileFromContainerUnsupported` を返します。
-CI の unit と Docker integration job は Linux のみを対象とするため、Windows
-の runtime coverage は手動で、Go 1.26 以上と Docker client/server 29.7.0 以上を
-使って実行してください。
+CI の unit test は Linux、macOS、Windows で実行し、Docker integration job は Linux で実行します。
+Windows での実際の Docker copy-out は、Go 1.26 以上と Docker client/server 29.7.0 以上を使って手動で統合テストしてください。
 
 ## インストール
 
@@ -1027,9 +1026,8 @@ integration tag のないドキュメント test は、この README の英語�
 一時 module 内でコンパイルします。tag付き `examples/` の example が実
 backend を動かします。
 
-リポジトリ CI の unit/race job は Ubuntu で実行します。
-Windows 固有の環境変数のテストは開発時にコンパイル確認しますが、
-この変更では Windows 実行時 CI のカバレッジを主張しません。
+cross-platform job では macOS と Windows でも unit test と integration tag 付き vet を実行します。
+Windows 固有の環境ファイルと process のテストも実行対象です。
 
 Design document: [docs/design.md](docs/design.md)（日本語版:
 [docs/design.ja.md](docs/design.ja.md)）。設計ドキュメントの「実装フェーズ」は

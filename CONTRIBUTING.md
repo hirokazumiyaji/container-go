@@ -28,9 +28,9 @@ pull other Hub images locally. The root module supports Go 1.26+; the nested
 `bench/` benchmark module requires Go 1.26+ and is documented in
 `bench/README.md`.
 
-Windows-specific copy tests use Windows build constraints and are cross-built
-with the package. No live Windows CI runner is configured; execute
-`go test ./...` on Windows separately when changing Windows-specific behavior.
+Windows-specific copy tests use Windows build constraints and run in the
+`windows-latest` unit job. Real Docker copy-out on Windows requires separate
+integration testing with Docker client/server 29.7.0 or newer.
 
 ## Pull requests
 

@@ -597,6 +597,12 @@ func validateEnvironmentEntry(option, description, key, value string) error {
 // WithCmd overrides the arguments passed to the image's entrypoint.
 func WithCmd(cmd ...string) Option {
 	return func(c *config) error {
+		for i, arg := range cmd {
+			if strings.ContainsRune(arg, 0) || !utf8.ValidString(arg) {
+				return validationErrorf("WithCmd", cmd,
+					"command argument %d must be valid UTF-8 without NUL bytes", i)
+			}
+		}
 		c.cmd = cmd
 		return nil
 	}
@@ -607,7 +613,7 @@ func WithCmd(cmd ...string) Option {
 // WithCmd.
 func WithEntrypoint(entrypoint string) Option {
 	return func(c *config) error {
-		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\n\x00") {
+		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\r\n\x00") || !utf8.ValidString(entrypoint) {
 			return validationErrorf("WithEntrypoint", entrypoint, "invalid entrypoint %q", entrypoint)
 		}
 		c.entrypoint = entrypoint
@@ -1037,7 +1043,7 @@ func WithUser(u string) Option {
 // WithWorkingDir sets the working directory of the init process.
 func WithWorkingDir(dir string) Option {
 	return func(c *config) error {
-		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
+		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\r\n\x00") || !utf8.ValidString(dir) {
 			return validationErrorf("WithWorkingDir", dir, "working directory %q must be an absolute path", dir)
 		}
 		c.workdir = dir

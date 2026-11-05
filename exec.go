@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -95,7 +96,7 @@ func WithExecUser(u string) ExecOption {
 // WithExecWorkDir sets the working directory for the exec'd process.
 func WithExecWorkDir(dir string) ExecOption {
 	return func(c *execConfig) error {
-		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
+		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\r\n\x00") || !utf8.ValidString(dir) {
 			return validationErrorf("WithExecWorkDir", dir, "exec working directory %q must be an absolute path", dir)
 		}
 		c.workdir = dir
@@ -158,6 +159,12 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 	}
 	if len(cmd) == 0 {
 		return 0, nil, OutputStats{}, validationErrorf("Exec", cmd, "exec: command must not be empty")
+	}
+	for i, arg := range cmd {
+		if strings.ContainsRune(arg, 0) || !utf8.ValidString(arg) {
+			return 0, nil, OutputStats{}, validationErrorf("Exec", cmd,
+				"exec argument %d must be valid UTF-8 without NUL bytes", i)
+		}
 	}
 	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
 	for _, opt := range opts {

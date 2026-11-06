@@ -1145,11 +1145,19 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 	}, nil
 }
 
-// ExitCode returns the exit code from a fresh container inspect.
+// ExitCode returns the reported exit code of a stopped container.
+// It returns ErrExitCodeUnavailable while the container has not stopped or
+// the backend has not reported an exit code.
 func (c *Container) ExitCode(ctx context.Context) (int, error) {
 	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
-		return 0, err
+		return 0, c.redactError(err)
+	}
+	if info.state != StateStopped {
+		return 0, c.redactError(fmt.Errorf("%w: container state is %s", ErrExitCodeUnavailable, info.state))
+	}
+	if !info.exitCodeReported {
+		return 0, ErrExitCodeUnavailable
 	}
 	return info.exitCode, nil
 }

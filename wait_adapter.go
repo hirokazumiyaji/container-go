@@ -188,11 +188,11 @@ func (t waitTarget) State(ctx context.Context) (wait.State, error) {
 	if t.c == nil || t.c.eng == nil {
 		return wait.StateRunning, nil
 	}
-	state, err := t.c.State(ctx)
+	info, err := t.c.inspectDynamicFresh(ctx)
 	if err != nil {
 		return wait.StateUnknown, waitTargetError(err)
 	}
-	switch state {
+	switch info.state {
 	case StateRunning:
 		return wait.StateRunning, nil
 	case StateStopped:

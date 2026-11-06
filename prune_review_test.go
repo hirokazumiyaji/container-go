@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"testing"
 
@@ -120,5 +121,102 @@ func TestNestedNonCLIBranchesVetoAbsenceConsistently(t *testing.T) {
 				t.Fatalf("depth=%d veto=%v classified absent", depth, veto)
 			}
 		}
+	}
+}
+
+type refusalRaceRunner struct {
+	eng         engine
+	after       string
+	cancel      context.CancelFunc
+	inspections int
+	failure     error
+}
+
+func (r *refusalRaceRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	id := "refusal-race"
+	if r.eng.name() == "docker" {
+		id = cleanupDockerIDOne
+	}
+	fixture := pruneFixture(id, "0123456789abcdef", "stopped", "", true)
+	switch args[0] {
+	case "ps":
+		return []byte(id + "\n"), nil, nil
+	case "ls":
+		return mustPruneJSON([]pruneFixtureContainer{fixture}), nil, nil
+	case "rm", "delete":
+		return nil, nil, r.failure
+	case "inspect":
+		r.inspections++
+		if r.inspections > 1 {
+			if r.after == "cancel" {
+				r.cancel()
+				return nil, nil, ctx.Err()
+			}
+			if r.after == "missing" {
+				message := `Error: notFound: "container not found: ` + id + `"`
+				if r.eng.name() == "docker" {
+					message = "Error: No such container: " + id
+				}
+				return nil, nil, &cli.CLIError{Binary: r.eng.binary(), Args: args, ExitCode: 1, Stderr: message}
+			}
+			fixture.Status.State = r.after
+		}
+		if r.eng.name() == "apple" {
+			return mustPruneJSON([]pruneFixtureContainer{fixture}), nil, nil
+		}
+		state := fixture.Status.State
+		if state == "stopped" {
+			state = "exited"
+		}
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/refusal-race","State":{"Status":%q},"Config":{"Labels":{%q:"true",%q:"0123456789abcdef",%q:%q}}}]`, id, state, managedLabel, creationLabel, sessionLabel, pruneFixtureSession)), nil, nil
+	}
+	return nil, nil, nil
+}
+
+func TestPruneDeleteRefusalRaces(t *testing.T) {
+	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
+		for _, after := range []string{"paused", "restarting", "missing", "cancel", "stopped"} {
+			t.Run(eng.name()+"/"+after, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				failure := errors.New("backend refused deletion")
+				r := &refusalRaceRunner{eng: eng, after: after, cancel: cancel, failure: failure}
+				removed, err := pruneWith(ctx, r, eng)
+				switch after {
+				case "cancel":
+					if !errors.Is(err, context.Canceled) || !errors.Is(err, failure) {
+						t.Fatalf("got %v, want cancellation and original deletion failure", err)
+					}
+				case "stopped":
+					if !errors.Is(err, failure) {
+						t.Fatalf("lost deletion failure: %v", err)
+					}
+				default:
+					if err != nil || len(removed) != 0 {
+						t.Fatalf("prune=(%v,%v), want skipped race", removed, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPruneDockerNonForceAcceptsRunnerWithoutStdout(t *testing.T) {
+	r := &dockerPruneDeleteRaceRunner{}
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err != nil || len(removed) != 1 {
+		t.Fatalf("prune=(%v,%v), want one deletion", removed, err)
+	}
+}
+
+func TestNonCLIPureWrapperTextVetoesAbsence(t *testing.T) {
+	absent := &cli.CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1, Stderr: "Error: No such container: missing"}
+	transport := fmt.Errorf("TLS certificate verification failed: %w", fmt.Errorf("dial: %w", errors.Join(io.EOF, io.ErrUnexpectedEOF)))
+	if isNotFoundFor(dockerEngine{}, errors.Join(absent, transport)) {
+		t.Fatal("lost non-CLI wrapper TLS veto")
+	}
+	confirmed := fmt.Errorf("%w: %w", ErrContainerNotFound, absent)
+	if !isNotFoundFor(dockerEngine{}, errors.Join(confirmed, errors.New("no such object: x"))) {
+		t.Fatal("lost confirmed absence sentinel")
 	}
 }

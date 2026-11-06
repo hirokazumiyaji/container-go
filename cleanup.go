@@ -443,15 +443,21 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	}
 	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), id) {
 		if reuseGroup == "" {
-			current, inspectErr := inspectContainer.inspectFresh(ctx)
-			if inspectErr == nil && current.state == StateRunning {
+			skip, absent, raceErr := pruneDeleteRace(ctx, eng, inspectContainer.inspectFresh)
+			if raceErr != nil {
+				return false, fmt.Errorf("%s %s: %w", errKind, id, errors.Join(err, raceErr))
+			}
+			if skip {
+				if absent {
+					unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
+				}
 				return false, nil
 			}
 		}
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
-	return err == nil && strings.TrimSpace(string(stdout)) != "", nil
+	return err == nil && (reuseGroup == "" || strings.TrimSpace(string(stdout)) != ""), nil
 }
 
 func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
@@ -561,8 +567,14 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), candidate.id) {
 		if reuseGroup == "" {
-			current, inspectErr := inspectContainer.inspectFreshLocked(guardCtx)
-			if inspectErr == nil && current.state == StateRunning {
+			skip, absent, raceErr := pruneDeleteRace(guardCtx, eng, inspectContainer.inspectFreshLocked)
+			if raceErr != nil {
+				return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, errors.Join(err, raceErr))
+			}
+			if skip {
+				if absent {
+					unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
+				}
 				return false, nil
 			}
 		}
@@ -578,4 +590,15 @@ func pruneDeleteArgs(eng engine, id, reuseGroup string) []string {
 		args = slices.DeleteFunc(args, func(arg string) bool { return arg == "--force" })
 	}
 	return args
+}
+
+func pruneDeleteRace(ctx context.Context, eng engine, inspect func(context.Context) (*engineInfo, error)) (skip, absent bool, err error) {
+	current, inspectErr := inspect(ctx)
+	if contextErr := commandContextError(ctx, inspectErr); contextErr != nil {
+		return false, false, contextErr
+	}
+	if isNotFoundFor(eng, inspectErr) {
+		return true, true, nil
+	}
+	return inspectErr == nil && current.state != StateStopped, false, nil
 }

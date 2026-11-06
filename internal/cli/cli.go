@@ -637,25 +637,21 @@ func probeRelevantError(err error, probe Probe) error {
 func CollectNonCLIErrorBranches(err error) []error {
 	var out []error
 	var walk func(error)
-	walk = func(original error) {
-		for current := original; current != nil; {
-			if joined, ok := current.(interface{ Unwrap() []error }); ok {
-				for _, child := range joined.Unwrap() {
-					walk(child)
-				}
-				return
-			}
-			if _, ok := current.(*CLIError); ok {
-				return
-			}
-			if wrapped, ok := current.(interface{ Unwrap() error }); ok {
-				if child := wrapped.Unwrap(); child != nil {
-					current = child
-					continue
-				}
-			}
-			out = append(out, original)
+	walk = func(current error) {
+		if current == nil {
 			return
+		}
+		var cliErr *CLIError
+		if !errors.As(current, &cliErr) {
+			out = append(out, current)
+			return
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+		} else if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap())
 		}
 	}
 	walk(err)
@@ -689,7 +685,12 @@ func ErrorBranches(err error, binary string) []ErrorBranch {
 				stdoutByError[owner] = stdout
 			}
 		}
-		if cliErr, ok := current.(*CLIError); ok {
+		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap())
+			return
+		}
+		var cliErr *CLIError
+		if errors.As(current, &cliErr) {
 			if binary != "" && !BinaryMatches(cliErr.Binary, binary) {
 				return
 			}
@@ -707,9 +708,6 @@ func ErrorBranches(err error, binary string) []ErrorBranch {
 			index[cliErr] = len(branches)
 			branches = append(branches, ErrorBranch{Error: cliErr, Stdout: stdout, Cause: cause})
 			return
-		}
-		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
-			walk(wrapped.Unwrap())
 		}
 	}
 	walk(err)

@@ -1492,3 +1492,14 @@ func TestErrorBranchesDeduplicatesStdoutWrappers(t *testing.T) {
 		t.Fatalf("branches=%+v", branches)
 	}
 }
+
+func TestErrorBranchesRecognizeRedactedCLILeaf(t *testing.T) {
+	failure := &CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1, Stderr: "Error: No such container: missing"}
+	safe := WithRedactor(failure, NewRedactor("private-target"))
+	if branches := CollectNonCLIErrorBranches(safe); len(branches) != 0 {
+		t.Fatalf("redacted CLI treated as non-CLI: %v", branches)
+	}
+	if branches := ErrorBranches(safe, "docker"); len(branches) != 1 {
+		t.Fatalf("redacted CLI branches=%v, want one", branches)
+	}
+}

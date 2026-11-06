@@ -534,6 +534,9 @@ func ambiguousNoSuchLine(line string) bool {
 }
 
 func hasNonCLIAmbiguousObjectText(err error) bool {
+	if errors.Is(err, ErrContainerNotFound) {
+		return false
+	}
 	for _, branch := range cli.CollectNonCLIErrorBranches(err) {
 		if !errors.Is(branch, ErrContainerNotFound) && ambiguousNoSuchLine(branch.Error()) {
 			return true

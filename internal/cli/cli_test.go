@@ -1474,3 +1474,13 @@ func TestExecRunnerIdentityDefaultsToBinary(t *testing.T) {
 		t.Fatalf("identity = %q, want container", got)
 	}
 }
+
+func TestCommandErrorPreservesWaitDelayContext(t *testing.T) {
+	err := commandError(context.Background(), "backend-wrapper", "docker", []string{"inspect", "target"}, nil, []byte("diagnostic"), exec.ErrWaitDelay)
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Fatalf("error = %v, want ErrWaitDelay", err)
+	}
+	if !strings.Contains(err.Error(), "backend-wrapper inspect target") {
+		t.Fatalf("missing command context: %v", err)
+	}
+}

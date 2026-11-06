@@ -757,54 +757,14 @@ func (p *streamProcessor) close() error {
 	return nil
 }
 
-// StreamRedactor incrementally applies a Redactor while retaining at most a
-// bounded overlap. It is useful for command stderr, where the safe copy must
-// be capped but a secret may be split between writes.
-type StreamRedactor struct {
-	processor *streamProcessor
-}
-
-// NewStreamRedactor returns an incremental redactor whose String method
-// contains at most limit safe bytes. Write and Close return an error before
-// emitting output when an explicit value or encoding exceeds the bounded
-// safety window. A non-positive limit means unbounded output and should only
-// be used with a downstream bounded sink.
-func (r *Redactor) NewStream(limit int) *StreamRedactor {
-	return &StreamRedactor{processor: newStreamProcessor(r, limit, nil)}
-}
-
-func (s *StreamRedactor) Write(p []byte) (int, error) {
-	if s == nil || s.processor == nil {
-		return len(p), nil
-	}
-	if err := s.processor.write(p); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (s *StreamRedactor) Close() error {
-	if s != nil && s.processor != nil {
-		return s.processor.close()
-	}
-	return nil
-}
-
-func (s *StreamRedactor) String() string {
-	if s == nil || s.processor == nil {
-		return ""
-	}
-	return string(s.processor.output)
-}
-
 // RedactBounded applies a redactor to a string without first creating a
 // second full-size redacted copy. The result is capped after redaction.
 func (r *Redactor) RedactBounded(value string, limit int) string {
-	stream := r.NewStream(limit)
-	if stream.processor.configErr == nil {
-		_ = stream.processor.writeString(value)
-		_ = stream.processor.close()
-		return stream.String()
+	processor := newStreamProcessor(r, limit, nil)
+	if processor.configErr == nil {
+		_ = processor.writeString(value)
+		_ = processor.close()
+		return string(processor.output)
 	}
 	// A complete value can be redacted safely without streaming. Public
 	// callers of this convenience method have no error return, so redact
@@ -915,5 +875,4 @@ func (r *Redactor) RedactTail(src io.Reader, limit int) (string, error) {
 	return tail.String(), err
 }
 
-var _ io.Writer = (*StreamRedactor)(nil)
 var _ io.Writer = (*TailBuffer)(nil)

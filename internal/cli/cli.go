@@ -395,8 +395,7 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	}
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
-	// If the process ignores the kill long enough to hold pipes open,
-	// give up waiting shortly after.
+	// Bound pipe draining when descendants retain inherited output handles.
 	cmd.WaitDelay = 3 * time.Second
 
 	start := hooks.start
@@ -474,6 +473,9 @@ func commandError(ctx context.Context, bin, identity string, args []string, stdo
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		return errors.Join(contextErr, err)
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 	return err
 }

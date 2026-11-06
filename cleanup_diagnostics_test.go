@@ -94,13 +94,10 @@ func TestClientPruneReuseGroupRedactsAppleInspectDiagnostics(t *testing.T) {
 	const group = "private-apple-prune-group"
 	f := newTestRunner()
 	r := &pruneDiagnosticRunner{fakeRunner: f, listOperation: "ls", list: fmt.Sprintf(`[{"id":"private-apple-candidate","configuration":{"labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:%q}},"status":{"state":"stopped"}}]`, managedLabel, reuseLabel, creationLabel, reuseGroupLabel, group)}
-	client, err := NewClient(WithClientBackend("apple"), WithClientRunner(r))
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := &Client{eng: appleEngine{}, runner: r}
 	f.failPrefix = "inspect"
 	f.failStderr = "inspect failure for " + group
-	_, err = client.PruneReuseGroup(context.Background(), group)
+	_, err := client.PruneReuseGroup(context.Background(), group)
 	if err == nil {
 		t.Fatal("expected inspect failure")
 	}

@@ -54,9 +54,21 @@ func TestClientPruneQueryTimeout(t *testing.T) {
 					if tc.client > 0 {
 						clientOpts = append(clientOpts, WithClientQueryTimeout(tc.client))
 					}
-					client, err := NewClient(clientOpts...)
-					if err != nil {
-						t.Fatal(err)
+					var client *Client
+					var err error
+					if eng.name() == "docker" {
+						client, err = NewClient(clientOpts...)
+						if err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						cfg := &clientConfig{}
+						for _, opt := range clientOpts {
+							if err := opt(cfg); err != nil {
+								t.Fatal(err)
+							}
+						}
+						client = &Client{eng: eng, runner: cfg.runner, queryTimeout: cfg.queryTimeout}
 					}
 					pruneOpts := []PruneOption{WithPruneTimeout(tc.overall)}
 					if tc.query > 0 {
@@ -129,10 +141,11 @@ func TestPruneQueryTimeoutWithoutClient(t *testing.T) {
 
 func TestClientQueryTimeoutAppliesToRun(t *testing.T) {
 	r := newTestRunner()
-	client, err := NewClient(WithClientBackend("apple"), WithClientRunner(r), WithClientQueryTimeout(2*time.Minute))
-	if err != nil {
+	cfg := &clientConfig{}
+	if err := WithClientQueryTimeout(2 * time.Minute)(cfg); err != nil {
 		t.Fatal(err)
 	}
+	client := &Client{eng: appleEngine{}, runner: r, queryTimeout: cfg.queryTimeout}
 	for _, override := range []time.Duration{0, 5 * time.Second} {
 		var opts []Option
 		want := 2 * time.Minute

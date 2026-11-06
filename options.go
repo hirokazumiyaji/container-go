@@ -240,13 +240,17 @@ func (c *config) dockerTargetOption() string {
 // WithReuseGroup without WithReuse, which is also what lets BuildLabels
 // decide whether to emit the reuse-group label.
 func (c *config) allLabels() map[string]string {
-	return domain.BuildLabels(domain.LabelConfig{
+	labels := domain.BuildLabels(domain.LabelConfig{
 		Session:    sessionID(),
 		Creation:   c.creation,
 		Reuse:      c.reuse,
 		ReuseGroup: c.reuseGroup,
 		Custom:     c.labels,
 	})
+	if c.reuse {
+		labels[domain.LabelReuseConfig] = c.reuseConfigHash()
+	}
+	return labels
 }
 
 // commonRunArgs builds the shared run flags after --name: labels,
@@ -330,9 +334,11 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // hostname options are part of the reuse compatibility identity and
 // must match an existing container. Capabilities follow a requested-subset
 // rule: every requested --cap-add/--cap-drop value must be present, while
-// an empty request accepts any inspected capability set. Other creation-only
-// options are intentionally ignored when attaching; use distinct names when
-// those differences matter. Returned handles are shared: Cleanup, TerminateContainer,
+// an empty request accepts any inspected capability set. Memory, user, working
+// directory, entrypoint, command, mounts, and custom labels must exactly match
+// the creation fingerprint, including omitted options. Reuse group must match.
+// Unfingerprinted containers must be recreated before attaching. Environment
+// differences are ignored. Returned handles are shared: Cleanup, TerminateContainer,
 // and the watchdog reaper do not remove them. Stop, CopyToContainer,
 // CopyContentToContainer, and CopyFileFromContainer refuse with
 // ErrSharedContainer so one process cannot disturb peers; use Shared to
@@ -347,8 +353,8 @@ func WithReuse() Option {
 }
 
 // WithReuseGroup tags a reused container for later PruneReuseGroup.
-// The group is not part of the reuse key; WithName alone identifies the
-// shared container. Requires WithReuse.
+// The group is part of reuse compatibility and the shared-flight key.
+// Attaching requires an exact group match. Requires WithReuse.
 func WithReuseGroup(group string) Option {
 	return func(c *config) error {
 		if err := validateReuseGroup(group); err != nil {
@@ -662,7 +668,7 @@ func WithLabels(labels map[string]string) Option {
 				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("invalid label key %q", k))
 			}
 			switch k {
-			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel:
+			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel, domain.LabelReuseConfig:
 				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("label key %q is reserved", k))
 			}
 			// Label values may carry secrets. Do not put them in Value or

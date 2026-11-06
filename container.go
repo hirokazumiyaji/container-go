@@ -25,11 +25,12 @@ import (
 )
 
 const (
-	managedLabel    = domain.LabelManaged
-	sessionLabel    = domain.LabelSession
-	reuseLabel      = domain.LabelReuse
-	reuseGroupLabel = domain.LabelReuseGroup
-	creationLabel   = domain.LabelCreation
+	reuseConfigLabel = domain.LabelReuseConfig
+	managedLabel     = domain.LabelManaged
+	sessionLabel     = domain.LabelSession
+	reuseLabel       = domain.LabelReuse
+	reuseGroupLabel  = domain.LabelReuseGroup
+	creationLabel    = domain.LabelCreation
 
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.

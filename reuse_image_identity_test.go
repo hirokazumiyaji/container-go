@@ -82,9 +82,10 @@ func (r *reuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, er
 				"Config": map[string]any{
 					"Image": r.containerImage,
 					"Labels": map[string]string{
-						managedLabel:  "true",
-						reuseLabel:    "true",
-						creationLabel: creation,
+						managedLabel:     "true",
+						reuseLabel:       "true",
+						reuseConfigLabel: defaultReuseFingerprint,
+						creationLabel:    creation,
 					},
 				},
 				"State": map[string]string{"Status": "running"},
@@ -105,9 +106,10 @@ func (r *reuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, er
 				},
 				"platform": freshPlatformMap(),
 				"labels": map[string]string{
-					managedLabel:  "true",
-					reuseLabel:    "true",
-					creationLabel: creation,
+					managedLabel:     "true",
+					reuseLabel:       "true",
+					reuseConfigLabel: defaultReuseFingerprint,
+					creationLabel:    creation,
 				},
 			},
 			"status": map[string]any{

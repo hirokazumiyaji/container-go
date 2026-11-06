@@ -103,9 +103,10 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
 		state: StateStopped,
 		labels: map[string]string{
-			managedLabel:  "true",
-			reuseLabel:    "true",
-			creationLabel: "aaaaaaaaaaaaaaaa",
+			managedLabel:     "true",
+			reuseLabel:       "true",
+			reuseConfigLabel: defaultReuseFingerprint,
+			creationLabel:    "aaaaaaaaaaaaaaaa",
 		},
 		uid: uid,
 	}

@@ -1562,7 +1562,7 @@ func TestReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testin
 	joined := make(chan struct{})
 	oldJoin := reuseFlights.onJoin
 	reuseFlights.onJoin = func(string) {
-		if joins.Add(1) == 2 {
+		if joins.Add(1) == 1 {
 			close(joined)
 		}
 	}
@@ -1582,13 +1582,7 @@ func TestReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testin
 			err error
 		}{ctr, err}
 	}()
-	mismatchResult := make(chan error, 1)
-	go func() {
-		_, err := Run(context.Background(), "nginx:alpine",
-			WithName("warning-reuse"), WithReuse(),
-			withRunner(runner), withEngine(appleEngine{}))
-		mismatchResult <- err
-	}()
+
 	select {
 	case <-joined:
 	case <-time.After(time.Second):
@@ -1610,6 +1604,13 @@ func TestReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testin
 	if !compatibleWait.called {
 		t.Fatal("compatible waiter skipped its readiness strategy")
 	}
+	mismatchResult := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "nginx:alpine",
+			WithName("warning-reuse"), WithReuse(),
+			withRunner(runner), withEngine(appleEngine{}))
+		mismatchResult <- err
+	}()
 	if err := <-mismatchResult; err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("mismatched waiter error = %v, want compatibility failure", err)
 	}
@@ -1955,4 +1956,58 @@ func newMarkedStaleEnvDir(t *testing.T, root, suffix string) (string, *os.File) 
 		t.Fatal(err)
 	}
 	return dir, lock
+}
+
+type cleanupWarningInvalidRunner struct {
+	*reuseEnvCleanupFailureRunner
+	labels map[string]string
+}
+
+func (r *cleanupWarningInvalidRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	out, stderr, err := r.reuseEnvCleanupFailureRunner.Run(ctx, args...)
+	if err == nil && args[0] == "inspect" && r.created.Load() {
+		out = reuseInspectWithLabels(out, r.labels)
+	}
+	return out, stderr, err
+}
+
+func TestReuseCleanupWarningDoesNotReturnInvalidHandle(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks unavailable")
+	}
+	for name, labels := range map[string]map[string]string{
+		"fingerprint": {reuseConfigLabel: "incompatible-fingerprint"},
+		"ownership":   {managedLabel: "false"},
+		"generation":  {creationLabel: "invalid-generation"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			isolateEnvFileRoot(t)
+			runner := &cleanupWarningInvalidRunner{reuseEnvCleanupFailureRunner: &reuseEnvCleanupFailureRunner{reuseCreateRunner: newReuseCreateRunner()}, labels: labels}
+			t.Cleanup(func() {
+				if runner.envPath == "" {
+					return
+				}
+				dir := filepath.Dir(runner.envPath)
+				if state := loadEnvCleanupState(dir); state != nil {
+					state.mu.Lock()
+					lock := state.lock
+					state.lock = nil
+					state.lockAcquired = false
+					state.mu.Unlock()
+					if lock != nil {
+						_ = closeEnvFileLock(lock)
+					}
+					clearEnvCleanupState(state)
+				}
+				_ = os.RemoveAll(dir)
+			})
+			ctr, err := Run(context.Background(), "redis:7-alpine", WithName("warning-mismatch"), WithReuse(), WithEnv(map[string]string{"TOKEN": "secret"}), withRunner(runner), withEngine(appleEngine{}))
+			if ctr != nil || err == nil || !errors.Is(err, errUnsafeEnvFile) {
+				t.Fatalf("got (%v,%v), want no invalid handle and preserved warning", ctr, err)
+			}
+			if errors.Is(err, ErrReuseMismatch) != (name == "fingerprint") {
+				t.Fatalf("wrong mismatch classification: %v", err)
+			}
+		})
+	}
 }

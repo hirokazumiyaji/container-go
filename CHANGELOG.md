@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reuse requires matching creation fingerprints and reuse groups, including when
+  fingerprinted options are omitted. Recreate existing reuse containers before
+  attaching with this version; environment values retain their attach semantics.
+
+### Added
+
+- `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,
+  platform, and port settings.
+
 ## [0.3.0] - 2026-10-26
 
 This section describes only the tagged `v0.3.0` release. The root

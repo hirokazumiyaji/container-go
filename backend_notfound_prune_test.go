@@ -118,7 +118,7 @@ func (r *reuseRollbackSafetyRunner) Run(_ context.Context, args ...string) ([]by
 			variant = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 			arch = "arm64"
 		}
-		return []byte(fmt.Sprintf(`[{"id":"shared","configuration":{"id":"shared","platform":{"os":"linux","architecture":%q},"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{%q:"true",%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, arch, variant, managedLabel, reuseLabel, creationLabel, r.creation)), nil, nil
+		return []byte(fmt.Sprintf(`[{"id":"shared","configuration":{"id":"shared","platform":{"os":"linux","architecture":%q},"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{"com.github.hirokazumiyaji.container-go.reuse-config":"`+defaultReuseFingerprint+`",%q:"true",%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, arch, variant, managedLabel, reuseLabel, creationLabel, r.creation)), nil, nil
 	case "cp":
 		return nil, nil, r.copyErr
 	case "delete", "rm":
@@ -184,8 +184,8 @@ func (r *applePruneSafetyRunner) Run(_ context.Context, args ...string) ([]byte,
 func TestApplePruneRetainsRunningReplacement(t *testing.T) {
 	const creation = "0123456789abcdef"
 	r := &applePruneSafetyRunner{
-		listJSON:    fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{%q:"true",%q:%q}},"status":{"state":"stopped","networks":[]}}]`, managedLabel, creationLabel, creation),
-		inspectJSON: fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, managedLabel, creationLabel, creation),
+		listJSON:    fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-config":"`+defaultReuseFingerprint+`",%q:"true",%q:%q}},"status":{"state":"stopped","networks":[]}}]`, managedLabel, creationLabel, creation),
+		inspectJSON: fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-config":"`+defaultReuseFingerprint+`",%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, managedLabel, creationLabel, creation),
 	}
 	removed, err := pruneWith(context.Background(), r, appleEngine{})
 	if err != nil {

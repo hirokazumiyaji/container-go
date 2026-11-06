@@ -49,7 +49,7 @@ func (r *cleanupErrRunner) Run(ctx context.Context, args ...string) ([]byte, []b
 		// fixture would make identity-safe cleanup refuse deletion.
 		name := args[len(args)-1]
 		return []byte(`[{"id":` + quote(name) + `,"configuration":{"id":` + quote(name) +
-			`,"image":{"reference":"redis:7-alpine"},"publishedPorts":[],"labels":{` +
+			`,"image":{"reference":"redis:7-alpine"},"publishedPorts":[],"labels":{"com.github.hirokazumiyaji.container-go.reuse-config":"` + defaultReuseFingerprint + `",` +
 			quote(managedLabel) + `:"true",` + quote(sessionLabel) + `:` + quote(sessionID()) + `,` +
 			quote(creationLabel) + `:` + quote(creation) + `}},` +
 			`"status":{"state":"created","networks":[]}}]`), nil, nil
@@ -333,7 +333,7 @@ func (r *reuseRollbackCleanupRunner) Run(ctx context.Context, args ...string) ([
 		}
 		return []byte(`[{"id":` + quote(name) + `,"configuration":{"id":` + quote(name) +
 			`,"image":{"reference":"docker.io/library/redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":` + quote(variantDigest) + `},` +
-			`"platform":` + platformJSON + `,"publishedPorts":[],"labels":{` +
+			`"platform":` + platformJSON + `,"publishedPorts":[],"labels":{"com.github.hirokazumiyaji.container-go.reuse-config":"` + defaultReuseFingerprint + `",` +
 			quote(managedLabel) + `:"true",` + quote(sessionLabel) + `:` + quote(sessionID()) + `,` +
 			quote(creationLabel) + `:` + quote(creation) + `,` + quote(reuseLabel) + `:"true"}},` +
 			`"status":{"state":"stopped","networks":[]}}]`), nil, nil

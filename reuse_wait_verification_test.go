@@ -150,9 +150,10 @@ func platformInspectJSON(platform string) map[string]string {
 
 func reuseInspectLabels(creation string) map[string]string {
 	return map[string]string{
-		managedLabel:  "true",
-		reuseLabel:    "true",
-		creationLabel: creation,
+		managedLabel:     "true",
+		reuseLabel:       "true",
+		reuseConfigLabel: defaultReuseFingerprint,
+		creationLabel:    creation,
 	}
 }
 

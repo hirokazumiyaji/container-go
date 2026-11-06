@@ -73,7 +73,7 @@ func TestReuseInfoRejectsCanceledCachedReadyInfo(t *testing.T) {
 	cfg := &config{}
 	ready := &engineInfo{state: StateRunning}
 
-	info, err := reuseInfoForCaller(ctx, cfg, &Container{sync: &lockPack{info: ready}})
+	info, err := reuseInfoForCaller(ctx, cfg, &Container{sync: &lockPack{info: ready}}, imageIdentity{}, "")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}

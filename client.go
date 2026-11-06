@@ -162,8 +162,11 @@ func WithClientPlatform(platform string) ClientOption {
 
 // WithClientQueryTimeout sets the default timeout for backend queries and control
 // operations during construction, Run, Prune, and on containers it creates.
-// The default is 30 seconds. Pull fetches use WithPullTimeout; Cleanup and
-// StrictCleanup retain their separate 30-second total teardown budget.
+// Short inspection queries always respect this limit. Payload transfers, logs,
+// lifecycle changes, and verification retries preserve an existing caller deadline
+// and use this value only when the caller has none. Pull fetches use WithPullTimeout;
+// Cleanup and StrictCleanup retain their separate 30-second total teardown budget.
+// Client target discovery is best-effort without an explicit query timeout.
 // WithQueryTimeout and WithPruneQueryTimeout override it for individual operations.
 func WithClientQueryTimeout(d time.Duration) ClientOption {
 	return func(c *clientConfig) error {
@@ -291,9 +294,9 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 		queryErr := queryCtx.Err()
 		queryCancel()
 		if err != nil {
-			// A cancellation or deadline belongs to this construction even
-			// when the Client has no explicit target to fail against.
-			if queryErr != nil {
+			// Caller cancellation and explicitly configured query budgets are
+			// terminal; implicit target discovery remains best-effort by default.
+			if ctx.Err() != nil || cfg.queryTimeout > 0 && queryErr != nil {
 				return nil, safePublicError(err, cfg.targetDiagnosticValues(de, runner)...)
 			}
 			if de.effectiveContext() != "" || de.effectiveHost() != "" {

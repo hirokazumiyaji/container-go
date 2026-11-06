@@ -15,9 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Honor query timeouts inside a longer Run or caller deadline, and preserve
-  successful prune deletions when cancellation arrives just after the command
-  completes. Earlier caller deadlines continue to bound every operation.
+- Honor short inspection-query timeouts inside a longer Run or caller deadline,
+  while payload transfers, logs, lifecycle changes, deletion, and verification
+  retries retain the caller's overall operation budget.
+- Preserve successful prune and container deletions when cancellation arrives just
+  after the backend command completes.
+- Retain best-effort implicit Client target discovery without an explicitly
+  configured query timeout; configured budget expiry and caller cancellation
+  still fail construction.
 
 ## [0.3.0] - 2026-10-26
 

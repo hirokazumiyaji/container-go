@@ -78,12 +78,15 @@ func TestTerminateInspectContextVetoesNotFoundSuccess(t *testing.T) {
 	}
 }
 
-func TestDeleteChecksContextAtTerminalReturn(t *testing.T) {
+func TestDeleteSuccessWinsCancellationAtTerminalReturn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runner := &contextRaceRunner{cancel: cancel}
 	ctr := &Container{id: "myctr", sync: &lockPack{uid: "immutable"}, runner: runner, eng: appleEngine{}}
-	if err := ctr.delete(ctx, "immutable"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("delete error = %v, want context cancellation", err)
+	if err := ctr.delete(ctx, "immutable"); err != nil {
+		t.Fatalf("successful delete error = %v, want nil despite late cancellation", err)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatal("runner did not cancel the operation context")
 	}
 }
 

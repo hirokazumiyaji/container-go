@@ -277,7 +277,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	}
 	ages := newPruneAgeFilter(cfg)
 
-	redactor := cli.NewHashedContextRedactor(reuseGroup)
+	redactor := (&config{eng: eng, reuseGroup: reuseGroup}).diagnosticRedactor()
 	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
 	defer overallCancel()
 
@@ -408,7 +408,7 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	// the overall deadline instead.
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
-	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}}
+	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}, diagnosticRedactorValue: (&config{eng: eng, reuseGroup: reuseGroup}).diagnosticRedactor()}
 	fresh, err := inspectContainer.inspectFresh(ctx)
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, contextErr)
@@ -532,7 +532,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	defer unlock()
 
-	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true, diagnosticRedactorValue: (&config{eng: eng, reuseGroup: reuseGroup}).diagnosticRedactor()}).inspectFreshLocked(guardCtx)
 	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, contextErr)
 	}

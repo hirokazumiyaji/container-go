@@ -214,15 +214,15 @@ func (c *config) diagnosticBoundaryValues() []string {
 	var values []string
 	for _, raw := range []string{de.effectiveHost()} {
 		if endpoint, err := parseDockerEndpoint(raw); err == nil && endpoint.isRemote {
-			values = append(values, endpoint.host, endpoint.clientHost)
+			values = append(values, dockerEndpointBoundaryValues(endpoint)...)
 		}
 	}
 	if de.resolvedTarget != nil && de.resolvedTarget.isRemote {
-		values = append(values, de.resolvedTarget.host, de.resolvedTarget.clientHost)
+		values = append(values, dockerEndpointBoundaryValues(*de.resolvedTarget)...)
 	}
 	if c.dockerHost != nil {
 		if endpoint, err := parseDockerEndpoint(*c.dockerHost); err == nil && endpoint.isRemote {
-			values = append(values, endpoint.host, endpoint.clientHost)
+			values = append(values, dockerEndpointBoundaryValues(endpoint)...)
 		}
 	}
 	filtered := values[:0]
@@ -232,4 +232,14 @@ func (c *config) diagnosticBoundaryValues() []string {
 		}
 	}
 	return filtered
+}
+
+func dockerEndpointBoundaryValues(endpoint dockerTargetEndpoint) []string {
+	values := make([]string, 0, 2)
+	for _, value := range []string{endpoint.host, endpoint.clientHost} {
+		if value != "docker" {
+			values = append(values, value)
+		}
+	}
+	return values
 }

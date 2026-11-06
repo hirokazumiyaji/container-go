@@ -576,7 +576,7 @@ func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *
 				if key == "DOCKER_HOST" {
 					values = append(values, value)
 					if endpoint, err := parseDockerEndpoint(value); err == nil && endpoint.isRemote {
-						boundaryValues = append(boundaryValues, endpoint.host, endpoint.clientHost)
+						boundaryValues = append(boundaryValues, dockerEndpointBoundaryValues(endpoint)...)
 					}
 				} else {
 					values = append(values, value)
@@ -598,13 +598,9 @@ func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup
 		defer cancel()
 		resolved, err := de.resolveTarget(queryCtx, runner)
 		if err != nil {
-			if ctx.Err() == nil && (cfg.queryTimeout <= 0 || queryCtx.Err() == nil) && de.effectiveHost() == "" && de.effectiveContext() == "" {
-				runnerHost, _ := runnerEnvLookup(runner, "DOCKER_HOST")
-				runnerContext, _ := runnerEnvLookup(runner, "DOCKER_CONTEXT")
-				var configErr *ConfigError
-				if runnerHost == "" && runnerContext == "" && (!errors.As(err, &configErr) || configErr.Option == "context") {
-					return runner, eng, nil
-				}
+			host, contextName, _, _ := de.targetSelection(runner)
+			if ctx.Err() == nil && (cfg.queryTimeout <= 0 || queryCtx.Err() == nil) && host == "" && contextName == "" && !de.explicitHost && !de.explicitContext {
+				return runner, eng, nil
 			}
 			return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))
 		}

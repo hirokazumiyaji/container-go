@@ -381,7 +381,7 @@ func TestExplicitLocalDockerEndpointIsRedacted(t *testing.T) {
 }
 
 func TestShortDockerHostnameIsBoundaryRedacted(t *testing.T) {
-	for _, host := range []string{"finance1", "docker", "db"} {
+	for _, host := range []string{"finance1", "db"} {
 		raw := "tcp://" + host + ":2375"
 		cfg := &config{eng: dockerEngine{host: raw, explicitHost: true}}
 		got := cfg.diagnosticRedactor().Text("lookup " + host + ": no such host; x" + host + "y database dbus debug")
@@ -489,5 +489,92 @@ func TestPruneContextLookupBudgetsKeepFailurePolicy(t *testing.T) {
 	cfg.runner = timeoutTestRunner(func(context.Context, ...string) ([]byte, []byte, error) { return nil, nil, context.DeadlineExceeded })
 	if _, _, err := cfg.prepareTarget(context.Background(), dockerEngine{}, ""); err != nil {
 		t.Fatalf("implicit unavailable lookup=%v", err)
+	}
+}
+
+func TestPruneRemovedContextKeepsHost(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX shell")
+	}
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_HOST", "tcp://host-a:2375")
+	dir := t.TempDir()
+	binary, log := filepath.Join(dir, "docker"), filepath.Join(dir, "env.log")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$DOCKER_HOST\" >> \"$PRUNE_ENV_LOG\"\n[ \"$1\" = ps ]\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &cli.ExecRunner{Binary: binary, Env: []string{"PRUNE_ENV_LOG=" + log}}
+	client, err := NewClient(WithClientRunner(runner))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOCKER_HOST", "tcp://host-b:2375")
+	if _, err := client.Prune(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runner.Env = append(runner.Env, "DOCKER_HOST=tcp://host-c:2375", "DOCKER_CONTEXT=removed-context", "DOCKER_CONTEXT")
+	if _, err := Prune(context.Background(), WithPruneRunner(runner)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ps tcp://host-a:2375\nps tcp://host-c:2375\n" {
+		t.Fatalf("targets=%q", got)
+	}
+}
+
+func TestPruneImplicitEmptyContextIsBestEffort(t *testing.T) {
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	for _, output := range []string{"[]", `[{"Name":"private-ctx","Endpoints":{"docker":{"Host":"tcp://private host:2375"}}}]`} {
+		r := timeoutTestRunner(func(_ context.Context, args ...string) ([]byte, []byte, error) {
+			if args[0] == "context" {
+				return []byte(output), nil, nil
+			}
+			return nil, nil, nil
+		})
+		if _, err := Prune(context.Background(), WithPruneRunner(r)); err != nil {
+			t.Fatalf("output=%s: %v", output, err)
+		}
+	}
+}
+
+func TestPruneMalformedExplicitContextEndpointIsRedacted(t *testing.T) {
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_CONTEXT", "private-ctx")
+	r := timeoutTestRunner(func(context.Context, ...string) ([]byte, []byte, error) {
+		return []byte(`[{"Endpoints":{"docker":{"Host":"tcp://private host:2375"}}}]`), nil, nil
+	})
+	_, err := Prune(context.Background(), WithPruneRunner(r))
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) || strings.Contains(err.Error(), "private host") || strings.Contains(configErr.Detail, "private host") {
+		t.Fatalf("unsafe error=%v (%+v)", err, configErr)
+	}
+}
+
+func TestDockerBinaryHostnameRemainsReadable(t *testing.T) {
+	de := newDockerEngine("tcp://docker:2375", "", "", "")
+	err := cli.WithRedactor(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, Stderr: "daemon docker tcp://docker:2375 failed"}, pruneDiagnosticRedactor(de, nil, ""))
+	var commandErr *cli.CLIError
+	if !errors.As(err, &commandErr) || commandErr.Binary != "docker" || !strings.Contains(err.Error(), "docker ps") || strings.Contains(err.Error(), "tcp://docker:2375") || strings.Contains(commandErr.Error(), "tcp://docker:2375") {
+		t.Fatalf("binary diagnostic=%v (%+v)", err, commandErr)
+	}
+}
+
+func TestPruneConfiguredContextFailurePreservesRedactedCause(t *testing.T) {
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_CONTEXT", "private-ctx")
+	r := timeoutTestRunner(func(_ context.Context, args ...string) ([]byte, []byte, error) {
+		return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "private-ctx failed"}
+	})
+	_, err := Prune(context.Background(), WithPruneRunner(r))
+	var commandErr *cli.CLIError
+	var configErr *ConfigError
+	if !errors.As(err, &commandErr) || !errors.As(err, &configErr) || strings.Contains(err.Error(), "private-ctx") || strings.Contains(commandErr.Error(), "private-ctx") {
+		t.Fatalf("cause=%v (%+v)", err, commandErr)
 	}
 }

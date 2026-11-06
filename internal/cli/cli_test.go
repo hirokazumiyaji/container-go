@@ -1487,3 +1487,15 @@ func TestCommandErrorPreservesWaitDelayContext(t *testing.T) {
 		t.Fatalf("missing stderr: %v", err)
 	}
 }
+
+func TestCommandErrorWaitDelayTrimsAndPreservesTail(t *testing.T) {
+	err := commandError(context.Background(), "docker", "docker", []string{"inspect", "target"}, nil, []byte(" \n\t"), exec.ErrWaitDelay)
+	if err.Error() != "docker inspect target: "+exec.ErrWaitDelay.Error() {
+		t.Fatalf("whitespace-only diagnostic added text: %v", err)
+	}
+	input := "first diagnostic\n" + strings.Repeat("padding\n", maxStderr) + "last actionable diagnostic\n"
+	err = commandError(context.Background(), "docker", "docker", []string{"inspect", "target"}, nil, []byte(input), exec.ErrWaitDelay)
+	if !strings.Contains(err.Error(), "last actionable diagnostic") || strings.Contains(err.Error(), "first diagnostic") {
+		t.Fatalf("not a stderr tail: %v", err)
+	}
+}

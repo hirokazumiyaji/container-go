@@ -405,7 +405,7 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	if err := start(cmd); err != nil {
 		lifecycle.failStart()
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+			contextErr := commandContextError(bin, args, nil, ctxErr)
 			return markRunStatus(errors.Join(contextErr, err), lifecycle.status())
 		}
 		return markRunStatus(err, lifecycle.status())
@@ -438,7 +438,7 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	stdout, stderr := captured()
 	commandErr := commandError(ctx, bin, identity, args, stdout, stderr, err)
 	if commandErr == nil && ctx.Err() != nil && status.TerminatedByCancellation {
-		commandErr = fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+		commandErr = commandContextError(bin, args, stderr, ctx.Err())
 	}
 	return markRunStatus(commandErr, status)
 }
@@ -454,7 +454,7 @@ func commandError(ctx context.Context, bin, identity string, args []string, stdo
 			// A Unix signal has no usable application status. Preserve the
 			// context contract while the lifecycle status records whether
 			// local cancellation actually terminated the process.
-			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+			return commandContextError(bin, args, stderr, ctxErr)
 		}
 		cliErr := &CLIError{
 			Binary:   identity,
@@ -466,23 +466,29 @@ func commandError(ctx context.Context, bin, identity string, args []string, stdo
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// The process did produce an exit status, but cancellation
 			// raced with its completion. Keep both facts observable.
-			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), errors.Join(commandErr, ctxErr))
+			return commandContextError(bin, args, stderr, errors.Join(commandErr, ctxErr))
 		}
 		return commandErr
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+		contextErr := commandContextError(bin, args, stderr, ctxErr)
 		return errors.Join(contextErr, err)
 	}
 	if errors.Is(err, exec.ErrWaitDelay) {
-		redactor := NewRedactor()
-		message := fmt.Sprintf("%s %s", redactor.Text(bin), strings.Join(redactor.Args(args), " "))
-		if diagnostic := redactor.RedactBounded(string(stderr), maxStderr); diagnostic != "" {
-			message += ": " + strings.TrimSpace(diagnostic)
-		}
-		return fmt.Errorf("%s: %w", message, err)
+		return commandContextError(bin, args, stderr, err)
 	}
+
 	return err
+}
+
+func commandContextError(bin string, args []string, stderr []byte, err error) error {
+	redactor := NewRedactor()
+	message := fmt.Sprintf("%s %s", redactor.Text(bin), strings.Join(redactor.Args(args), " "))
+	if diagnostic := strings.TrimSpace(string(stderr)); diagnostic != "" {
+		tail, _ := redactor.RedactTail(strings.NewReader(diagnostic), maxStderr)
+		message += ": " + tail
+	}
+	return fmt.Errorf("%s: %w", message, err)
 }
 
 // commandRunError is the historical helper name retained for tests that

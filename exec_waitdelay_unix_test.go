@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -42,5 +43,21 @@ func TestExecWaitDelayRedactsCommandAndPreservesDiagnostics(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "backend diagnostic") {
 		t.Fatalf("missing stderr diagnostic: %v", err)
+	}
+}
+
+func TestExecTimeoutRedactsCommand(t *testing.T) {
+	stub := filepath.Join(t.TempDir(), "container")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nsleep 5\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &waitDelayExecRunner{fakeRunner: newTestRunner(), command: &cli.ExecRunner{Binary: stub, Identity: "container"}}
+	ctr := runTestContainer(t, runner, withEngine(appleEngine{}))
+	_, _, err := ctr.Exec(context.Background(), []string{"sh", "-c", "mysql --password=hunter2"}, WithExecTimeout(100*time.Millisecond))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want deadline exceeded", err)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Fatalf("secret leaked: %v", err)
 	}
 }

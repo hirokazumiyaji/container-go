@@ -12,9 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ErrExitCodeUnavailable`, `ErrContainerNotStopped`, and `InspectInfo.ExitCodeReported`
   distinguish unavailable process status from a reported zero exit code.
 
-### Fixed
+### Changed
 
-- `Container.ExitCode` and `Wait` no longer assume success when the backend omits
+- **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
   an exit code. `ExitCode` also rejects containers that have not stopped. Callers
   relying on `0, nil` must handle these errors; snapshot users must check
   `ExitCodeReported` and `State` before interpreting `InspectInfo.ExitCode`.

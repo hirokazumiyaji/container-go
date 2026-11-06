@@ -37,8 +37,7 @@ type streamProcessor struct {
 	valueCandidates   []streamValueCandidate
 	valueMatches      []streamValueMatch
 	valueOverflow     bool
-	byShortPrefix     map[uint32][]valueHash
-	byLongPrefix      map[uint32][]valueHash
+	index             *valueHashIndex
 	limit             int
 	output            []byte
 	done              bool
@@ -63,14 +62,18 @@ func newStreamProcessor(r *Redactor, limit int, emit func([]byte)) *streamProces
 	if r == nil {
 		r = NewRedactor()
 	}
+	r = &Redactor{hashes: r.hashes, index: r.index, force: r.force}
+	if r.index == nil {
+		r.index = newValueHashIndex(r.hashes)
+	}
+	r.index.initialize()
 	overlap := r.streamOverlap()
 	p := &streamProcessor{
-		redactor:      r,
-		overlap:       overlap,
-		limit:         limit,
-		emit:          emit,
-		byShortPrefix: r.index.byShort,
-		byLongPrefix:  r.index.byPrefix,
+		redactor: r,
+		overlap:  overlap,
+		limit:    limit,
+		emit:     emit,
+		index:    r.index,
 	}
 	if overlap > MaxStreamOverlap {
 		p.configErr = errStreamValueTooLarge
@@ -101,7 +104,13 @@ func (r *Redactor) streamOverlap() int {
 // StreamValueFits reports whether a value and every common escaped form fit in
 // the bounded streaming redaction window.
 func StreamValueFits(value string) bool {
-	return NewRedactor(value).streamOverlap() <= MaxStreamOverlap
+	r := &Redactor{source: []string{value}}
+	for _, expanded := range r.expandedValues() {
+		if len(expanded) > MaxStreamOverlap {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *streamProcessor) write(input []byte) error {
@@ -183,8 +192,9 @@ func (p *streamProcessor) scanValueMatches() {
 	}
 	for position := p.nextShortScan; position < pendingEnd; position++ {
 		local := int(position - p.pendingStart)
-		entries := p.byShortPrefix[shortPrefixAtBytes(p.pending, local)]
-		for _, entry := range entries {
+		entries := p.index.byShort[shortPrefixAtBytes(p.pending, local)]
+		for _, at := range entries {
+			entry := p.index.hashes[at]
 			if !p.redactor.force && (entry.length < minimumTokenLength || local > 0 && entry.firstWord && wordByte(p.pending[local-1])) {
 				continue
 			}
@@ -199,8 +209,9 @@ func (p *streamProcessor) scanValueMatches() {
 	}
 	for position := p.nextValueScan; position < longEnd; position++ {
 		local := int(position - p.pendingStart)
-		entries := p.byLongPrefix[valuePrefixAtBytes(p.pending, local)]
-		for _, entry := range entries {
+		entries := p.index.byPrefix[valuePrefixAtBytes(p.pending, local)]
+		for _, at := range entries {
+			entry := p.index.hashes[at]
 			if !p.redactor.force && local > 0 && entry.firstWord && wordByte(p.pending[local-1]) {
 				continue
 			}

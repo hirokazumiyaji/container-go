@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// Bound long-lived clients even when all cached answers are still fresh.
 const imageCacheLimit = 256
 
 // imageCache remembers that an image is present in a backend's local
@@ -86,7 +87,8 @@ func (c *imageCache) seen(eng engine, image, platform string) bool {
 }
 
 // remember records that the image is present. While inserting it also
-// drops any expired entries so a long-lived Option used with changing
+// drops expired entries and evicts the earliest-expiring entry at capacity.
+// A long-lived Option used with changing
 // image references does not retain dead keys forever; seen() already
 // drops an expired key on lookup, but keys that are never queried again
 // would otherwise linger until the Option itself is discarded.
@@ -104,20 +106,19 @@ func (c *imageCache) rememberIdentity(eng engine, image, platform string, identi
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var oldestKey string
+	var oldestExpiry time.Time
+	haveOldest := false
 	for k, entry := range c.entries {
 		if !now.Before(entry.expiry) {
 			delete(c.entries, k)
+			continue
+		}
+		if !haveOldest || entry.expiry.Before(oldestExpiry) {
+			oldestKey, oldestExpiry, haveOldest = k, entry.expiry, true
 		}
 	}
 	if _, exists := c.entries[key]; !exists && len(c.entries) >= imageCacheLimit {
-		var oldestKey string
-		var oldestExpiry time.Time
-		for existing, entry := range c.entries {
-			if oldestExpiry.IsZero() || entry.expiry.Before(oldestExpiry) {
-				oldestKey = existing
-				oldestExpiry = entry.expiry
-			}
-		}
 		delete(c.entries, oldestKey)
 	}
 	c.entries[key] = imageCacheEntry{

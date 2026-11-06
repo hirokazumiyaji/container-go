@@ -301,3 +301,31 @@ func TestComposedRedactorsProtectTextAndStreams(t *testing.T) {
 		t.Fatalf("closed Text() = %q, want %q", got, input)
 	}
 }
+
+func TestStreamRetainsExplicitValuesAfterSourceClose(t *testing.T) {
+	const secret = "explicit-stream-context"
+	r := NewHashedContextRedactor(secret)
+	stream := r.NewStream(0)
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write([]byte(secret)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := stream.String(); got != Redacted {
+		t.Fatalf("stream = %q, want %q", got, Redacted)
+	}
+}
+
+func TestHashedWithValuesDoesNotRetainPlaintext(t *testing.T) {
+	r := NewHashedContextRedactor("first").WithValues("second")
+	if len(r.source) != 0 || len(r.values) != 0 {
+		t.Fatal("hashed composition retained plaintext")
+	}
+	if got := r.Text("first second"); got != Redacted+" "+Redacted {
+		t.Fatalf("Text = %q", got)
+	}
+}

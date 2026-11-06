@@ -1474,3 +1474,21 @@ func TestExecRunnerIdentityDefaultsToBinary(t *testing.T) {
 		t.Fatalf("identity = %q, want container", got)
 	}
 }
+
+func TestCollectNonCLIThroughNestedWrappers(t *testing.T) {
+	cliErr := &CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1}
+	veto := errors.New("TLS certificate rejected")
+	err := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", errors.Join(cliErr, veto)))
+	branches := CollectNonCLIErrorBranches(err)
+	if len(branches) != 1 || !errors.Is(branches[0], veto) {
+		t.Fatalf("branches=%v, want TLS veto", branches)
+	}
+}
+
+func TestErrorBranchesDeduplicatesStdoutWrappers(t *testing.T) {
+	failure := &CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1}
+	branches := ErrorBranches(errors.Join(failure, WithStdout(failure, "diagnostic")), "docker")
+	if len(branches) != 1 || branches[0].Stdout != "diagnostic" {
+		t.Fatalf("branches=%+v", branches)
+	}
+}

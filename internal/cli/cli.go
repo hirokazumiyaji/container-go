@@ -623,72 +623,97 @@ func probeRelevantError(err error, probe Probe) error {
 	}
 
 	var branches []error
-	var nonCLI []error
-	stdoutByCLIError := make(map[*CLIError]string)
+	for _, branch := range ErrorBranches(err, probe.Binary) {
+		if CommandOperation(branch.Error.Args) == operation {
+			branches = append(branches, branch.Cause)
+		}
+	}
+	if len(branches) == 0 {
+		return err
+	}
+	return errors.Join(append(branches, CollectNonCLIErrorBranches(err)...)...)
+}
+
+func CollectNonCLIErrorBranches(err error) []error {
+	var out []error
 	var walk func(error)
-	walk = func(cur error) {
-		if cur == nil {
+	walk = func(original error) {
+		for current := original; current != nil; {
+			if joined, ok := current.(interface{ Unwrap() []error }); ok {
+				for _, child := range joined.Unwrap() {
+					walk(child)
+				}
+				return
+			}
+			if _, ok := current.(*CLIError); ok {
+				return
+			}
+			if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+				if child := wrapped.Unwrap(); child != nil {
+					current = child
+					continue
+				}
+			}
+			out = append(out, original)
 			return
 		}
-		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+	}
+	walk(err)
+	return out
+}
+
+type ErrorBranch struct {
+	Error  *CLIError
+	Stdout string
+	Cause  error
+}
+
+func ErrorBranches(err error, binary string) []ErrorBranch {
+	var branches []ErrorBranch
+	stdoutByError := make(map[*CLIError]string)
+	index := make(map[*CLIError]int)
+	var walk func(error)
+	walk = func(current error) {
+		if current == nil {
+			return
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
 			for _, child := range joined.Unwrap() {
 				walk(child)
 			}
 			return
 		}
-		if stdout, _, _ := DiagnosticText(cur); stdout != "" {
+		if stdout, _, _ := DiagnosticText(current); stdout != "" {
 			var owner *CLIError
-			if errors.As(cur, &owner) {
-				stdoutByCLIError[owner] = stdout
+			if errors.As(current, &owner) {
+				stdoutByError[owner] = stdout
 			}
 		}
-		if cliErr, ok := cur.(*CLIError); ok {
-			if probe.Binary == "" || BinaryMatches(cliErr.Binary, probe.Binary) {
-				if CommandOperation(cliErr.Args) == operation {
-					cause := error(cliErr)
-					if stdout := stdoutByCLIError[cliErr]; stdout != "" {
-						cause = WithStdout(cliErr, stdout)
-					}
-					branches = append(branches, cause)
-				}
+		if cliErr, ok := current.(*CLIError); ok {
+			if binary != "" && !BinaryMatches(cliErr.Binary, binary) {
+				return
 			}
+			stdout := stdoutByError[cliErr]
+			cause := error(cliErr)
+			if stdout != "" {
+				cause = WithStdout(cliErr, stdout)
+			}
+			if at, ok := index[cliErr]; ok {
+				if stdout != "" {
+					branches[at].Stdout, branches[at].Cause = stdout, cause
+				}
+				return
+			}
+			index[cliErr] = len(branches)
+			branches = append(branches, ErrorBranch{Error: cliErr, Stdout: stdout, Cause: cause})
 			return
 		}
-		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
 			walk(wrapped.Unwrap())
 		}
 	}
 	walk(err)
-	CollectNonCLIErrorBranches(err, &nonCLI)
-	if len(branches) == 0 {
-		return err
-	}
-	parts := append(branches, nonCLI...)
-	return errors.Join(parts...)
-}
-
-func CollectNonCLIErrorBranches(err error, out *[]error) {
-	if err == nil {
-		return
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			CollectNonCLIErrorBranches(child, out)
-		}
-		return
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		child := wrapped.Unwrap()
-		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			CollectNonCLIErrorBranches(child, out)
-			return
-		}
-	}
-	var cliErr *CLIError
-	if errors.As(err, &cliErr) {
-		return
-	}
-	*out = append(*out, err)
+	return branches
 }
 
 func CommandOperation(args []string) string {
@@ -704,6 +729,7 @@ func CommandOperation(args []string) string {
 	return args[0]
 }
 
+// BinaryMatches compares executable names; want must be non-empty.
 func BinaryMatches(got, want string) bool {
 	got = strings.TrimSpace(strings.ToLower(got))
 	if got == "" {

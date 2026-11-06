@@ -823,7 +823,8 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()
-	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
+	args := eng.imageInspectArgs(image, platform)
+	stdout, _, err := r.Run(qCtx, args...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
 		return imageIdentity{}, false, contextErr
 	}
@@ -831,7 +832,7 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 		if eng.imageMissingForTarget(err, image) || imageMissingError(eng, err) {
 			return imageIdentity{}, false, nil
 		}
-		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, cli.CommandOperation(eng.imageInspectArgs(image, platform)), image)
+		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, cli.CommandOperation(args), image)
 	}
 	if contextErr := commandContextError(qCtx, nil); contextErr != nil {
 		return imageIdentity{}, false, contextErr

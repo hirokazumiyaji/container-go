@@ -34,67 +34,14 @@ type cliErrorBranch struct {
 // joined parents and siblings never lend their diagnostics to another
 // branch.
 func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
-	if err == nil {
-		return nil
-	}
 	var branches []cliErrorBranch
-	stdoutByCLIError := make(map[*cli.CLIError]string)
-	branchIndex := make(map[*cli.CLIError]int)
-	var walk func(error)
-	walk = func(cur error) {
-		if cur == nil {
-			return
-		}
-		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
-			for _, child := range joined.Unwrap() {
-				walk(child)
-			}
-			return
-		}
-		if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" {
-			var owner *cli.CLIError
-			if errors.As(cur, &owner) {
-				stdoutByCLIError[owner] = stdout
-			}
-		}
-		if cliErr, ok := cur.(*cli.CLIError); ok {
-			// Empty Binary is the historical `container` executable, so a
-			// Docker classifier never accepts an error without an explicit
-			// Docker binary. ExecRunner always records the executable name.
-			if backend != "" && !cli.BinaryMatches(cliErr.Binary, backend) {
-				return
-			}
-			operation := cli.CommandOperation(cliErr.Args)
-			stdout := stdoutByCLIError[cliErr]
-			cause := error(cliErr)
-			if stdout != "" {
-				cause = cli.WithStdout(cliErr, stdout)
-			}
-			if index, ok := branchIndex[cliErr]; ok {
-				if stdout != "" {
-					branches[index].stdout = stdout
-					branches[index].cause = cause
-				}
-				return
-			}
-			branchIndex[cliErr] = len(branches)
-			branches = append(branches, cliErrorBranch{
-				ctx: cliErrorContext{
-					err:       cliErr,
-					operation: operation,
-					target:    commandTarget(cliErr.Args, operation),
-				},
-				stdout: stdout,
-				stderr: cliErr.Stderr,
-				cause:  cause,
-			})
-			return
-		}
-		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
-			walk(wrapped.Unwrap())
-		}
+	for _, branch := range cli.ErrorBranches(err, backend) {
+		operation := cli.CommandOperation(branch.Error.Args)
+		branches = append(branches, cliErrorBranch{
+			ctx:    cliErrorContext{err: branch.Error, operation: operation, target: commandTarget(branch.Error.Args, operation)},
+			stdout: branch.Stdout, stderr: branch.Error.Stderr, cause: branch.Cause,
+		})
 	}
-	walk(err)
 	return branches
 }
 

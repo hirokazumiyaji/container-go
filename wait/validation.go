@@ -26,20 +26,6 @@ func (o options) validate() error {
 	return nil
 }
 
-func validatePortSpec(port string, allowEmpty bool) error {
-	if port == "" {
-		if allowEmpty {
-			return nil
-		}
-		return invalidConfigf("port must not be empty")
-	}
-
-	if _, err := portspec.Parse(port); err != nil {
-		return invalidConfigf("%s", err)
-	}
-	return nil
-}
-
 func isPermanentCheckError(err error) bool {
 	if err == nil {
 		return false
@@ -137,9 +123,6 @@ func ValidateWithPorts(strategy Strategy, ports []string) error {
 	}
 	allowed := make(map[string]struct{}, len(ports))
 	for _, port := range ports {
-		if err := validatePortSpec(port, false); err != nil {
-			return err
-		}
 		canonical, err := canonicalPortSpec(port)
 		if err != nil {
 			return err

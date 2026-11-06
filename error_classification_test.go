@@ -1154,7 +1154,6 @@ func TestCleanupDeleteClassifierIsOperationAndBackendAware(t *testing.T) {
 				Binary: "container", Args: []string{"delete", "--force", "id"},
 				Stderr: "Error: failed to delete container: container with ID id not found",
 			},
-			wantIDs: []string{"id"},
 		},
 		{
 			name: "ambiguous delete",

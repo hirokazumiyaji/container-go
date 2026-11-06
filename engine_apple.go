@@ -419,8 +419,7 @@ func appleProbeUnavailable(err error) bool {
 			return false
 		}
 	}
-	var nonCLI []error
-	cli.CollectNonCLIErrorBranches(err, &nonCLI)
+	nonCLI := cli.CollectNonCLIErrorBranches(err)
 	for _, extra := range nonCLI {
 		if cli.IsProbeConfigurationError(extra) {
 			return false

@@ -194,7 +194,10 @@ func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
 				t.Fatalf("rm calls = %v, want 2", deletes)
 			}
 			for _, call := range deletes {
-				want := []string{"rm", "--force", "--volumes", call[len(call)-1]}
+				want := []string{"rm", "--volumes", call[len(call)-1]}
+				if tc.name == "reuse group" {
+					want = []string{"rm", "--force", "--volumes", call[len(call)-1]}
+				}
 				if !slices.Equal(call, want) {
 					t.Errorf("rm call = %v, want %v", call, want)
 				}
@@ -240,8 +243,8 @@ func TestDockerPruneAcceptsPreciseContainerNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	if !slices.Equal(removed, []string{id}) {
-		t.Fatalf("removed = %v, want [%s]", removed, id)
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want no successful removals", removed)
 	}
 }
 

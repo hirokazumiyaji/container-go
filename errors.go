@@ -542,8 +542,7 @@ func isNotFoundForOperation(eng engine, err error, operation string, targets ...
 	for _, branch := range selected {
 		parts = append(parts, branch.cause)
 	}
-	var nonCLI []error
-	cli.CollectNonCLIErrorBranches(err, &nonCLI)
+	nonCLI := cli.CollectNonCLIErrorBranches(err)
 	parts = append(parts, nonCLI...)
 	return isNotFoundFor(eng, errors.Join(parts...))
 }
@@ -902,8 +901,7 @@ func classifyErrorForWithProbe(ctx context.Context, r cli.Runner, err error, eng
 	}
 	allBranches := backendCLIErrorBranches(err, "")
 	selected := branch.cause
-	var nonCLI []error
-	cli.CollectNonCLIErrorBranches(err, &nonCLI)
+	nonCLI := cli.CollectNonCLIErrorBranches(err)
 	parts := make([]error, 0, len(allBranches)+len(nonCLI))
 	parts = append(parts, selected)
 	for _, related := range allBranches {

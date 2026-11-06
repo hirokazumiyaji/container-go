@@ -609,7 +609,7 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる。
 - `ErrImageIdentityNotLocal`：選択した policy で pinned reference が local image store に存在しないことが確認された。Apple の `container run` に暗黙の fetch を許さない
 - `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。mutable tag fallback は使わない
 - `ErrOutputDelivery`：caller-owned output sink が CLI output を拒否した場合。元の writer error は chain に残る
-- `ErrReuseMismatch`：再利用時の設定、image、platform、network、port、reuse group の不一致。一時的な port binding の未反映は再試行し、attach 予算の終了時は `context.DeadlineExceeded` にも一致する。呼び出し元の取消や所有権・世代の検証失敗は構成不一致に分類しない。
+- `ErrReuseMismatch`：再利用時の設定、image、platform、network、port、reuse group の不一致。Docker の一時的な port binding の未反映は再試行し、attach 予算の終了時は `context.DeadlineExceeded` にも一致する。Apple の明示的な publication の欠落は即座に不一致とする。呼び出し元の取消や所有権・世代の検証失敗は構成不一致に分類しない。
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。reuse は readiness 後の再 inspect で置き換えを検出し、handle を返さない。
 - `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。

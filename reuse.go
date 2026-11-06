@@ -23,6 +23,10 @@ var reuseFlights flightGroup[*Container]
 
 var errReusePortPending = errors.New("reuse port binding is not ready")
 
+type reuseValidationError struct{ error }
+
+func (e *reuseValidationError) Unwrap() error { return e.error }
+
 type reuseCleanupWarning struct {
 	err error
 }
@@ -244,6 +248,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			return nil, fmt.Errorf("reuse %s: timed out waiting for complete inspect: %w", cfg.name, err)
+		}
+		var invalid *reuseValidationError
+		if errors.As(err, &invalid) {
+			return nil, joinEnvFileCleanupError(err, leaderWarning)
 		}
 		if leader && leaderWarning != nil {
 			// The create itself succeeded and the only known warning is
@@ -1076,6 +1084,9 @@ func checkReusePortCompat(info *engineInfo, cfg *config) error {
 	for _, p := range cfg.published {
 		b, ok := matchingPublishedBinding(info.bound, p, cfg.eng)
 		if !ok {
+			if cfg.eng.directIP() {
+				return fmt.Errorf("%w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, cfg.name, p.raw)
+			}
 			return fmt.Errorf("%w: %w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, errReusePortPending, cfg.name, p.raw)
 		}
 		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
@@ -1461,24 +1472,24 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 	}
 	var pendingPort error
 	for ctx.Err() == nil {
-		pendingPort = nil
 		info, err := inspectReuseBase(ctx, base, cfg)
 		if err == nil {
+			pendingPort = nil
 			if base != nil {
 				base.pack().mu.Lock()
 				creation := base.creation
 				uid := base.immutableID()
 				base.pack().mu.Unlock()
 				if creation != "" && info.labels[creationLabel] != creation {
-					return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+					return nil, &reuseValidationError{fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)}
 				}
 				if uid != "" && info.uid != "" && info.uid != uid {
-					return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+					return nil, &reuseValidationError{fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)}
 				}
 			}
 			if info.state == StateRunning {
 				if err := checkReuseOwnedIdentity(info, requested, original, cfg); err != nil {
-					return nil, err
+					return nil, &reuseValidationError{err}
 				}
 				if configNeedsDefaultNetwork(cfg) {
 					name, err := base.ensureDefaultNetworkForConfig(ctx, cfg)
@@ -1490,7 +1501,7 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 
 				if err := checkReuseConfigCompat(info, cfg); err != nil {
 					if !errors.Is(err, errReusePortPending) {
-						return nil, err
+						return nil, &reuseValidationError{err}
 					}
 					pendingPort = err
 				} else {
@@ -1502,17 +1513,23 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 			}
 			switch info.state {
 			case StateStopping:
-				return nil, fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)
+				return nil, &reuseValidationError{fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)}
 			case StatePaused:
-				return nil, fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)
+				return nil, &reuseValidationError{fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)}
 			case StateStopped:
-				return nil, fmt.Errorf("reuse %s: container stopped before becoming ready", cfg.name)
+				return nil, &reuseValidationError{fmt.Errorf("reuse %s: container stopped before becoming ready", cfg.name)}
 			}
 		} else {
+			if ctx.Err() != nil {
+				break
+			}
 			if isNotFound(err) {
-				return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+				return nil, &reuseValidationError{fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)}
 			}
 			if !transientReuseInspectError(err) {
+				if ctx.Err() != nil {
+					break
+				}
 				return nil, err
 			}
 		}

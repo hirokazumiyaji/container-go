@@ -1192,9 +1192,10 @@ and cancellation paths.
   `PullNever` without an implicit fetch; `Run` and `Pull` reject it before any
   CLI call. Use `PullMissing` or `PullAlways`.
 - `ErrReuseMismatch`: incompatible reuse creation settings, image, platform,
-  network, ports, or reuse group. Temporarily missing port bindings are
+  network, ports, or reuse group. Temporarily missing Docker port bindings are
   retried; if the attach budget expires, the error also matches
-  `context.DeadlineExceeded`. Caller cancellation and ownership/generation
+  `context.DeadlineExceeded`. Missing Apple publications fail immediately.
+  Caller cancellation and ownership/generation
   errors are not configuration mismatches.
 - `ErrPortNotExposed`: a port was neither declared nor published, or
   the declared port had no usable host binding.

@@ -415,3 +415,46 @@ func TestReusePortPollingDoesNotMisclassifyRestartingState(t *testing.T) {
 		t.Fatalf("got %v, want restarting timeout without stale port mismatch", err)
 	}
 }
+
+func TestReusePortPendingSurvivesDeadlineDuringInspect(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	backend := reuseBackendFixtures()[0]
+	spec := backend.runningSpec()
+	spec.ports = nil
+	data := backend.inspect(spec)
+	f := newTestRunner()
+	f.imagePresent = true
+	calls := 0
+	runner := waitRunnerFunc(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		if args[0] != "inspect" {
+			return f.Run(ctx, args...)
+		}
+		calls++
+		if calls >= 3 {
+			<-ctx.Done()
+			return nil, nil, ctx.Err()
+		}
+		return data, nil, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := Run(ctx, "redis:7-alpine", WithName("shared"), WithReuse(), WithExposedPorts("6379"), WithReusePollInterval(time.Millisecond), WithReuseAttachTimeout(50*time.Millisecond), withEngine(backend.eng), withRunner(runner))
+	if !errors.Is(err, ErrReuseMismatch) || !errors.Is(err, context.DeadlineExceeded) || calls < 3 {
+		t.Fatalf("calls=%d error=%v, want pending-port deadline during inspect", calls, err)
+	}
+}
+
+func TestReuseAppleMissingPublicationIsPermanentMismatch(t *testing.T) {
+	backend := reuseBackendFixtures()[1]
+	spec := backend.runningSpec()
+	spec.ports = nil
+	data := backend.inspect(spec)
+	runner := newReuseTransitionRunner(data, data, backend.eng)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := Run(ctx, "redis:7-alpine", WithName("shared"), WithReuse(), WithPublishedPort("8080:9999"), WithReuseAttachTimeout(50*time.Millisecond), withEngine(backend.eng), withRunner(runner))
+	if !errors.Is(err, ErrReuseMismatch) || errors.Is(err, context.DeadlineExceeded) || runner.inspectCalls != 2 {
+		t.Fatalf("inspects=%d error=%v, want immediate Apple publication mismatch", runner.inspectCalls, err)
+	}
+}

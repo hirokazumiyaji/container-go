@@ -113,21 +113,21 @@ func checkStreamRedactorInvariants(t *testing.T, r *Redactor, input string, must
 	}
 
 	want := r.Text(input)
-	stream := r.NewStream(0)
+	stream := newStreamProcessor(r, 0, nil)
 	const chunkSize = 4096
 	for start := 0; start < len(input); start += chunkSize {
 		end := start + chunkSize
 		if end > len(input) {
 			end = len(input)
 		}
-		if _, err := stream.Write([]byte(input[start:end])); err != nil {
+		if err := stream.write([]byte(input[start:end])); err != nil {
 			t.Fatalf("stream.Write: %v", err)
 		}
 	}
-	if err := stream.Close(); err != nil {
+	if err := stream.close(); err != nil {
 		t.Fatalf("stream.Close: %v", err)
 	}
-	got := stream.String()
+	got := string(stream.output)
 	if got != want {
 		t.Fatalf("streamed redaction = %q, want one-shot Text() = %q", got, want)
 	}

@@ -138,19 +138,19 @@ func TestSanitizeEscapesTerminalSequencesAndLineBreaks(t *testing.T) {
 func TestStreamRedactorCarriesSecretAcrossChunks(t *testing.T) {
 	const secret = "stream-boundary-secret-value"
 	r := NewContextRedactor(secret)
-	stream := r.NewStream(1024 * 1024)
+	stream := newStreamProcessor(r, 1024*1024, nil)
 	first := strings.Repeat("x", DefaultStreamOverlap-8) + "password=" + secret[:len(secret)/2]
 	second := secret[len(secret)/2:] + strings.Repeat("y", DefaultStreamOverlap)
-	if _, err := stream.Write([]byte(first)); err != nil {
+	if err := stream.write([]byte(first)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := stream.Write([]byte(second)); err != nil {
+	if err := stream.write([]byte(second)); err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.Close(); err != nil {
+	if err := stream.close(); err != nil {
 		t.Fatal(err)
 	}
-	got := stream.String()
+	got := string(stream.output)
 	if strings.Contains(got, secret) || strings.Contains(got, secret[:len(secret)/2]) || strings.Contains(got, secret[len(secret)/2:]) {
 		t.Fatalf("stream = %q, contains split secret", got)
 	}
@@ -161,11 +161,11 @@ func TestStreamRedactorCarriesSecretAcrossChunks(t *testing.T) {
 
 func TestStreamRedactorDoesNotSplitLongStructuralValue(t *testing.T) {
 	secret := strings.Repeat("b", DefaultStreamOverlap+1024)
-	stream := NewRedactor().NewStream(2 * 1024 * 1024)
-	_, _ = stream.Write([]byte("Authorization: Basic " + secret[:len(secret)/2]))
-	_, _ = stream.Write([]byte(secret[len(secret)/2:] + "\n"))
-	_ = stream.Close()
-	got := stream.String()
+	stream := newStreamProcessor(NewRedactor(), 2*1024*1024, nil)
+	_ = stream.write([]byte("Authorization: Basic " + secret[:len(secret)/2]))
+	_ = stream.write([]byte(secret[len(secret)/2:] + "\n"))
+	_ = stream.close()
+	got := string(stream.output)
 	if strings.Contains(got, secret) || strings.Contains(got, secret[:len(secret)/2]) || strings.Contains(got, secret[len(secret)/2:]) || !strings.Contains(got, Redacted) {
 		t.Fatalf("stream leaked a long structural value: len=%d", len(got))
 	}
@@ -173,10 +173,10 @@ func TestStreamRedactorDoesNotSplitLongStructuralValue(t *testing.T) {
 
 func TestStreamRedactorBoundsOutputAndLargeValues(t *testing.T) {
 	secret := strings.Repeat("s", 4096)
-	stream := NewContextRedactor(secret).NewStream(32)
-	_, _ = stream.Write([]byte("password=" + secret + strings.Repeat("z", 128*1024)))
-	_ = stream.Close()
-	if got := stream.String(); len(got) > 32 || strings.Contains(got, secret) {
+	stream := newStreamProcessor(NewContextRedactor(secret), 32, nil)
+	_ = stream.write([]byte("password=" + secret + strings.Repeat("z", 128*1024)))
+	_ = stream.close()
+	if got := string(stream.output); len(got) > 32 || strings.Contains(got, secret) {
 		t.Fatalf("bounded stream = %q (len %d), want <=32 without secret", got, len(got))
 	}
 }

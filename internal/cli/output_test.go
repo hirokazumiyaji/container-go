@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 type cappedTestWriter struct {
@@ -238,5 +239,18 @@ func TestCountingWriterStopsWritingAfterSinkError(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("snapshot error = nil, want first sink error")
+	}
+}
+
+func TestExecRunnerRunToTimeoutOmitsTruncatedRawStderr(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'password=' >&2; head -c 131072 /dev/zero | tr '\000' S >&2; sleep 10`)}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	stats, err := r.RunTo(ctx, io.Discard, io.Discard, "exec", "target")
+	if stats.StderrBytes <= maxStderr {
+		t.Fatalf("stderr bytes = %d, want truncated capture", stats.StderrBytes)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), strings.Repeat("S", 32)) {
+		t.Fatalf("unsafe timeout diagnostic: %.200v", err)
 	}
 }

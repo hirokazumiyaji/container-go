@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -160,7 +164,7 @@ func TestPruneRedactsResolvedAndRunnerTargets(t *testing.T) {
 			r := envPruneDiagnosticRunner{pruneDiagnosticRunner: &pruneDiagnosticRunner{fakeRunner: f, listOperation: "ps"}}
 			eng := dockerEngine{context: "prod", explicitContext: true}
 			if source == "resolved" {
-				eng.resolvedTarget = &dockerTargetEndpoint{rawHost: "tcp://" + host + ":2375", host: host, clientHost: host, context: "prod"}
+				eng.resolvedTarget = &dockerTargetEndpoint{rawHost: "tcp://" + host + ":2375", host: host, clientHost: host, context: "prod", isRemote: true}
 				eng.configDir = configDir
 			} else {
 				r.env = []string{"DOCKER_HOST=tcp://" + host + ":2375", "DOCKER_CONFIG=" + configDir}
@@ -212,7 +216,8 @@ func TestDockerLocalTargetDiagnosticsStayReadable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cfg := &config{eng: dockerEngine{host: raw, explicitHost: true, resolvedTarget: &ep}, dockerHost: &raw}
+			t.Setenv("DOCKER_HOST", "")
+			cfg := &config{eng: dockerEngine{resolvedTarget: &ep}}
 			input := "Cannot connect to the Docker daemon at " + raw + ". dial 127.0.0.1:5000: connection refused"
 			got := cfg.publicError(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, ExitCode: 1, Stderr: input}).Error()
 			if !strings.Contains(got, input) {
@@ -229,7 +234,7 @@ func TestDockerGenericHostnameDoesNotCorruptDiagnostics(t *testing.T) {
 			cfg := &config{eng: dockerEngine{host: raw, explicitHost: true}}
 			input := "docker daemon debug database dbus failure at " + raw
 			got := cfg.publicError(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, ExitCode: 1, Stderr: input}).Error()
-			if !strings.HasPrefix(got, "docker ps:") || !strings.Contains(got, "docker daemon debug database dbus failure at ") {
+			if !strings.Contains(got, "debug database dbus failure at ") {
 				t.Fatalf("generic hostname corrupted diagnostic: %s", got)
 			}
 			if strings.Contains(got, raw) {
@@ -363,5 +368,126 @@ func TestPackagePruneTargetResolutionSharesOverallBudget(t *testing.T) {
 				t.Fatalf("lookup deadline=%v list deadline=%v, want one shared overall budget", lookupDeadline, listDeadline)
 			}
 		})
+	}
+}
+
+func TestExplicitLocalDockerEndpointIsRedacted(t *testing.T) {
+	for _, raw := range []string{"unix:///home/alice/acme-widgets/docker.sock", "tcp://127.0.0.1:12345"} {
+		cfg := &config{dockerHost: &raw, eng: dockerEngine{host: raw, explicitHost: true}}
+		if got := cfg.diagnosticRedactor().Text("endpoint " + raw); strings.Contains(got, raw) {
+			t.Fatalf("explicit target leaked: %s", got)
+		}
+	}
+}
+
+func TestShortDockerHostnameIsBoundaryRedacted(t *testing.T) {
+	for _, host := range []string{"finance1", "docker", "db"} {
+		raw := "tcp://" + host + ":2375"
+		cfg := &config{eng: dockerEngine{host: raw, explicitHost: true}}
+		got := cfg.diagnosticRedactor().Text("lookup " + host + ": no such host; x" + host + "y database dbus debug")
+		if strings.Contains(got, "lookup "+host+":") || !strings.Contains(got, "x"+host+"y database dbus debug") {
+			t.Fatalf("host boundary redaction: %s", got)
+		}
+	}
+}
+
+func TestPackagePruneImplicitContextLookupIsBestEffort(t *testing.T) {
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	r := timeoutTestRunner(func(_ context.Context, args ...string) ([]byte, []byte, error) {
+		if args[0] == "context" {
+			return nil, []byte("failed for private-ctx"), &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "failed for private-ctx"}
+		}
+		if args[0] == "ps" {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("unexpected command: %v", args)
+	})
+	if removed, err := Prune(context.Background(), WithPruneRunner(r)); err != nil || len(removed) != 0 {
+		t.Fatalf("Prune=%v,%v", removed, err)
+	}
+}
+
+func TestPruneUnavailableContextPreservesCause(t *testing.T) {
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "private-ctx")
+	r := timeoutTestRunner(func(_ context.Context, args ...string) ([]byte, []byte, error) {
+		return nil, []byte("context private-ctx: executable file not found"), &exec.Error{Name: "docker", Err: exec.ErrNotFound}
+	})
+	_, err := Prune(context.Background(), WithPruneRunner(r))
+	if !errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "private-ctx") {
+		t.Fatalf("Prune cause/redaction=%v", err)
+	}
+}
+
+func TestPruneRunnerConfigStoreStaysPinned(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell stub")
+	}
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_CONFIG", "/ambient-zz")
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "docker-stub")
+	log := filepath.Join(dir, "env.log")
+	script := `#!/bin/sh
+printf '%s %s\n' "$1" "${DOCKER_CONFIG-unset}" >> "$PRUNE_ENV_LOG"
+case "$1" in
+context) printf '%s\n' '[{"Name":"runner-context","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]' ;;
+ps) ;;
+*) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range []string{"DOCKER_CONFIG=/runner-zz", "DOCKER_CONFIG"} {
+		if err := os.WriteFile(log, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		r := &cli.ExecRunner{Binary: binary, Env: []string{setting, "PRUNE_ENV_LOG=" + log}}
+		if _, err := Prune(context.Background(), WithPruneRunner(r)); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(log)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := "/runner-zz"
+		if setting == "DOCKER_CONFIG" {
+			value = "unset"
+		}
+		want := "context " + value + "\nps " + value + "\n"
+		if string(got) != want {
+			t.Fatalf("child config stores=%q, want %q", got, want)
+		}
+	}
+}
+
+func TestPruneContextLookupBudgetsKeepFailurePolicy(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	r := timeoutTestRunner(func(ctx context.Context, _ ...string) ([]byte, []byte, error) {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cfg := pruneConfig{timeout: time.Second, queryTimeout: time.Millisecond, runner: r}
+	if _, _, err := cfg.prepareTarget(ctx, dockerEngine{}, ""); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("explicit budget=%v", err)
+	}
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	cfg.queryTimeout = 0
+	if _, _, err := cfg.prepareTarget(canceled, dockerEngine{}, ""); !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent cancellation=%v", err)
+	}
+	cfg.runner = timeoutTestRunner(func(context.Context, ...string) ([]byte, []byte, error) { return nil, nil, context.DeadlineExceeded })
+	if _, _, err := cfg.prepareTarget(context.Background(), dockerEngine{}, ""); err != nil {
+		t.Fatalf("implicit unavailable lookup=%v", err)
 	}
 }

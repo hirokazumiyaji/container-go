@@ -3,7 +3,6 @@ package container
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
@@ -34,7 +33,7 @@ func (c *config) diagnosticValues() []string {
 		values = append(values, published.raw)
 	}
 	if c.dockerHost != nil {
-		values = append(values, dockerEndpointDiagnosticValues(*c.dockerHost)...)
+		values = append(values, *c.dockerHost)
 	}
 	if c.dockerContext != nil && *c.dockerContext != "default" {
 		values = append(values, *c.dockerContext)
@@ -49,12 +48,14 @@ func (c *config) diagnosticValues() []string {
 	// any value the bounded streaming window cannot redact instead of
 	// making every stream on this handle fail.
 	if de, ok := c.eng.(dockerEngine); ok {
-		targetValues := append(dockerEndpointDiagnosticValues(de.effectiveHost()), de.effectiveConfigDir())
+		targetValues := []string{de.effectiveHost(), de.effectiveConfigDir()}
 		if context := de.effectiveContext(); context != "default" {
 			targetValues = append(targetValues, context)
 		}
 		if de.resolvedTarget != nil {
-			targetValues = append(targetValues, dockerEndpointDiagnosticValues(de.resolvedTarget.rawHost)...)
+			if de.resolvedTarget.isRemote {
+				targetValues = append(targetValues, de.resolvedTarget.rawHost)
+			}
 		}
 		for _, value := range targetValues {
 			if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
@@ -79,7 +80,7 @@ func (c *config) diagnosticRedactor(extra ...string) *cli.Redactor {
 	values := append([]string(nil), c.diagnosticSecrets...)
 	values = append(values, c.diagnosticValues()...)
 	values = append(values, extra...)
-	return cli.NewHashedContextRedactor(values...)
+	return cli.NewHashedContextRedactor(values...).WithBoundaryValues(c.diagnosticBoundaryValues()...)
 }
 
 func safePublicError(err error, values ...string) error {
@@ -205,20 +206,30 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
-func dockerEndpointDiagnosticValues(raw string) []string {
-	endpoint, err := parseDockerEndpoint(raw)
-	if err != nil {
-		return []string{raw}
-	}
-	if !endpoint.isRemote {
+func (c *config) diagnosticBoundaryValues() []string {
+	de, ok := c.eng.(dockerEngine)
+	if !ok {
 		return nil
 	}
-	values := []string{raw}
-	// Generic service names are not specific enough for forced substring masking.
-	for _, host := range []string{endpoint.host, endpoint.clientHost} {
-		if len(host) >= 10 || strings.ContainsAny(host, "-_.:") {
-			values = append(values, host)
+	var values []string
+	for _, raw := range []string{de.effectiveHost()} {
+		if endpoint, err := parseDockerEndpoint(raw); err == nil && endpoint.isRemote {
+			values = append(values, endpoint.host, endpoint.clientHost)
 		}
 	}
-	return values
+	if de.resolvedTarget != nil && de.resolvedTarget.isRemote {
+		values = append(values, de.resolvedTarget.host, de.resolvedTarget.clientHost)
+	}
+	if c.dockerHost != nil {
+		if endpoint, err := parseDockerEndpoint(*c.dockerHost); err == nil && endpoint.isRemote {
+			values = append(values, endpoint.host, endpoint.clientHost)
+		}
+	}
+	filtered := values[:0]
+	for _, value := range uniqueStrings(values) {
+		if len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }

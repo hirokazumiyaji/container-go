@@ -265,3 +265,39 @@ func (r *errorAfterReader) Read(p []byte) (int, error) {
 	}
 	return 0, r.err
 }
+
+func TestBoundaryValuesRemainBoundaryAwareInForcedContext(t *testing.T) {
+	r := NewHashedContextRedactor("force-value").WithBoundaryValues("finance1", "db")
+	r = r.Compose(NewHashedContextRedactor("another-secret")).WithForce()
+	const input = "lookup finance1: db; xfinance1y database dbus prefixforce-valuesuffix"
+	const want = "lookup [REDACTED]: [REDACTED]; xfinance1y database dbus prefix[REDACTED]suffix"
+	if got := r.Text(input); got != want {
+		t.Fatalf("Text=%q, want %q", got, want)
+	}
+	if got := r.RedactBounded(input, 1024); got != want {
+		t.Fatalf("stream=%q, want %q", got, want)
+	}
+}
+
+func TestForcedValueWinsOverDuplicateBoundaryValue(t *testing.T) {
+	for _, r := range []*Redactor{
+		NewHashedContextRedactor("db").WithBoundaryValues("db"),
+		NewHashedContextRedactor().WithBoundaryValues("db").Compose(NewHashedContextRedactor("db")),
+	} {
+		if got := r.Text("dbus"); got != "[REDACTED]us" {
+			t.Fatalf("duplicate force=%q", got)
+		}
+	}
+}
+
+func TestBoundaryValueWinsOverDuplicateOrdinaryValue(t *testing.T) {
+	for _, r := range []*Redactor{
+		NewHashedRedactor("db").WithBoundaryValues("db"),
+		NewHashedRedactor().WithBoundaryValues("db").Compose(NewHashedRedactor("db")),
+		NewHashedRedactor().WithBoundaryValues("db").WithValues("db"),
+	} {
+		if got := r.Text("lookup db; dbus"); got != "lookup [REDACTED]; dbus" {
+			t.Fatalf("duplicate boundary=%q", got)
+		}
+	}
+}

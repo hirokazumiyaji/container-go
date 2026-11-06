@@ -917,6 +917,9 @@ func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
 	env := eenv.ExternalEnv()
 	prefix := key + "="
 	for i := len(env) - 1; i >= 0; i-- {
+		if env[i] == key {
+			return "", true
+		}
 		if strings.HasPrefix(env[i], prefix) {
 			return env[i][len(prefix):], true
 		}
@@ -925,12 +928,15 @@ func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
 }
 
 type dockerContextUnavailableError struct {
+	cause  error
 	detail string
 }
 
 func (e *dockerContextUnavailableError) Error() string {
 	return "docker context command unavailable: " + e.detail
 }
+
+func (e *dockerContextUnavailableError) Unwrap() error { return e.cause }
 
 func isDockerContextUnavailable(err error, stderr string) bool {
 	if err == nil {
@@ -975,7 +981,7 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 			errMsg = err.Error()
 		}
 		if isDockerContextUnavailable(err, errMsg) {
-			return "", "", &dockerContextUnavailableError{detail: errMsg}
+			return "", "", &dockerContextUnavailableError{detail: errMsg, cause: err}
 		}
 		if contextName != "" {
 			return "", "", &ConfigError{
@@ -984,11 +990,7 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 				Detail:  fmt.Sprintf("unknown Docker context %q: %s", contextName, errMsg),
 			}
 		}
-		return "", "", &ConfigError{
-			Backend: "docker",
-			Option:  "context",
-			Detail:  fmt.Sprintf("failed to inspect active Docker context: %s", errMsg),
-		}
+		return "", "", &ConfigError{Backend: "docker", Option: "context", Detail: fmt.Sprintf("failed to inspect active Docker context: %s", errMsg)}
 	}
 
 	if len(strings.TrimSpace(string(stdout))) == 0 {
@@ -1114,6 +1116,12 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 	}
 
 	clone := e
+	if !e.explicitConfigDir {
+		if value, ok := runnerEnvLookup(runner, "DOCKER_CONFIG"); ok {
+			clone.configDir = value
+			clone.explicitConfigDir = true
+		}
+	}
 	if resolvedCtx != "" {
 		ep.context = resolvedCtx
 	}

@@ -569,18 +569,22 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *cli.Redactor {
 	cfg := &config{eng: eng, reuseGroup: reuseGroup}
 	values := cfg.diagnosticValues()
+	boundaryValues := cfg.diagnosticBoundaryValues()
 	if _, ok := eng.(dockerEngine); ok {
 		for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"} {
 			if value, ok := runnerEnvLookup(runner, key); ok && value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) && (key != "DOCKER_CONTEXT" || value != "default") {
 				if key == "DOCKER_HOST" {
-					values = append(values, dockerEndpointDiagnosticValues(value)...)
+					values = append(values, value)
+					if endpoint, err := parseDockerEndpoint(value); err == nil && endpoint.isRemote {
+						boundaryValues = append(boundaryValues, endpoint.host, endpoint.clientHost)
+					}
 				} else {
 					values = append(values, value)
 				}
 			}
 		}
 	}
-	return cli.NewHashedContextRedactor(values...)
+	return cli.NewHashedContextRedactor(values...).WithBoundaryValues(boundaryValues...)
 }
 
 func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup string) (Runner, engine, error) {
@@ -594,6 +598,14 @@ func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup
 		defer cancel()
 		resolved, err := de.resolveTarget(queryCtx, runner)
 		if err != nil {
+			if ctx.Err() == nil && (cfg.queryTimeout <= 0 || queryCtx.Err() == nil) && de.effectiveHost() == "" && de.effectiveContext() == "" {
+				runnerHost, _ := runnerEnvLookup(runner, "DOCKER_HOST")
+				runnerContext, _ := runnerEnvLookup(runner, "DOCKER_CONTEXT")
+				var configErr *ConfigError
+				if runnerHost == "" && runnerContext == "" && (!errors.As(err, &configErr) || configErr.Option == "context") {
+					return runner, eng, nil
+				}
+			}
 			return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))
 		}
 		eng = resolved

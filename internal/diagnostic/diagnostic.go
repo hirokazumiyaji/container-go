@@ -163,8 +163,18 @@ func (r *Redactor) WithValues(values ...string) *Redactor {
 		return NewRedactor(values...)
 	}
 	combined := newRedactor(values, true, r.force)
-	combined.hashes = mergeValueHashes(r.hashes, combined.hashes)
+	combined.hashes = mergeValueHashes(r.force, r.hashes, combined.hashes)
 	return combined
+}
+
+// WithBoundaryValues adds context values whose token boundaries remain significant
+// even when this redactor also carries forced operation secrets.
+func (r *Redactor) WithBoundaryValues(values ...string) *Redactor {
+	added := newRedactor(values, true, false)
+	for i := range added.hashes {
+		added.hashes[i].boundary = true
+	}
+	return r.Compose(added)
 }
 
 // Add is an alias for WithValues, useful when composing independently-created
@@ -178,7 +188,7 @@ func (r *Redactor) WithForce() *Redactor {
 		return NewContextRedactor()
 	}
 	combined := newRedactor(nil, true, true)
-	combined.hashes = mergeValueHashes(r.hashes)
+	combined.hashes = mergeValueHashes(true, r.hashes)
 	return combined
 }
 
@@ -200,7 +210,7 @@ func (r *Redactor) Compose(others ...*Redactor) *Redactor {
 		}
 	}
 	combined := newRedactor(nil, true, force)
-	combined.hashes = mergeValueHashes(hashes)
+	combined.hashes = mergeValueHashes(force, hashes)
 	return combined
 }
 

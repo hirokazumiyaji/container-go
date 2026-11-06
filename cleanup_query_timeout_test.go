@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ type pruneQueryDeadlineRunner struct {
 	*fakeRunner
 	eng       engine
 	deadlines map[string]time.Time
+	remaining map[string]time.Duration
 	group     string
 }
 
@@ -18,6 +20,9 @@ func (r *pruneQueryDeadlineRunner) Run(ctx context.Context, args ...string) ([]b
 	op := args[0]
 	if op == "ps" || op == "ls" || op == "inspect" || op == "rm" || op == "delete" {
 		r.deadlines[op], _ = ctx.Deadline()
+		if r.remaining != nil {
+			r.remaining[op] = time.Until(r.deadlines[op])
+		}
 		if op == "ps" {
 			return []byte(cleanupDockerIDOne + "\n"), nil, nil
 		}
@@ -43,10 +48,10 @@ func TestClientPruneQueryTimeout(t *testing.T) {
 				{name: "client short", client: 5 * time.Second, overall: time.Hour, want: 5 * time.Second},
 				{name: "client long", client: 2 * time.Minute, overall: time.Hour, want: 2 * time.Minute},
 				{name: "override", client: 5 * time.Second, query: 3 * time.Minute, overall: time.Hour, want: 3 * time.Minute},
-				{name: "overall cap", client: 2 * time.Minute, overall: time.Second, want: time.Second},
+				{name: "overall cap", client: 2 * time.Hour, overall: time.Hour, want: time.Hour},
 			} {
 				t.Run(fmt.Sprintf("%s/group=%v/%s", eng.name(), grouped, tc.name), func(t *testing.T) {
-					r := &pruneQueryDeadlineRunner{fakeRunner: newTestRunner(), eng: eng, deadlines: map[string]time.Time{}, group: "timeout-group"}
+					r := &pruneQueryDeadlineRunner{fakeRunner: newTestRunner(), eng: eng, deadlines: map[string]time.Time{}, remaining: map[string]time.Duration{}, group: "timeout-group"}
 					clientOpts := []ClientOption{WithClientBackend(eng.name()), WithClientRunner(r)}
 					if eng.name() == "docker" {
 						clientOpts = append(clientOpts, WithClientDockerHost("tcp://timeout-daemon:2375"))
@@ -74,7 +79,6 @@ func TestClientPruneQueryTimeout(t *testing.T) {
 					if tc.query > 0 {
 						pruneOpts = append(pruneOpts, WithPruneQueryTimeout(tc.query))
 					}
-					started := time.Now()
 					var removed []string
 					if grouped {
 						removed, err = client.PruneReuseGroup(context.Background(), r.group, pruneOpts...)
@@ -96,8 +100,11 @@ func TestClientPruneQueryTimeout(t *testing.T) {
 						if !ok {
 							t.Fatalf("missing %s", op)
 						}
-						got := d.Sub(started)
-						if got < tc.want-time.Second/2 || got > tc.want+time.Second/2 {
+						got := r.remaining[op]
+						if tc.name == "overall cap" && !d.Equal(r.deadlines[list]) {
+							t.Errorf("%s deadline %v exceeds shared overall deadline %v", op, d, r.deadlines[list])
+						}
+						if got <= tc.want/2 || got > tc.want {
 							t.Errorf("%s deadline=%v, want %v", op, got, tc.want)
 						}
 					}
@@ -121,8 +128,7 @@ func TestPruneQueryTimeoutValidation(t *testing.T) {
 func TestPruneQueryTimeoutWithoutClient(t *testing.T) {
 	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
 		t.Run(eng.name(), func(t *testing.T) {
-			r := &pruneQueryDeadlineRunner{fakeRunner: newTestRunner(), eng: eng, deadlines: map[string]time.Time{}, group: "timeout-group"}
-			started := time.Now()
+			r := &pruneQueryDeadlineRunner{fakeRunner: newTestRunner(), eng: eng, deadlines: map[string]time.Time{}, remaining: map[string]time.Duration{}, group: "timeout-group"}
 			removed, err := pruneWith(context.Background(), r, eng, WithPruneQueryTimeout(2*time.Minute))
 			if err != nil {
 				t.Fatal(err)
@@ -130,8 +136,8 @@ func TestPruneQueryTimeoutWithoutClient(t *testing.T) {
 			if len(removed) != 1 {
 				t.Fatalf("removed=%v, want one candidate", removed)
 			}
-			for op, deadline := range r.deadlines {
-				if got := deadline.Sub(started); got < 119*time.Second || got > 121*time.Second {
+			for op, got := range r.remaining {
+				if got <= time.Minute || got > 2*time.Minute {
 					t.Errorf("%s deadline=%v, want two minutes", op, got)
 				}
 			}
@@ -160,5 +166,93 @@ func TestClientQueryTimeoutAppliesToRun(t *testing.T) {
 		if got := ctr.effectiveQueryTimeout(); got != want {
 			t.Errorf("container query timeout=%v, want %v", got, want)
 		}
+	}
+}
+
+func TestClientRunQueriesHonorShortTimeoutWithinRunBudget(t *testing.T) {
+	f := newTestRunner()
+	var remaining time.Duration
+	var inspectRemaining time.Duration
+	r := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		if len(args) > 1 && args[0] == "image" && args[1] == "inspect" {
+			deadline, _ := ctx.Deadline()
+			remaining = time.Until(deadline)
+		}
+		if args[0] == "inspect" {
+			deadline, _ := ctx.Deadline()
+			inspectRemaining = time.Until(deadline)
+		}
+		return f.Run(ctx, args...)
+	})
+	client := &Client{eng: appleEngine{}, runner: r, queryTimeout: 5 * time.Second}
+	ctr, err := client.Run(context.Background(), "redis:7-alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	if _, err := ctr.State(parent); err != nil {
+		t.Fatal(err)
+	}
+	if inspectRemaining <= 0 || inspectRemaining > 5*time.Second {
+		t.Fatalf("handle inspect has %v remaining, want <=5s", inspectRemaining)
+	}
+	if remaining <= 0 || remaining > 5*time.Second {
+		t.Fatalf("image inspect has %v remaining, want <=5s", remaining)
+	}
+}
+
+func TestClientConstructionHonorsQueryTimeout(t *testing.T) {
+	var remaining time.Duration
+	r := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		if args[0] == "context" {
+			deadline, _ := ctx.Deadline()
+			remaining = time.Until(deadline)
+			return []byte(`[{"Name":"test","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`), nil, nil
+		}
+		return nil, nil, nil
+	})
+	if _, err := NewClient(WithClientBackend("docker"), WithClientRunner(r), WithClientQueryTimeout(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 || remaining > 5*time.Second {
+		t.Fatalf("context inspect has %v remaining, want <=5s", remaining)
+	}
+}
+
+func TestClientConstructionQueryDeadlineIsNotIgnored(t *testing.T) {
+	r := timeoutTestRunner(func(ctx context.Context, _ ...string) ([]byte, []byte, error) {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	})
+	_, err := NewClient(WithClientBackend("docker"), WithClientRunner(r), WithClientQueryTimeout(time.Millisecond))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want deadline exceeded", err)
+	}
+}
+
+type cancelAfterPruneDeleteRunner struct {
+	*pruneQueryDeadlineRunner
+	cancel context.CancelFunc
+}
+
+func (r cancelAfterPruneDeleteRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	stdout, stderr, err := r.pruneQueryDeadlineRunner.Run(ctx, args...)
+	if args[0] == "rm" || args[0] == "delete" {
+		r.cancel()
+	}
+	return stdout, stderr, err
+}
+func TestPruneKeepsSuccessfulDeleteAfterCancellation(t *testing.T) {
+	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
+		t.Run(eng.name(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := cancelAfterPruneDeleteRunner{pruneQueryDeadlineRunner: &pruneQueryDeadlineRunner{fakeRunner: newTestRunner(), eng: eng, deadlines: map[string]time.Time{}, group: "timeout-group"}, cancel: cancel}
+			removed, err := pruneReuseGroupWith(ctx, r, eng, "timeout-group")
+			if err != nil || len(removed) != 1 {
+				t.Fatalf("removed=%v, err=%v, want successful removal", removed, err)
+			}
+		})
 	}
 }

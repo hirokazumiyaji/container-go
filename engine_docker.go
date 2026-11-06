@@ -272,7 +272,7 @@ func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, ti
 	if qTimeout <= 0 {
 		qTimeout = queryTimeout
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
+	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{.Server.Os}}")
 	if err != nil {
@@ -336,7 +336,9 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 		}
 	}
 
-	resolvedEng, err := e.resolveTarget(ctx, cfg.runner)
+	queryCtx, queryCancel := context.WithTimeout(ctx, cfg.effectiveQueryTimeout())
+	resolvedEng, err := e.resolveTarget(queryCtx, cfg.runner)
+	queryCancel()
 	if err != nil {
 		return err
 	}
@@ -394,7 +396,7 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 }
 
 func inspectDockerNetwork(ctx context.Context, cfg *config) (dockerNetworkInfo, error) {
-	queryCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
+	queryCtx, cancel := context.WithTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 	stdout, _, err := cfg.runner.Run(queryCtx, "network", "inspect", cfg.network)
 	if err != nil {
@@ -1684,7 +1686,7 @@ func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runne
 	if qTimeout <= 0 {
 		qTimeout = queryTimeout
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
+	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{json .}}")
 	if err != nil {

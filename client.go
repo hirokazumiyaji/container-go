@@ -161,7 +161,9 @@ func WithClientPlatform(platform string) ClientOption {
 }
 
 // WithClientQueryTimeout sets the default timeout for backend queries and control
-// operations on this Client and the containers it creates. The default is 30 seconds.
+// operations during construction, Run, Prune, and on containers it creates.
+// The default is 30 seconds. Pull fetches use WithPullTimeout; Cleanup and
+// StrictCleanup retain their separate 30-second total teardown budget.
 // WithQueryTimeout and WithPruneQueryTimeout override it for individual operations.
 func WithClientQueryTimeout(d time.Duration) ClientOption {
 	return func(c *clientConfig) error {
@@ -284,11 +286,14 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 	}
 
 	if de, ok := eng.(dockerEngine); ok {
-		resolved, err := de.resolveTarget(ctx, runner)
+		queryCtx, queryCancel := context.WithTimeout(ctx, (&config{queryTimeout: cfg.queryTimeout}).effectiveQueryTimeout())
+		resolved, err := de.resolveTarget(queryCtx, runner)
+		queryErr := queryCtx.Err()
+		queryCancel()
 		if err != nil {
 			// A cancellation or deadline belongs to this construction even
 			// when the Client has no explicit target to fail against.
-			if ctx.Err() != nil {
+			if queryErr != nil {
 				return nil, safePublicError(err, cfg.targetDiagnosticValues(de, runner)...)
 			}
 			if de.effectiveContext() != "" || de.effectiveHost() != "" {
@@ -362,7 +367,6 @@ func (c *Client) Pull(ctx context.Context, image string, opts ...PullOption) err
 		return validationErrorf(cfg.dockerTargetOption(), nil, "cannot override Docker target options on Client.Pull")
 	}
 	opCfg := cfg.operationConfig(c.pullRunner(cfg), c.eng)
-	opCfg.queryTimeout = c.queryTimeout
 	if err := pullWithConfig(ctx, opCfg, image); err != nil {
 		return opCfg.publicError(err)
 	}
@@ -373,12 +377,9 @@ func (c *Client) Pull(ctx context.Context, image string, opts ...PullOption) err
 // target. PruneOption values such as WithPruneTimeout and WithPruneOlderThan
 // apply to this prune.
 func (c *Client) Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
-	cfg, err := parsePruneOptions("Client.Prune", opts)
+	cfg, err := c.parsePrune("Client.Prune", opts)
 	if err != nil {
 		return nil, safePublicError(err)
-	}
-	if cfg.queryTimeout == 0 {
-		cfg.queryTimeout = c.queryTimeout
 	}
 	return pruneWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.pruneRunner(cfg)), c.eng, cfg)
 }
@@ -390,12 +391,9 @@ func (c *Client) PruneReuseGroup(ctx context.Context, group string, opts ...Prun
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err
 	}
-	cfg, err := parsePruneOptions("Client.PruneReuseGroup", opts)
+	cfg, err := c.parsePrune("Client.PruneReuseGroup", opts)
 	if err != nil {
 		return nil, safePublicError(err)
-	}
-	if cfg.queryTimeout == 0 {
-		cfg.queryTimeout = c.queryTimeout
 	}
 	return pruneReuseGroupWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.pruneRunner(cfg)), c.eng, group, cfg)
 }
@@ -454,4 +452,15 @@ func (c *Client) IsRemote() bool {
 		return c.eng.isRemote()
 	}
 	return false
+}
+
+func (c *Client) parsePrune(name string, opts []PruneOption) (pruneConfig, error) {
+	cfg, err := parsePruneOptions(name, opts)
+	if err != nil {
+		return cfg, err
+	}
+	if cfg.queryTimeout == 0 {
+		cfg.queryTimeout = c.queryTimeout
+	}
+	return cfg, nil
 }

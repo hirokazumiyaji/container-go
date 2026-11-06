@@ -280,7 +280,7 @@ func (c *Container) copyFiles(ctx context.Context, files []File) error {
 	if len(files) == 0 {
 		return nil
 	}
-	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	cliCtx, cliCancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	target, err := c.verifiedOperationTarget(cliCtx)
 	cliCancel()
 	if err != nil {
@@ -379,7 +379,7 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 		return err
 	}
 
-	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	cliCtx, cliCancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
 	target, err := c.verifiedOperationTarget(cliCtx)
 	if err != nil {
@@ -398,7 +398,7 @@ func (c *Container) copyContentToContainer(ctx context.Context, content []byte, 
 	if err := validateCopyContentSize("CopyContentToContainer", len(content)); err != nil {
 		return err
 	}
-	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	cliCtx, cliCancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
 	target, err := c.verifiedOperationTarget(cliCtx)
 	if err != nil {
@@ -452,7 +452,7 @@ func (c *Container) copyFileWithTarget(ctx context.Context, target string, f Fil
 }
 
 func (c *Container) runCopyCommand(ctx context.Context, target, staged, containerPath string) error {
-	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	cliCtx, cliCancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
 	_, _, err := c.runner.Run(cliCtx, c.eng.copyToArgs(target, staged, containerPath)...)
 	if err != nil {
@@ -1047,7 +1047,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, c.publicError(err)
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	qCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {

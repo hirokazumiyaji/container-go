@@ -713,7 +713,7 @@ func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo
 	}
 
 	target := cfg.name
-	guardCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
+	guardCtx, cancel := context.WithTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 	unlock := func() {}
 	if !requiresImmutableID(cfg.eng) {

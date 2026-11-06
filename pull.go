@@ -821,7 +821,7 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 	if qTimeout <= 0 {
 		qTimeout = queryTimeout
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
+	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {

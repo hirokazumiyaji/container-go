@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `WithClientQueryTimeout` for Client construction, Run queries, container
+  control operations, and prune defaults, and `WithPruneQueryTimeout` for an
+  individual prune's listing and candidate budgets.
+
+### Fixed
+
+- Honor query timeouts inside a longer Run or caller deadline, and preserve
+  successful prune deletions when cancellation arrives just after the command
+  completes. Earlier caller deadlines continue to bound every operation.
+
 ## [0.3.0] - 2026-10-26
 
 This section describes only the tagged `v0.3.0` release. The root

@@ -731,7 +731,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 	if c == nil || cfg == nil || !validCreationID(c.creation) {
 		return fmt.Errorf("verify created container: invalid creation generation")
 	}
-	verifyCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
+	verifyCtx, cancel := context.WithTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 
 	var info *engineInfo
@@ -1018,7 +1018,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
 	}
-	stopCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
+	stopCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(stopCtx)
 	if err != nil {
@@ -1200,7 +1200,7 @@ func (c *Container) start(ctx context.Context, reattach bool) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("start %s: %w", c.id, ErrSharedContainer)
 	}
-	startCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	startCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(startCtx)
 	if err != nil {
@@ -1241,7 +1241,7 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("restart %s: %w", c.id, ErrSharedContainer)
 	}
-	restartCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
+	restartCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(restartCtx)
 	if err != nil {
@@ -1303,7 +1303,7 @@ func (c *Container) Kill(ctx context.Context, signal string) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("kill %s: %w", c.id, ErrSharedContainer)
 	}
-	killCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	killCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(killCtx)
 	if err != nil {
@@ -1349,7 +1349,7 @@ func (c *Container) Pause(ctx context.Context) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("pause %s: %w", c.id, ErrSharedContainer)
 	}
-	pCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	pCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(pCtx)
 	if err != nil {
@@ -1373,7 +1373,7 @@ func (c *Container) Unpause(ctx context.Context) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("unpause %s: %w", c.id, ErrSharedContainer)
 	}
-	pCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	pCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(pCtx)
 	if err != nil {
@@ -1816,7 +1816,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 
 func (c *Container) delete(ctx context.Context, target string) error {
 	c.stopAttached()
-	delCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	delCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
 	if contextErr := commandContextError(delCtx, err); contextErr != nil {
@@ -2539,7 +2539,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		return nil, identityError("Apple handle has no valid creation generation")
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	qCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)

@@ -108,7 +108,8 @@ func WithPruneTimeout(d time.Duration) PruneOption {
 }
 
 // WithPruneQueryTimeout sets the timeout for listing candidates and for each
-// candidate's verification and deletion. The default is 30 seconds; Client
+// candidate's verification and deletion, including the Apple name-lock wait.
+// The default is 30 seconds; Client
 // operations inherit WithClientQueryTimeout. The overall prune deadline still applies.
 func WithPruneQueryTimeout(d time.Duration) PruneOption {
 	return func(c *pruneConfig) error {
@@ -118,13 +119,6 @@ func WithPruneQueryTimeout(d time.Duration) PruneOption {
 		c.queryTimeout = d
 		return nil
 	}
-}
-
-func (c pruneConfig) effectiveQueryTimeout() time.Duration {
-	if c.queryTimeout > 0 {
-		return c.queryTimeout
-	}
-	return queryTimeout
 }
 
 // WithPruneOlderThan limits Prune and PruneReuseGroup to candidates the
@@ -296,13 +290,16 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	if cfg.timeout <= 0 {
 		cfg.timeout = defaultPruneTimeout
 	}
+	if cfg.queryTimeout <= 0 {
+		cfg.queryTimeout = queryTimeout
+	}
 	ages := newPruneAgeFilter(cfg)
 
 	redactor := cli.NewHashedContextRedactor(reuseGroup)
 	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
 	defer overallCancel()
 
-	qCtx, cancel := context.WithTimeout(overallCtx, cfg.effectiveQueryTimeout())
+	qCtx, cancel := context.WithTimeout(overallCtx, cfg.queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
@@ -372,10 +369,10 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 					if !ok {
 						opErr = fmt.Errorf("%s %s: list candidate metadata missing", errKind, job.id)
 					} else {
-						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, ages, cfg.effectiveQueryTimeout())
+						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, ages, cfg.queryTimeout)
 					}
 				} else {
-					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages, cfg.effectiveQueryTimeout())
+					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages, cfg.queryTimeout)
 				}
 				mu.Lock()
 				attemptedAt[job.index] = true
@@ -422,14 +419,11 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	if !dockerIDRE.MatchString(id) {
 		return false, nil
 	}
-	// The verify and the delete together must not outlive one queryTimeout.
-	// The overall prune deadline is longer (five minutes by default) and
-	// withDefaultTimeout leaves a context that already has a deadline
-	// unchanged, so bounding only the delete would let a hung inspect run to
-	// the overall deadline instead.
+	// Verification and deletion share one budget so a hung inspect cannot
+	// consume the overall prune deadline before deletion is attempted.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}}
+	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}, queryTimeout: timeout}
 	fresh, err := inspectContainer.inspectFresh(ctx)
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, contextErr)
@@ -458,8 +452,10 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	}
 	deleteArgs := eng.deleteArgs(id)
 	_, _, err = r.Run(ctx, deleteArgs...)
-	if contextErr := commandContextError(ctx, err); contextErr != nil {
-		return false, fmt.Errorf("%s %s: %w", errKind, id, contextErr)
+	if err != nil {
+		if contextErr := commandContextError(ctx, err); contextErr != nil {
+			return false, fmt.Errorf("%s %s: %w", errKind, id, contextErr)
+		}
 	}
 	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
@@ -553,7 +549,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	defer unlock()
 
-	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true, queryTimeout: timeout}).inspectFreshLocked(guardCtx)
 	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, contextErr)
 	}
@@ -569,8 +565,10 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	deleteArgs := eng.deleteArgs(candidate.id)
 	_, _, err = r.Run(guardCtx, deleteArgs...)
-	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
-		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, contextErr)
+	if err != nil {
+		if contextErr := commandContextError(guardCtx, err); contextErr != nil {
+			return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, contextErr)
+		}
 	}
 	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), candidate.id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)

@@ -167,7 +167,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		cfg.imagePrepared = true
 	}
-	key := reuseFlightKey(cfg)
+	key := reuseFlightKey(cfg) + cfg.operationBudgetKey() + fmt.Sprintf("\x00attach=%d", cfg.effectiveReuseAttachTimeout())
 	var leaderWarning error
 	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
 		// Do not detach a canceled preflight into a new shared flight.
@@ -355,10 +355,10 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
 			if !isNotFoundFor(cfg.eng, err) {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
 					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 				}
-				if !transientReuseInspectError(err) {
+				if !retryableInspectError(ctx, err) {
 					return nil, err
 				}
 				lastInspectErr = err
@@ -623,7 +623,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		if err == nil {
 			break
 		}
-		if !transientReuseInspectError(err) {
+		if !retryableInspectError(inspectCtx, err) {
 			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 		}
 		if err := waitForReusePoll(inspectCtx, cfg.effectiveReusePollInterval()); err != nil {
@@ -798,6 +798,16 @@ func rollbackReuse(ctx context.Context, ctr *Container, cfg *config) (bool, erro
 		return false, fmt.Errorf("reuse %s: stopped generation changed; refusing automatic deletion", cfg.name)
 	}
 	return true, nil
+}
+
+func retryableInspectError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, ErrSystemNotRunning) || errors.Is(err, context.Canceled) || errors.Is(err, ErrInvalidConfig) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return !cli.IsProbeConfigurationError(err)
+	}
+	return transientReuseInspectError(err)
 }
 
 func transientReuseInspectError(err error) bool {
@@ -1472,7 +1482,7 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 			if isNotFound(err) {
 				return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
 			}
-			if !transientReuseInspectError(err) {
+			if !retryableInspectError(ctx, err) {
 				return nil, err
 			}
 		}

@@ -763,7 +763,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if err == nil {
 			break
 		}
-		if !isNotFoundFor(cfg.eng, err) && !transientReuseInspectError(err) {
+		if !isNotFoundFor(cfg.eng, err) && !retryableInspectError(verifyCtx, err) {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
 		if err := waitForReusePoll(verifyCtx, cfg.effectiveReusePollInterval()); err != nil {
@@ -1175,7 +1175,7 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 			// A daemon that is briefly unreachable or busy must not fail a
 			// wait that is still within its context; only a terminal inspect
 			// error ends the wait.
-			if !transientReuseInspectError(err) {
+			if !retryableInspectError(ctx, err) {
 				return 0, err
 			}
 		} else if info.state == StateStopped {

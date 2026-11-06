@@ -205,6 +205,10 @@ func NewClientContext(ctx context.Context, opts ...ClientOption) (*Client, error
 }
 
 func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client, error) {
+	return newClientWithQueryDefault(ctx, name, queryTimeout, opts...)
+}
+
+func newClientWithQueryDefault(ctx context.Context, name string, implicitQueryTimeout time.Duration, opts ...ClientOption) (*Client, error) {
 	cfg := &clientConfig{}
 	for i, opt := range opts {
 		if opt == nil {
@@ -289,7 +293,11 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 	}
 
 	if de, ok := eng.(dockerEngine); ok {
-		queryCtx, queryCancel := context.WithTimeout(ctx, (&config{queryTimeout: cfg.queryTimeout}).effectiveQueryTimeout())
+		timeout := cfg.queryTimeout
+		if timeout <= 0 {
+			timeout = implicitQueryTimeout
+		}
+		queryCtx, queryCancel := context.WithTimeout(ctx, timeout)
 		resolved, err := de.resolveTarget(queryCtx, runner)
 		queryErr := queryCtx.Err()
 		queryCancel()

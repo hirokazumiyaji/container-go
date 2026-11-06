@@ -1040,7 +1040,10 @@ only when no deadline exists. An explicit `WithPruneQueryTimeout` or
 and `Cleanup` / `StrictCleanup` retain their independent 30-second complete-teardown
 budget. Client target discovery remains best-effort for an implicit target when
 no query timeout is explicitly configured; caller cancellation and explicit
-query-budget expiry fail construction.
+query-budget expiry fail construction. Verification and reuse retry loops retry a
+per-query expiry while their overall operation context remains live. Shared image,
+reuse, and Docker metadata flights isolate differing execution budgets; successful
+metadata cache entries remain reusable across budgets.
 
 `container.WithPruneOlderThan(d)` narrows that selection to candidates the
 backend reports as created before now-d. It is useful for a sweep on a

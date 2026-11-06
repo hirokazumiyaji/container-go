@@ -437,7 +437,7 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 				return imageIdentity{}, err
 			}
 		}
-		resolveKey := flightKey(c.eng, image, flightPull, platform) + "\x00resolve"
+		resolveKey := flightKey(c.eng, image, flightPull, platform) + "\x00resolve" + c.operationBudgetKey()
 		if c.allowMutableImageTag {
 			resolveKey += "\x00allow-mutable-tag"
 		}
@@ -452,7 +452,7 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 		c.imageCache.rememberIdentity(c.eng, image, platform, resolved)
 		return resolved, nil
 	default:
-		key := flightKey(c.eng, image, flightMissing, platform)
+		key := flightKey(c.eng, image, flightMissing, platform) + c.operationBudgetKey()
 		if c.allowMutableImageTag {
 			// A fallback-enabled caller must not share a result with a
 			// default fail-closed caller (or vice versa).
@@ -859,4 +859,8 @@ func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform st
 		return classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(args), image)
 	}
 	return nil
+}
+
+func (c *config) operationBudgetKey() string {
+	return fmt.Sprintf("\x00query=%d;run=%d;probe=%d", c.effectiveQueryTimeout(), c.effectiveRunTimeout(), c.effectiveProbeTimeout())
 }

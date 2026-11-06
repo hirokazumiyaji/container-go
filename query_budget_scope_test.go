@@ -116,7 +116,7 @@ func TestClientDefaultResolutionTimeoutRemainsBestEffort(t *testing.T) {
 		}
 		return nil, nil, nil
 	})
-	client, err := NewClient(WithClientBackend("docker"), WithClientRunner(runner))
+	client, err := newClientWithQueryDefault(context.Background(), "NewClient", time.Millisecond, WithClientBackend("docker"), WithClientRunner(runner))
 	if err != nil || client == nil {
 		t.Fatalf("implicit target resolution timeout: client=%v err=%v, want best-effort client", client, err)
 	}

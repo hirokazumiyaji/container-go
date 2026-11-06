@@ -1157,7 +1157,12 @@ long-running command. An existing caller deadline remains authoritative for the 
 individual short inspection queries may have an earlier query limit. Client
 construction preserves best-effort implicit target discovery when no query timeout
 is explicitly configured; caller cancellation or an explicit query-budget expiry
-fails construction. Timeout classification uses structured context,
+fails construction. Verification and reuse loops retry a per-query deadline only
+while their outer operation context remains live. Shared image resolution and reuse
+flights separate query, probe, run, and attach execution budgets as applicable.
+Docker metadata flights use the configured query limit instead of a fixed detached
+30-second cap, while successful cache entries remain independent of that limit.
+Timeout classification uses structured context,
 `Timeout() bool`, or signal evidence; arbitrary workload stderr is never
 interpreted as a timeout. On cancellation the direct CLI child is killed
 and reaped. Unix may also best-effort `SIGKILL` descendants that remain in

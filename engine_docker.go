@@ -275,6 +275,9 @@ func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, ti
 	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{.Server.Os}}")
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return "", fmt.Errorf("inspect Docker server platform: %w", contextErr)
+	}
 	if err != nil {
 		classified := classifyErrorWithProbe(ctx, runner, err, eng, timeouts.probe)
 		return "", fmt.Errorf("inspect Docker server platform: %w", classified)

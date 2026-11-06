@@ -641,6 +641,12 @@ func CollectNonCLIErrorBranches(err error) []error {
 		if current == nil {
 			return
 		}
+		if safe, ok := current.(*safeError); ok {
+			for _, branch := range CollectNonCLIErrorBranches(safe.err) {
+				out = append(out, WithRedactor(branch, safe.redactor))
+			}
+			return
+		}
 		var cliErr *CLIError
 		if !errors.As(current, &cliErr) {
 			out = append(out, current)
@@ -671,6 +677,18 @@ func ErrorBranches(err error, binary string) []ErrorBranch {
 	var walk func(error)
 	walk = func(current error) {
 		if current == nil {
+			return
+		}
+		if safe, ok := current.(*safeError); ok {
+			for _, branch := range ErrorBranches(safe.err, binary) {
+				var redacted *CLIError
+				branch.Error.asRedacted(&redacted, safe.redactor)
+				branches = append(branches, ErrorBranch{
+					Error:  redacted,
+					Stdout: safe.redactor.Text(branch.Stdout),
+					Cause:  WithRedactor(branch.Cause, safe.redactor),
+				})
+			}
 			return
 		}
 		if joined, ok := current.(interface{ Unwrap() []error }); ok {

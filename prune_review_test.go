@@ -125,11 +125,12 @@ func TestNestedNonCLIBranchesVetoAbsenceConsistently(t *testing.T) {
 }
 
 type refusalRaceRunner struct {
-	eng         engine
-	after       string
-	cancel      context.CancelFunc
-	inspections int
-	failure     error
+	eng            engine
+	after          string
+	cancel         context.CancelFunc
+	inspections    int
+	failure        error
+	inspectFailure error
 }
 
 func (r *refusalRaceRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -148,6 +149,9 @@ func (r *refusalRaceRunner) Run(ctx context.Context, args ...string) ([]byte, []
 	case "inspect":
 		r.inspections++
 		if r.inspections > 1 {
+			if r.inspectFailure != nil {
+				return nil, nil, r.inspectFailure
+			}
 			if r.after == "cancel" {
 				r.cancel()
 				return nil, nil, ctx.Err()
@@ -175,23 +179,36 @@ func (r *refusalRaceRunner) Run(ctx context.Context, args ...string) ([]byte, []
 
 func TestPruneDeleteRefusalRaces(t *testing.T) {
 	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
-		for _, after := range []string{"paused", "restarting", "missing", "cancel", "stopped"} {
+		for _, after := range []string{"paused", "restarting", "missing", "cancel", "stopped", "unknown", "created", "stopping", "inspect-error"} {
 			t.Run(eng.name()+"/"+after, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				failure := errors.New("backend refused deletion")
+				inspectFailure := errors.New("TLS reinspection failed")
 				r := &refusalRaceRunner{eng: eng, after: after, cancel: cancel, failure: failure}
+				if after == "inspect-error" {
+					r.inspectFailure = inspectFailure
+				}
 				removed, err := pruneWith(ctx, r, eng)
 				switch after {
 				case "cancel":
 					if !errors.Is(err, context.Canceled) || !errors.Is(err, failure) {
 						t.Fatalf("got %v, want cancellation and original deletion failure", err)
 					}
-				case "stopped":
+				case "stopped", "unknown", "created", "stopping", "inspect-error":
 					if !errors.Is(err, failure) {
 						t.Fatalf("lost deletion failure: %v", err)
 					}
+					if after == "inspect-error" && !errors.Is(err, inspectFailure) {
+						t.Fatalf("lost reinspection failure: %v", err)
+					}
 				default:
+					if eng.name() == "apple" && (after == "paused" || after == "restarting") {
+						if !errors.Is(err, failure) {
+							t.Fatalf("unknown Apple status lost deletion failure: %v", err)
+						}
+						return
+					}
 					if err != nil || len(removed) != 0 {
 						t.Fatalf("prune=(%v,%v), want skipped race", removed, err)
 					}
@@ -218,5 +235,36 @@ func TestNonCLIPureWrapperTextVetoesAbsence(t *testing.T) {
 	confirmed := fmt.Errorf("%w: %w", ErrContainerNotFound, absent)
 	if !isNotFoundFor(dockerEngine{}, errors.Join(confirmed, errors.New("no such object: x"))) {
 		t.Fatal("lost confirmed absence sentinel")
+	}
+}
+
+func TestPruneDeleteRaceRequiresProvenRevival(t *testing.T) {
+	for _, state := range []State{StateUnknown, StateCreated, StateStopping, StateStopped, StateRunning, StateRestarting, StatePaused} {
+		t.Run(fmt.Sprint(state), func(t *testing.T) {
+			skip, absent, err := pruneDeleteRace(context.Background(), dockerEngine{}, func(context.Context) (*engineInfo, error) { return &engineInfo{state: state}, nil })
+			wantSkip := state == StateRunning || state == StateRestarting || state == StatePaused
+			if skip != wantSkip || absent || err != nil {
+				t.Fatalf("race = %v/%v/%v, want skip %v", skip, absent, err, wantSkip)
+			}
+		})
+	}
+	failure := errors.New("reinspection failed")
+	skip, absent, err := pruneDeleteRace(context.Background(), dockerEngine{}, func(context.Context) (*engineInfo, error) { return nil, failure })
+	if skip || absent || !errors.Is(err, failure) {
+		t.Fatalf("lost reinspection failure: %v/%v/%v", skip, absent, err)
+	}
+}
+
+func TestRedactedJoinedVetoPreventsAbsence(t *testing.T) {
+	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
+		message := "Error: No such container: candidate"
+		if eng.name() == "apple" {
+			message = `Error: notFound: "container not found: candidate"`
+		}
+		absent := &cli.CLIError{Binary: eng.binary(), Args: []string{"inspect", "candidate"}, ExitCode: 1, Stderr: message}
+		err := cli.WithRedactor(errors.Join(absent, errors.New("TLS certificate verification failed private-value")), cli.NewRedactor("private-value"))
+		if isNotFoundFor(eng, err) || isNotFoundForOperation(eng, err, "inspect", "candidate") {
+			t.Fatalf("%s discarded redacted TLS veto", eng.name())
+		}
 	}
 }

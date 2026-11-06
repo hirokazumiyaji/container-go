@@ -600,5 +600,13 @@ func pruneDeleteRace(ctx context.Context, eng engine, inspect func(context.Conte
 	if isNotFoundFor(eng, inspectErr) {
 		return true, true, nil
 	}
-	return inspectErr == nil && current.state != StateStopped, false, nil
+	if inspectErr != nil {
+		return false, false, inspectErr
+	}
+	switch current.state {
+	case StateRunning, StateRestarting, StatePaused:
+		return true, false, nil
+	default:
+		return false, false, nil
+	}
 }

@@ -48,7 +48,17 @@ func (c *config) diagnosticValues() []string {
 	// any value the bounded streaming window cannot redact instead of
 	// making every stream on this handle fail.
 	if de, ok := c.eng.(dockerEngine); ok {
-		for _, value := range []string{de.effectiveHost(), de.effectiveContext(), de.effectiveConfigDir()} {
+		targetValues := []string{de.effectiveHost(), de.effectiveConfigDir()}
+		if context := de.effectiveContext(); context != "default" {
+			targetValues = append(targetValues, context)
+		}
+		if endpoint, err := parseDockerEndpoint(de.effectiveHost()); err == nil && de.effectiveHost() != "" {
+			targetValues = append(targetValues, endpoint.host, endpoint.clientHost)
+		}
+		if de.resolvedTarget != nil {
+			targetValues = append(targetValues, de.resolvedTarget.rawHost, de.resolvedTarget.host, de.resolvedTarget.clientHost)
+		}
+		for _, value := range targetValues {
 			if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
 				values = append(values, value)
 			}

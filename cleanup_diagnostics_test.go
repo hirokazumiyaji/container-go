@@ -49,8 +49,6 @@ func TestClientPruneRedactsDockerTargetDiagnostics(t *testing.T) {
 								opts = append(opts, WithClientDockerContext(dockerContext))
 							}
 						} else {
-							t.Setenv("DOCKER_HOST", "")
-							t.Setenv("DOCKER_CONTEXT", "")
 							if target == "host" {
 								t.Setenv("DOCKER_HOST", host)
 							} else {
@@ -119,5 +117,89 @@ func assertPruneDiagnosticSecrets(t *testing.T, err error, secrets ...string) {
 		if strings.Contains(cliErr.Error(), secret) {
 			t.Errorf("CLIError contains %q: %v", secret, cliErr)
 		}
+	}
+}
+
+type canceledPruneDiagnosticRunner struct {
+	cancel context.CancelFunc
+	group  string
+}
+
+func (r canceledPruneDiagnosticRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	r.cancel()
+	return nil, nil, errors.Join(fmt.Errorf("docker %s %s: %w", strings.Join(args, " "), r.group, context.Canceled), &cli.CLIError{Binary: "docker", Args: args, Stderr: "failure at private-cancel-daemon"})
+}
+func TestPruneCancellationRedactsDiagnosticContext(t *testing.T) {
+	const group = "cancel-secret-group"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &Client{eng: dockerEngine{host: "tcp://private-cancel-daemon:2375", explicitHost: true}, runner: canceledPruneDiagnosticRunner{cancel: cancel, group: group}}
+	_, err := client.PruneReuseGroup(ctx, group)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want cancellation", err)
+	}
+	assertPruneDiagnosticSecrets(t, err, group, "private-cancel-daemon")
+}
+
+type envPruneDiagnosticRunner struct {
+	*pruneDiagnosticRunner
+	env []string
+}
+
+func (r envPruneDiagnosticRunner) ExternalEnv() []string { return r.env }
+func TestPruneRedactsResolvedAndRunnerTargets(t *testing.T) {
+	for _, source := range []string{"resolved", "runner"} {
+		t.Run(source, func(t *testing.T) {
+			const host = "private-resolved-daemon"
+			const configDir = "/private/runner-config"
+			f := newTestRunner()
+			f.binary = "docker"
+			f.failPrefix = "ps"
+			f.failStderr = "Cannot connect to http://" + host + ":2375: lookup " + host + "; config " + configDir
+			r := envPruneDiagnosticRunner{pruneDiagnosticRunner: &pruneDiagnosticRunner{fakeRunner: f, listOperation: "ps"}}
+			eng := dockerEngine{context: "prod", explicitContext: true}
+			if source == "resolved" {
+				eng.resolvedTarget = &dockerTargetEndpoint{rawHost: "tcp://" + host + ":2375", host: host, clientHost: host, context: "prod"}
+				eng.configDir = configDir
+			} else {
+				r.env = []string{"DOCKER_HOST=tcp://" + host + ":2375", "DOCKER_CONFIG=" + configDir}
+			}
+			client := &Client{eng: eng, runner: r}
+			_, err := client.Prune(context.Background())
+			if err == nil {
+				t.Fatal("expected failure")
+			}
+			assertPruneDiagnosticSecrets(t, err, host, configDir)
+		})
+	}
+}
+
+func TestPruneAppleListAndDeleteRedaction(t *testing.T) {
+	for _, op := range []string{"ls", "delete"} {
+		t.Run(op, func(t *testing.T) {
+			const group = "private-apple-prune-group"
+			f := newTestRunner()
+			f.failPrefix = op
+			f.failStderr = "failure " + group
+			f.inspectJSON = fmt.Sprintf(`[{"id":"private-apple-candidate","configuration":{"labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:%q}},"status":{"state":"stopped"}}]`, managedLabel, reuseLabel, creationLabel, reuseGroupLabel, group)
+			r := &pruneDiagnosticRunner{fakeRunner: f, listOperation: "ls", list: f.inspectJSON}
+			_, err := (&Client{eng: appleEngine{}, runner: r}).PruneReuseGroup(context.Background(), group)
+			if err == nil {
+				t.Fatal("expected failure")
+			}
+			assertPruneDiagnosticSecrets(t, err, group)
+		})
+	}
+}
+
+func TestPruneKeepsDefaultContextDiagnosticText(t *testing.T) {
+	f := newTestRunner()
+	f.binary = "docker"
+	f.failPrefix = "ps"
+	f.failStderr = "default daemon unavailable"
+	client := &Client{eng: dockerEngine{context: "default", explicitContext: true}, runner: f}
+	_, err := client.Prune(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "default daemon unavailable") {
+		t.Fatalf("default context changed diagnostic: %v", err)
 	}
 }

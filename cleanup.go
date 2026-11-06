@@ -265,7 +265,7 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 	return pruneListedWithGroupConfig(ctx, r, eng, listArgs, parse, errKind, "", cfg)
 }
 
-func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string, cfg pruneConfig) ([]string, error) {
+func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string, cfg pruneConfig) (removedIDs []string, resultErr error) {
 	// Parsed entry points always supply positive defaults. Keep this helper
 	// fail-safe for direct internal callers: zero parallelism would silently
 	// remove nothing, and a non-positive timeout would expire immediately.
@@ -277,7 +277,8 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	}
 	ages := newPruneAgeFilter(cfg)
 
-	redactor := (&config{eng: eng, reuseGroup: reuseGroup}).diagnosticRedactor()
+	redactor := pruneDiagnosticRedactor(eng, r, reuseGroup)
+	defer func() { resultErr = cli.WithRedactor(resultErr, redactor) }()
 	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
 	defer overallCancel()
 
@@ -288,14 +289,14 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 		return nil, contextErr
 	}
 	if err != nil {
-		return nil, cli.WithRedactor(classifyError(overallCtx, r, err, eng), redactor)
+		return nil, classifyError(overallCtx, r, err, eng)
 	}
 	ids, err := parse(stdout)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
 		return nil, contextErr
 	}
 	if err != nil {
-		return nil, cli.WithRedactor(err, redactor)
+		return nil, err
 	}
 
 	if len(ids) == 0 {
@@ -394,7 +395,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 		}
 	}
 
-	return removed, cli.WithRedactor(errors.Join(errs...), redactor)
+	return removed, errors.Join(errs...)
 }
 
 func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter) (bool, error) {
@@ -408,7 +409,7 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	// the overall deadline instead.
 	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
-	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}, diagnosticRedactorValue: (&config{eng: eng, reuseGroup: reuseGroup}).diagnosticRedactor()}
+	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}}
 	fresh, err := inspectContainer.inspectFresh(ctx)
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, contextErr)
@@ -532,7 +533,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	defer unlock()
 
-	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true, diagnosticRedactorValue: (&config{eng: eng, reuseGroup: reuseGroup}).diagnosticRedactor()}).inspectFreshLocked(guardCtx)
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
 	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, contextErr)
 	}
@@ -556,4 +557,22 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
 	return true, nil
+}
+
+func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *cli.Redactor {
+	cfg := &config{eng: eng, reuseGroup: reuseGroup}
+	values := cfg.diagnosticValues()
+	if _, ok := eng.(dockerEngine); ok {
+		for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"} {
+			if value, ok := runnerEnvLookup(runner, key); ok && value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) && (key != "DOCKER_CONTEXT" || value != "default") {
+				values = append(values, value)
+				if key == "DOCKER_HOST" {
+					if endpoint, err := parseDockerEndpoint(value); err == nil {
+						values = append(values, endpoint.host, endpoint.clientHost)
+					}
+				}
+			}
+		}
+	}
+	return cli.NewHashedContextRedactor(values...)
 }

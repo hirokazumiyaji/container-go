@@ -3,6 +3,7 @@ package container
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
@@ -33,9 +34,9 @@ func (c *config) diagnosticValues() []string {
 		values = append(values, published.raw)
 	}
 	if c.dockerHost != nil {
-		values = append(values, *c.dockerHost)
+		values = append(values, dockerEndpointDiagnosticValues(*c.dockerHost)...)
 	}
-	if c.dockerContext != nil {
+	if c.dockerContext != nil && *c.dockerContext != "default" {
 		values = append(values, *c.dockerContext)
 	}
 	if c.dockerConfigDir != nil {
@@ -48,15 +49,12 @@ func (c *config) diagnosticValues() []string {
 	// any value the bounded streaming window cannot redact instead of
 	// making every stream on this handle fail.
 	if de, ok := c.eng.(dockerEngine); ok {
-		targetValues := []string{de.effectiveHost(), de.effectiveConfigDir()}
+		targetValues := append(dockerEndpointDiagnosticValues(de.effectiveHost()), de.effectiveConfigDir())
 		if context := de.effectiveContext(); context != "default" {
 			targetValues = append(targetValues, context)
 		}
-		if endpoint, err := parseDockerEndpoint(de.effectiveHost()); err == nil && de.effectiveHost() != "" {
-			targetValues = append(targetValues, endpoint.host, endpoint.clientHost)
-		}
 		if de.resolvedTarget != nil {
-			targetValues = append(targetValues, de.resolvedTarget.rawHost, de.resolvedTarget.host, de.resolvedTarget.clientHost)
+			targetValues = append(targetValues, dockerEndpointDiagnosticValues(de.resolvedTarget.rawHost)...)
 		}
 		for _, value := range targetValues {
 			if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
@@ -205,4 +203,22 @@ func uniqueStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func dockerEndpointDiagnosticValues(raw string) []string {
+	endpoint, err := parseDockerEndpoint(raw)
+	if err != nil {
+		return []string{raw}
+	}
+	if !endpoint.isRemote {
+		return nil
+	}
+	values := []string{raw}
+	// Generic service names are not specific enough for forced substring masking.
+	for _, host := range []string{endpoint.host, endpoint.clientHost} {
+		if len(host) >= 10 || strings.ContainsAny(host, "-_.:") {
+			values = append(values, host)
+		}
+	}
+	return values
 }

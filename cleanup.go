@@ -81,12 +81,13 @@ func StrictCleanup(tb testing.TB, ctr *Container) {
 type PruneOption func(*pruneConfig) error
 
 type pruneConfig struct {
-	timeout     time.Duration
-	parallelism int
-	runner      Runner
-	binary      string
-	olderThan   time.Duration
-	now         func() time.Time
+	timeout      time.Duration
+	queryTimeout time.Duration
+	parallelism  int
+	runner       Runner
+	binary       string
+	olderThan    time.Duration
+	now          func() time.Time
 }
 
 const defaultPruneParallelism = 4
@@ -201,7 +202,13 @@ func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWithConfig(ctx, cfg.runnerFor(eng), eng, cfg)
+	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
+	defer overallCancel()
+	runner, eng, err := cfg.prepareTarget(overallCtx, eng, "")
+	if err != nil {
+		return nil, err
+	}
+	return pruneWithConfig(overallCtx, runner, eng, cfg)
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine, opts ...PruneOption) ([]string, error) {
@@ -565,14 +572,32 @@ func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *
 	if _, ok := eng.(dockerEngine); ok {
 		for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"} {
 			if value, ok := runnerEnvLookup(runner, key); ok && value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) && (key != "DOCKER_CONTEXT" || value != "default") {
-				values = append(values, value)
 				if key == "DOCKER_HOST" {
-					if endpoint, err := parseDockerEndpoint(value); err == nil {
-						values = append(values, endpoint.host, endpoint.clientHost)
-					}
+					values = append(values, dockerEndpointDiagnosticValues(value)...)
+				} else {
+					values = append(values, value)
 				}
 			}
 		}
 	}
 	return cli.NewHashedContextRedactor(values...)
+}
+
+func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup string) (Runner, engine, error) {
+	runner := cfg.runnerFor(eng)
+	if de, ok := eng.(dockerEngine); ok {
+		timeout := cfg.queryTimeout
+		if timeout <= 0 {
+			timeout = queryTimeout
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, min(cfg.timeout, timeout))
+		defer cancel()
+		resolved, err := de.resolveTarget(queryCtx, runner)
+		if err != nil {
+			return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))
+		}
+		eng = resolved
+		runner = pinRunnerTargetEnv(eng, runner)
+	}
+	return runner, eng, nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -201,5 +202,166 @@ func TestPruneKeepsDefaultContextDiagnosticText(t *testing.T) {
 	_, err := client.Prune(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "default daemon unavailable") {
 		t.Fatalf("default context changed diagnostic: %v", err)
+	}
+}
+
+func TestDockerLocalTargetDiagnosticsStayReadable(t *testing.T) {
+	for _, raw := range []string{"unix:///var/run/docker.sock", "tcp://127.0.0.1:2375", "tcp://localhost:2375"} {
+		t.Run(raw, func(t *testing.T) {
+			ep, err := parseDockerEndpoint(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config{eng: dockerEngine{host: raw, explicitHost: true, resolvedTarget: &ep}, dockerHost: &raw}
+			input := "Cannot connect to the Docker daemon at " + raw + ". dial 127.0.0.1:5000: connection refused"
+			got := cfg.publicError(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, ExitCode: 1, Stderr: input}).Error()
+			if !strings.Contains(got, input) {
+				t.Fatalf("local diagnostic changed: %s", got)
+			}
+		})
+	}
+}
+
+func TestDockerGenericHostnameDoesNotCorruptDiagnostics(t *testing.T) {
+	for _, host := range []string{"docker", "db"} {
+		t.Run(host, func(t *testing.T) {
+			raw := "tcp://" + host + ":2375"
+			cfg := &config{eng: dockerEngine{host: raw, explicitHost: true}}
+			input := "docker daemon debug database dbus failure at " + raw
+			got := cfg.publicError(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, ExitCode: 1, Stderr: input}).Error()
+			if !strings.HasPrefix(got, "docker ps:") || !strings.Contains(got, "docker daemon debug database dbus failure at ") {
+				t.Fatalf("generic hostname corrupted diagnostic: %s", got)
+			}
+			if strings.Contains(got, raw) {
+				t.Fatalf("raw remote target leaked: %s", got)
+			}
+		})
+	}
+}
+
+func TestPackagePruneRedactsResolvedContextEndpoint(t *testing.T) {
+	for _, source := range []string{"environment", "active", "runner"} {
+		for _, grouped := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/group=%v", source, grouped), func(t *testing.T) {
+				t.Setenv("CONTAINERGO_BACKEND", "docker")
+				t.Setenv("DOCKER_HOST", "")
+				t.Setenv("DOCKER_CONTEXT", "")
+				t.Setenv("DOCKER_CONFIG", "")
+				const host = "private-package-prune-daemon"
+				contextName := "private-prune-context"
+				f := newTestRunner()
+				f.binary = "docker"
+				f.contextJSON = fmt.Sprintf(`[{"Name":%q,"Endpoints":{"docker":{"Host":"tcp://%s:2375"}}}]`, contextName, host)
+				f.failPrefix = "ps"
+				f.failStderr = "failure from http://" + host + ":2375: lookup " + host + " in " + contextName
+				r := envPruneDiagnosticRunner{pruneDiagnosticRunner: &pruneDiagnosticRunner{fakeRunner: f, listOperation: "ps"}}
+				if source == "environment" {
+					t.Setenv("DOCKER_CONTEXT", contextName)
+				}
+				if source == "runner" {
+					r.env = []string{"DOCKER_CONTEXT=" + contextName}
+				}
+				var err error
+				if grouped {
+					_, err = PruneReuseGroup(context.Background(), "private-prune-group", WithPruneRunner(r))
+				} else {
+					_, err = Prune(context.Background(), WithPruneRunner(r))
+				}
+				if err == nil {
+					t.Fatal("expected list failure")
+				}
+				assertPruneDiagnosticSecrets(t, err, host, contextName)
+			})
+		}
+	}
+}
+
+func TestPruneContextResolutionUsesQueryAndOverallBudgets(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		query, overall, want time.Duration
+	}{
+		{name: "default", overall: time.Hour, want: queryTimeout},
+		{name: "configured", query: 5 * time.Second, overall: time.Hour, want: 5 * time.Second},
+		{name: "overall", query: time.Minute, overall: time.Second, want: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DOCKER_HOST", "")
+			t.Setenv("DOCKER_CONTEXT", "")
+			var remaining time.Duration
+			r := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+				if args[0] != "context" {
+					t.Fatalf("unexpected operation: %v", args)
+				}
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					t.Fatal("missing context lookup deadline")
+				}
+				remaining = time.Until(deadline)
+				return []byte(`[{"Name":"default","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`), nil, nil
+			})
+			cfg := pruneConfig{timeout: tc.overall, queryTimeout: tc.query, runner: r}
+			if _, _, err := cfg.prepareTarget(context.Background(), dockerEngine{}, ""); err != nil {
+				t.Fatal(err)
+			}
+			if remaining <= 0 || remaining > tc.want {
+				t.Fatalf("remaining=%v, want <=%v", remaining, tc.want)
+			}
+		})
+	}
+}
+
+func TestDockerLocalTargetCredentialsAreRedacted(t *testing.T) {
+	const raw = "tcp://private-local-token@localhost:2375"
+	cfg := &config{eng: dockerEngine{host: raw, explicitHost: true}, dockerHost: new(string)}
+	*cfg.dockerHost = raw
+	input := "Cannot connect at " + raw + ". dial 127.0.0.1:5000: connection refused"
+	got := cfg.publicError(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, ExitCode: 1, Stderr: input}).Error()
+	if strings.Contains(got, "private-local-token") {
+		t.Fatalf("local credentials leaked: %s", got)
+	}
+	if !strings.Contains(got, "dial 127.0.0.1:5000: connection refused") {
+		t.Fatalf("local address lost: %s", got)
+	}
+}
+
+func TestPackagePruneTargetResolutionSharesOverallBudget(t *testing.T) {
+	for _, grouped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("group=%v", grouped), func(t *testing.T) {
+			t.Setenv("CONTAINERGO_BACKEND", "docker")
+			t.Setenv("DOCKER_HOST", "")
+			t.Setenv("DOCKER_CONTEXT", "")
+			var lookupDeadline, listDeadline time.Time
+			r := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					t.Fatal("missing deadline")
+				}
+				switch args[0] {
+				case "context":
+					lookupDeadline = deadline
+					return []byte(`[{"Name":"default","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`), nil, nil
+				case "ps":
+					listDeadline = deadline
+					return nil, nil, nil
+				default:
+					t.Fatalf("unexpected operation: %v", args)
+					return nil, nil, nil
+				}
+			})
+			opts := []PruneOption{WithPruneRunner(r), WithPruneTimeout(5 * time.Second)}
+			var err error
+			if grouped {
+				_, err = PruneReuseGroup(context.Background(), "review-budget", opts...)
+			} else {
+				_, err = Prune(context.Background(), opts...)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lookupDeadline.IsZero() || !lookupDeadline.Equal(listDeadline) {
+				t.Fatalf("lookup deadline=%v list deadline=%v, want one shared overall budget", lookupDeadline, listDeadline)
+			}
+		})
 	}
 }

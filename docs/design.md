@@ -265,11 +265,13 @@ described below are not.
   compatibility identity and must match an existing container.
   Capabilities use a requested-subset rule: every requested
   `--cap-add`/`--cap-drop` value must be present, while an empty request
-  accepts any inspected capability set. Other creation-only options are
-  ignored on attach.
+  accepts any inspected capability set. Memory, user, working directory,
+  entrypoint, command, mounts, and custom labels must exactly match the
+  creation fingerprint, including omitted values. Environment differences
+  are ignored on attach.
 - `WithReuseGroup(group string)`: label a reused container for
-  `PruneReuseGroup`; it requires `WithReuse` and is not part of the
-  reuse key. `PruneReuseGroup` applies the same group grammar as
+  `PruneReuseGroup`; it requires `WithReuse` and an exact group match
+  when attaching. The group is also part of the shared-flight key. `PruneReuseGroup` applies the same group grammar as
   `WithReuseGroup`.
 - `WithCPUs(v float64)` / `WithMemory(size string)`: resource limits.
   `WithCPUs` accepts fractional values such as `0.5` and rejects
@@ -1190,7 +1192,10 @@ and cancellation paths.
   `PullNever` without an implicit fetch; `Run` and `Pull` reject it before any
   CLI call. Use `PullMissing` or `PullAlways`.
 - `ErrReuseMismatch`: incompatible reuse creation settings, image, platform,
-  network, ports, or reuse group.
+  network, ports, or reuse group. Temporarily missing port bindings are
+  retried; if the attach budget expires, the error also matches
+  `context.DeadlineExceeded`. Caller cancellation and ownership/generation
+  errors are not configuration mismatches.
 - `ErrPortNotExposed`: a port was neither declared nor published, or
   the declared port had no usable host binding.
 - `ErrGenerationReplaced`: a delete-time generation check found a

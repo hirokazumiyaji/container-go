@@ -1957,3 +1957,43 @@ func newMarkedStaleEnvDir(t *testing.T, root, suffix string) (string, *os.File) 
 	}
 	return dir, lock
 }
+
+type cleanupWarningMismatchRunner struct{ *reuseEnvCleanupFailureRunner }
+
+func (r *cleanupWarningMismatchRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	out, stderr, err := r.reuseEnvCleanupFailureRunner.Run(ctx, args...)
+	if err == nil && args[0] == "inspect" && r.created.Load() {
+		out = reuseInspectWithLabels(out, map[string]string{reuseConfigLabel: "incompatible-fingerprint"})
+	}
+	return out, stderr, err
+}
+
+func TestReuseCleanupWarningDoesNotReturnMismatchedHandle(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks unavailable")
+	}
+	isolateEnvFileRoot(t)
+	runner := &cleanupWarningMismatchRunner{reuseEnvCleanupFailureRunner: &reuseEnvCleanupFailureRunner{reuseCreateRunner: newReuseCreateRunner()}}
+	t.Cleanup(func() {
+		if runner.envPath == "" {
+			return
+		}
+		dir := filepath.Dir(runner.envPath)
+		if state := loadEnvCleanupState(dir); state != nil {
+			state.mu.Lock()
+			lock := state.lock
+			state.lock = nil
+			state.lockAcquired = false
+			state.mu.Unlock()
+			if lock != nil {
+				_ = closeEnvFileLock(lock)
+			}
+			clearEnvCleanupState(state)
+		}
+		_ = os.RemoveAll(dir)
+	})
+	ctr, err := Run(context.Background(), "redis:7-alpine", WithName("warning-mismatch"), WithReuse(), WithEnv(map[string]string{"TOKEN": "secret"}), withRunner(runner), withEngine(appleEngine{}))
+	if ctr != nil || !errors.Is(err, ErrReuseMismatch) || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("got (%v,%v), want no handle and mismatch with cleanup warning", ctr, err)
+	}
+}

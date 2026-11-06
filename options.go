@@ -353,8 +353,8 @@ func WithReuse() Option {
 }
 
 // WithReuseGroup tags a reused container for later PruneReuseGroup.
-// The group is not part of the reuse key; WithName alone identifies the
-// shared container. Requires WithReuse.
+// The group is part of reuse compatibility and the shared-flight key.
+// Attaching requires an exact group match. Requires WithReuse.
 func WithReuseGroup(group string) Option {
 	return func(c *config) error {
 		if err := validateReuseGroup(group); err != nil {

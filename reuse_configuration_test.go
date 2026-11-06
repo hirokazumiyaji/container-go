@@ -349,10 +349,10 @@ func TestReuseRunningPortMismatchIsConfigurationError(t *testing.T) {
 	spec := backend.runningSpec()
 	data := backend.inspect(spec)
 	runner := newReuseTransitionRunner(data, data, backend.eng)
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := Run(ctx, "redis:7-alpine", WithName("shared"), WithReuse(), WithExposedPorts("9999"), withEngine(backend.eng), withRunner(runner))
-	if !errors.Is(err, ErrReuseMismatch) || errors.Is(err, context.DeadlineExceeded) {
+	_, err := Run(ctx, "redis:7-alpine", WithName("shared"), WithReuse(), WithReuseAttachTimeout(50*time.Millisecond), WithExposedPorts("9999"), withEngine(backend.eng), withRunner(runner))
+	if !errors.Is(err, ErrReuseMismatch) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want configuration mismatch", err)
 	}
 }
@@ -388,5 +388,30 @@ func TestReuseIdentityFailuresAreNotConfigurationMismatches(t *testing.T) {
 	err = checkReuseCompat(info, "redis:7-alpine", cfg)
 	if !errors.Is(err, ErrReuseMismatch) || strings.Count(err.Error(), ErrReuseMismatch.Error()) != 1 {
 		t.Fatalf("got %v, want one mismatch prefix", err)
+	}
+}
+
+func TestReusePortPollingPreservesCallerDeadline(t *testing.T) {
+	backend := reuseBackendFixtures()[0]
+	data := backend.inspect(backend.runningSpec())
+	runner := newReuseTransitionRunner(data, data, backend.eng)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	ctr, err := Run(ctx, "redis:7-alpine", WithName("shared"), WithReuse(), WithExposedPorts("9999"), WithReuseAttachTimeout(time.Second), withEngine(backend.eng), withRunner(runner))
+	if ctr != nil || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrReuseMismatch) {
+		t.Fatalf("got (%v,%v), want caller deadline without mismatch", ctr, err)
+	}
+}
+
+func TestReusePortPollingDoesNotMisclassifyRestartingState(t *testing.T) {
+	data := reuseTransientInspect(false)
+	restarting := strings.Replace(data, `"Status":"running"`, `"Status":"restarting"`, 1)
+	runner := &reuseTransientRunner{fakeRunner: newTestRunner(), steps: []reuseTransientInspectStep{{data: data}, {data: data}, {data: restarting}}}
+	runner.imagePresent = true
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := Run(ctx, "redis:7-alpine", WithName("myctr"), WithReuse(), WithExposedPorts("6379"), WithReusePollInterval(time.Millisecond), WithReuseAttachTimeout(50*time.Millisecond), withEngine(dockerEngine{}), withRunner(runner))
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrReuseMismatch) {
+		t.Fatalf("got %v, want restarting timeout without stale port mismatch", err)
 	}
 }

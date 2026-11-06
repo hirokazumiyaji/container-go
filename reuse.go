@@ -21,6 +21,8 @@ import (
 // own compatibility check and wait strategy afterward.
 var reuseFlights flightGroup[*Container]
 
+var errReusePortPending = errors.New("reuse port binding is not ready")
+
 type reuseCleanupWarning struct {
 	err error
 }
@@ -234,6 +236,12 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	defer infoCancel()
 	info, err := reuseInfoForCaller(infoCtx, cfg, base, resolvedImage, image)
 	if err != nil {
+		if errors.Is(err, ErrReuseMismatch) {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			}
+			return nil, joinEnvFileCleanupError(err, leaderWarning)
+		}
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			return nil, fmt.Errorf("reuse %s: timed out waiting for complete inspect: %w", cfg.name, err)
 		}
@@ -1036,29 +1044,6 @@ func checkReuseConfigCompat(info *engineInfo, cfg *config) error {
 			}
 		}
 	}
-	// Auto-published exposed ports only appear as host bindings on
-	// published-port backends. Explicit WithPublishedPort always needs
-	// validation, including on direct-IP engines.
-	if !cfg.eng.directIP() {
-		for _, spec := range cfg.exposed {
-			b, ok := matchingExposedBinding(info.bound, spec, cfg.eng)
-			if !ok {
-				return fmt.Errorf("%w: reuse %s: exposed port %s missing on existing container", ErrReuseMismatch, cfg.name, spec)
-			}
-			if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
-				return fmt.Errorf("%w: reuse %s: exposed port %s: %w", ErrReuseMismatch, cfg.name, spec, err)
-			}
-		}
-	}
-	for _, p := range cfg.published {
-		b, ok := matchingPublishedBinding(info.bound, p, cfg.eng)
-		if !ok {
-			return fmt.Errorf("%w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, cfg.name, p.raw)
-		}
-		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
-			return fmt.Errorf("%w: reuse %s: published port %s: %w", ErrReuseMismatch, cfg.name, p.raw, err)
-		}
-	}
 	if cfg.platform != "" {
 		if info.platform == "" || platformSelectorUnverifiable(cfg.platform, info.platform) {
 			return fmt.Errorf("%w: reuse %s: platform %q could not be verified", ErrReuseMismatch, cfg.name, cfg.platform)
@@ -1069,6 +1054,33 @@ func checkReuseConfigCompat(info *engineInfo, cfg *config) error {
 	}
 	if err := checkReuseRunOptions(info, cfg); err != nil {
 		return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
+	}
+	return checkReusePortCompat(info, cfg)
+}
+
+func checkReusePortCompat(info *engineInfo, cfg *config) error {
+	// Auto-published exposed ports only appear as host bindings on
+	// published-port backends. Explicit WithPublishedPort always needs
+	// validation, including on direct-IP engines.
+	if !cfg.eng.directIP() {
+		for _, spec := range cfg.exposed {
+			b, ok := matchingExposedBinding(info.bound, spec, cfg.eng)
+			if !ok {
+				return fmt.Errorf("%w: %w: reuse %s: exposed port %s missing on existing container", ErrReuseMismatch, errReusePortPending, cfg.name, spec)
+			}
+			if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
+				return fmt.Errorf("%w: reuse %s: exposed port %s: %w", ErrReuseMismatch, cfg.name, spec, err)
+			}
+		}
+	}
+	for _, p := range cfg.published {
+		b, ok := matchingPublishedBinding(info.bound, p, cfg.eng)
+		if !ok {
+			return fmt.Errorf("%w: %w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, errReusePortPending, cfg.name, p.raw)
+		}
+		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
+			return fmt.Errorf("%w: reuse %s: published port %s: %w", ErrReuseMismatch, cfg.name, p.raw, err)
+		}
 	}
 	return nil
 }
@@ -1447,10 +1459,9 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+	var pendingPort error
+	for ctx.Err() == nil {
+		pendingPort = nil
 		info, err := inspectReuseBase(ctx, base, cfg)
 		if err == nil {
 			if base != nil {
@@ -1476,11 +1487,17 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 					}
 					info.defaultNetwork = name
 				}
+
 				if err := checkReuseConfigCompat(info, cfg); err != nil {
-					return nil, err
-				}
-				if !cfg.eng.directIP() || (len(cfg.exposed) == 0 && len(cfg.published) == 0) || info.ip != "" {
-					return info, nil
+					if !errors.Is(err, errReusePortPending) {
+						return nil, err
+					}
+					pendingPort = err
+				} else {
+					pendingPort = nil
+					if !cfg.eng.directIP() || (len(cfg.exposed) == 0 && len(cfg.published) == 0) || info.ip != "" {
+						return info, nil
+					}
 				}
 			}
 			switch info.state {
@@ -1499,10 +1516,14 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 				return nil, err
 			}
 		}
-		if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
-			return nil, err
+		if waitForReusePoll(ctx, cfg.effectiveReusePollInterval()) != nil {
+			break
 		}
 	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && pendingPort != nil {
+		return nil, fmt.Errorf("%w: %w", pendingPort, ctx.Err())
+	}
+	return nil, ctx.Err()
 }
 
 func (c *config) reuseConfigHash() string {

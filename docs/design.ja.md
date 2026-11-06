@@ -157,7 +157,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithPublishedPort(spec string)`：ホスト側ポートの明示的な公開を指定する。Apple Container は通常コンテナへ直接接続し、Docker は `WithExposedPorts` で宣言したポートを daemon が host port へ自動公開する。特定の host port が必要な場合だけ明示的な binding を使う。
 - `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever`（Docker のみ。Apple は `ErrPullNeverUnsupported`）を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
 - `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。CPU、shm、capability、ulimit、extra host、hostname の option は reuse の互換性 identity に含まれ、既存コンテナと一致しなければならない。capability は requested-subset rule で、要求した `--cap-add`/`--cap-drop` のすべてが存在する必要があり、空の要求は inspect された任意の capability set を受け入れる。それ以外の作成専用 option は attach 時に無視される。
-- `WithReuseGroup(group string)`：再利用するコンテナにラベルを付け、`PruneReuseGroup` の対象にする。`WithReuse` が必要で、再利用キーには含まれない。`PruneReuseGroup` は `WithReuseGroup` と同じ group grammar を使う。
+- `WithReuseGroup(group string)`：再利用するコンテナにラベルを付け、`PruneReuseGroup` の対象にする。`WithReuse` が必要で、attach 時は group の完全一致を要求し、共有 flight のキーにも含める。`PruneReuseGroup` は `WithReuseGroup` と同じ group grammar を使う。
 - `WithCPUs(v float64)` / `WithMemory(size string)`：リソース制限を指定する。`WithCPUs` は `0.5` のような小数を受け付け、zero 以下と非有限値を拒否する。Apple Container は整数のみを受け付けるため、小数は `ErrUnsupportedCapability` で拒否する。`WithMemory` と `WithShmSize` は整数と任意の `K`/`M`/`G`/`T`/`P` suffix の同じ文法を使い、zero と overflow を拒否する。
 - `WithShmSize(size string)`：`/dev/shm` のサイズ（例: `64M`）を指定する。Docker と Apple Container はどちらも `--shm-size` として渡す。
 - `WithPrivileged()`：Docker の `--privileged`。Apple Container に相当する capability はなく、`ErrUnsupportedCapability` で拒否する。
@@ -609,6 +609,7 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる。
 - `ErrImageIdentityNotLocal`：選択した policy で pinned reference が local image store に存在しないことが確認された。Apple の `container run` に暗黙の fetch を許さない
 - `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。mutable tag fallback は使わない
 - `ErrOutputDelivery`：caller-owned output sink が CLI output を拒否した場合。元の writer error は chain に残る
+- `ErrReuseMismatch`：再利用時の設定、image、platform、network、port、reuse group の不一致。一時的な port binding の未反映は再試行し、attach 予算の終了時は `context.DeadlineExceeded` にも一致する。呼び出し元の取消や所有権・世代の検証失敗は構成不一致に分類しない。
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。reuse は readiness 後の再 inspect で置き換えを検出し、handle を返さない。
 - `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。

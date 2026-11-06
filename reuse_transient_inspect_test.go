@@ -109,7 +109,7 @@ func TestWithReuseRetriesTransientInspect(t *testing.T) {
 	}
 }
 
-func TestWithReuseRejectsMissingPortOnRunningContainer(t *testing.T) {
+func TestWithReuseRetriesIncompleteInspect(t *testing.T) {
 	oldPoll := reusePollInterval
 	oldTimeout := reuseAttachTimeout
 	reusePollInterval = time.Millisecond
@@ -132,11 +132,11 @@ func TestWithReuseRejectsMissingPortOnRunningContainer(t *testing.T) {
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithReuse(), WithExposedPorts("6379/tcp"),
 		withRunner(runner), withEngine(dockerEngine{}))
-	if !errors.Is(err, ErrReuseMismatch) {
-		t.Fatalf("got %v, want ErrReuseMismatch", err)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	if got := runner.inspectCount(); got != 2 {
-		t.Fatalf("inspect calls=%d, want no retry after a running container's missing binding", got)
+	if got := runner.inspectCount(); got < 3 {
+		t.Fatalf("inspect calls=%d, want incomplete bindings retried", got)
 	}
 
 }

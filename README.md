@@ -1165,8 +1165,9 @@ Contract:
   entries that use the full immutable ID are not name-addressed and need no
   lock. Treat external uncoordinated CLI operations as uncoordinated.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
-  container tagged with that group (CI teardown). The group is a label,
-  not part of the reuse key. On Apple Container, it applies the same fresh
+  container tagged with that group (CI teardown). The group is a label and
+  part of reuse compatibility and the shared-flight key; attachment requires
+  an exact match. On Apple Container, it applies the same fresh
   candidate inspection (generation, session, managed/reuse/group labels,
   running/stopped state) under the per-name lock before deletion.
   Ordinary `Prune` uses the backend filter described above; on Docker that

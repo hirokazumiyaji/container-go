@@ -64,7 +64,7 @@ func TestExitCodeRequiresReportedStoppedStatus(t *testing.T) {
 func TestExitCodePreservesInspectErrors(t *testing.T) {
 	const secret = "exitcode-inspect-secret"
 	f := newTestRunner()
-	ctr := runTestContainer(t, f, WithEnv(map[string]string{"TOKEN": secret}))
+	ctr := runTestContainer(t, f, WithLabels(map[string]string{"purpose": secret}))
 	f.failPrefix = "inspect"
 	f.failStderr = "permission denied: " + secret
 	if _, err := ctr.ExitCode(context.Background()); err == nil || strings.Contains(err.Error(), secret) {

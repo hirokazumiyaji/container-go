@@ -1180,7 +1180,8 @@ const waitExitPollInterval = 100 * time.Millisecond
 // Wait blocks until the container reaches StateStopped and returns its exit code.
 // If the container is already stopped, it returns immediately. A missing backend
 // exit code returns ErrExitCodeUnavailable rather than an assumed zero result.
-func (c *Container) Wait(ctx context.Context) (int, error) {
+func (c *Container) Wait(ctx context.Context) (code int, err error) {
+	defer func() { err = c.redactError(err) }()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -1192,7 +1193,8 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 			return 0, ctx.Err()
 		case <-timer.C:
 		}
-		info, err := c.inspectLifecycle(ctx)
+		// Retry classification needs raw diagnostics; redact only the final public error.
+		info, err := c.inspectDynamicFresh(ctx)
 		if err != nil {
 			// A daemon that is briefly unreachable or busy must not fail a
 			// wait that is still within its context; only a terminal inspect

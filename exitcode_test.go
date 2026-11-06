@@ -115,3 +115,14 @@ func TestExitCodePreservesInspectErrors(t *testing.T) {
 		t.Fatalf("ExitCode error = %v, want context.Canceled", err)
 	}
 }
+
+func TestWaitClassifiesTransientErrorsBeforeRedaction(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f, WithLabels(map[string]string{"purpose": "busy"}))
+	runner := &flakyInspectRunner{inner: f, errs: []error{&cli.CLIError{Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: "busy"}}, responses: []string{stoppedInspectResponse(ctr, 7)}}
+	ctr.runner = runner
+	code, err := ctr.Wait(context.Background())
+	if err != nil || code != 7 {
+		t.Fatalf("Wait=%d,%v, want retry then 7,nil", code, err)
+	}
+}

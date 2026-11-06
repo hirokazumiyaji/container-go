@@ -437,15 +437,21 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 		return false, nil
 	}
 	deleteArgs := pruneDeleteArgs(eng, id, reuseGroup)
-	_, _, err = r.Run(ctx, deleteArgs...)
+	stdout, _, err := r.Run(ctx, deleteArgs...)
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, contextErr)
 	}
 	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), id) {
+		if reuseGroup == "" {
+			current, inspectErr := inspectContainer.inspectFresh(ctx)
+			if inspectErr == nil && current.state == StateRunning {
+				return false, nil
+			}
+		}
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
-	return err == nil, nil
+	return err == nil && strings.TrimSpace(string(stdout)) != "", nil
 }
 
 func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
@@ -533,7 +539,8 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	defer unlock()
 
-	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
+	inspectContainer := &Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}
+	fresh, err := inspectContainer.inspectFreshLocked(guardCtx)
 	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, contextErr)
 	}
@@ -553,6 +560,12 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, contextErr)
 	}
 	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), candidate.id) {
+		if reuseGroup == "" {
+			current, inspectErr := inspectContainer.inspectFreshLocked(guardCtx)
+			if inspectErr == nil && current.state == StateRunning {
+				return false, nil
+			}
+		}
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")

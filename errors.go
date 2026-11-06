@@ -643,32 +643,10 @@ func sameCLIErrorContext(a, b cliErrorBranch) bool {
 }
 
 func hasNonCLIDefinitiveErrorText(err error) bool {
-	if err == nil {
-		return false
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			if hasNonCLIDefinitiveErrorText(child) {
-				return true
-			}
+	for _, branch := range cli.CollectNonCLIErrorBranches(err) {
+		if cli.IsDefinitiveNonLivenessError(branch) {
+			return true
 		}
-		return false
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		child := wrapped.Unwrap()
-		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			return hasNonCLIDefinitiveErrorText(child)
-		}
-	}
-	var cliErr *cli.CLIError
-	if errors.As(err, &cliErr) {
-		return false
-	}
-	if cli.IsDefinitiveNonLivenessError(err) {
-		return true
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return hasNonCLIDefinitiveErrorText(wrapped.Unwrap())
 	}
 	return false
 }

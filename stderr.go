@@ -534,35 +534,10 @@ func ambiguousNoSuchLine(line string) bool {
 }
 
 func hasNonCLIAmbiguousObjectText(err error) bool {
-	if err == nil || errors.Is(err, ErrContainerNotFound) {
-		return false
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			if hasNonCLIAmbiguousObjectText(child) {
-				return true
-			}
+	for _, branch := range cli.CollectNonCLIErrorBranches(err) {
+		if !errors.Is(branch, ErrContainerNotFound) && ambiguousNoSuchLine(branch.Error()) {
+			return true
 		}
-		return false
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		child := wrapped.Unwrap()
-		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			return hasNonCLIAmbiguousObjectText(child)
-		}
-	}
-	if _, ok := err.(*cli.CLIError); ok {
-		return false
-	}
-	var cliErr *cli.CLIError
-	if errors.As(err, &cliErr) {
-		return false
-	}
-	if ambiguousNoSuchLine(err.Error()) {
-		return true
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return hasNonCLIAmbiguousObjectText(wrapped.Unwrap())
 	}
 	return false
 }

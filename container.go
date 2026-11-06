@@ -997,7 +997,7 @@ func (c *Container) deleteOperation() string {
 // fresh inspect so wait fail-fast-on-stop and other lifecycle checks are
 // not delayed by the short dynamic-inspect TTL.
 func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectDynamicFresh(ctx)
+	info, err := c.inspectLifecycle(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
@@ -1046,20 +1046,21 @@ func (c *Container) Image() string {
 
 // InspectInfo represents a point-in-time snapshot of container state and metadata.
 type InspectInfo struct {
-	id         string
-	name       string
-	uid        string
-	image      string
-	imageID    string
-	state      State
-	exitCode   int
-	createdAt  time.Time
-	startedAt  time.Time
-	finishedAt time.Time
-	labels     map[string]string
-	ip         string
-	platform   string
-	ports      []PortBinding
+	id               string
+	name             string
+	uid              string
+	image            string
+	imageID          string
+	state            State
+	exitCode         int
+	exitCodeReported bool
+	createdAt        time.Time
+	startedAt        time.Time
+	finishedAt       time.Time
+	labels           map[string]string
+	ip               string
+	platform         string
+	ports            []PortBinding
 }
 
 // ID returns the logical container name, which is the handle's address and
@@ -1080,7 +1081,13 @@ func (i *InspectInfo) ContainerID() string { return i.uid }
 func (i *InspectInfo) Image() string   { return i.image }
 func (i *InspectInfo) ImageID() string { return i.imageID }
 func (i *InspectInfo) State() State    { return i.state }
-func (i *InspectInfo) ExitCode() int   { return i.exitCode }
+
+// ExitCode returns the backend value, or zero when no value was reported.
+// Check State and ExitCodeReported before interpreting zero as process success.
+func (i *InspectInfo) ExitCode() int { return i.exitCode }
+
+// ExitCodeReported distinguishes a reported process result from an omitted value.
+func (i *InspectInfo) ExitCodeReported() bool { return i.exitCodeReported }
 
 // CreatedAt returns the backend-reported creation time. The zero time is the
 // documented unknown marker: the backend omitted the field or reported a form
@@ -1114,7 +1121,7 @@ func (i *InspectInfo) Ports() []PortBinding {
 
 // Inspect returns a fresh snapshot of the container's metadata and runtime state.
 func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
-	info, err := c.inspectDynamicFresh(ctx)
+	info, err := c.inspectLifecycle(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1128,33 +1135,39 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 		}
 	}
 	return &InspectInfo{
-		id:         c.id,
-		name:       info.name,
-		uid:        info.uid,
-		image:      info.image,
-		imageID:    info.imageID,
-		state:      info.state,
-		exitCode:   info.exitCode,
-		createdAt:  info.createdAt,
-		startedAt:  info.startedAt,
-		finishedAt: info.finishedAt,
-		labels:     info.labels,
-		ip:         info.ip,
-		platform:   info.platform,
-		ports:      ports,
+		id:               c.id,
+		name:             info.name,
+		uid:              info.uid,
+		image:            info.image,
+		imageID:          info.imageID,
+		state:            info.state,
+		exitCode:         info.exitCode,
+		exitCodeReported: info.exitCodeReported,
+		createdAt:        info.createdAt,
+		startedAt:        info.startedAt,
+		finishedAt:       info.finishedAt,
+		labels:           info.labels,
+		ip:               info.ip,
+		platform:         info.platform,
+		ports:            ports,
 	}, nil
 }
 
 // ExitCode returns the reported exit code of a stopped container.
-// It returns ErrExitCodeUnavailable while the container has not stopped or
-// the backend has not reported an exit code.
+// ErrContainerNotStopped indicates that the process has not stopped. Both that
+// error and an omitted backend exit code match ErrExitCodeUnavailable.
+// Apple CLI versions that omit status.exitCode cannot provide a process result.
 func (c *Container) ExitCode(ctx context.Context) (int, error) {
-	info, err := c.inspectDynamicFresh(ctx)
+	info, err := c.inspectLifecycle(ctx)
 	if err != nil {
-		return 0, c.redactError(err)
+		return 0, err
 	}
+	return reportedExitCode(info)
+}
+
+func reportedExitCode(info *engineInfo) (int, error) {
 	if info.state != StateStopped {
-		return 0, c.redactError(fmt.Errorf("%w: container state is %s", ErrExitCodeUnavailable, info.state))
+		return 0, fmt.Errorf("%w: %w: container state is %s", ErrContainerNotStopped, ErrExitCodeUnavailable, info.state)
 	}
 	if !info.exitCodeReported {
 		return 0, ErrExitCodeUnavailable
@@ -1165,7 +1178,8 @@ func (c *Container) ExitCode(ctx context.Context) (int, error) {
 const waitExitPollInterval = 100 * time.Millisecond
 
 // Wait blocks until the container reaches StateStopped and returns its exit code.
-// If the container is already stopped, it returns its exit code immediately.
+// If the container is already stopped, it returns immediately. A missing backend
+// exit code returns ErrExitCodeUnavailable rather than an assumed zero result.
 func (c *Container) Wait(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -1178,7 +1192,7 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 			return 0, ctx.Err()
 		case <-timer.C:
 		}
-		info, err := c.inspectDynamicFresh(ctx)
+		info, err := c.inspectLifecycle(ctx)
 		if err != nil {
 			// A daemon that is briefly unreachable or busy must not fail a
 			// wait that is still within its context; only a terminal inspect
@@ -1187,7 +1201,7 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 				return 0, err
 			}
 		} else if info.state == StateStopped {
-			return info.exitCode, nil
+			return reportedExitCode(info)
 		}
 		timer.Reset(waitExitPollInterval)
 	}
@@ -2063,6 +2077,11 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 		}
 	}
 	return c.refreshDynamic(ctx)
+}
+
+func (c *Container) inspectLifecycle(ctx context.Context) (*engineInfo, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	return info, c.redactError(err)
 }
 
 // inspectDynamicFresh always performs an identity-checked inspect and

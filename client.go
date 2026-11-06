@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -15,8 +16,9 @@ import (
 // Prune, PruneReuseGroup) consistently target the configured daemon and backend,
 // even if process-level environment variables (such as DOCKER_HOST) change later.
 type Client struct {
-	eng    engine
-	runner cli.Runner
+	queryTimeout time.Duration
+	eng          engine
+	runner       cli.Runner
 	// dockerMeta is the Docker metadata cache shared by every operation and
 	// handle this Client creates. It is keyed by the resolved target, so it
 	// never answers for another daemon.
@@ -27,6 +29,7 @@ type Client struct {
 type ClientOption func(*clientConfig) error
 
 type clientConfig struct {
+	queryTimeout    time.Duration
 	backend         string
 	binary          string
 	dockerHost      *string
@@ -153,6 +156,19 @@ func WithClientPlatform(platform string) ClientOption {
 			return err
 		}
 		c.platform = &platform
+		return nil
+	}
+}
+
+// WithClientQueryTimeout sets the default timeout for backend queries and control
+// operations on this Client and the containers it creates. The default is 30 seconds.
+// WithQueryTimeout and WithPruneQueryTimeout override it for individual operations.
+func WithClientQueryTimeout(d time.Duration) ClientOption {
+	return func(c *clientConfig) error {
+		if d <= 0 {
+			return validationErrorf("WithClientQueryTimeout", d, "timeout must be positive")
+		}
+		c.queryTimeout = d
 		return nil
 	}
 }
@@ -297,9 +313,10 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 	}
 
 	return &Client{
-		eng:        eng,
-		runner:     runner,
-		dockerMeta: newDockerMetadataCache(dockerMetadataTTL),
+		queryTimeout: cfg.queryTimeout,
+		eng:          eng,
+		runner:       runner,
+		dockerMeta:   newDockerMetadataCache(dockerMetadataTTL),
 	}, nil
 }
 
@@ -310,6 +327,9 @@ func (c *Client) Run(ctx context.Context, image string, opts ...Option) (*Contai
 		withRunner(cloneRunner(c.runner)),
 		withClientPinned(),
 		withClientDockerMeta(c.dockerMeta),
+	}
+	if c.queryTimeout > 0 {
+		clientOpts = append(clientOpts, WithQueryTimeout(c.queryTimeout))
 	}
 	allOpts := append(clientOpts, opts...)
 	return Run(ctx, image, allOpts...)
@@ -342,6 +362,7 @@ func (c *Client) Pull(ctx context.Context, image string, opts ...PullOption) err
 		return validationErrorf(cfg.dockerTargetOption(), nil, "cannot override Docker target options on Client.Pull")
 	}
 	opCfg := cfg.operationConfig(c.pullRunner(cfg), c.eng)
+	opCfg.queryTimeout = c.queryTimeout
 	if err := pullWithConfig(ctx, opCfg, image); err != nil {
 		return opCfg.publicError(err)
 	}
@@ -356,6 +377,9 @@ func (c *Client) Prune(ctx context.Context, opts ...PruneOption) ([]string, erro
 	if err != nil {
 		return nil, safePublicError(err)
 	}
+	if cfg.queryTimeout == 0 {
+		cfg.queryTimeout = c.queryTimeout
+	}
 	return pruneWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.pruneRunner(cfg)), c.eng, cfg)
 }
 
@@ -369,6 +393,9 @@ func (c *Client) PruneReuseGroup(ctx context.Context, group string, opts ...Prun
 	cfg, err := parsePruneOptions("Client.PruneReuseGroup", opts)
 	if err != nil {
 		return nil, safePublicError(err)
+	}
+	if cfg.queryTimeout == 0 {
+		cfg.queryTimeout = c.queryTimeout
 	}
 	return pruneReuseGroupWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.pruneRunner(cfg)), c.eng, group, cfg)
 }

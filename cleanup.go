@@ -81,12 +81,13 @@ func StrictCleanup(tb testing.TB, ctr *Container) {
 type PruneOption func(*pruneConfig) error
 
 type pruneConfig struct {
-	timeout     time.Duration
-	parallelism int
-	runner      Runner
-	binary      string
-	olderThan   time.Duration
-	now         func() time.Time
+	timeout      time.Duration
+	queryTimeout time.Duration
+	parallelism  int
+	runner       Runner
+	binary       string
+	olderThan    time.Duration
+	now          func() time.Time
 }
 
 const defaultPruneParallelism = 4
@@ -104,6 +105,26 @@ func WithPruneTimeout(d time.Duration) PruneOption {
 		c.timeout = d
 		return nil
 	}
+}
+
+// WithPruneQueryTimeout sets the timeout for listing candidates and for each
+// candidate's verification and deletion. The default is 30 seconds; Client
+// operations inherit WithClientQueryTimeout. The overall prune deadline still applies.
+func WithPruneQueryTimeout(d time.Duration) PruneOption {
+	return func(c *pruneConfig) error {
+		if d <= 0 {
+			return validationErrorf("WithPruneQueryTimeout", d, "timeout must be positive")
+		}
+		c.queryTimeout = d
+		return nil
+	}
+}
+
+func (c pruneConfig) effectiveQueryTimeout() time.Duration {
+	if c.queryTimeout > 0 {
+		return c.queryTimeout
+	}
+	return queryTimeout
 }
 
 // WithPruneOlderThan limits Prune and PruneReuseGroup to candidates the
@@ -281,7 +302,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
 	defer overallCancel()
 
-	qCtx, cancel := context.WithTimeout(overallCtx, queryTimeout)
+	qCtx, cancel := context.WithTimeout(overallCtx, cfg.effectiveQueryTimeout())
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
@@ -351,10 +372,10 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 					if !ok {
 						opErr = fmt.Errorf("%s %s: list candidate metadata missing", errKind, job.id)
 					} else {
-						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, ages)
+						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, ages, cfg.effectiveQueryTimeout())
 					}
 				} else {
-					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages)
+					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages, cfg.effectiveQueryTimeout())
 				}
 				mu.Lock()
 				attemptedAt[job.index] = true
@@ -397,7 +418,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	return removed, cli.WithRedactor(errors.Join(errs...), redactor)
 }
 
-func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter) (bool, error) {
+func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
 	if !dockerIDRE.MatchString(id) {
 		return false, nil
 	}
@@ -406,7 +427,7 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	// withDefaultTimeout leaves a context that already has a deadline
 	// unchanged, so bounding only the delete would let a hung inspect run to
 	// the overall deadline instead.
-	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}}
 	fresh, err := inspectContainer.inspectFresh(ctx)
@@ -514,7 +535,7 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 	return true
 }
 
-func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string, ages pruneAgeFilter) (bool, error) {
+func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
 	if eng.name() != "apple" || !pruneCandidateEligible(candidate, reuseGroup) {
 		return false, nil
 	}
@@ -524,7 +545,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if ages.active && !candidate.createdAt.IsZero() && !ages.admits(candidate.createdAt) {
 		return false, nil
 	}
-	guardCtx, guardCancel := context.WithTimeout(ctx, queryTimeout)
+	guardCtx, guardCancel := context.WithTimeout(ctx, timeout)
 	defer guardCancel()
 	unlock, err := lockName(guardCtx, candidate.id)
 	if err != nil {

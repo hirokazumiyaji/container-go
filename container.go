@@ -763,8 +763,10 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if err == nil {
 			break
 		}
-		if !isNotFoundFor(cfg.eng, err) && !retryableInspectError(verifyCtx, err) {
-			return fmt.Errorf("verify created container %s: %w", c.id, err)
+		if !isNotFoundFor(cfg.eng, err) {
+			if err := inspectRetryError(verifyCtx, err); err != nil {
+				return fmt.Errorf("verify created container %s: %w", c.id, err)
+			}
 		}
 		if err := waitForReusePoll(verifyCtx, cfg.effectiveReusePollInterval()); err != nil {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
@@ -1158,6 +1160,7 @@ const waitExitPollInterval = 100 * time.Millisecond
 
 // Wait blocks until the container reaches StateStopped and returns its exit code.
 // If the container is already stopped, it returns its exit code immediately.
+// Retrying individual query deadlines requires a deadline on ctx.
 func (c *Container) Wait(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -1175,7 +1178,14 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 			// A daemon that is briefly unreachable or busy must not fail a
 			// wait that is still within its context; only a terminal inspect
 			// error ends the wait.
-			if !retryableInspectError(ctx, err) {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			_, bounded := ctx.Deadline()
+			if retryErr := inspectRetryError(ctx, err); retryErr != nil {
+				return 0, retryErr
+			}
+			if !bounded && errors.Is(err, context.DeadlineExceeded) {
 				return 0, err
 			}
 		} else if info.state == StateStopped {

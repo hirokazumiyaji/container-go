@@ -264,3 +264,155 @@ func TestInspectQueryRetryPreservesTerminalErrorPriority(t *testing.T) {
 		t.Fatal("finished operation retried its query deadline")
 	}
 }
+
+func TestInspectRetryLoopsPreserveOuterDeadline(t *testing.T) {
+	for _, operation := range []string{"wait", "reuse", "refresh", "ownership"} {
+		t.Run(operation, func(t *testing.T) {
+			f := newTestRunner()
+			ctr := runTestContainer(t, f)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+			defer cancel()
+			runner := timeoutTestRunner(func(context.Context, ...string) ([]byte, []byte, error) {
+				<-ctx.Done()
+				return nil, nil, errors.New("temporary refreshed inspect failure")
+			})
+			ctr.runner = runner
+			cfg := newConfig()
+			cfg.eng, cfg.runner, cfg.name = appleEngine{}, runner, "myctr"
+			var err error
+			switch operation {
+			case "wait":
+				_, err = ctr.Wait(ctx)
+			case "reuse":
+				_, err = reuseEnsureContainer(ctx, "redis:7-alpine", cfg)
+			case "refresh":
+				_, err = reuseInfoForCaller(ctx, cfg, ctr)
+			case "ownership":
+				err = verifyCreatedOwnership(ctx, ctr, cfg)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("got %v, want outer deadline", err)
+			}
+		})
+	}
+}
+
+func TestWaitWithoutDeadlineStopsOnQueryExpiry(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	ctr.queryTimeout = 5 * time.Millisecond
+	ctr.runner = timeoutTestRunner(func(ctx context.Context, _ ...string) ([]byte, []byte, error) {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := ctr.Wait(ctx); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Wait retried without an outer deadline")
+	}
+}
+
+func TestMissingImageSharesPullAcrossQueryBudgets(t *testing.T) {
+	f := newTestRunner()
+	pulling, secondPull, joined := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var mu sync.Mutex
+	pulls := 0
+	runner := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		if len(args) > 1 && args[0] == "image" && args[1] == "pull" {
+			mu.Lock()
+			pulls++
+			n := pulls
+			mu.Unlock()
+			switch n {
+			case 1:
+				close(pulling)
+			case 2:
+				close(secondPull)
+			}
+			<-release
+		}
+		return f.Run(ctx, args...)
+	})
+	imageResolutionFlights.mu.Lock()
+	oldHook := imageResolutionFlights.onJoin
+	var joinedOnce sync.Once
+	imageResolutionFlights.onJoin = func(string) { joinedOnce.Do(func() { close(joined) }) }
+	imageResolutionFlights.mu.Unlock()
+	defer func() {
+		imageResolutionFlights.mu.Lock()
+		imageResolutionFlights.onJoin = oldHook
+		imageResolutionFlights.mu.Unlock()
+	}()
+	done := make(chan error, 2)
+	for i, budget := range []time.Duration{time.Second, 2 * time.Second} {
+		cfg := newConfig()
+		cfg.eng = appleEngine{}
+		cfg.runner = runner
+		cfg.queryTimeout = budget
+		go func() { _, err := cfg.ensureImageRef(context.Background(), "redis:7-alpine"); done <- err }()
+		if i == 0 {
+			<-pulling
+		}
+	}
+	select {
+	case <-joined:
+	case <-secondPull:
+		t.Error("different query budgets launched duplicate pulls")
+	case <-time.After(time.Second):
+		t.Error("joiner did not join shared fetch")
+	}
+	releaseOnce.Do(func() { close(release) })
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if pulls != 1 {
+		t.Fatalf("pulls=%d, want1", pulls)
+	}
+}
+
+func TestReuseAttachRetriesImageQueryDeadline(t *testing.T) {
+	f := newTestRunner()
+	f.imagePresent = true
+	attempts := 0
+	runner := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		if len(args) > 1 && args[0] == "image" && args[1] == "inspect" {
+			attempts++
+			if attempts == 1 {
+				<-ctx.Done()
+				return nil, nil, ctx.Err()
+			}
+		}
+		if args[0] == "inspect" {
+			return []byte(reuseInspectJSON("myctr", "running", "redis:7-alpine")), nil, nil
+		}
+		return f.Run(ctx, args...)
+	})
+	cfg := newConfig()
+	cfg.eng = appleEngine{}
+	cfg.runner = runner
+	cfg.name = "myctr"
+	cfg.queryTimeout = 10 * time.Millisecond
+	cfg.reusePollInterval = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := reuseEnsureContainer(ctx, "redis:7-alpine", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d, want3", attempts)
+	}
+}

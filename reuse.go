@@ -334,14 +334,28 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 	var lastInspectErr error
 	var resolvedImage imageIdentity
 	imageResolved := false
-	resolveImage := func() error {
+	resolveImage := func(resolveCtx context.Context) error {
 		if imageResolved {
 			return nil
 		}
 		var err error
-		resolvedImage, err = cfg.ensureImageRef(context.WithoutCancel(ctx), image)
-		if err != nil {
-			return err
+		for {
+			resolvedImage, err = cfg.ensureImageRef(resolveCtx, image)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if retryErr := inspectRetryError(ctx, err); retryErr != nil {
+				return retryErr
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
+				return err
+			}
 		}
 		imageResolved = true
 		return nil
@@ -355,10 +369,13 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
 			if !isNotFoundFor(cfg.eng, err) {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil {
+				if ctx.Err() != nil {
+					return nil, reuseInspectWaitError(cfg.name, ctx.Err(), lastInspectErr)
+				}
+				if errors.Is(err, context.Canceled) {
 					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 				}
-				if !retryableInspectError(ctx, err) {
+				if err := inspectRetryError(ctx, err); err != nil {
 					return nil, err
 				}
 				lastInspectErr = err
@@ -374,7 +391,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// Resolve the caller's image immediately before create: a
 			// tag might have changed while waiting, and we want the
 			// immutable image that will actually be passed to run.
-			if err := resolveImage(); err != nil {
+			if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
 				return nil, err
 			}
 			ctr, createErr := reuseCreateResolved(context.WithoutCancel(ctx), image, cfg, resolvedImage)
@@ -406,7 +423,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		}
 		lastInspectErr = nil
 
-		if err := resolveImage(); err != nil {
+		if err := resolveImage(ctx); err != nil {
 			return nil, err
 		}
 		if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
@@ -428,7 +445,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		case domain.ActionRecreate:
 			// Only recycle containers this library created for reuse
 			// with a compatible resolved image; never delete foreign leftovers.
-			if err := resolveImage(); err != nil {
+			if err := resolveImage(ctx); err != nil {
 				return nil, err
 			}
 			if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
@@ -440,7 +457,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case domain.ActionAttach:
-			if err := resolveImage(); err != nil {
+			if err := resolveImage(ctx); err != nil {
 				return nil, err
 			}
 			ctr := &Container{
@@ -623,7 +640,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		if err == nil {
 			break
 		}
-		if !retryableInspectError(inspectCtx, err) {
+		if err := inspectRetryError(inspectCtx, err); err != nil {
 			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 		}
 		if err := waitForReusePoll(inspectCtx, cfg.effectiveReusePollInterval()); err != nil {
@@ -798,6 +815,16 @@ func rollbackReuse(ctx context.Context, ctr *Container, cfg *config) (bool, erro
 		return false, fmt.Errorf("reuse %s: stopped generation changed; refusing automatic deletion", cfg.name)
 	}
 	return true, nil
+}
+
+func inspectRetryError(ctx context.Context, err error) error {
+	if retryableInspectError(ctx, err) {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func retryableInspectError(ctx context.Context, err error) bool {
@@ -1479,10 +1506,13 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 				return nil, fmt.Errorf("reuse %s: container stopped before becoming ready", cfg.name)
 			}
 		} else {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			if isNotFound(err) {
 				return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
 			}
-			if !retryableInspectError(ctx, err) {
+			if err := inspectRetryError(ctx, err); err != nil {
 				return nil, err
 			}
 		}

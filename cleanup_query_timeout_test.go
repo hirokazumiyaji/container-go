@@ -203,6 +203,9 @@ func TestClientRunQueriesHonorShortTimeoutWithinRunBudget(t *testing.T) {
 }
 
 func TestClientConstructionHonorsQueryTimeout(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	var remaining time.Duration
 	r := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
 		if args[0] == "context" {
@@ -221,6 +224,9 @@ func TestClientConstructionHonorsQueryTimeout(t *testing.T) {
 }
 
 func TestClientConstructionQueryDeadlineIsNotIgnored(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
 	r := timeoutTestRunner(func(ctx context.Context, _ ...string) ([]byte, []byte, error) {
 		<-ctx.Done()
 		return nil, nil, ctx.Err()

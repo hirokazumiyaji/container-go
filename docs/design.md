@@ -1158,8 +1158,10 @@ individual short inspection queries may have an earlier query limit. Client
 construction preserves best-effort implicit target discovery when no query timeout
 is explicitly configured; caller cancellation or an explicit query-budget expiry
 fails construction. Verification and reuse loops retry a per-query deadline only
-while their outer operation context remains live. Shared image resolution and reuse
-flights separate query, probe, run, and attach execution budgets as applicable.
+while their outer operation context remains live. `Wait` requires an overall caller
+deadline to retry individual query expiries. PullMissing keeps one shared fetch
+across execution budgets; joiners retry a leader deadline with their own budget.
+Reuse flights separate query, probe, run, and attach budgets as applicable.
 Docker metadata flights use the configured query limit instead of a fixed detached
 30-second cap, while successful cache entries remain independent of that limit.
 Timeout classification uses structured context,

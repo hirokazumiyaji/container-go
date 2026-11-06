@@ -452,42 +452,50 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 		c.imageCache.rememberIdentity(c.eng, image, platform, resolved)
 		return resolved, nil
 	default:
-		key := flightKey(c.eng, image, flightMissing, platform) + c.operationBudgetKey()
+		key := flightKey(c.eng, image, flightMissing, platform)
 		if c.allowMutableImageTag {
 			// A fallback-enabled caller must not share a result with a
 			// default fail-closed caller (or vice versa).
 			key += "\x00allow-mutable-tag"
 		}
-		resolved, err := imageResolutionFlights.do(ctx, key, func() (imageIdentity, error) {
-			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), c.effectiveRunTimeout())
-			defer cancel()
-			identity, exists, err := c.inspectImage(execCtx, image, platform)
+		for {
+			resolved, leader, err := imageResolutionFlights.doWithLeader(ctx, key, func() (imageIdentity, error) {
+				execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), c.effectiveRunTimeout())
+				defer cancel()
+				identity, exists, err := c.inspectImage(execCtx, image, platform)
+				if err != nil {
+					return imageIdentity{}, err
+				}
+				if exists {
+					// A record without a complete requested variant is not
+					// proof that PullMissing already has the requested
+					// platform. Pull explicitly when that policy permits;
+					// PullNever still returns the typed not-local error below.
+					if identity.notLocal && c.pullPolicy == PullMissing {
+						if err := c.pullImage(execCtx, image, platform); err != nil {
+							return imageIdentity{}, err
+						}
+						return c.resolveImage(execCtx, image, platform)
+					}
+					return c.resolveInspectedImage(execCtx, image, platform, identity)
+				}
+				if err := c.pullImage(execCtx, image, platform); err != nil {
+					return imageIdentity{}, err
+				}
+				return c.resolveImage(execCtx, image, platform)
+			})
+			if ctx.Err() != nil {
+				return imageIdentity{}, ctx.Err()
+			}
+			if !leader && errors.Is(err, context.DeadlineExceeded) && retryableInspectError(ctx, err) {
+				continue
+			}
 			if err != nil {
 				return imageIdentity{}, err
 			}
-			if exists {
-				// A record without a complete requested variant is not
-				// proof that PullMissing already has the requested
-				// platform. Pull explicitly when that policy permits;
-				// PullNever still returns the typed not-local error below.
-				if identity.notLocal && c.pullPolicy == PullMissing {
-					if err := c.pullImage(execCtx, image, platform); err != nil {
-						return imageIdentity{}, err
-					}
-					return c.resolveImage(execCtx, image, platform)
-				}
-				return c.resolveInspectedImage(execCtx, image, platform, identity)
-			}
-			if err := c.pullImage(execCtx, image, platform); err != nil {
-				return imageIdentity{}, err
-			}
-			return c.resolveImage(execCtx, image, platform)
-		})
-		if err != nil {
-			return imageIdentity{}, err
+			c.imageCache.rememberIdentity(c.eng, image, platform, resolved)
+			return resolved, nil
 		}
-		c.imageCache.rememberIdentity(c.eng, image, platform, resolved)
-		return resolved, nil
 	}
 }
 

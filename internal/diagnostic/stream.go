@@ -69,15 +69,8 @@ func newStreamProcessor(r *Redactor, limit int, emit func([]byte)) *streamProces
 		overlap:       overlap,
 		limit:         limit,
 		emit:          emit,
-		byShortPrefix: make(map[uint32][]valueHash),
-		byLongPrefix:  make(map[uint32][]valueHash),
-	}
-	for _, entry := range r.hashes {
-		if entry.short {
-			p.byShortPrefix[entry.prefix] = append(p.byShortPrefix[entry.prefix], entry)
-		} else {
-			p.byLongPrefix[entry.prefix] = append(p.byLongPrefix[entry.prefix], entry)
-		}
+		byShortPrefix: r.index.byShort,
+		byLongPrefix:  r.index.byPrefix,
 	}
 	if overlap > MaxStreamOverlap {
 		p.configErr = errStreamValueTooLarge

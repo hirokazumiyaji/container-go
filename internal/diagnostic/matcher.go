@@ -125,20 +125,29 @@ func longestHashMatch(s string, start int, entries []valueHash, force bool) int 
 	return matched
 }
 
-func replaceHashedValues(s string, hashes []valueHash, force bool) string {
-	if len(hashes) == 0 || s == "" {
-		return s
+type valueHashIndex struct {
+	byPrefix map[uint32][]valueHash
+	byShort  map[uint32][]valueHash
+}
+
+func (r *Redactor) setHashes(hashes []valueHash) {
+	r.hashes = hashes
+	r.index = valueHashIndex{}
+	if len(hashes) == 0 {
+		return
 	}
-	byPrefix := make(map[uint32][]valueHash, len(hashes))
-	byShort := make(map[uint32][]valueHash)
+	r.index.byPrefix = make(map[uint32][]valueHash, len(hashes))
+	r.index.byShort = make(map[uint32][]valueHash)
 	for _, entry := range hashes {
 		if entry.short {
-			byShort[entry.prefix] = append(byShort[entry.prefix], entry)
+			r.index.byShort[entry.prefix] = append(r.index.byShort[entry.prefix], entry)
 		} else {
-			byPrefix[entry.prefix] = append(byPrefix[entry.prefix], entry)
+			r.index.byPrefix[entry.prefix] = append(r.index.byPrefix[entry.prefix], entry)
 		}
 	}
+}
 
+func (index valueHashIndex) replace(s string, force bool) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); {
@@ -147,9 +156,9 @@ func replaceHashedValues(s string, hashes []valueHash, force bool) string {
 			i += len(Redacted)
 			continue
 		}
-		matched := longestHashMatch(s, i, byShort[shortPrefixAt(s, i)], force)
+		matched := longestHashMatch(s, i, index.byShort[shortPrefixAt(s, i)], force)
 		if len(s)-i >= 4 {
-			if n := longestHashMatch(s, i, byPrefix[valuePrefixAt(s, i)], force); n > matched {
+			if n := longestHashMatch(s, i, index.byPrefix[valuePrefixAt(s, i)], force); n > matched {
 				matched = n
 			}
 		}
@@ -201,7 +210,7 @@ func (r *Redactor) Close() error {
 	}
 	r.source = nil
 	r.values = nil
-	r.hashes = nil
+	r.setHashes(nil)
 	r.force = false
 	return nil
 }

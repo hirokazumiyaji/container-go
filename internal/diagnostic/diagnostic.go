@@ -58,6 +58,7 @@ type Redactor struct {
 	source []string
 	values []string
 	hashes []valueHash
+	index  valueHashIndex
 	force  bool
 }
 
@@ -91,7 +92,7 @@ func newRedactor(values []string, expand, force bool) *Redactor {
 	} else {
 		r.values = append([]string(nil), r.source...)
 	}
-	r.hashes = hashValues(r.values)
+	r.setHashes(hashValues(r.values))
 	return r
 }
 
@@ -163,7 +164,7 @@ func (r *Redactor) WithValues(values ...string) *Redactor {
 		return NewRedactor(values...)
 	}
 	combined := newRedactor(values, true, r.force)
-	combined.hashes = mergeValueHashes(r.hashes, combined.hashes)
+	combined.setHashes(mergeValueHashes(r.hashes, combined.hashes))
 	return combined
 }
 
@@ -178,7 +179,7 @@ func (r *Redactor) WithForce() *Redactor {
 		return NewContextRedactor()
 	}
 	combined := newRedactor(nil, true, true)
-	combined.hashes = mergeValueHashes(r.hashes)
+	combined.setHashes(mergeValueHashes(r.hashes))
 	return combined
 }
 
@@ -200,7 +201,7 @@ func (r *Redactor) Compose(others ...*Redactor) *Redactor {
 		}
 	}
 	combined := newRedactor(nil, true, force)
-	combined.hashes = mergeValueHashes(hashes)
+	combined.setHashes(mergeValueHashes(hashes))
 	return combined
 }
 
@@ -238,7 +239,7 @@ func (r *Redactor) Text(s string) string {
 	s = redactURLCredentials(s)
 	s = redactSecretShaped(s)
 	if len(r.hashes) > 0 {
-		s = replaceHashedValues(s, r.hashes, r.force)
+		s = r.index.replace(s, r.force)
 	} else {
 		for _, value := range r.values {
 			s = replaceKnownValue(s, value, r.force)

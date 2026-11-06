@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const imageCacheLimit = 256
+
 // imageCache remembers that an image is present in a backend's local
 // store, so a later Run does not have to ask the daemon again.
 //
@@ -106,6 +108,17 @@ func (c *imageCache) rememberIdentity(eng engine, image, platform string, identi
 		if !now.Before(entry.expiry) {
 			delete(c.entries, k)
 		}
+	}
+	if _, exists := c.entries[key]; !exists && len(c.entries) >= imageCacheLimit {
+		var oldestKey string
+		var oldestExpiry time.Time
+		for existing, entry := range c.entries {
+			if oldestExpiry.IsZero() || entry.expiry.Before(oldestExpiry) {
+				oldestKey = existing
+				oldestExpiry = entry.expiry
+			}
+		}
+		delete(c.entries, oldestKey)
 	}
 	c.entries[key] = imageCacheEntry{
 		expiry:   now.Add(c.ttl),

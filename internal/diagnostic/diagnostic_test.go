@@ -265,3 +265,39 @@ func (r *errorAfterReader) Read(p []byte) (int, error) {
 	}
 	return 0, r.err
 }
+
+func TestComposedRedactorsProtectTextAndStreams(t *testing.T) {
+	base := NewHashedContextRedactor("xy", "abcdef")
+	redactors := []*Redactor{
+		base.WithValues("abcdeg"),
+		base.Compose(NewHashedRedactor("abcdeg")),
+		NewHashedRedactor("xy", "abcdef", "abcdeg").WithForce(),
+	}
+	const input = "(xy) abcdef abcdeg"
+	const want = "([REDACTED]) [REDACTED] [REDACTED]"
+	for _, r := range redactors {
+		for range 2 {
+			if got := r.Text(input); got != want {
+				t.Fatalf("Text() = %q, want %q", got, want)
+			}
+			stream := r.NewStream(1024)
+			for _, chunk := range []string{"(x", "y) abc", "def abcd", "eg"} {
+				if _, err := stream.Write([]byte(chunk)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := stream.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if got := stream.String(); got != want {
+				t.Fatalf("stream = %q, want %q", got, want)
+			}
+		}
+	}
+	if err := base.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := base.Text(input); got != input {
+		t.Fatalf("closed Text() = %q, want %q", got, input)
+	}
+}

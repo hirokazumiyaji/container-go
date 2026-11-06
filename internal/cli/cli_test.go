@@ -1483,4 +1483,7 @@ func TestCommandErrorPreservesWaitDelayContext(t *testing.T) {
 	if !strings.Contains(err.Error(), "backend-wrapper inspect target") {
 		t.Fatalf("missing command context: %v", err)
 	}
+	if !strings.Contains(err.Error(), "diagnostic") {
+		t.Fatalf("missing stderr: %v", err)
+	}
 }

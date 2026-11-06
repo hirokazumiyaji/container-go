@@ -475,7 +475,12 @@ func commandError(ctx context.Context, bin, identity string, args []string, stdo
 		return errors.Join(contextErr, err)
 	}
 	if errors.Is(err, exec.ErrWaitDelay) {
-		return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
+		redactor := NewRedactor()
+		message := fmt.Sprintf("%s %s", redactor.Text(bin), strings.Join(redactor.Args(args), " "))
+		if diagnostic := redactor.RedactBounded(string(stderr), maxStderr); diagnostic != "" {
+			message += ": " + strings.TrimSpace(diagnostic)
+		}
+		return fmt.Errorf("%s: %w", message, err)
 	}
 	return err
 }

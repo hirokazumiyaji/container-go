@@ -27,7 +27,7 @@ func (r *waitDelayExecRunner) Run(ctx context.Context, args ...string) ([]byte, 
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestExecWaitDelayRedactsCommandAndPreservesDiagnostics(t *testing.T) {
+func TestExecWaitDelayRedactsCommandAndOmitsStderr(t *testing.T) {
 	stub := filepath.Join(t.TempDir(), "container")
 	if err := os.WriteFile(stub, []byte("#!/bin/sh\nsleep 5 &\nprintf 'backend diagnostic password=stderrsecret\\n' >&2\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -41,8 +41,8 @@ func TestExecWaitDelayRedactsCommandAndPreservesDiagnostics(t *testing.T) {
 	if strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "stderrsecret") {
 		t.Fatalf("secret leaked: %v", err)
 	}
-	if !strings.Contains(err.Error(), "backend diagnostic") {
-		t.Fatalf("missing stderr diagnostic: %v", err)
+	if strings.Contains(err.Error(), "backend diagnostic") {
+		t.Fatalf("WaitDelay includes raw stderr: %v", err)
 	}
 }
 

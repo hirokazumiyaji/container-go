@@ -1476,26 +1476,19 @@ func TestExecRunnerIdentityDefaultsToBinary(t *testing.T) {
 }
 
 func TestCommandErrorPreservesWaitDelayContext(t *testing.T) {
-	err := commandError(context.Background(), "backend-wrapper", "docker", []string{"inspect", "target"}, nil, []byte("diagnostic"), exec.ErrWaitDelay)
-	if !errors.Is(err, exec.ErrWaitDelay) {
-		t.Fatalf("error = %v, want ErrWaitDelay", err)
-	}
-	if !strings.Contains(err.Error(), "backend-wrapper inspect target") {
-		t.Fatalf("missing command context: %v", err)
-	}
-	if !strings.Contains(err.Error(), "diagnostic") {
-		t.Fatalf("missing stderr: %v", err)
+	err := commandError(context.Background(), "backend-wrapper", "docker", []string{"inspect", "target"}, nil, []byte(strings.Repeat("secret-fragment", maxStderr)), exec.ErrWaitDelay)
+	if !errors.Is(err, exec.ErrWaitDelay) || err.Error() != "backend-wrapper inspect target: "+exec.ErrWaitDelay.Error() {
+		t.Fatalf("error = %v, want safe command context and WaitDelay only", err)
 	}
 }
 
-func TestCommandErrorWaitDelayTrimsAndPreservesTail(t *testing.T) {
-	err := commandError(context.Background(), "docker", "docker", []string{"inspect", "target"}, nil, []byte(" \n\t"), exec.ErrWaitDelay)
-	if err.Error() != "docker inspect target: "+exec.ErrWaitDelay.Error() {
-		t.Fatalf("whitespace-only diagnostic added text: %v", err)
-	}
-	input := "first diagnostic\n" + strings.Repeat("padding\n", maxStderr) + "last actionable diagnostic\n"
-	err = commandError(context.Background(), "docker", "docker", []string{"inspect", "target"}, nil, []byte(input), exec.ErrWaitDelay)
-	if !strings.Contains(err.Error(), "last actionable diagnostic") || strings.Contains(err.Error(), "first diagnostic") {
-		t.Fatalf("not a stderr tail: %v", err)
+func TestCommandErrorCancellationRaceDoesNotDuplicateDiagnostic(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 7")
+	exitErr := cmd.Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := commandError(ctx, "docker", "docker", []string{"inspect", "target"}, nil, []byte("actionable diagnostic"), exitErr)
+	if !errors.Is(err, context.Canceled) || strings.Count(err.Error(), "docker inspect target") != 1 || strings.Count(err.Error(), "actionable diagnostic") != 1 {
+		t.Fatalf("duplicated cancellation diagnostic: %v", err)
 	}
 }

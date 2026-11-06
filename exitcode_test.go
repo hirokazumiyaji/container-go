@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -124,5 +125,31 @@ func TestWaitClassifiesTransientErrorsBeforeRedaction(t *testing.T) {
 	code, err := ctr.Wait(context.Background())
 	if err != nil || code != 7 {
 		t.Fatalf("Wait=%d,%v, want retry then 7,nil", code, err)
+	}
+}
+
+func TestPublicLifecyclePreservesRedactedPathError(t *testing.T) {
+	const secret = "private-executable-path"
+	raw := &os.PathError{Op: "fork/exec", Path: "/opt/" + secret + "/docker", Err: os.ErrPermission}
+	ctr := &Container{id: "myctr", runner: waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) { return nil, nil, raw }), eng: dockerEngine{}, sync: &lockPack{uid: strings.Repeat("a", 64)}, diagnosticRedactorValue: cli.NewHashedContextRedactor(secret)}
+	for name, op := range map[string]func() error{
+		"State":    func() error { _, err := ctr.State(context.Background()); return err },
+		"Wait":     func() error { _, err := ctr.Wait(context.Background()); return err },
+		"Inspect":  func() error { _, err := ctr.Inspect(context.Background()); return err },
+		"ExitCode": func() error { _, err := ctr.ExitCode(context.Background()); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := op()
+			var pathErr *os.PathError
+			if !errors.As(err, &pathErr) || !errors.Is(err, os.ErrPermission) || !cli.PermanentStartError(err) {
+				t.Fatalf("got %T %v, want typed permanent path error", err, err)
+			}
+			if strings.Contains(err.Error(), secret) || strings.Contains(pathErr.Path, secret) || strings.Contains(pathErr.Error(), secret) {
+				t.Fatalf("path fields leak secret: %v", pathErr)
+			}
+			if pathErr == raw || !strings.Contains(raw.Path, secret) {
+				t.Fatal("public error must be a redacted copy")
+			}
+		})
 	}
 }

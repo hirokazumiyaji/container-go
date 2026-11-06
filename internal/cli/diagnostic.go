@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"reflect"
 
@@ -195,6 +196,13 @@ func (e *safeError) as(target any, r *Redactor) bool {
 			return asSafeDiagnostic(e.err, target, r)
 		}
 		*ptr = raw.withRedactor(r)
+		return true
+	case **os.PathError:
+		var raw *os.PathError
+		if !errors.As(e.err, &raw) {
+			return false
+		}
+		*ptr = &os.PathError{Op: r.Text(raw.Op), Path: r.Text(raw.Path), Err: WithRedactor(raw.Err, r)}
 		return true
 	case **exec.Error:
 		var raw *exec.Error

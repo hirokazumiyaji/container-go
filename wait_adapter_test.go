@@ -760,13 +760,16 @@ func TestWaitTargetHealthInspectRateStaysAtLifecycleCadence(t *testing.T) {
 func TestWaitTargetPreservesPermanentInspectFailure(t *testing.T) {
 	for name, cause := range map[string]error{"permission": os.ErrPermission, "missing executable": os.ErrNotExist} {
 		t.Run(name, func(t *testing.T) {
-			original := &os.PathError{Op: "fork/exec", Path: "/opt/docker", Err: cause}
+			original := &os.PathError{Op: "fork/exec", Path: "/opt/private-executable-path/docker", Err: cause}
 			runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) { return nil, nil, original })
-			ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}, sync: &lockPack{uid: strings.Repeat("a", 64)}}
+			ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}, sync: &lockPack{uid: strings.Repeat("a", 64)}, diagnosticRedactorValue: cli.NewHashedContextRedactor("private-executable-path")}
 			_, err := (waitTarget{c: ctr}).State(context.Background())
 			var pathErr *os.PathError
 			if !errors.As(err, &pathErr) || !errors.Is(err, cause) || !cli.PermanentStartError(err) {
 				t.Fatalf("got %T %v, want typed permanent start failure", err, err)
+			}
+			if strings.Contains(pathErr.Path, "private-executable-path") || strings.Contains(err.Error(), "private-executable-path") {
+				t.Fatalf("wait target exposes private path: %v", err)
 			}
 		})
 	}

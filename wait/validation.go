@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/portspec"
 )
 
 func invalidConfigf(format string, args ...any) error {
@@ -33,13 +34,8 @@ func validatePortSpec(port string, allowEmpty bool) error {
 		return invalidConfigf("port must not be empty")
 	}
 
-	portPart, proto, hasProto := strings.Cut(port, "/")
-	if hasProto && proto != "tcp" && proto != "udp" {
-		return invalidConfigf("invalid port %q: protocol must be tcp or udp", port)
-	}
-	n, err := strconv.Atoi(portPart)
-	if err != nil || n < 1 || n > 65535 {
-		return invalidConfigf("invalid port %q: port must be 1-65535", port)
+	if _, err := portspec.Parse(port); err != nil {
+		return invalidConfigf("%s", err)
 	}
 	return nil
 }
@@ -187,18 +183,14 @@ func validateStrategies(strategies []Strategy) error {
 }
 
 func canonicalPortSpec(port string) (string, error) {
-	if err := validatePortSpec(port, false); err != nil {
-		return "", err
+	if port == "" {
+		return "", invalidConfigf("port must not be empty")
 	}
-	portPart, proto, hasProto := strings.Cut(port, "/")
-	if !hasProto {
-		proto = "tcp"
-	}
-	n, err := strconv.Atoi(portPart)
+	spec, err := portspec.Parse(port)
 	if err != nil {
-		return "", err
+		return "", invalidConfigf("%s", err)
 	}
-	return strconv.Itoa(n) + "/" + proto, nil
+	return strconv.Itoa(spec.Port) + "/" + spec.Protocol, nil
 }
 
 func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error {

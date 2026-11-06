@@ -574,7 +574,7 @@ func attachProbeStdout(err error, stdout string, probe Probe) error {
 	}
 	operation := probe.Operation
 	if operation == "" {
-		operation = probeOperation(probe.Args)
+		operation = CommandOperation(probe.Args)
 	}
 	if operation == "" {
 		return err
@@ -599,7 +599,7 @@ func matchingProbeCLIError(err error, binary, operation string) *CLIError {
 		return nil
 	}
 	if cliErr, ok := err.(*CLIError); ok {
-		if (binary == "" || probeBinaryMatches(cliErr.Binary, binary)) && probeOperation(cliErr.Args) == operation {
+		if (binary == "" || BinaryMatches(cliErr.Binary, binary)) && CommandOperation(cliErr.Args) == operation {
 			return cliErr
 		}
 		return nil
@@ -616,7 +616,7 @@ func probeRelevantError(err error, probe Probe) error {
 	}
 	operation := probe.Operation
 	if operation == "" {
-		operation = probeOperation(probe.Args)
+		operation = CommandOperation(probe.Args)
 	}
 	if operation == "" {
 		return err
@@ -643,8 +643,8 @@ func probeRelevantError(err error, probe Probe) error {
 			}
 		}
 		if cliErr, ok := cur.(*CLIError); ok {
-			if probe.Binary == "" || probeBinaryMatches(cliErr.Binary, probe.Binary) {
-				if probeOperation(cliErr.Args) == operation {
+			if probe.Binary == "" || BinaryMatches(cliErr.Binary, probe.Binary) {
+				if CommandOperation(cliErr.Args) == operation {
 					cause := error(cliErr)
 					if stdout := stdoutByCLIError[cliErr]; stdout != "" {
 						cause = WithStdout(cliErr, stdout)
@@ -659,7 +659,7 @@ func probeRelevantError(err error, probe Probe) error {
 		}
 	}
 	walk(err)
-	collectProbeNonCLI(err, &nonCLI)
+	CollectNonCLIErrorBranches(err, &nonCLI)
 	if len(branches) == 0 {
 		return err
 	}
@@ -667,20 +667,20 @@ func probeRelevantError(err error, probe Probe) error {
 	return errors.Join(parts...)
 }
 
-func collectProbeNonCLI(err error, out *[]error) {
+func CollectNonCLIErrorBranches(err error, out *[]error) {
 	if err == nil {
 		return
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		for _, child := range joined.Unwrap() {
-			collectProbeNonCLI(child, out)
+			CollectNonCLIErrorBranches(child, out)
 		}
 		return
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
 		child := wrapped.Unwrap()
 		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			collectProbeNonCLI(child, out)
+			CollectNonCLIErrorBranches(child, out)
 			return
 		}
 	}
@@ -691,7 +691,7 @@ func collectProbeNonCLI(err error, out *[]error) {
 	*out = append(*out, err)
 }
 
-func probeOperation(args []string) string {
+func CommandOperation(args []string) string {
 	if len(args) == 0 {
 		return ""
 	}
@@ -704,10 +704,7 @@ func probeOperation(args []string) string {
 	return args[0]
 }
 
-func probeBinaryMatches(got, want string) bool {
-	if want == "" {
-		return true
-	}
+func BinaryMatches(got, want string) bool {
 	got = strings.TrimSpace(strings.ToLower(got))
 	if got == "" {
 		got = "container"

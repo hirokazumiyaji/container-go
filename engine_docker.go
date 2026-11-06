@@ -663,7 +663,7 @@ func dockerProbeUnavailable(err error) bool {
 		}
 	}
 	var nonCLI []error
-	collectNonCLIErrorBranches(err, &nonCLI)
+	cli.CollectNonCLIErrorBranches(err, &nonCLI)
 	for _, extra := range nonCLI {
 		if cli.IsProbeConfigurationError(extra) {
 			return false

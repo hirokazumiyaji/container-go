@@ -543,7 +543,7 @@ func isNotFoundForOperation(eng engine, err error, operation string, targets ...
 		parts = append(parts, branch.cause)
 	}
 	var nonCLI []error
-	collectNonCLIErrorBranches(err, &nonCLI)
+	cli.CollectNonCLIErrorBranches(err, &nonCLI)
 	parts = append(parts, nonCLI...)
 	return isNotFoundFor(eng, errors.Join(parts...))
 }
@@ -586,10 +586,10 @@ func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict
 	}
 	var cliErr *cli.CLIError
 	if errors.As(err, &cliErr) {
-		if !cliBinaryMatches(cliErr.Binary, eng.binary()) {
+		if !cli.BinaryMatches(cliErr.Binary, eng.binary()) {
 			return false, true
 		}
-		operation := commandOperation(cliErr.Args)
+		operation := cli.CommandOperation(cliErr.Args)
 		if operation != "inspect" {
 			// Probe or unrelated CLI branches joined after Classify must
 			// not veto a confirmed inspect absence.
@@ -612,7 +612,7 @@ func engineForCLIError(err *cli.CLIError) engine {
 	if err == nil {
 		return nil
 	}
-	if cliBinaryMatches(err.Binary, "docker") {
+	if cli.BinaryMatches(err.Binary, "docker") {
 		return dockerEngine{}
 	}
 	return appleEngine{}
@@ -688,7 +688,7 @@ func cliCommandParts(err error) (command string, args []string, ok bool) {
 
 func cliErrorBelongsTo(err error, backend string) bool {
 	var cliErr *cli.CLIError
-	return errors.As(err, &cliErr) && cliBinaryMatches(cliErr.Binary, backend)
+	return errors.As(err, &cliErr) && cli.BinaryMatches(cliErr.Binary, backend)
 }
 
 func cliCommandTarget(command string, args []string) string {
@@ -903,11 +903,11 @@ func classifyErrorForWithProbe(ctx context.Context, r cli.Runner, err error, eng
 	allBranches := backendCLIErrorBranches(err, "")
 	selected := branch.cause
 	var nonCLI []error
-	collectNonCLIErrorBranches(err, &nonCLI)
+	cli.CollectNonCLIErrorBranches(err, &nonCLI)
 	parts := make([]error, 0, len(allBranches)+len(nonCLI))
 	parts = append(parts, selected)
 	for _, related := range allBranches {
-		if related.ctx.err == branch.ctx.err || !cliBinaryMatches(related.ctx.err.Binary, eng.binary()) ||
+		if related.ctx.err == branch.ctx.err || !cli.BinaryMatches(related.ctx.err.Binary, eng.binary()) ||
 			!sameCLIErrorContext(related, branch) {
 			continue
 		}
@@ -940,28 +940,4 @@ func classifyErrorForWithProbe(ctx context.Context, r cli.Runner, err error, eng
 		return classified
 	}
 	return errors.Join(classified, err)
-}
-
-func collectNonCLIErrorBranches(err error, out *[]error) {
-	if err == nil {
-		return
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			collectNonCLIErrorBranches(child, out)
-		}
-		return
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		child := wrapped.Unwrap()
-		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			collectNonCLIErrorBranches(child, out)
-			return
-		}
-	}
-	var cliErr *cli.CLIError
-	if errors.As(err, &cliErr) {
-		return
-	}
-	*out = append(*out, err)
 }

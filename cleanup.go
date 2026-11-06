@@ -440,7 +440,7 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, contextErr)
 	}
-	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), id) {
+	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
@@ -551,7 +551,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, contextErr)
 	}
-	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), candidate.id) {
+	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), candidate.id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")

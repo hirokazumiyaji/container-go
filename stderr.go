@@ -61,10 +61,10 @@ func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
 			// Empty Binary is the historical `container` executable, so a
 			// Docker classifier never accepts an error without an explicit
 			// Docker binary. ExecRunner always records the executable name.
-			if backend != "" && !cliBinaryMatches(cliErr.Binary, backend) {
+			if backend != "" && !cli.BinaryMatches(cliErr.Binary, backend) {
 				return
 			}
-			operation := commandOperation(cliErr.Args)
+			operation := cli.CommandOperation(cliErr.Args)
 			stdout := stdoutByCLIError[cliErr]
 			cause := error(cliErr)
 			if stdout != "" {
@@ -187,30 +187,6 @@ func hasParsedCLITarget(ctx cliErrorContext) bool {
 	return strings.TrimSpace(ctx.target) != ""
 }
 
-func cliBinaryMatches(got, want string) bool {
-	got = strings.TrimSpace(strings.ToLower(got))
-	if got == "" {
-		return strings.EqualFold(want, "container")
-	}
-	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
-		got = got[i+1:]
-	}
-	return got == strings.ToLower(want)
-}
-
-func commandOperation(args []string) string {
-	if len(args) == 0 {
-		return ""
-	}
-	if args[0] == "image" {
-		if len(args) > 1 {
-			return "image " + args[1]
-		}
-		return "image"
-	}
-	return args[0]
-}
-
 func commandTarget(args []string, operation string) string {
 	if len(args) == 0 {
 		return ""
@@ -300,11 +276,11 @@ func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
 	if cliErr == nil {
 		return false
 	}
-	operation := commandOperation(cliErr.Args)
-	if cliBinaryMatches(cliErr.Binary, "container") {
+	operation := cli.CommandOperation(cliErr.Args)
+	if cli.BinaryMatches(cliErr.Binary, "container") {
 		return true
 	}
-	if !cliBinaryMatches(cliErr.Binary, "docker") {
+	if !cli.BinaryMatches(cliErr.Binary, "docker") {
 		return false
 	}
 	switch operation {
@@ -349,8 +325,8 @@ func cliErrorLinePrefix(line string, cliErr *cli.CLIError) (string, bool) {
 	if cliErr == nil {
 		return "", false
 	}
-	operation := commandOperation(cliErr.Args)
-	if cliBinaryMatches(cliErr.Binary, "docker") {
+	operation := cli.CommandOperation(cliErr.Args)
+	if cli.BinaryMatches(cliErr.Binary, "docker") {
 		for _, prefix := range []string{"docker: ", "error response from daemon: "} {
 			if strings.HasPrefix(line, prefix) {
 				return prefix, true
@@ -358,7 +334,7 @@ func cliErrorLinePrefix(line string, cliErr *cli.CLIError) (string, bool) {
 		}
 		return "", false
 	}
-	if cliBinaryMatches(cliErr.Binary, "container") && appleContainerPrefixAllowed(operation) {
+	if cli.BinaryMatches(cliErr.Binary, "container") && appleContainerPrefixAllowed(operation) {
 		if strings.HasPrefix(line, "container: ") {
 			return "container: ", true
 		}

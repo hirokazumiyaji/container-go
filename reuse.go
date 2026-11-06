@@ -232,7 +232,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// reusable name.
 	infoCtx, infoCancel := context.WithTimeout(ctx, cfg.effectiveReuseAttachTimeout())
 	defer infoCancel()
-	info, err := reuseInfoForCaller(infoCtx, cfg, base)
+	info, err := reuseInfoForCaller(infoCtx, cfg, base, resolvedImage, image)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			return nil, fmt.Errorf("reuse %s: timed out waiting for complete inspect: %w", cfg.name, err)
@@ -244,16 +244,6 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			return base, joinEnvFileCleanupError(err, leaderWarning)
 		}
 		return nil, err
-	}
-	if configNeedsDefaultNetwork(cfg) {
-		name, err := base.ensureDefaultNetworkForConfig(ctx, cfg)
-		if err != nil {
-			return nil, err
-		}
-		info.defaultNetwork = name
-	}
-	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
-		return nil, joinEnvFileCleanupError(err, leaderWarning)
 	}
 
 	if cfg.eng.name() == "apple" && resolvedImage.pinned {
@@ -969,9 +959,6 @@ func checkReuseIdentity(info *engineInfo, cfg *config) error {
 	if info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("reuse: existing container was not created with WithReuse")
 	}
-	if info.labels[reuseGroupLabel] != cfg.reuseGroup {
-		return fmt.Errorf("%w: reuse group does not match the existing container", ErrReuseMismatch)
-	}
 	if !validCreationID(info.labels[creationLabel]) {
 		return identityError(fmt.Sprintf("reuse %s: existing container has no valid creation generation", cfg.name))
 	}
@@ -992,6 +979,9 @@ func checkReuseIdentity(info *engineInfo, cfg *config) error {
 func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
 	if err := checkReuseIdentity(info, cfg); err != nil {
 		return err
+	}
+	if info.labels[reuseGroupLabel] != cfg.reuseGroup {
+		return fmt.Errorf("%w: reuse group does not match the existing container", ErrReuseMismatch)
 	}
 	if requested.pinned {
 		actual := imageFromInfo(info)
@@ -1018,15 +1008,14 @@ func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 
 // checkReuseCompatIdentity applies the resolved image and port checks
 // for a reuse request.
-func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) (err error) {
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("%w: %w", ErrReuseMismatch, err)
-		}
-	}()
+func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
 	if err := checkReuseOwnedIdentity(info, requested, original, cfg); err != nil {
 		return err
 	}
+	return checkReuseConfigCompat(info, cfg)
+}
+
+func checkReuseConfigCompat(info *engineInfo, cfg *config) error {
 	if err := checkReuseCreationConfig(info, cfg); err != nil {
 		return err
 	}
@@ -1036,14 +1025,14 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 			requested = ""
 		}
 		if err := dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork); err != nil {
-			return fmt.Errorf("reuse %s: %w", cfg.name, err)
+			return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
 		}
 		if err := dockerReuseNetworkAliasesError(cfg, info); err != nil {
-			return fmt.Errorf("reuse %s: %w", cfg.name, err)
+			return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
 		}
 		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {
 			if err := dockerNetworkEndpointError(info.networkMode); err != nil {
-				return fmt.Errorf("reuse %s: %w", cfg.name, err)
+				return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
 			}
 		}
 	}
@@ -1054,32 +1043,32 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 		for _, spec := range cfg.exposed {
 			b, ok := matchingExposedBinding(info.bound, spec, cfg.eng)
 			if !ok {
-				return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
+				return fmt.Errorf("%w: reuse %s: exposed port %s missing on existing container", ErrReuseMismatch, cfg.name, spec)
 			}
 			if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
-				return fmt.Errorf("reuse %s: exposed port %s: %w", cfg.name, spec, err)
+				return fmt.Errorf("%w: reuse %s: exposed port %s: %w", ErrReuseMismatch, cfg.name, spec, err)
 			}
 		}
 	}
 	for _, p := range cfg.published {
 		b, ok := matchingPublishedBinding(info.bound, p, cfg.eng)
 		if !ok {
-			return fmt.Errorf("reuse %s: published port %s missing on existing container", cfg.name, p.raw)
+			return fmt.Errorf("%w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, cfg.name, p.raw)
 		}
 		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
-			return fmt.Errorf("reuse %s: published port %s: %w", cfg.name, p.raw, err)
+			return fmt.Errorf("%w: reuse %s: published port %s: %w", ErrReuseMismatch, cfg.name, p.raw, err)
 		}
 	}
 	if cfg.platform != "" {
 		if info.platform == "" || platformSelectorUnverifiable(cfg.platform, info.platform) {
-			return fmt.Errorf("reuse %s: platform %q could not be verified", cfg.name, cfg.platform)
+			return fmt.Errorf("%w: reuse %s: platform %q could not be verified", ErrReuseMismatch, cfg.name, cfg.platform)
 		}
 		if !enginePlatformCompatible(cfg.eng, cfg.platform, info) {
-			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
+			return fmt.Errorf("%w: reuse %s: platform %q does not match existing %q", ErrReuseMismatch, cfg.name, cfg.platform, info.platform)
 		}
 	}
 	if err := checkReuseRunOptions(info, cfg); err != nil {
-		return fmt.Errorf("reuse %s: %w", cfg.name, err)
+		return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
 	}
 	return nil
 }
@@ -1454,7 +1443,7 @@ func reuseContextError(ctx context.Context, name string) error {
 	return ctx.Err()
 }
 
-func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*engineInfo, error) {
+func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, requested imageIdentity, original string) (*engineInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1477,12 +1466,22 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 				}
 			}
 			if info.state == StateRunning {
-				if err := checkReuseCreationConfig(info, cfg); err != nil {
+				if err := checkReuseOwnedIdentity(info, requested, original, cfg); err != nil {
 					return nil, err
 				}
-			}
-			if reuseInfoReady(cfg, info) {
-				return info, nil
+				if configNeedsDefaultNetwork(cfg) {
+					name, err := base.ensureDefaultNetworkForConfig(ctx, cfg)
+					if err != nil {
+						return nil, err
+					}
+					info.defaultNetwork = name
+				}
+				if err := checkReuseConfigCompat(info, cfg); err != nil {
+					return nil, err
+				}
+				if !cfg.eng.directIP() || (len(cfg.exposed) == 0 && len(cfg.published) == 0) || info.ip != "" {
+					return info, nil
+				}
 			}
 			switch info.state {
 			case StateStopping:
@@ -1504,40 +1503,6 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 			return nil, err
 		}
 	}
-}
-
-func reuseInfoReady(cfg *config, info *engineInfo) bool {
-	return info != nil && info.state == StateRunning && reuseInfoComplete(cfg, info)
-}
-
-func reuseInfoComplete(cfg *config, info *engineInfo) bool {
-	if info == nil {
-		return false
-	}
-	if len(cfg.exposed) == 0 && len(cfg.published) == 0 {
-		return true
-	}
-	if cfg.eng.directIP() {
-		return info.ip != ""
-	}
-	for _, spec := range cfg.exposed {
-		bound := false
-		for _, b := range info.bound {
-			if b.containerPort == spec.port && b.proto == spec.proto && b.hostPort > 0 {
-				bound = true
-				break
-			}
-		}
-		if !bound {
-			return false
-		}
-	}
-	for _, p := range cfg.published {
-		if _, ok := matchingPublishedBinding(info.bound, p, cfg.eng); !ok {
-			return false
-		}
-	}
-	return true
 }
 
 func (c *config) reuseConfigHash() string {

@@ -190,7 +190,7 @@ func TestReuseMismatchPrecedesPortPolling(t *testing.T) {
 	base := &Container{id: "shared", runner: runner, eng: cfg.eng, creation: spec.creation, sync: &lockPack{uid: spec.uid}}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	_, err := reuseInfoForCaller(ctx, cfg, base)
+	_, err := reuseInfoForCaller(ctx, cfg, base, imageIdentity{reference: "redis:7-alpine"}, "redis:7-alpine")
 	if !errors.Is(err, ErrReuseMismatch) {
 		t.Fatalf("got %v, want mismatch before missing port poll", err)
 	}
@@ -341,5 +341,52 @@ func TestReuseCompatibilityErrorsUseSentinel(t *testing.T) {
 				t.Fatalf("got %v, want ErrReuseMismatch", err)
 			}
 		})
+	}
+}
+
+func TestReuseRunningPortMismatchIsConfigurationError(t *testing.T) {
+	backend := reuseBackendFixtures()[0]
+	spec := backend.runningSpec()
+	data := backend.inspect(spec)
+	runner := newReuseTransitionRunner(data, data, backend.eng)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := Run(ctx, "redis:7-alpine", WithName("shared"), WithReuse(), WithExposedPorts("9999"), withEngine(backend.eng), withRunner(runner))
+	if !errors.Is(err, ErrReuseMismatch) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want configuration mismatch", err)
+	}
+}
+
+func TestReuseIdentityFailuresAreNotConfigurationMismatches(t *testing.T) {
+	backend := reuseBackendFixtures()[0]
+	for name, mutate := range map[string]func(*engineInfo){
+		"foreign":            func(info *engineInfo) { delete(info.labels, managedLabel) },
+		"invalid generation": func(info *engineInfo) { info.labels[creationLabel] = "invalid" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			info, err := backend.eng.parseInspect(backend.inspect(backend.runningSpec()), "shared")
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(info)
+			cfg := newConfig()
+			cfg.eng = backend.eng
+			cfg.name = "shared"
+			err = checkReuseCompat(info, "redis:7-alpine", cfg)
+			if err == nil || errors.Is(err, ErrReuseMismatch) {
+				t.Fatalf("got %v, want ownership/identity error only", err)
+			}
+		})
+	}
+	info, err := backend.eng.parseInspect(backend.inspect(backend.runningSpec()), "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := newConfig()
+	cfg.eng = backend.eng
+	cfg.memory = "512M"
+	err = checkReuseCompat(info, "redis:7-alpine", cfg)
+	if !errors.Is(err, ErrReuseMismatch) || strings.Count(err.Error(), ErrReuseMismatch.Error()) != 1 {
+		t.Fatalf("got %v, want one mismatch prefix", err)
 	}
 }

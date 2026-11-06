@@ -157,7 +157,7 @@ func TestReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 				eng:    dockerEngine{},
 				name:   "shared",
 			}
-			info, err := reuseInfoForCaller(context.Background(), cfg, base)
+			info, err := reuseInfoForCaller(context.Background(), cfg, base, imageIdentity{reference: "redis:7-alpine"}, "redis:7-alpine")
 			if !errors.Is(err, ErrGenerationReplaced) {
 				t.Fatalf("info = %+v, error = %v, want ErrGenerationReplaced", info, err)
 			}

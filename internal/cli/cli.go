@@ -393,9 +393,8 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 		}
 		return lifecycle.cancel()
 	}
-	safeStderr := NewRedactor().NewStream(maxStderr)
 	cmd.Stdout = stdoutW
-	cmd.Stderr = io.MultiWriter(stderrW, safeStderr)
+	cmd.Stderr = stderrW
 	// If the process ignores the kill long enough to hold pipes open,
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second

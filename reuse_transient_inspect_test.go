@@ -69,7 +69,7 @@ func reuseTransientInspectIdentity(bound bool, uid, creation string) string {
 		"Id":%q,
 		"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":"/myctr",
-		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true"%s%s}},
+		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`"%s%s}},
 		"State":{"Status":"running"},
 		"HostConfig":{"NetworkMode":"bridge"},
 		"NetworkSettings":{"IPAddress":"172.17.0.2","Ports":%s,"Networks":{"bridge":{"IPAddress":"172.17.0.2"}}}

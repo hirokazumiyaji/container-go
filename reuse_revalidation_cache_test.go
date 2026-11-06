@@ -28,7 +28,7 @@ func ownedDockerInspect(uid, generation string, reused, bound bool) string {
 		"Id":%q,
 		"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":"/myctr",
-		"Config":{"Image":"redis:7-alpine","Labels":{
+		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go.reuse-config":"`+defaultReuseFingerprint+`",
 			"%s":"true",
 			"%s":%q,
 			"%s":%q%s
@@ -181,7 +181,8 @@ func TestClassifyingStreamCachesOriginalTerminalCLIError(t *testing.T) {
 
 func TestReuseRejectsUnmanagedOrUngeneratedAdoption(t *testing.T) {
 	cases := map[string]map[string]string{
-		"unmanaged":   {reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa"},
+		"unmanaged": {reuseLabel: "true",
+			reuseConfigLabel: defaultReuseFingerprint, creationLabel: "aaaaaaaaaaaaaaaa"},
 		"ungenerated": {managedLabel: "true", reuseLabel: "true"},
 	}
 	for name, labels := range cases {

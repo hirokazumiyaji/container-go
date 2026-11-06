@@ -24,7 +24,7 @@ type LabelConfig struct {
 // for ownership and cleanup decisions.
 func reservedLabel(key string) bool {
 	switch key {
-	case LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup:
+	case LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup, LabelReuseConfig:
 		return true
 	default:
 		return false

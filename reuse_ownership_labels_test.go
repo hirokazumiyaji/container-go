@@ -26,26 +26,29 @@ func TestCheckReuseOwnedRequiresAllOwnershipLabels(t *testing.T) {
 		{
 			name: "managed and reuse",
 			labels: map[string]string{
-				managedLabel: "true",
-				reuseLabel:   "true",
+				managedLabel:     "true",
+				reuseLabel:       "true",
+				reuseConfigLabel: defaultReuseFingerprint,
 			},
 			wantErr: true,
 		},
 		{
 			name: "managed reuse and generation",
 			labels: map[string]string{
-				managedLabel:  "true",
-				reuseLabel:    "true",
-				creationLabel: validCreation,
+				managedLabel:     "true",
+				reuseLabel:       "true",
+				reuseConfigLabel: defaultReuseFingerprint,
+				creationLabel:    validCreation,
 			},
 			wantErr: false,
 		},
 		{
 			name: "invalid generation",
 			labels: map[string]string{
-				managedLabel:  "true",
-				reuseLabel:    "true",
-				creationLabel: "not-a-generation",
+				managedLabel:     "true",
+				reuseLabel:       "true",
+				reuseConfigLabel: defaultReuseFingerprint,
+				creationLabel:    "not-a-generation",
 			},
 			wantErr: true,
 		},
@@ -196,18 +199,20 @@ func TestReuseDoesNotAdoptOrDeleteWithoutOwnershipLabels(t *testing.T) {
 			name:  "running owned",
 			state: StateRunning,
 			labels: map[string]string{
-				managedLabel:  "true",
-				reuseLabel:    "true",
-				creationLabel: validCreation,
+				managedLabel:     "true",
+				reuseLabel:       "true",
+				reuseConfigLabel: defaultReuseFingerprint,
+				creationLabel:    validCreation,
 			},
 		},
 		{
 			name:  "stopped owned",
 			state: StateStopped,
 			labels: map[string]string{
-				managedLabel:  "true",
-				reuseLabel:    "true",
-				creationLabel: validCreation,
+				managedLabel:     "true",
+				reuseLabel:       "true",
+				reuseConfigLabel: defaultReuseFingerprint,
+				creationLabel:    validCreation,
 			},
 			wantDeleted: true,
 			wantCreated: true,
@@ -305,9 +310,10 @@ func (r *reuseOwnershipRunner) Run(ctx context.Context, args ...string) ([]byte,
 
 func TestReuseDeleteNotFoundRemainsIdempotent(t *testing.T) {
 	labels := map[string]string{
-		managedLabel:  "true",
-		reuseLabel:    "true",
-		creationLabel: "0123456789abcdef",
+		managedLabel:     "true",
+		reuseLabel:       "true",
+		reuseConfigLabel: defaultReuseFingerprint,
+		creationLabel:    "0123456789abcdef",
 	}
 	r := &inspectErrorRunner{stderr: "container not found: shared"}
 	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}

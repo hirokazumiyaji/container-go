@@ -223,7 +223,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "image": {"reference": "docker.io/library/redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "variantDigest": %q},
       "platform": %s,
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q, "com.github.hirokazumiyaji.container-go.reuse": "true"}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q, "com.github.hirokazumiyaji.container-go.reuse": "true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`"}
     },
     "status": {
       "state": "running",

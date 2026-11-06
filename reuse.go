@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -121,8 +122,11 @@ func reuseFlightKey(cfg *config, image string) string {
 	}
 	sort.Strings(ports)
 	parts = append(parts, ports...)
+	for i, part := range parts {
+		parts[i] = strconv.Quote(part)
+	}
 	data, _ := json.Marshal(parts)
-	return fmt.Sprintf("%x", sha256.Sum256(data))
+	return string(data)
 }
 
 // runOptionsKey returns a canonical, order-independent representation of the
@@ -965,6 +969,9 @@ func checkReuseIdentity(info *engineInfo, cfg *config) error {
 	if info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("reuse: existing container was not created with WithReuse")
 	}
+	if info.labels[reuseGroupLabel] != cfg.reuseGroup {
+		return fmt.Errorf("%w: reuse group does not match the existing container", ErrReuseMismatch)
+	}
 	if !validCreationID(info.labels[creationLabel]) {
 		return identityError(fmt.Sprintf("reuse %s: existing container has no valid creation generation", cfg.name))
 	}
@@ -989,7 +996,7 @@ func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original
 	if requested.pinned {
 		actual := imageFromInfo(info)
 		if !requestedImageIdentitiesCompatible(requested, actual) {
-			return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
+			return fmt.Errorf("%w: reuse %s: image %q does not match existing %q", ErrReuseMismatch, cfg.name, original, info.image)
 		}
 		return nil
 	}
@@ -998,7 +1005,7 @@ func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original
 		compatible = appleImageReferencesCompatible(original, info.image)
 	}
 	if !compatible {
-		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
+		return fmt.Errorf("%w: reuse %s: image %q does not match existing %q", ErrReuseMismatch, cfg.name, original, info.image)
 	}
 	return nil
 }
@@ -1011,8 +1018,16 @@ func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 
 // checkReuseCompatIdentity applies the resolved image and port checks
 // for a reuse request.
-func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
+func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) (err error) {
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("%w: %w", ErrReuseMismatch, err)
+		}
+	}()
 	if err := checkReuseOwnedIdentity(info, requested, original, cfg); err != nil {
+		return err
+	}
+	if err := checkReuseCreationConfig(info, cfg); err != nil {
 		return err
 	}
 	if cfg.eng != nil && cfg.eng.name() == "docker" {
@@ -1083,9 +1098,6 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 // equality would reject a compatible container. An inspected ALL satisfies any
 // requested capability.
 func checkReuseRunOptions(info *engineInfo, cfg *config) error {
-	if info.labels[domain.LabelReuseConfig] != cfg.reuseConfigHash() {
-		return fmt.Errorf("%w: creation configuration does not match the existing container; recreate it with the requested options", ErrReuseMismatch)
-	}
 	reported := info.runOptions
 	if cfg.cpus > 0 {
 		if !reported.cpusReported {
@@ -1464,6 +1476,11 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 					return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
 				}
 			}
+			if info.state == StateRunning {
+				if err := checkReuseCreationConfig(info, cfg); err != nil {
+					return nil, err
+				}
+			}
 			if reuseInfoReady(cfg, info) {
 				return info, nil
 			}
@@ -1531,6 +1548,14 @@ func (c *config) reuseConfigHash() string {
 		mounts = append(mounts, string(data))
 	}
 	sort.Strings(mounts)
+	cmd := make([]string, len(c.cmd))
+	for i, arg := range c.cmd {
+		cmd[i] = strconv.Quote(arg)
+	}
+	labels := make(map[string]string, len(c.labels))
+	for key, value := range c.labels {
+		labels[key] = strconv.Quote(value)
+	}
 	value := struct {
 		Memory     uint64            `json:",omitempty"`
 		User       string            `json:",omitempty"`
@@ -1539,10 +1564,14 @@ func (c *config) reuseConfigHash() string {
 		Cmd        []string          `json:",omitempty"`
 		Mounts     []string          `json:",omitempty"`
 		Labels     map[string]string `json:",omitempty"`
-	}{memory, c.user, c.workdir, c.entrypoint, c.cmd, mounts, c.labels}
+	}{memory, strconv.Quote(c.user), strconv.Quote(c.workdir), strconv.Quote(c.entrypoint), cmd, mounts, labels}
 	data, _ := json.Marshal(value)
-	if string(data) == "{}" {
-		return ""
-	}
 	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+func checkReuseCreationConfig(info *engineInfo, cfg *config) error {
+	if info.labels[domain.LabelReuseConfig] != cfg.reuseConfigHash() {
+		return fmt.Errorf("%w: creation configuration does not match the existing container; recreate it with the requested options", ErrReuseMismatch)
+	}
+	return nil
 }

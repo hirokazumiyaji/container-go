@@ -1141,8 +1141,8 @@ Contract:
 - `WithMemory`, `WithUser`, `WithWorkingDir`, `WithEntrypoint`,
   `WithCmd`, `WithMounts`, and custom labels must match the creation
   fingerprint stored on the container, or Run returns `ErrReuseMismatch`.
-  Existing containers without a fingerprint must be recreated to use these
-  options. Environment differences still attach; use distinct names when
+  Omitted options must also match, and the reuse group must match exactly.
+  Existing containers without a fingerprint must be recreated before attaching. Environment differences still attach; use distinct names when
   they matter. `WithFiles` is copied for every reuse
   caller, including attach callers; a failed attach copy returns an error
   without deleting the shared container. `PullAlways` fetches the image for

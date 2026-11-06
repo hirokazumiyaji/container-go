@@ -315,9 +315,10 @@ func TestDockerReuseNetworkAliasCompatibility(t *testing.T) {
 				WithName("myctr"), WithReuse(), WithNetwork("test-net"), WithNetworkAliases("db"))
 			info := &engineInfo{
 				labels: map[string]string{
-					managedLabel:  "true",
-					reuseLabel:    "true",
-					creationLabel: "0123456789abcdef",
+					managedLabel:     "true",
+					reuseLabel:       "true",
+					reuseConfigLabel: defaultReuseFingerprint,
+					creationLabel:    "0123456789abcdef",
 				},
 				uid:            dockerFixtureID,
 				image:          "redis:7-alpine",
@@ -385,7 +386,7 @@ func (r *dockerReuseAliasRunner) Run(ctx context.Context, args ...string) ([]byt
 			"Image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			"Name": "/myctr",
 			"State": {"Status": "running"},
-			"Config": {"Image": "redis:7-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Labels": {
+			"Config": {"Image": "redis:7-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Labels": {"com.github.hirokazumiyaji.container-go.reuse-config":"`+defaultReuseFingerprint+`",
 				%q: "true",
 				%q: "true",
 				%q: %q

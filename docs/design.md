@@ -903,8 +903,9 @@ A loopback binding inspected on a remote daemon fails with
 `ErrEndpointUnreachable`.
 `WithMemory`, user, working directory, entrypoint, command, mounts, and custom
 labels must match the creation fingerprint stored in a reserved label on both
-backends. A missing or different fingerprint returns `ErrReuseMismatch` when
-these options are requested. Recreate older containers to use these options.
+backends. A missing or different fingerprint returns `ErrReuseMismatch`, including when
+all these options are omitted. The reuse group must also match exactly.
+Recreate older containers before attaching.
 Environment differences still attach; use distinct names when they matter.
 
 Each creation carries a `creationLabel` (16-hex). Reuse requires the
@@ -1188,6 +1189,8 @@ and cancellation paths.
 - `ErrPullNeverUnsupported`: the backend (Apple Container) cannot honor
   `PullNever` without an implicit fetch; `Run` and `Pull` reject it before any
   CLI call. Use `PullMissing` or `PullAlways`.
+- `ErrReuseMismatch`: incompatible reuse creation settings, image, platform,
+  network, ports, or reuse group.
 - `ErrPortNotExposed`: a port was neither declared nor published, or
   the declared port had no usable host binding.
 - `ErrGenerationReplaced`: a delete-time generation check found a
@@ -1439,6 +1442,8 @@ These are deliberately recorded rather than implied by the current API:
   distinguish an external CLI delete/recreate in the same window; closing
   that race requires an immutable identity or an atomic conditional delete
   from the backend.
+- **Reuse errors**: `ErrReuseMismatch` identifies incompatible creation settings,
+  images, ports, platforms, networks, and reuse groups.
 - **Remote Docker detection**: remote endpoints are resolved from
   both `DOCKER_HOST` and Docker contexts (supporting `tcp://` and `ssh://` transports).
 - **Reuse compatibility**: image is checked on both backends. Docker

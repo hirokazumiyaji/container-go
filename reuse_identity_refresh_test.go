@@ -59,7 +59,7 @@ func reuseTestInspectJSON(uid, generation string, bound bool) string {
 		"Name":"/shared",
 		"Config":{"Image":"redis:7-alpine","Labels":{
 			"com.github.hirokazumiyaji.container-go":"true",
-			"com.github.hirokazumiyaji.container-go.reuse":"true",
+			"com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`",
 			"com.github.hirokazumiyaji.container-go.creation":%q
 		}},
 		"State":{"Status":"running"},
@@ -181,7 +181,7 @@ func (createdRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			"Name":"/shared",
 			"Config":{"Image":"redis:7-alpine","Labels":{
 				"com.github.hirokazumiyaji.container-go":"true",
-				"com.github.hirokazumiyaji.container-go.reuse":"true",
+				"com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`",
 				"com.github.hirokazumiyaji.container-go.creation":%q
 			}},
 			"State":{"Status":"created"},

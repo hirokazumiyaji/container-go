@@ -248,9 +248,7 @@ func (c *config) allLabels() map[string]string {
 		Custom:     c.labels,
 	})
 	if c.reuse {
-		if hash := c.reuseConfigHash(); hash != "" {
-			labels[domain.LabelReuseConfig] = hash
-		}
+		labels[domain.LabelReuseConfig] = c.reuseConfigHash()
 	}
 	return labels
 }
@@ -336,9 +334,11 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // hostname options are part of the reuse compatibility identity and
 // must match an existing container. Capabilities follow a requested-subset
 // rule: every requested --cap-add/--cap-drop value must be present, while
-// an empty request accepts any inspected capability set. Other creation-only
-// options are intentionally ignored when attaching; use distinct names when
-// those differences matter. Returned handles are shared: Cleanup, TerminateContainer,
+// an empty request accepts any inspected capability set. Memory, user, working
+// directory, entrypoint, command, mounts, and custom labels must exactly match
+// the creation fingerprint, including omitted options. Reuse group must match.
+// Unfingerprinted containers must be recreated before attaching. Environment
+// differences are ignored. Returned handles are shared: Cleanup, TerminateContainer,
 // and the watchdog reaper do not remove them. Stop, CopyToContainer,
 // CopyContentToContainer, and CopyFileFromContainer refuse with
 // ErrSharedContainer so one process cannot disturb peers; use Shared to

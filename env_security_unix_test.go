@@ -1562,7 +1562,7 @@ func TestReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testin
 	joined := make(chan struct{})
 	oldJoin := reuseFlights.onJoin
 	reuseFlights.onJoin = func(string) {
-		if joins.Add(1) == 2 {
+		if joins.Add(1) == 1 {
 			close(joined)
 		}
 	}
@@ -1582,13 +1582,7 @@ func TestReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testin
 			err error
 		}{ctr, err}
 	}()
-	mismatchResult := make(chan error, 1)
-	go func() {
-		_, err := Run(context.Background(), "nginx:alpine",
-			WithName("warning-reuse"), WithReuse(),
-			withRunner(runner), withEngine(appleEngine{}))
-		mismatchResult <- err
-	}()
+
 	select {
 	case <-joined:
 	case <-time.After(time.Second):
@@ -1610,6 +1604,13 @@ func TestReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testin
 	if !compatibleWait.called {
 		t.Fatal("compatible waiter skipped its readiness strategy")
 	}
+	mismatchResult := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "nginx:alpine",
+			WithName("warning-reuse"), WithReuse(),
+			withRunner(runner), withEngine(appleEngine{}))
+		mismatchResult <- err
+	}()
 	if err := <-mismatchResult; err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("mismatched waiter error = %v, want compatibility failure", err)
 	}

@@ -901,9 +901,11 @@ Reuse re-inspects by immutable Docker UID before compatibility checks and
 again before returning the handle.
 A loopback binding inspected on a remote daemon fails with
 `ErrEndpointUnreachable`.
-`env`, `cmd`, and `mounts` differences attach silently to the existing
-container by design; callers needing isolation should use distinct
-names or reset state via `Exec`.
+`WithMemory`, user, working directory, entrypoint, command, mounts, and custom
+labels must match the creation fingerprint stored in a reserved label on both
+backends. A missing or different fingerprint returns `ErrReuseMismatch` when
+these options are requested. Recreate older containers to use these options.
+Environment differences still attach; use distinct names when they matter.
 
 Each creation carries a `creationLabel` (16-hex). Reuse requires the
 managed marker, the `WithReuse` marker, a valid creation generation, and
@@ -1442,10 +1444,9 @@ These are deliberately recorded rather than implied by the current API:
 - **Reuse compatibility**: image is checked on both backends. Docker
   also checks published port bindings; Apple cannot compare
   `WithExposedPorts` declarations because they are not retained in its
-  inspect data. `env`, `cmd`, and `mounts` differences intentionally
-  attach. Whether a future release should compare more configuration is
-  an open product decision; callers needing isolation should use
-  distinct names.
+  inspect data. Memory, user, working directory, entrypoint, command,
+  mounts, and custom labels are compared through a creation fingerprint.
+  Environment differences still attach; use distinct names when they matter.
 - **Logger injection**: no public logger hook exists. Adding one would
   require a separate API and a decision about what command data may be
   exposed.

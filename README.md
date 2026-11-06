@@ -1138,8 +1138,12 @@ Contract:
   each new handle uses its own exposed-port declaration against the shared
   container IP, so use distinct names when those declarations must be
   isolated.
-- `env` / `cmd` / `mounts` differences attach silently by design; use
-  distinct names when they matter. `WithFiles` is copied for every reuse
+- `WithMemory`, `WithUser`, `WithWorkingDir`, `WithEntrypoint`,
+  `WithCmd`, `WithMounts`, and custom labels must match the creation
+  fingerprint stored on the container, or Run returns `ErrReuseMismatch`.
+  Existing containers without a fingerprint must be recreated to use these
+  options. Environment differences still attach; use distinct names when
+  they matter. `WithFiles` is copied for every reuse
   caller, including attach callers; a failed attach copy returns an error
   without deleting the shared container. `PullAlways` fetches the image for
   every caller before attach.

@@ -2,6 +2,8 @@ package container
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -108,12 +110,19 @@ func isReuseIncompleteSetupError(err error) bool {
 // and security options are part of the identity: callers that ask for the same
 // name with different settings must not share a leader's result. The order of
 // capabilities, ulimits, extra hosts, and network aliases is irrelevant.
-func reuseFlightKey(cfg *config) string {
-	key := cfg.eng.name() + "\x00" + cfg.eng.targetID() + "\x00" + cfg.name
-	if options := cfg.runOptionsKey(); options != "" {
-		return key + "\x00" + options
+func reuseFlightKey(cfg *config, image string) string {
+	parts := []string{cfg.eng.name(), cfg.eng.targetID(), cfg.name, image, cfg.platform, cfg.network, fmt.Sprint(cfg.networkExplicit), cfg.reuseGroup, cfg.runOptionsKey(), cfg.reuseConfigHash()}
+	ports := make([]string, 0, len(cfg.exposed)+len(cfg.published))
+	for _, port := range cfg.exposed {
+		ports = append(ports, "expose="+port.String())
 	}
-	return key
+	for _, port := range cfg.published {
+		ports = append(ports, fmt.Sprintf("publish=%s:%d:%d/%s", port.hostAddr, port.hostPort, port.containerPort, port.proto))
+	}
+	sort.Strings(ports)
+	parts = append(parts, ports...)
+	data, _ := json.Marshal(parts)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
 // runOptionsKey returns a canonical, order-independent representation of the
@@ -167,7 +176,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		cfg.imagePrepared = true
 	}
-	key := reuseFlightKey(cfg)
+	key := reuseFlightKey(cfg, image)
 	var leaderWarning error
 	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
 		// Do not detach a canceled preflight into a new shared flight.
@@ -207,12 +216,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, errors.New("reuse returned an empty container handle")
 	}
 
-	// The ensure result may have been inspected before a peer changed
-	// network or port state. Once Docker has supplied an immutable ID,
-	// every compatibility inspect must target that ID rather than the
-	// The shared ensure may have been started with another caller's image
-	// reference; every caller must still verify that the container is
-	// compatible with its own resolved image identity.
+	// Mutable image tags may move during the shared ensure.
 	resolvedImage, err := cfg.ensureImageRef(ctx, image)
 	if err != nil {
 		return nil, err
@@ -1079,6 +1083,9 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 // equality would reject a compatible container. An inspected ALL satisfies any
 // requested capability.
 func checkReuseRunOptions(info *engineInfo, cfg *config) error {
+	if info.labels[domain.LabelReuseConfig] != cfg.reuseConfigHash() {
+		return fmt.Errorf("%w: creation configuration does not match the existing container; recreate it with the requested options", ErrReuseMismatch)
+	}
 	reported := info.runOptions
 	if cfg.cpus > 0 {
 		if !reported.cpusReported {
@@ -1514,4 +1521,28 @@ func reuseInfoComplete(cfg *config, info *engineInfo) bool {
 		}
 	}
 	return true
+}
+
+func (c *config) reuseConfigHash() string {
+	memory, _ := parseSizeBytes("WithMemory", "memory", c.memory)
+	mounts := make([]string, 0, len(c.mounts))
+	for _, mount := range c.mounts {
+		data, _ := json.Marshal(mount)
+		mounts = append(mounts, string(data))
+	}
+	sort.Strings(mounts)
+	value := struct {
+		Memory     uint64            `json:",omitempty"`
+		User       string            `json:",omitempty"`
+		Workdir    string            `json:",omitempty"`
+		Entrypoint string            `json:",omitempty"`
+		Cmd        []string          `json:",omitempty"`
+		Mounts     []string          `json:",omitempty"`
+		Labels     map[string]string `json:",omitempty"`
+	}{memory, c.user, c.workdir, c.entrypoint, c.cmd, mounts, c.labels}
+	data, _ := json.Marshal(value)
+	if string(data) == "{}" {
+		return ""
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data))
 }

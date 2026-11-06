@@ -333,7 +333,8 @@ inspect の `default` mode を実際の network 名 (`bridge` または `nat`) �
 inspect に network mode が無い場合も互換性なしとして拒否します。
 リモートデーモンの既存 loopback binding は
 `ErrEndpointUnreachable` として拒否します。
-`env`、`cmd`、`mounts` の差は従来どおり attach 時に無視します。
+`WithMemory`、user、working directory、entrypoint、cmd、mounts、custom labels は作成時の fingerprint と比較し、不一致なら `ErrReuseMismatch` を返します。
+`env` の差は attach 時に無視します。
 
 ## 待機戦略
 
@@ -478,7 +479,7 @@ reuse container は削除・再作成される。この変数をグローバル�
 
 ## Reuse
 
-`WithReuse` は安定した `WithName` に対する `Run` を get-or-create にする。共有は同じ host の process 間で行う。既存コンテナは managed marker、`WithReuse` marker、有効な creation generation、および Docker では有効な immutable UID を持つ必要があり、各呼び出しは自分の wait strategy を再実行する。停止済みコンテナはこれらの ownership check と image check に合格した場合だけ削除・再作成の対象になる。image 互換性は元の mutable tag ではなく解決済み digest / image ID で判定し、Docker では要求した network identity も一致する必要がある。reuse は互換性 check の前と readiness 後、handle を返す直前に再 inspect する。Docker は immutable UID、Apple は creation generation を再確認するため、wait 中の置き換えは adopt せず error になる。port 互換性は backend ごとに異なる。Docker は `WithExposedPorts` の自動公開 binding と明示的な `WithPublishedPort` binding を比較する。Apple は明示的な published binding を比較するが、library の Apple inspect model に `WithExposedPorts` の宣言が残らないため、その宣言は比較できない。Apple の各呼び出しは自分の exposed-port 宣言を共有コンテナ IP へ使う。宣言を分離したい場合は名前を変える。`WithFiles` は attach caller を含むすべての caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずエラーを返す。`PullAlways` は attach 前にも各 caller で実行される。`env`、`cmd`、`mounts` の差は既存コンテナへ黙って attach する。分離が必要なら異なる名前を使うか、`Exec` で状態を初期化する。`CONTAINERGO_KEEP=1` はこの reuse rule を変えない。条件に一致した stopped reuse container は削除・再作成され、`PruneReuseGroup` はその group を削除できる。
+`WithReuse` は安定した `WithName` に対する `Run` を get-or-create にする。共有は同じ host の process 間で行う。既存コンテナは managed marker、`WithReuse` marker、有効な creation generation、および Docker では有効な immutable UID を持つ必要があり、各呼び出しは自分の wait strategy を再実行する。停止済みコンテナはこれらの ownership check と image check に合格した場合だけ削除・再作成の対象になる。image 互換性は元の mutable tag ではなく解決済み digest / image ID で判定し、Docker では要求した network identity も一致する必要がある。reuse は互換性 check の前と readiness 後、handle を返す直前に再 inspect する。Docker は immutable UID、Apple は creation generation を再確認するため、wait 中の置き換えは adopt せず error になる。port 互換性は backend ごとに異なる。Docker は `WithExposedPorts` の自動公開 binding と明示的な `WithPublishedPort` binding を比較する。Apple は明示的な published binding を比較するが、library の Apple inspect model に `WithExposedPorts` の宣言が残らないため、その宣言は比較できない。Apple の各呼び出しは自分の exposed-port 宣言を共有コンテナ IP へ使う。宣言を分離したい場合は名前を変える。`WithFiles` は attach caller を含むすべての caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずエラーを返す。`PullAlways` は attach 前にも各 caller で実行される。`WithMemory`、user、working directory、entrypoint、cmd、mounts、custom labels は作成時に予約ラベルへ保存した fingerprint と比較し、不一致なら `ErrReuseMismatch` を返す。これらの設定を指定して既存のラベルなしコンテナへ attach するには再作成が必要となる。`env` の差は attach 時に無視する。分離が必要なら異なる名前を使う。`CONTAINERGO_KEEP=1` はこの reuse rule を変えない。条件に一致した stopped reuse container は削除・再作成され、`PruneReuseGroup` はその group を削除できる。
 
 Apple では delete 前に fresh inspect を行い、inspect と delete を現在ユーザー専用の永続ディレクトリ内で、コンテナ名のハッシュを使う名前単位 `flock` で直列化する。同じ host で本ライブラリの generation-checked `Terminate` と failed-create cleanup、Apple の `Prune` と `PruneReuseGroup`、および名前で address する reaper entry は名前単位 `flock` で保護される。外部ツールによる同じ窓の delete / recreate は保証外である。Docker の handle は `docker run` が出力した、または inspect で検証した完全な不変 `Id` で削除するため、同じ名前の置き換えとは delete target の ID が一致しない。Docker のすべての backend operation はその immutable ID を使い、inspect parser は要求した ID や name に一致しない object を拒否する。これらは別の保護であり、reuse は backend CLI を直接使う信頼できない process に対する一般的な fail-closed 保証ではない。
 
@@ -732,7 +733,7 @@ v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、�
 
 - **Apple の名前ベース削除**：non-empty で一致する作成世代チェックと per-name `flock` は、同じ host で本ライブラリの generation-checked `Terminate` / failed-create cleanup、`Prune` / `PruneReuseGroup`、および名前で address する reaper entry を保護する。同じ窓で外部の CLI が delete して再作成した場合には区別できず、外部競合を閉じるには backend の不変 ID または原子的な条件付き削除が必要である。
 - **remote Docker の検出**：remote endpoint は `DOCKER_HOST` および Docker context（`tcp://` および `ssh://` トランスポートをサポート）の両方から解決される。
-- **Reuse の互換性**：両 backend で image を検査する。Docker は published port binding も検査するが、Apple は inspect data に `WithExposedPorts` の宣言を残さないため比較できない。`env`、`cmd`、`mounts` の差は意図的に attach する。今後の release で設定を比較すべきかは未解決の製品上の決定であり、分離が必要なら別の名前を使う。
+- **Reuse の互換性**：両 backend で image を検査する。Docker は published port binding も検査するが、Apple は inspect data に `WithExposedPorts` の宣言を残さないため比較できない。`WithMemory`、user、working directory、entrypoint、cmd、mounts、custom labels は作成時の fingerprint と比較する。`env` の差は attach 時に無視する。分離が必要なら別の名前を使う。
 - **logger injection**：公開 logger hook は存在しない。追加するには新しい API と、公開できるコマンドデータの範囲を決める決定が必要である。
 - **remote bind mount**：remote Docker daemon への bind mount は、daemon が source path を自分の host で解決するため拒否している。remote bind mount をサポートするかは未解決である。ローカル Docker daemon では Windows の host path を受け付ける。
 - **UDP readiness**：`ForListeningPort` と `ForExposedPort` は TCP-only で、UDP 宣言は endpoint 設定にだけ使う。UDP probe を追加するかは未解決である。

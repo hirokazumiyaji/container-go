@@ -102,7 +102,7 @@ func TestReuseCallerRefreshRejectsReplacedIdentity(t *testing.T) {
 	waiterResult := make(chan error, 1)
 	go func() {
 		_, err := Run(ctx, "redis:7-alpine",
-			WithName("shared"), WithReuse(), WithExposedPorts("6379/tcp"),
+			WithName("shared"), WithReuse(),
 			withRunner(runner), withEngine(dockerEngine{}))
 		waiterResult <- err
 	}()
@@ -274,7 +274,7 @@ func TestReuseCallerRefreshTimeoutPreservesDeadlineExceeded(t *testing.T) {
 	waiterResult := make(chan error, 1)
 	go func() {
 		_, err := Run(ctx, "redis:7-alpine",
-			WithName("shared"), WithReuse(), WithExposedPorts("6379/tcp"),
+			WithName("shared"), WithReuse(),
 			withRunner(runner), withEngine(dockerEngine{}))
 		waiterResult <- err
 	}()

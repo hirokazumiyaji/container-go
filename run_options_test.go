@@ -304,7 +304,7 @@ func TestReuseFlightKeyIncludesRunOptions(t *testing.T) {
 	}
 
 	plain := base()
-	baseKey := reuseFlightKey(plain)
+	baseKey := reuseFlightKey(plain, "image")
 
 	withCPUs := base()
 	if err := WithCPUs(0.5)(withCPUs); err != nil {
@@ -345,7 +345,7 @@ func TestReuseFlightKeyIncludesRunOptions(t *testing.T) {
 		"extra-host": withExtraHost,
 		"hostname":   withHostname,
 	} {
-		key := reuseFlightKey(cfg)
+		key := reuseFlightKey(cfg, "image")
 		if key == baseKey {
 			t.Fatalf("%s did not change the reuse flight key", name)
 		}
@@ -390,7 +390,7 @@ func TestReuseFlightKeyIncludesRunOptions(t *testing.T) {
 	if err := WithExtraHost("db", "127.0.0.1")(second); err != nil {
 		t.Fatal(err)
 	}
-	if firstKey, secondKey := reuseFlightKey(first), reuseFlightKey(second); firstKey != secondKey {
+	if firstKey, secondKey := reuseFlightKey(first, "image"), reuseFlightKey(second, "image"); firstKey != secondKey {
 		t.Fatalf("option order changed the reuse flight key: %q != %q", firstKey, secondKey)
 	}
 }
@@ -736,14 +736,14 @@ func TestWithUlimitUnlimited(t *testing.T) {
 
 func TestReuseFlightKeyIncludesAliasesWithRunOptions(t *testing.T) {
 	cfg := dockerTestConfig(t, WithNetwork("test-net"), WithNetworkAliases("db"), WithCPUs(0.5))
-	original := reuseFlightKey(cfg)
+	original := reuseFlightKey(cfg, "image")
 	cfg.networkAliases = []string{"cache"}
-	if reuseFlightKey(cfg) == original {
+	if reuseFlightKey(cfg, "image") == original {
 		t.Fatal("run options hid a different alias request")
 	}
 	cfg.networkAliases = []string{"db"}
 	cfg.cpus = 0.75
-	if reuseFlightKey(cfg) == original {
+	if reuseFlightKey(cfg, "image") == original {
 		t.Fatal("aliases hid a different CPU request")
 	}
 }

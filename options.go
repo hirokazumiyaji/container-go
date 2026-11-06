@@ -240,13 +240,19 @@ func (c *config) dockerTargetOption() string {
 // WithReuseGroup without WithReuse, which is also what lets BuildLabels
 // decide whether to emit the reuse-group label.
 func (c *config) allLabels() map[string]string {
-	return domain.BuildLabels(domain.LabelConfig{
+	labels := domain.BuildLabels(domain.LabelConfig{
 		Session:    sessionID(),
 		Creation:   c.creation,
 		Reuse:      c.reuse,
 		ReuseGroup: c.reuseGroup,
 		Custom:     c.labels,
 	})
+	if c.reuse {
+		if hash := c.reuseConfigHash(); hash != "" {
+			labels[domain.LabelReuseConfig] = hash
+		}
+	}
+	return labels
 }
 
 // commonRunArgs builds the shared run flags after --name: labels,
@@ -662,7 +668,7 @@ func WithLabels(labels map[string]string) Option {
 				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("invalid label key %q", k))
 			}
 			switch k {
-			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel:
+			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel, domain.LabelReuseConfig:
 				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("label key %q is reserved", k))
 			}
 			// Label values may carry secrets. Do not put them in Value or

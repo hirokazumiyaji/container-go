@@ -277,11 +277,11 @@ func TestReuseFlightKeyIncludesNetworkAliases(t *testing.T) {
 	cfg.network = "test-net"
 	cfg.networkExplicit = true
 
-	base := reuseFlightKey(cfg)
+	base := reuseFlightKey(cfg, "image")
 	cfg.networkAliases = []string{"db"}
-	withDB := reuseFlightKey(cfg)
+	withDB := reuseFlightKey(cfg, "image")
 	cfg.networkAliases = []string{"cache"}
-	withCache := reuseFlightKey(cfg)
+	withCache := reuseFlightKey(cfg, "image")
 	if base == withDB {
 		t.Fatal("network alias did not change the reuse flight key")
 	}
@@ -290,9 +290,9 @@ func TestReuseFlightKeyIncludesNetworkAliases(t *testing.T) {
 	}
 
 	cfg.networkAliases = []string{"db", "cache"}
-	first := reuseFlightKey(cfg)
+	first := reuseFlightKey(cfg, "image")
 	cfg.networkAliases = []string{"cache", "db"}
-	second := reuseFlightKey(cfg)
+	second := reuseFlightKey(cfg, "image")
 	if first != second {
 		t.Fatalf("alias order changed the reuse flight key: %q != %q", first, second)
 	}

@@ -633,3 +633,34 @@ esac
 		}
 	}
 }
+
+func TestPackagePruneAmbientContextCommandUnavailableIsBestEffort(t *testing.T) {
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "private-ctx")
+	for _, grouped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("group=%v", grouped), func(t *testing.T) {
+			listed := false
+			r := timeoutTestRunner(func(_ context.Context, args ...string) ([]byte, []byte, error) {
+				switch args[0] {
+				case "context":
+					return nil, []byte("unknown command: docker context"), &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "unknown command: docker context"}
+				case "ps":
+					listed = true
+					return nil, nil, nil
+				default:
+					return nil, nil, fmt.Errorf("unexpected command: %v", args)
+				}
+			})
+			var err error
+			if grouped {
+				_, err = PruneReuseGroup(context.Background(), "review-group", WithPruneRunner(r))
+			} else {
+				_, err = Prune(context.Background(), WithPruneRunner(r))
+			}
+			if err != nil || !listed {
+				t.Fatalf("listed=%v, err=%v", listed, err)
+			}
+		})
+	}
+}

@@ -1050,7 +1050,9 @@ func (e dockerEngine) targetSelection(runner cli.Runner) (effectiveHost, effecti
 	effectiveCtx = e.effectiveContext()
 	if !e.explicitContext {
 		if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); ok {
-			_, effectiveCtx, runnerSelectedContext = strings.Cut(entry, "=")
+			if _, value, assigned := strings.Cut(entry, "="); assigned {
+				effectiveCtx, runnerSelectedContext = value, true
+			}
 		}
 	}
 

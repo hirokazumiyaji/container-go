@@ -590,6 +590,10 @@ func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *
 func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup string) (Runner, engine, error) {
 	runner := cfg.runnerFor(eng)
 	if de, ok := eng.(dockerEngine); ok {
+		implicitContext := !de.explicitContext
+		if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); implicitContext && ok && entry == "DOCKER_CONTEXT" {
+			de.context, de.explicitContext = "", true
+		}
 		// Package prune follows the child's Docker environment, where a host
 		// overrides the ambient context; discovery must not retarget the runner.
 		if host, _, _, _ := de.targetSelection(runner); host != "" {
@@ -605,7 +609,8 @@ func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup
 		resolved, err := de.resolveTarget(queryCtx, runner)
 		if err != nil {
 			host, contextName, _, _ := de.targetSelection(runner)
-			if ctx.Err() == nil && (cfg.queryTimeout <= 0 || queryCtx.Err() == nil) && host == "" && contextName == "" && !de.explicitHost && !de.explicitContext {
+			var unavailable *dockerContextUnavailableError
+			if ctx.Err() == nil && (cfg.queryTimeout <= 0 || queryCtx.Err() == nil) && host == "" && (contextName == "" || errors.As(err, &unavailable)) && !de.explicitHost && implicitContext {
 				return runner, eng, nil
 			}
 			return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))

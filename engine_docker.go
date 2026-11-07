@@ -133,7 +133,8 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 			// Index a bare removal marker too, so re-applying the pinned
 			// environment cannot append the same marker twice.
 			if key != "" {
-				if _, seen := index[key]; seen {
+				if at, seen := index[key]; seen {
+					env[at] = entry
 					continue
 				}
 				index[key] = len(env)
@@ -910,6 +911,12 @@ type dockerContextInspect struct {
 }
 
 func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
+	entry, ok := runnerEnvEntry(runner, key)
+	_, value, _ := strings.Cut(entry, "=")
+	return value, ok
+}
+
+func runnerEnvEntry(runner cli.Runner, key string) (string, bool) {
 	eenv, ok := runner.(interface{ ExternalEnv() []string })
 	if !ok {
 		return "", false
@@ -917,20 +924,23 @@ func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
 	env := eenv.ExternalEnv()
 	prefix := key + "="
 	for i := len(env) - 1; i >= 0; i-- {
-		if strings.HasPrefix(env[i], prefix) {
-			return env[i][len(prefix):], true
+		if env[i] == key || strings.HasPrefix(env[i], prefix) {
+			return env[i], true
 		}
 	}
 	return "", false
 }
 
 type dockerContextUnavailableError struct {
+	cause  error
 	detail string
 }
 
 func (e *dockerContextUnavailableError) Error() string {
 	return "docker context command unavailable: " + e.detail
 }
+
+func (e *dockerContextUnavailableError) Unwrap() error { return e.cause }
 
 func isDockerContextUnavailable(err error, stderr string) bool {
 	if err == nil {
@@ -975,20 +985,16 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 			errMsg = err.Error()
 		}
 		if isDockerContextUnavailable(err, errMsg) {
-			return "", "", &dockerContextUnavailableError{detail: errMsg}
+			return "", "", &dockerContextUnavailableError{detail: errMsg, cause: err}
 		}
 		if contextName != "" {
-			return "", "", &ConfigError{
+			return "", "", fmt.Errorf("%w: %w", &ConfigError{
 				Backend: "docker",
 				Option:  "WithContext",
 				Detail:  fmt.Sprintf("unknown Docker context %q: %s", contextName, errMsg),
-			}
+			}, err)
 		}
-		return "", "", &ConfigError{
-			Backend: "docker",
-			Option:  "context",
-			Detail:  fmt.Sprintf("failed to inspect active Docker context: %s", errMsg),
-		}
+		return "", "", fmt.Errorf("%w: %w", &ConfigError{Backend: "docker", Option: "context", Detail: fmt.Sprintf("failed to inspect active Docker context: %s", errMsg)}, err)
 	}
 
 	if len(strings.TrimSpace(string(stdout))) == 0 {
@@ -1032,13 +1038,8 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 	return resolvedName, endpointHost, nil
 }
 
-func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (dockerEngine, error) {
-	if e.resolvedTarget != nil && e.explicitTarget {
-		return e, nil
-	}
-
-	effectiveHost := e.effectiveHost()
-	runnerHasHost := false
+func (e dockerEngine) targetSelection(runner cli.Runner) (effectiveHost, effectiveCtx string, runnerHasHost, runnerSelectedContext bool) {
+	effectiveHost = e.effectiveHost()
 	if !e.explicitHost {
 		if val, ok := runnerEnvLookup(runner, "DOCKER_HOST"); ok {
 			effectiveHost = val
@@ -1046,14 +1047,24 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		}
 	}
 
-	effectiveCtx := e.effectiveContext()
-	runnerHasContext := false
+	effectiveCtx = e.effectiveContext()
 	if !e.explicitContext {
-		if val, ok := runnerEnvLookup(runner, "DOCKER_CONTEXT"); ok {
-			effectiveCtx = val
-			runnerHasContext = true
+		if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); ok {
+			if _, value, assigned := strings.Cut(entry, "="); assigned {
+				effectiveCtx, runnerSelectedContext = value, true
+			}
 		}
 	}
+
+	return
+}
+
+func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (dockerEngine, error) {
+	if e.resolvedTarget != nil && e.explicitTarget {
+		return e, nil
+	}
+
+	effectiveHost, effectiveCtx, runnerHasHost, runnerSelectedContext := e.targetSelection(runner)
 
 	resolvedCtx := effectiveCtx
 	var targetHost string
@@ -1106,14 +1117,20 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		if effectiveCtx != "" {
 			option = "WithContext"
 		}
-		return e, &ConfigError{
+		return e, cli.WithRedactor(&ConfigError{
 			Backend: "docker",
 			Option:  option,
 			Detail:  err.Error(),
-		}
+		}, cli.NewHashedRedactor(targetHost, resolvedCtx))
 	}
 
 	clone := e
+	if !e.explicitConfigDir {
+		if value, ok := runnerEnvLookup(runner, "DOCKER_CONFIG"); ok {
+			clone.configDir = value
+			clone.explicitConfigDir = true
+		}
+	}
 	if resolvedCtx != "" {
 		ep.context = resolvedCtx
 	}
@@ -1122,7 +1139,7 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		clone.host = effectiveHost
 		clone.explicitHost = true
 		clone.explicitTarget = true
-	} else if e.explicitContext || runnerHasContext {
+	} else if e.explicitContext || runnerSelectedContext {
 		clone.context = resolvedCtx
 		clone.host = ""
 		clone.explicitContext = true

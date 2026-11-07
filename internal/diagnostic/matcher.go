@@ -6,6 +6,7 @@ import (
 )
 
 type valueHash struct {
+	boundary  bool
 	length    int
 	digest    [sha256.Size]byte
 	prefix    uint32
@@ -89,15 +90,20 @@ func fingerprint(value string) uint32 {
 	return hash
 }
 
-func mergeValueHashes(groups ...[]valueHash) []valueHash {
-	seen := make(map[[sha256.Size]byte]struct{})
+func mergeValueHashes(force bool, groups ...[]valueHash) []valueHash {
+	seen := make(map[[sha256.Size]byte]int)
 	var out []valueHash
 	for _, group := range groups {
 		for _, entry := range group {
-			if _, ok := seen[entry.digest]; ok {
+			if at, ok := seen[entry.digest]; ok {
+				if force {
+					out[at].boundary = out[at].boundary && entry.boundary
+				} else {
+					out[at].boundary = out[at].boundary || entry.boundary
+				}
 				continue
 			}
-			seen[entry.digest] = struct{}{}
+			seen[entry.digest] = len(out)
 			out = append(out, entry)
 		}
 	}
@@ -107,12 +113,12 @@ func mergeValueHashes(groups ...[]valueHash) []valueHash {
 func longestHashMatch(s string, start int, entries []valueHash, force bool) int {
 	matched := 0
 	for _, entry := range entries {
-		if (!force && entry.length < minimumTokenLength) || entry.length > len(s)-start {
+		if (!force && !entry.boundary && entry.length < minimumTokenLength) || entry.length > len(s)-start {
 			continue
 		}
 		boundarySafe := (!entry.firstWord || start == 0 || !wordByte(s[start-1])) &&
 			(!entry.lastWord || start+entry.length == len(s) || !wordByte(s[start+entry.length]))
-		if !force && !boundarySafe {
+		if (!force || entry.boundary) && !boundarySafe {
 			continue
 		}
 		if sha256.Sum256([]byte(s[start:start+entry.length])) != entry.digest {

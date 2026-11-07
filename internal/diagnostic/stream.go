@@ -192,7 +192,7 @@ func (p *streamProcessor) scanValueMatches() {
 		local := int(position - p.pendingStart)
 		entries := p.byShortPrefix[shortPrefixAtBytes(p.pending, local)]
 		for _, entry := range entries {
-			if !p.redactor.force && (entry.length < minimumTokenLength || local > 0 && entry.firstWord && wordByte(p.pending[local-1])) {
+			if (!p.redactor.force && !entry.boundary && entry.length < minimumTokenLength) || ((!p.redactor.force || entry.boundary) && local > 0 && entry.firstWord && wordByte(p.pending[local-1])) {
 				continue
 			}
 			p.valueCandidates = append(p.valueCandidates, streamValueCandidate{start: position, value: entry})
@@ -208,7 +208,7 @@ func (p *streamProcessor) scanValueMatches() {
 		local := int(position - p.pendingStart)
 		entries := p.byLongPrefix[valuePrefixAtBytes(p.pending, local)]
 		for _, entry := range entries {
-			if !p.redactor.force && local > 0 && entry.firstWord && wordByte(p.pending[local-1]) {
+			if (!p.redactor.force || entry.boundary) && local > 0 && entry.firstWord && wordByte(p.pending[local-1]) {
 				continue
 			}
 			p.valueCandidates = append(p.valueCandidates, streamValueCandidate{start: position, value: entry})
@@ -337,10 +337,10 @@ func fingerprintBytes(value []byte) uint32 {
 }
 
 func hashMatchesAtBytes(s []byte, start int, entry valueHash, force bool) bool {
-	if entry.length > len(s)-start || (!force && entry.length < minimumTokenLength) {
+	if entry.length > len(s)-start || (!force && !entry.boundary && entry.length < minimumTokenLength) {
 		return false
 	}
-	if !force {
+	if !force || entry.boundary {
 		if entry.firstWord && start > 0 && wordByte(s[start-1]) {
 			return false
 		}

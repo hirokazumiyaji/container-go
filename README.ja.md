@@ -910,6 +910,15 @@ func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
 }
 ```
 
+`WithPruneQueryTimeout(d)` は一覧取得と、各候補のロック待ち・検証・削除を制限します（既定は30秒）。
+`WithPruneTimeout(d)` は prune 全体の時間を制限します。
+Client の `WithClientQueryTimeout(d)` はこの query 既定値に加え、Client 構築と Run / handle の短い inspect query にも適用します。
+転送、スナップショットログ、ライフサイクル変更、検証の再試行は呼び出し側の deadline を保持し、deadline がない場合だけ query の既定値を使います。
+`WithPruneQueryTimeout` や `WithQueryTimeout` の明示指定は Client の既定値を上書きします。
+Client で target と query timeout を明示しない場合、target 検出の内部期限切れは従来どおりベストエフォートで扱います。
+呼び出し側のキャンセルと、明示した query 予算の期限切れは Client 構築を失敗させます。
+Pull のイメージ取得は `WithPullTimeout`、`Cleanup` / `StrictCleanup` の teardown 全体は独立した30秒の予算で制限します。
+
 `container.WithPruneOlderThan(d)` は、backend が報告する作成時刻が
 now-d より前の candidate だけに対象を絞ります。共有 daemon や remote
 daemon で掃除するとき、並行して動く job が最近停止したコンテナを

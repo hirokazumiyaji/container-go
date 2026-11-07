@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `WithClientQueryTimeout` for Client construction, Run queries, container
+  control operations, and prune defaults, and `WithPruneQueryTimeout` for an
+  individual prune's listing and candidate budgets.
+
+### Fixed
+
+- Retry inspection-query deadlines while the enclosing verification or reuse
+  budget remains live, and isolate shared query work across different budgets.
+- Honor configured long Docker metadata query budgets without a separate fixed
+  30-second leader cap.
+
+- Honor short inspection-query timeouts inside a longer Run or caller deadline,
+  while payload transfers, logs, lifecycle changes, deletion, and verification
+  retries retain the caller's overall operation budget.
+- Preserve successful prune and container deletions when cancellation arrives just
+  after the backend command completes.
+- Retain best-effort implicit Client target discovery without an explicitly
+  configured query timeout; configured budget expiry and caller cancellation
+  still fail construction.
+
 ## [0.3.0] - 2026-10-26
 
 This section describes only the tagged `v0.3.0` release. The root

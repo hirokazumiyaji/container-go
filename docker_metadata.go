@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,9 +15,6 @@ const (
 	// hosts, contexts, or client configuration never reads another daemon's
 	// answer; the TTL only bounds a change on the same endpoint.
 	dockerMetadataTTL = 30 * time.Second
-	// dockerMetadataLookupTimeout bounds the detached leader lookup so a
-	// canceled caller cannot strand joiners forever.
-	dockerMetadataLookupTimeout = 30 * time.Second
 	// dockerMetadataLimit bounds the number of entries one Client can
 	// retain. A Client pins one target, so in practice it needs a handful;
 	// the limit keeps a caller that constructs engines directly from
@@ -47,10 +45,6 @@ type dockerMetadataCache struct {
 	// now and ttl are injectable so expiry is testable without sleeping.
 	now func() time.Time
 	ttl time.Duration
-	// lookupTimeout bounds one detached leader lookup. A caller that starts
-	// the flight may cancel immediately afterwards; joiners with healthy
-	// contexts must still be able to complete it.
-	lookupTimeout time.Duration
 	// limit is the maximum number of live entries; a non-positive limit
 	// disables eviction.
 	limit int
@@ -58,11 +52,10 @@ type dockerMetadataCache struct {
 
 func newDockerMetadataCache(ttl time.Duration) *dockerMetadataCache {
 	return &dockerMetadataCache{
-		entries:       map[string]dockerMetadataEntry{},
-		now:           time.Now,
-		ttl:           ttl,
-		limit:         dockerMetadataLimit,
-		lookupTimeout: dockerMetadataLookupTimeout,
+		entries: map[string]dockerMetadataEntry{},
+		now:     time.Now,
+		ttl:     ttl,
+		limit:   dockerMetadataLimit,
 	}
 }
 
@@ -76,25 +69,25 @@ func (c *dockerMetadataCache) currentTime() time.Time {
 // lookup returns a cached successful value for key, or runs fn once for all
 // concurrent callers with that key. A nil cache still runs fn, which keeps the
 // process-global Run path working without a package-level cache.
-func (c *dockerMetadataCache) lookup(ctx context.Context, key string, fn func(context.Context) (string, error)) (string, error) {
+func (c *dockerMetadataCache) lookup(ctx context.Context, key string, timeout time.Duration, fn func(context.Context) (string, error)) (string, error) {
 	if c == nil {
 		return fn(ctx)
 	}
 	if value, ok := c.get(key); ok {
 		return value, nil
 	}
-	return c.flights.do(ctx, key, func() (string, error) {
+	if timeout <= 0 {
+		timeout = queryTimeout
+	}
+	flightKey := key + "\x00query=" + strconv.FormatInt(int64(timeout), 10)
+	return c.flights.do(ctx, flightKey, func() (string, error) {
 		// A leader may have populated the entry after this caller missed
 		// the unlocked read but before it became the leader.
 		if value, ok := c.get(key); ok {
 			return value, nil
 		}
-		lookupCtx := ctx
-		if c.lookupTimeout > 0 {
-			var cancel context.CancelFunc
-			lookupCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), c.lookupTimeout)
-			defer cancel()
-		}
+		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer cancel()
 		value, err := fn(lookupCtx)
 		if err != nil {
 			return "", err
@@ -145,7 +138,8 @@ func (c *dockerMetadataCache) store(key, value string) {
 // dockerDefaultNetworkKey identifies one daemon default-network answer: the
 // backend, the resolved target and client settings, and the executable that
 // issued the query. The effective query timeout changes how long a lookup may
-// take, not what a successful answer means, so it is intentionally excluded.
+// take, not what a successful answer means, so cache entries omit it; flights
+// append the timeout separately to isolate callers with different budgets.
 func dockerDefaultNetworkKey(eng engine, runner cli.Runner) string {
 	return eng.name() + "\x00" + eng.imageStoreID() + "\x00" + dockerRunnerKey(runner)
 }
@@ -168,7 +162,7 @@ func dockerDefaultNetworkCached(ctx context.Context, cache *dockerMetadataCache,
 	if cache == nil {
 		return dockerDefaultNetwork(ctx, runner, eng, timeouts)
 	}
-	return cache.lookup(ctx, dockerDefaultNetworkKey(eng, runner), func(ctx context.Context) (string, error) {
+	return cache.lookup(ctx, dockerDefaultNetworkKey(eng, runner), timeouts.query, func(ctx context.Context) (string, error) {
 		return dockerDefaultNetwork(ctx, runner, eng, timeouts)
 	})
 }
@@ -198,6 +192,6 @@ func dockerCopyFileFromContainerVersionCached(ctx context.Context, cache *docker
 		_, err := check(ctx)
 		return err
 	}
-	_, err := cache.lookup(ctx, dockerCopyVersionKey(eng, runner), check)
+	_, err := cache.lookup(ctx, dockerCopyVersionKey(eng, runner), timeouts.query, check)
 	return err
 }

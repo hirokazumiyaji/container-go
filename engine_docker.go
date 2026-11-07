@@ -911,6 +911,12 @@ type dockerContextInspect struct {
 }
 
 func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
+	entry, ok := runnerEnvEntry(runner, key)
+	_, value, _ := strings.Cut(entry, "=")
+	return value, ok
+}
+
+func runnerEnvEntry(runner cli.Runner, key string) (string, bool) {
 	eenv, ok := runner.(interface{ ExternalEnv() []string })
 	if !ok {
 		return "", false
@@ -918,11 +924,8 @@ func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
 	env := eenv.ExternalEnv()
 	prefix := key + "="
 	for i := len(env) - 1; i >= 0; i-- {
-		if env[i] == key {
-			return "", true
-		}
-		if strings.HasPrefix(env[i], prefix) {
-			return env[i][len(prefix):], true
+		if env[i] == key || strings.HasPrefix(env[i], prefix) {
+			return env[i], true
 		}
 	}
 	return "", false
@@ -1046,9 +1049,8 @@ func (e dockerEngine) targetSelection(runner cli.Runner) (effectiveHost, effecti
 
 	effectiveCtx = e.effectiveContext()
 	if !e.explicitContext {
-		if val, ok := runnerEnvLookup(runner, "DOCKER_CONTEXT"); ok {
-			effectiveCtx = val
-			runnerSelectedContext = val != ""
+		if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); ok {
+			_, effectiveCtx, runnerSelectedContext = strings.Cut(entry, "=")
 		}
 	}
 

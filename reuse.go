@@ -344,10 +344,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err == nil {
 				break
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if retryErr := inspectRetryError(ctx, err); retryErr != nil {
+			if retryErr := inspectRetryError(resolveCtx, err); retryErr != nil {
 				return retryErr
 			}
 			if !errors.Is(err, context.DeadlineExceeded) {
@@ -423,7 +420,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		}
 		lastInspectErr = nil
 
-		if err := resolveImage(ctx); err != nil {
+		if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
 			return nil, err
 		}
 		if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
@@ -445,7 +442,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		case domain.ActionRecreate:
 			// Only recycle containers this library created for reuse
 			// with a compatible resolved image; never delete foreign leftovers.
-			if err := resolveImage(ctx); err != nil {
+			if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
 				return nil, err
 			}
 			if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
@@ -457,7 +454,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case domain.ActionAttach:
-			if err := resolveImage(ctx); err != nil {
+			if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
 				return nil, err
 			}
 			ctr := &Container{

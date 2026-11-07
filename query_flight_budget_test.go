@@ -3,6 +3,8 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"strings"
 	"sync"
@@ -414,5 +416,40 @@ func TestReuseAttachRetriesImageQueryDeadline(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Fatalf("attempts=%d, want3", attempts)
+	}
+}
+
+func TestReusePreservesSlowPullFailure(t *testing.T) {
+	for _, found := range []bool{false, true} {
+		t.Run(fmt.Sprintf("found=%v", found), func(t *testing.T) {
+			f := newTestRunner()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			pullErr := errors.New("manifest unknown")
+			runner := timeoutTestRunner(func(runCtx context.Context, args ...string) ([]byte, []byte, error) {
+				if args[0] == "inspect" {
+					if found {
+						return []byte(reuseInspectJSON("myctr", "running", "redis:7-alpine")), nil, nil
+					}
+					return nil, nil, &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: `Error: notFound: "container not found: myctr"`}
+				}
+				if len(args) > 1 && args[0] == "image" && args[1] == "pull" {
+					<-ctx.Done()
+					if err := runCtx.Err(); err != nil {
+						return nil, nil, err
+					}
+					return nil, nil, pullErr
+				}
+				return f.Run(runCtx, args...)
+			})
+			cfg := newConfig()
+			cfg.eng = appleEngine{}
+			cfg.runner = runner
+			cfg.name = "myctr"
+			_, err := reuseEnsureContainer(ctx, "redis:7-alpine", cfg)
+			if !errors.Is(err, pullErr) {
+				t.Fatalf("err=%v, want manifest failure after attach deadline", err)
+			}
+		})
 	}
 }

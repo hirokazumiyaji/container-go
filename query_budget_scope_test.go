@@ -106,19 +106,25 @@ func TestTerminateKeepsSuccessfulDeleteAfterCancellation(t *testing.T) {
 	}
 }
 
-func TestClientDefaultResolutionTimeoutRemainsBestEffort(t *testing.T) {
+func TestClientResolutionPreservesLongCallerDeadline(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "")
-	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_CONTEXT", "long-context")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	want, _ := ctx.Deadline()
+	var observed time.Time
 	runner := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
 		if args[0] == "context" {
-			<-ctx.Done()
-			return nil, nil, ctx.Err()
+			observed, _ = ctx.Deadline()
+			return []byte(`[{"Name":"long-context","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`), nil, nil
 		}
 		return nil, nil, nil
 	})
-	client, err := newClientWithQueryDefault(context.Background(), "NewClient", time.Millisecond, WithClientBackend("docker"), WithClientRunner(runner))
-	if err != nil || client == nil {
-		t.Fatalf("implicit target resolution timeout: client=%v err=%v, want best-effort client", client, err)
+	if _, err := NewClientContext(ctx, WithClientBackend("docker"), WithClientRunner(runner)); err != nil {
+		t.Fatal(err)
+	}
+	if !observed.Equal(want) {
+		t.Fatalf("resolution deadline=%v, want caller deadline=%v", observed, want)
 	}
 }
 

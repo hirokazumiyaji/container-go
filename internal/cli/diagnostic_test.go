@@ -274,3 +274,29 @@ func TestRedactedPathErrorKeepsArbitraryCausePrivate(t *testing.T) {
 		t.Fatal("lost cause identity")
 	}
 }
+
+func TestWithRedactorPreservesWrappedTimeouts(t *testing.T) {
+	const secret = "private-timeout-context"
+	for name, tc := range map[string]struct {
+		err     error
+		timeout bool
+	}{
+		"wrapped deadline":    {fmt.Errorf(secret+": %w", context.DeadlineExceeded), true},
+		"joined deadline":     {errors.Join(errors.New(secret), context.DeadlineExceeded), true},
+		"joined timeout":      {errors.Join(errors.New(secret), timeoutTestError{}), true},
+		"joined cancellation": {errors.Join(errors.New(secret), context.Canceled), false},
+		"ordinary failure":    {errors.New(secret), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			safe := WithRedactor(tc.err, NewRedactor(secret))
+			var timeout interface{ Timeout() bool }
+			got := errors.As(safe, &timeout) && timeout.Timeout()
+			if got != tc.timeout || os.IsTimeout(safe) != tc.timeout {
+				t.Fatalf("timeout=%v os.IsTimeout=%v, want %v", got, os.IsTimeout(safe), tc.timeout)
+			}
+			if strings.Contains(safe.Error(), secret) {
+				t.Fatal("timeout classification exposed raw diagnostic")
+			}
+		})
+	}
+}

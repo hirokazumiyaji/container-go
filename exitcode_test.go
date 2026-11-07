@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -185,5 +187,33 @@ func TestPublicLifecyclePreservesBareContextErrors(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestStatePreservesInFlightDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX shell")
+	}
+	const secret = "private-inspect-timeout-value"
+	binary := filepath.Join(t.TempDir(), "docker")
+	started := filepath.Join(t.TempDir(), "started")
+	script := "#!/bin/sh\nprintf '" + secret + "' >&2\nprintf started > \"$INSPECT_STARTED\"\nexec sleep 30\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &cli.ExecRunner{Binary: binary, Identity: "docker", Env: []string{"INSPECT_STARTED=" + started}}
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}, sync: &lockPack{uid: strings.Repeat("a", 64)}, diagnosticRedactorValue: cli.NewHashedContextRedactor(secret)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := ctr.State(ctx)
+	if _, startErr := os.Stat(started); startErr != nil {
+		t.Fatalf("inspect never started: %v", startErr)
+	}
+	var timeout interface{ Timeout() bool }
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &timeout) || !timeout.Timeout() || !os.IsTimeout(err) {
+		t.Fatalf("State lost in-flight timeout semantics: %T %v", err, err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("timeout diagnostic leaked secret")
 	}
 }

@@ -157,6 +157,14 @@ func (e *safeError) Is(target error) bool {
 	return e != nil && errors.Is(e.err, target)
 }
 
+func (e *safeError) Timeout() bool {
+	if e == nil {
+		return false
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(e.err, &timeout) && timeout.Timeout()
+}
+
 func (e *safeError) As(target any) bool {
 	if e == nil {
 		return false

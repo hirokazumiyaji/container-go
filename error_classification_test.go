@@ -116,8 +116,8 @@ func TestProductionProbeFixtures(t *testing.T) {
 			if probe.Hint != wantHint {
 				t.Fatalf("probe hint = %q, want %q", probe.Hint, wantHint)
 			}
-			if commandOperation(probe.Args) != fixture.Operation {
-				t.Fatalf("probe operation = %q, want fixture %q", commandOperation(probe.Args), fixture.Operation)
+			if cli.CommandOperation(probe.Args) != fixture.Operation {
+				t.Fatalf("probe operation = %q, want fixture %q", cli.CommandOperation(probe.Args), fixture.Operation)
 			}
 			original := &cli.CLIError{
 				Binary: eng.binary(), Args: []string{"run"}, ExitCode: 1, Stderr: "command failed",
@@ -1154,7 +1154,6 @@ func TestCleanupDeleteClassifierIsOperationAndBackendAware(t *testing.T) {
 				Binary: "container", Args: []string{"delete", "--force", "id"},
 				Stderr: "Error: failed to delete container: container with ID id not found",
 			},
-			wantIDs: []string{"id"},
 		},
 		{
 			name: "ambiguous delete",

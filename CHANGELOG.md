@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** Ordinary prune uses non-force deletion so candidates restarted
+  after inspection are retained. A verified restart is skipped without an error;
+  other deletion failures are still returned. Reuse-group prune remains forceful.
+- Prune results exclude candidates already removed by another actor, including
+  Docker force-delete no-ops with empty successful output.
+
+### Fixed
+
+- Preserve non-CLI configuration and ambiguous-object vetoes at any wrapper depth
+  when classifying CLI absence errors.
+
 ## [0.3.0] - 2026-10-26
 
 This section describes only the tagged `v0.3.0` release. The root

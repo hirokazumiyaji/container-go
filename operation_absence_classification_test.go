@@ -183,7 +183,7 @@ func TestPruneDeleteHonorsSentinelWithoutCLIError(t *testing.T) {
 		context.Background(), r, dockerEngine{}, []string{"ps"},
 		func([]byte) ([]string, error) { return []string{targetID}, nil }, "prune",
 	)
-	if err != nil || len(removed) != 1 || removed[0] != targetID {
+	if err != nil || len(removed) != 0 {
 		t.Fatalf("prune = %v/%v, want target treated as already absent", removed, err)
 	}
 }

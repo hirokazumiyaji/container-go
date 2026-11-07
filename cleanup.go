@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -435,16 +436,28 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 		// that became running after the daemon-side list.
 		return false, nil
 	}
-	deleteArgs := eng.deleteArgs(id)
-	_, _, err = r.Run(ctx, deleteArgs...)
+	deleteArgs := pruneDeleteArgs(eng, id, reuseGroup)
+	stdout, _, err := r.Run(ctx, deleteArgs...)
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, contextErr)
 	}
-	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), id) {
+	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), id) {
+		if reuseGroup == "" {
+			skip, absent, raceErr := pruneDeleteRace(ctx, eng, inspectContainer.inspectFresh)
+			if raceErr != nil {
+				return false, fmt.Errorf("%s %s: %w", errKind, id, errors.Join(err, raceErr))
+			}
+			if skip {
+				if absent {
+					unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
+				}
+				return false, nil
+			}
+		}
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
-	return true, nil
+	return err == nil && (reuseGroup == "" || strings.TrimSpace(string(stdout)) != ""), nil
 }
 
 func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
@@ -532,7 +545,8 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	defer unlock()
 
-	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
+	inspectContainer := &Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}
+	fresh, err := inspectContainer.inspectFreshLocked(guardCtx)
 	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, contextErr)
 	}
@@ -546,14 +560,53 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) || fresh.uid != "" || !ages.admits(fresh.createdAt) {
 		return false, nil
 	}
-	deleteArgs := eng.deleteArgs(candidate.id)
+	deleteArgs := pruneDeleteArgs(eng, candidate.id, reuseGroup)
 	_, _, err = r.Run(guardCtx, deleteArgs...)
 	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, contextErr)
 	}
-	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), candidate.id) {
+	if err != nil && !isNotFoundForOperation(eng, err, cli.CommandOperation(deleteArgs), candidate.id) {
+		if reuseGroup == "" {
+			skip, absent, raceErr := pruneDeleteRace(guardCtx, eng, inspectContainer.inspectFreshLocked)
+			if raceErr != nil {
+				return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, errors.Join(err, raceErr))
+			}
+			if skip {
+				if absent {
+					unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
+				}
+				return false, nil
+			}
+		}
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
-	return true, nil
+	return err == nil, nil
+}
+
+func pruneDeleteArgs(eng engine, id, reuseGroup string) []string {
+	args := eng.deleteArgs(id)
+	if reuseGroup == "" {
+		args = slices.DeleteFunc(args, func(arg string) bool { return arg == "--force" })
+	}
+	return args
+}
+
+func pruneDeleteRace(ctx context.Context, eng engine, inspect func(context.Context) (*engineInfo, error)) (skip, absent bool, err error) {
+	current, inspectErr := inspect(ctx)
+	if contextErr := commandContextError(ctx, inspectErr); contextErr != nil {
+		return false, false, contextErr
+	}
+	if isNotFoundFor(eng, inspectErr) {
+		return true, true, nil
+	}
+	if inspectErr != nil {
+		return false, false, inspectErr
+	}
+	switch current.state {
+	case StateRunning, StateRestarting, StatePaused:
+		return true, false, nil
+	default:
+		return false, false, nil
+	}
 }

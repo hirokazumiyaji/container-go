@@ -210,7 +210,7 @@ func TestStatePreservesInFlightDeadline(t *testing.T) {
 		t.Fatalf("inspect never started: %v", startErr)
 	}
 	var timeout interface{ Timeout() bool }
-	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &timeout) || !timeout.Timeout() || !os.IsTimeout(err) {
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &timeout) || !timeout.Timeout() {
 		t.Fatalf("State lost in-flight timeout semantics: %T %v", err, err)
 	}
 	if strings.Contains(err.Error(), secret) {

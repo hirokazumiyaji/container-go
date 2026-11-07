@@ -291,12 +291,54 @@ func TestWithRedactorPreservesWrappedTimeouts(t *testing.T) {
 			safe := WithRedactor(tc.err, NewRedactor(secret))
 			var timeout interface{ Timeout() bool }
 			got := errors.As(safe, &timeout) && timeout.Timeout()
-			if got != tc.timeout || os.IsTimeout(safe) != tc.timeout {
+			if got != tc.timeout || os.IsTimeout(safe) {
 				t.Fatalf("timeout=%v os.IsTimeout=%v, want %v", got, os.IsTimeout(safe), tc.timeout)
 			}
 			if strings.Contains(safe.Error(), secret) {
 				t.Fatal("timeout classification exposed raw diagnostic")
 			}
 		})
+	}
+}
+
+func TestRedactedNonTimeoutDoesNotHideSiblingTimeout(t *testing.T) {
+	const secret = "private-non-timeout-failure"
+	safe := WithRedactor(errors.New(secret), NewRedactor(secret))
+	for name, timeout := range map[string]error{"deadline": context.DeadlineExceeded, "custom": timeoutTestError{}} {
+		t.Run(name, func(t *testing.T) {
+			joined := errors.Join(safe, timeout)
+			var got interface{ Timeout() bool }
+			if !errors.As(joined, &got) || !got.Timeout() {
+				t.Fatal("redacted non-timeout hid sibling timeout")
+			}
+			if !IsOperationTimeoutError(joined) {
+				t.Fatal("operation classifier lost sibling timeout")
+			}
+			if strings.Contains(joined.Error(), secret) {
+				t.Fatal("timeout classification exposed secret")
+			}
+		})
+	}
+}
+
+type privateTimeoutError string
+
+func (e privateTimeoutError) Error() string { return string(e) }
+func (privateTimeoutError) Timeout() bool   { return true }
+
+func TestRedactedTimeoutViewKeepsDiagnosticsPrivate(t *testing.T) {
+	const secret = "private-typed-timeout"
+	safe := WithRedactor(privateTimeoutError(secret), NewRedactor(secret))
+	var timeout interface{ Timeout() bool }
+	if !errors.As(safe, &timeout) || !timeout.Timeout() {
+		t.Fatal("lost timeout interface")
+	}
+	exposed, ok := timeout.(error)
+	if !ok || strings.Contains(exposed.Error(), secret) {
+		t.Fatalf("unsafe timeout view: %T", timeout)
+	}
+	var raw privateTimeoutError
+	if errors.As(exposed, &raw) {
+		t.Fatal("timeout view exposed raw error type")
 	}
 }

@@ -157,13 +157,12 @@ func (e *safeError) Is(target error) bool {
 	return e != nil && errors.Is(e.err, target)
 }
 
-func (e *safeError) Timeout() bool {
-	if e == nil {
-		return false
-	}
-	var timeout interface{ Timeout() bool }
-	return errors.As(e.err, &timeout) && timeout.Timeout()
+type safeTimeoutError struct {
+	*safeError
+	timeout bool
 }
+
+func (e *safeTimeoutError) Timeout() bool { return e.timeout }
 
 func (e *safeError) As(target any) bool {
 	if e == nil {
@@ -196,6 +195,13 @@ func (e *safeError) as(target any, r *Redactor) bool {
 		r = NewRedactor()
 	}
 	switch ptr := target.(type) {
+	case *interface{ Timeout() bool }:
+		var timeout interface{ Timeout() bool }
+		if !errors.As(e.err, &timeout) {
+			return false
+		}
+		*ptr = &safeTimeoutError{safeError: &safeError{err: e.err, redactor: r}, timeout: timeout.Timeout()}
+		return true
 	case **CLIError:
 		raw, ok := findRawCLIError(e.err)
 		if !ok {

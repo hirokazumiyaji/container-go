@@ -668,16 +668,17 @@ func hasNonCLIDefinitiveErrorText(err error) bool {
 // "not found" (for example, a missing volume plugin) as a missing
 // container.
 func cliCommandParts(err error) (command string, args []string, ok bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) || len(cliErr.Args) == 0 {
+	branches := backendCLIErrorBranches(err, "")
+	if len(branches) == 0 || len(branches[0].ctx.err.Args) == 0 {
 		return "", nil, false
 	}
-	return strings.ToLower(cliErr.Args[0]), cliErr.Args[1:], true
+	args = branches[0].ctx.err.Args
+	return strings.ToLower(args[0]), args[1:], true
 }
 
 func cliErrorBelongsTo(err error, backend string) bool {
-	var cliErr *cli.CLIError
-	return errors.As(err, &cliErr) && cli.BinaryMatches(cliErr.Binary, backend)
+	branches := backendCLIErrorBranches(err, "")
+	return len(branches) > 0 && cli.BinaryMatches(branches[0].ctx.err.Binary, backend)
 }
 
 func cliCommandTarget(command string, args []string) string {
@@ -780,10 +781,11 @@ func cliReadOptionTakesValue(option string) bool {
 // as backend evidence; arbitrary application/configuration prefixes remain
 // visible and cannot satisfy an anchored backend matcher.
 func cliErrorLines(err error) ([]string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	branches := backendCLIErrorBranches(err, "")
+	if len(branches) == 0 {
 		return nil, false
 	}
+	cliErr := branches[0].ctx.err
 	allowGenericError := genericErrorWrapperAllowed(cliErr)
 	var lines []string
 	for _, line := range strings.Split(cliErr.Stderr, "\n") {

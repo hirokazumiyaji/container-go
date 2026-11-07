@@ -320,13 +320,34 @@ func MatchError(err error, predicate func(error) bool) bool {
 	return predicate(classificationErrorTree(err))
 }
 
+// ClassificationBranches keeps redaction from merging distinct backend targets.
+// Its raw diagnostics must remain inside backend classification.
+func ClassificationBranches(err error, binary string) []ErrorBranch {
+	branches := ErrorBranches(classificationErrorTree(err), binary)
+	if redactors := redactorsIn(err); len(redactors) > 0 {
+		redactor := ComposeRedactors(redactors...)
+		for i := range branches {
+			branches[i].Cause = WithRedactor(branches[i].Cause, redactor)
+		}
+	}
+	return branches
+}
+
 type classificationError struct {
+	error
+	child error
+}
+
+func (e classificationError) Unwrap() error        { return e.child }
+func (e classificationError) Is(target error) bool { return errors.Is(e.error, target) }
+
+type classificationJoin struct {
 	error
 	children []error
 }
 
-func (e classificationError) Unwrap() []error      { return e.children }
-func (e classificationError) Is(target error) bool { return errors.Is(e.error, target) }
+func (e classificationJoin) Unwrap() []error      { return e.children }
+func (e classificationJoin) Is(target error) bool { return errors.Is(e.error, target) }
 
 func classificationErrorTree(err error) error {
 	children := append([]error(nil), rawChildren(err)...)
@@ -343,7 +364,10 @@ func classificationErrorTree(err error) error {
 		changed = changed || !sameError(children[i], child)
 	}
 	if changed {
-		return classificationError{error: err, children: children}
+		if wrapped {
+			return classificationError{error: err, child: children[0]}
+		}
+		return classificationJoin{error: err, children: children}
 	}
 	return err
 }

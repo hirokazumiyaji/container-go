@@ -306,3 +306,73 @@ func TestRedactedNotFoundKeepsDistinctTargets(t *testing.T) {
 		})
 	}
 }
+
+func TestRedactedWrapperTextVetoPreventsAbsence(t *testing.T) {
+	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
+		message := "Error: No such container: candidate"
+		if eng.name() == "apple" {
+			message = `Error: notFound: "container not found: candidate"`
+		}
+		absent := &cli.CLIError{Binary: eng.binary(), Args: []string{"inspect", "candidate"}, ExitCode: 1, Stderr: message}
+		veto := fmt.Errorf("TLS certificate verification failed: %w", cli.WithRedactor(errors.New("private-value"), cli.NewRedactor("private-value")))
+		err := errors.Join(absent, veto)
+		if isNotFound(err) || isNotFoundFor(eng, err) || isNotFoundForOperation(eng, err, "inspect", "candidate") {
+			t.Fatalf("%s discarded wrapper TLS veto", eng.name())
+		}
+	}
+}
+
+func TestRedactedBackendClassifiersKeepTargetIdentities(t *testing.T) {
+	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
+		for _, target := range []string{"secret-a", "secret-b"} {
+			imageMessage := "Error: No such image: " + target
+			containerMessage := "Error: No such container: " + target
+			conflictMessage := fmt.Sprintf(`Error response from daemon: Conflict. The container name "/%s" is already in use by container "id".`, target)
+			if eng.name() == "apple" {
+				imageMessage = "Error: image not found: " + target
+				containerMessage = fmt.Sprintf(`Error: notFound: "container not found: %s"`, target)
+				conflictMessage = fmt.Sprintf(`Error: exists: "container already exists: %s"`, target)
+			}
+			for _, tc := range []struct {
+				name     string
+				args     []string
+				message  string
+				classify func(error) bool
+			}{
+				{"image", []string{"image", "inspect", "secret-a"}, imageMessage, eng.imageMissing},
+				{"image target", []string{"image", "inspect", "secret-a"}, imageMessage, func(err error) bool { return eng.imageMissingForTarget(err, "secret-a") }},
+				{"container", []string{"inspect", "secret-a"}, containerMessage, eng.containerMissing},
+				{"name", []string{"run", "--name", "secret-a", "image"}, conflictMessage, eng.nameConflict},
+				{"name target", []string{"run", "--name", "secret-a", "image"}, conflictMessage, func(err error) bool { return eng.nameConflictForTarget(err, "secret-a") }},
+			} {
+				t.Run(eng.name()+"/"+target+"/"+tc.name, func(t *testing.T) {
+					raw := &cli.CLIError{Binary: eng.binary(), Args: tc.args, ExitCode: 1, Stderr: tc.message}
+					r := cli.NewRedactor("secret-a", "secret-b")
+					safe := cli.WithRedactor(raw, r)
+					want := tc.classify(raw)
+					for _, err := range []error{safe, fmt.Errorf("outer: %w", safe), errors.Join(safe), cli.WithRedactor(fmt.Errorf("inner: %w", safe), r)} {
+						if got := tc.classify(err); got != want {
+							t.Errorf("classification = %v, raw = %v", got, want)
+						}
+						if strings.Contains(err.Error(), "secret-a") || strings.Contains(err.Error(), "secret-b") {
+							t.Fatal("classification exposed secret")
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestBackendClassificationPreservesSafeReturnedCause(t *testing.T) {
+	raw := &cli.CLIError{Binary: "docker", Args: []string{"inspect", "secret-a"}, ExitCode: 1, Stderr: "Error: No such container: secret-b"}
+	safe := cli.WithRedactor(raw, cli.NewRedactor("secret-a", "secret-b"))
+	got := classifyErrorFor(context.Background(), nil, safe, dockerEngine{}, "inspect", "secret-a")
+	if got == nil || strings.Contains(got.Error(), "secret-a") || strings.Contains(got.Error(), "secret-b") {
+		t.Fatalf("unsafe classified error: %v", got)
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(got, &cliErr) || strings.Contains(cliErr.Stderr, "secret-b") {
+		t.Fatalf("unsafe classified CLI error: %v", cliErr)
+	}
+}

@@ -35,7 +35,7 @@ type cliErrorBranch struct {
 // branch.
 func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
 	var branches []cliErrorBranch
-	for _, branch := range cli.ErrorBranches(err, backend) {
+	for _, branch := range cli.ClassificationBranches(err, backend) {
 		operation := cli.CommandOperation(branch.Error.Args)
 		branches = append(branches, cliErrorBranch{
 			ctx:    cliErrorContext{err: branch.Error, operation: operation, target: commandTarget(branch.Error.Args, operation)},

@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"reflect"
+	"syscall"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
@@ -56,6 +58,14 @@ func ComposeRedactors(redactors ...*Redactor) *Redactor {
 func WithRedactor(err error, r *Redactor) error {
 	if err == nil {
 		return nil
+	}
+	// Standard sentinels and numeric errno values contain no caller diagnostics.
+	switch err {
+	case context.Canceled, context.DeadlineExceeded, os.ErrPermission, os.ErrNotExist, os.ErrExist, exec.ErrNotFound:
+		return err
+	}
+	if _, ok := err.(syscall.Errno); ok {
+		return err
 	}
 	if r == nil {
 		r = NewRedactor()

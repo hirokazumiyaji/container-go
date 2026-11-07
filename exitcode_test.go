@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -130,7 +132,7 @@ func TestWaitClassifiesTransientErrorsBeforeRedaction(t *testing.T) {
 
 func TestPublicLifecyclePreservesRedactedPathError(t *testing.T) {
 	const secret = "private-executable-path"
-	raw := &os.PathError{Op: "fork/exec", Path: "/opt/" + secret + "/docker", Err: os.ErrPermission}
+	raw := &os.PathError{Op: "fork/exec", Path: "/opt/" + secret + "/docker", Err: syscall.EACCES}
 	ctr := &Container{id: "myctr", runner: waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) { return nil, nil, raw }), eng: dockerEngine{}, sync: &lockPack{uid: strings.Repeat("a", 64)}, diagnosticRedactorValue: cli.NewHashedContextRedactor(secret)}
 	for name, op := range map[string]func() error{
 		"State":    func() error { _, err := ctr.State(context.Background()); return err },
@@ -147,9 +149,41 @@ func TestPublicLifecyclePreservesRedactedPathError(t *testing.T) {
 			if strings.Contains(err.Error(), secret) || strings.Contains(pathErr.Path, secret) || strings.Contains(pathErr.Error(), secret) {
 				t.Fatalf("path fields leak secret: %v", pathErr)
 			}
+			if !os.IsPermission(pathErr) || pathErr.Err != syscall.EACCES {
+				t.Fatalf("path cause = %T %v, want original errno and os.IsPermission", pathErr.Err, pathErr.Err)
+			}
 			if pathErr == raw || !strings.Contains(raw.Path, secret) {
 				t.Fatal("public error must be a redacted copy")
 			}
 		})
+	}
+}
+
+func TestPublicLifecyclePreservesBareContextErrors(t *testing.T) {
+	ctr := &Container{id: "myctr", eng: dockerEngine{}, sync: &lockPack{uid: strings.Repeat("a", 64)}, diagnosticRedactorValue: cli.NewHashedContextRedactor("context")}
+	expired, expire := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer expire()
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for name, ctx := range map[string]context.Context{"deadline": expired, "cancellation": canceled} {
+		for operation, op := range map[string]func(context.Context) error{
+			"State":    func(ctx context.Context) error { _, err := ctr.State(ctx); return err },
+			"Wait":     func(ctx context.Context) error { _, err := ctr.Wait(ctx); return err },
+			"Inspect":  func(ctx context.Context) error { _, err := ctr.Inspect(ctx); return err },
+			"ExitCode": func(ctx context.Context) error { _, err := ctr.ExitCode(ctx); return err },
+		} {
+			t.Run(name+"/"+operation, func(t *testing.T) {
+				err := op(ctx)
+				if err != ctx.Err() {
+					t.Fatalf("error = %T %v, want original %v", err, err, ctx.Err())
+				}
+				if name == "deadline" {
+					var timeout interface{ Timeout() bool }
+					if !os.IsTimeout(err) || !errors.As(err, &timeout) || !timeout.Timeout() {
+						t.Fatalf("error lost structured timeout: %v", err)
+					}
+				}
+			})
+		}
 	}
 }

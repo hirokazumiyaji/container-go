@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
@@ -230,5 +233,44 @@ func TestClassifyPreservesOriginalAndProbeChains(t *testing.T) {
 	}
 	if strings.Contains(got.Error(), "original-secret") || strings.Contains(got.Stderr, "original-secret") {
 		t.Fatalf("errors.As CLIError is unsafe: error=%q stderr=%q", got.Error(), got.Stderr)
+	}
+}
+
+func TestWithRedactorPreservesValueFreeErrors(t *testing.T) {
+	for _, raw := range []error{context.Canceled, context.DeadlineExceeded, syscall.EACCES, syscall.ENOENT, syscall.EEXIST, os.ErrPermission, os.ErrNotExist, os.ErrExist, exec.ErrNotFound} {
+		t.Run(raw.Error(), func(t *testing.T) {
+			if got := WithRedactor(raw, NewRedactor(raw.Error())); got != raw {
+				t.Fatalf("got %T %v, want original error", got, got)
+			}
+		})
+	}
+}
+
+func TestRedactedExecutableErrorsPreserveErrno(t *testing.T) {
+	const secret = "private-executable-value"
+	raw := &exec.Error{Name: secret, Err: syscall.EACCES}
+	safe := WithRedactor(raw, NewRedactor(secret))
+	var got *exec.Error
+	if !errors.As(safe, &got) || got.Err != syscall.EACCES {
+		t.Fatalf("got %v, want exec.Error with original errno", safe)
+	}
+	if got == raw || strings.Contains(got.Error(), secret) || raw.Name != secret {
+		t.Fatal("executable error must be a safe clone")
+	}
+}
+
+func TestRedactedPathErrorKeepsArbitraryCausePrivate(t *testing.T) {
+	const secret = "private-path-cause"
+	raw := &os.PathError{Op: "open", Path: secret, Err: errors.New(secret)}
+	safe := WithRedactor(raw, NewRedactor(secret))
+	var got *os.PathError
+	if !errors.As(safe, &got) {
+		t.Fatal("lost PathError")
+	}
+	if strings.Contains(got.Error(), secret) || strings.Contains(got.Err.Error(), secret) {
+		t.Fatal("path cause leaked")
+	}
+	if !errors.Is(got, raw.Err) {
+		t.Fatal("lost cause identity")
 	}
 }

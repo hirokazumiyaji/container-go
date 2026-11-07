@@ -340,6 +340,7 @@ type classificationError struct {
 
 func (e classificationError) Unwrap() error        { return e.child }
 func (e classificationError) Is(target error) bool { return errors.Is(e.error, target) }
+func (e classificationError) As(target any) bool   { return errors.As(e.error, target) }
 
 type classificationJoin struct {
 	error
@@ -348,6 +349,7 @@ type classificationJoin struct {
 
 func (e classificationJoin) Unwrap() []error      { return e.children }
 func (e classificationJoin) Is(target error) bool { return errors.Is(e.error, target) }
+func (e classificationJoin) As(target any) bool   { return errors.As(e.error, target) }
 
 func classificationErrorTree(err error) error {
 	children := append([]error(nil), rawChildren(err)...)
@@ -459,7 +461,7 @@ func sameError(a, b error) bool {
 	if av.Type() != bv.Type() {
 		return false
 	}
-	if av.Type().Comparable() {
+	if av.Comparable() && bv.Comparable() {
 		return av.Interface() == bv.Interface()
 	}
 	return false

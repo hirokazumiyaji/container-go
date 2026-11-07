@@ -376,3 +376,40 @@ func TestBackendClassificationPreservesSafeReturnedCause(t *testing.T) {
 		t.Fatalf("unsafe classified CLI error: %v", cliErr)
 	}
 }
+
+type detailClassificationError struct{ detail any }
+
+func (detailClassificationError) Error() string { return "detail error" }
+
+func TestClassificationHandlesNonComparableDetails(t *testing.T) {
+	for _, detail := range []any{[]string{"a"}, map[string]string{"a": "b"}} {
+		t.Run(fmt.Sprintf("%T", detail), func(t *testing.T) {
+			err := fmt.Errorf("outer: %w", detailClassificationError{detail: detail})
+			if isNotFound(err) || isNotFoundFor(dockerEngine{}, err) {
+				t.Fatal("ordinary error classified as container absence")
+			}
+		})
+	}
+}
+
+type timeoutClassificationWrapper struct{ error }
+
+func (e timeoutClassificationWrapper) Unwrap() error { return e.error }
+func (timeoutClassificationWrapper) Timeout() bool   { return true }
+
+func TestRedactedWrapperTimeoutVetoPreventsAbsence(t *testing.T) {
+	for _, eng := range []engine{dockerEngine{}, appleEngine{}} {
+		t.Run(eng.name(), func(t *testing.T) {
+			message := "Error: No such container: candidate"
+			if eng.name() == "apple" {
+				message = `Error: notFound: "container not found: candidate"`
+			}
+			absent := &cli.CLIError{Binary: eng.binary(), Args: []string{"inspect", "candidate"}, ExitCode: 1, Stderr: message}
+			veto := timeoutClassificationWrapper{cli.WithRedactor(errors.New("private-value"), cli.NewRedactor("private-value"))}
+			err := errors.Join(absent, veto)
+			if isNotFound(err) || isNotFoundFor(eng, err) || isNotFoundForOperation(eng, err, "inspect", "candidate") {
+				t.Fatal("discarded wrapper timeout veto")
+			}
+		})
+	}
+}

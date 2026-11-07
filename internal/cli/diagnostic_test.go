@@ -271,3 +271,22 @@ func TestClassificationTreeClonesMutableJoinedChildren(t *testing.T) {
 		t.Fatal("classification aliases original child slice")
 	}
 }
+
+type timeoutClassificationJoin struct{ children []error }
+
+func (e *timeoutClassificationJoin) Error() string   { return errors.Join(e.children...).Error() }
+func (e *timeoutClassificationJoin) Unwrap() []error { return e.children }
+func (*timeoutClassificationJoin) Timeout() bool     { return true }
+
+func TestClassificationTreePreservesJoinedWrapperType(t *testing.T) {
+	safe := WithRedactor(errors.New("private-value"), NewRedactor("private-value"))
+	wrapper := &timeoutClassificationJoin{children: []error{safe}}
+	tree := classificationErrorTree(wrapper)
+	var original *timeoutClassificationJoin
+	if !errors.As(tree, &original) || original != wrapper {
+		t.Fatal("classification lost joined wrapper type")
+	}
+	if !IsDefinitiveNonLivenessError(tree) {
+		t.Fatal("classification lost joined wrapper timeout veto")
+	}
+}

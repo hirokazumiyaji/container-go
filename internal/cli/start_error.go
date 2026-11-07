@@ -22,7 +22,7 @@ func PermanentStartError(err error) bool {
 	if !errors.As(err, &pathErr) {
 		return false
 	}
-	return os.IsPermission(err) || os.IsNotExist(err) ||
-		errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ENOEXEC) ||
-		badExecutableStartError(err)
+	return errors.Is(pathErr.Err, os.ErrPermission) || errors.Is(pathErr.Err, os.ErrNotExist) ||
+		errors.Is(pathErr.Err, syscall.ENOTDIR) || errors.Is(pathErr.Err, syscall.ENOEXEC) ||
+		badExecutableStartError(pathErr.Err)
 }

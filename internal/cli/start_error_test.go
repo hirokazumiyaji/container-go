@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"runtime"
@@ -32,6 +33,10 @@ func TestPermanentStartErrorClassification(t *testing.T) {
 		"lookup": {
 			err:  &exec.Error{Name: "backend", Err: syscall.ENOENT},
 			want: true,
+		},
+		"transient path with unrelated permission": {
+			err:  errors.Join(&os.PathError{Op: "fork/exec", Path: "backend", Err: syscall.EAGAIN}, os.ErrPermission),
+			want: false,
 		},
 		"temporary resource": {
 			err:  &os.PathError{Op: "fork/exec", Path: "backend", Err: syscall.EAGAIN},

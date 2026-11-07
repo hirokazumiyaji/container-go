@@ -73,12 +73,8 @@ func TestInspectSnapshotAndGetters(t *testing.T) {
 	if ctr.Image() != ctr.image.reference {
 		t.Errorf("ctr.Image() = %q, want %q", ctr.Image(), ctr.image.reference)
 	}
-	exitCode, err := ctr.ExitCode(context.Background())
-	if err != nil {
-		t.Fatalf("ctr.ExitCode(): %v", err)
-	}
-	if exitCode != 0 {
-		t.Errorf("ctr.ExitCode() = %d, want 0", exitCode)
+	if _, err := ctr.ExitCode(context.Background()); !errors.Is(err, ErrExitCodeUnavailable) {
+		t.Fatalf("running container ExitCode error = %v, want ErrExitCodeUnavailable", err)
 	}
 }
 

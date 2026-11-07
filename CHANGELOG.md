@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ErrExitCodeUnavailable`, `ErrContainerNotStopped`, and `InspectInfo.ExitCodeReported`
+  distinguish unavailable process status from a reported zero exit code.
+
+### Changed
+
+- **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
+  an exit code. `ExitCode` also rejects containers that have not stopped. Callers
+  relying on `0, nil` must handle these errors; snapshot users must check
+  `ExitCodeReported` and `State` before interpreting `InspectInfo.ExitCode`.
+- Apple CLI versions that omit `status.exitCode` report `ErrExitCodeUnavailable`;
+  a stopped state alone does not establish whether the process succeeded.
+
 ## [0.3.0] - 2026-10-26
 
 This section describes only the tagged `v0.3.0` release. The root

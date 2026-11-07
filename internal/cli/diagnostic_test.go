@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
@@ -230,5 +233,112 @@ func TestClassifyPreservesOriginalAndProbeChains(t *testing.T) {
 	}
 	if strings.Contains(got.Error(), "original-secret") || strings.Contains(got.Stderr, "original-secret") {
 		t.Fatalf("errors.As CLIError is unsafe: error=%q stderr=%q", got.Error(), got.Stderr)
+	}
+}
+
+func TestWithRedactorPreservesValueFreeErrors(t *testing.T) {
+	for _, raw := range []error{context.Canceled, context.DeadlineExceeded, syscall.EACCES, syscall.ENOENT, syscall.EEXIST, os.ErrPermission, os.ErrNotExist, os.ErrExist, exec.ErrNotFound} {
+		t.Run(raw.Error(), func(t *testing.T) {
+			if got := WithRedactor(raw, NewRedactor(raw.Error())); got != raw {
+				t.Fatalf("got %T %v, want original error", got, got)
+			}
+		})
+	}
+}
+
+func TestRedactedExecutableErrorsPreserveErrno(t *testing.T) {
+	const secret = "private-executable-value"
+	raw := &exec.Error{Name: secret, Err: syscall.EACCES}
+	safe := WithRedactor(raw, NewRedactor(secret))
+	var got *exec.Error
+	if !errors.As(safe, &got) || got.Err != syscall.EACCES {
+		t.Fatalf("got %v, want exec.Error with original errno", safe)
+	}
+	if got == raw || strings.Contains(got.Error(), secret) || raw.Name != secret {
+		t.Fatal("executable error must be a safe clone")
+	}
+}
+
+func TestRedactedPathErrorKeepsArbitraryCausePrivate(t *testing.T) {
+	const secret = "private-path-cause"
+	raw := &os.PathError{Op: "open", Path: secret, Err: errors.New(secret)}
+	safe := WithRedactor(raw, NewRedactor(secret))
+	var got *os.PathError
+	if !errors.As(safe, &got) {
+		t.Fatal("lost PathError")
+	}
+	if strings.Contains(got.Error(), secret) || strings.Contains(got.Err.Error(), secret) {
+		t.Fatal("path cause leaked")
+	}
+	if !errors.Is(got, raw.Err) {
+		t.Fatal("lost cause identity")
+	}
+}
+
+func TestWithRedactorPreservesWrappedTimeouts(t *testing.T) {
+	const secret = "private-timeout-context"
+	for name, tc := range map[string]struct {
+		err     error
+		timeout bool
+	}{
+		"wrapped deadline":    {fmt.Errorf(secret+": %w", context.DeadlineExceeded), true},
+		"joined deadline":     {errors.Join(errors.New(secret), context.DeadlineExceeded), true},
+		"joined timeout":      {errors.Join(errors.New(secret), timeoutTestError{}), true},
+		"joined cancellation": {errors.Join(errors.New(secret), context.Canceled), false},
+		"ordinary failure":    {errors.New(secret), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			safe := WithRedactor(tc.err, NewRedactor(secret))
+			var timeout interface{ Timeout() bool }
+			got := errors.As(safe, &timeout) && timeout.Timeout()
+			if got != tc.timeout || os.IsTimeout(safe) {
+				t.Fatalf("timeout=%v os.IsTimeout=%v, want %v", got, os.IsTimeout(safe), tc.timeout)
+			}
+			if strings.Contains(safe.Error(), secret) {
+				t.Fatal("timeout classification exposed raw diagnostic")
+			}
+		})
+	}
+}
+
+func TestRedactedNonTimeoutDoesNotHideSiblingTimeout(t *testing.T) {
+	const secret = "private-non-timeout-failure"
+	safe := WithRedactor(errors.New(secret), NewRedactor(secret))
+	for name, timeout := range map[string]error{"deadline": context.DeadlineExceeded, "custom": timeoutTestError{}} {
+		t.Run(name, func(t *testing.T) {
+			joined := errors.Join(safe, timeout)
+			var got interface{ Timeout() bool }
+			if !errors.As(joined, &got) || !got.Timeout() {
+				t.Fatal("redacted non-timeout hid sibling timeout")
+			}
+			if !IsOperationTimeoutError(joined) {
+				t.Fatal("operation classifier lost sibling timeout")
+			}
+			if strings.Contains(joined.Error(), secret) {
+				t.Fatal("timeout classification exposed secret")
+			}
+		})
+	}
+}
+
+type privateTimeoutError string
+
+func (e privateTimeoutError) Error() string { return string(e) }
+func (privateTimeoutError) Timeout() bool   { return true }
+
+func TestRedactedTimeoutViewKeepsDiagnosticsPrivate(t *testing.T) {
+	const secret = "private-typed-timeout"
+	safe := WithRedactor(privateTimeoutError(secret), NewRedactor(secret))
+	var timeout interface{ Timeout() bool }
+	if !errors.As(safe, &timeout) || !timeout.Timeout() {
+		t.Fatal("lost timeout interface")
+	}
+	exposed, ok := timeout.(error)
+	if !ok || strings.Contains(exposed.Error(), secret) {
+		t.Fatalf("unsafe timeout view: %T", timeout)
+	}
+	var raw privateTimeoutError
+	if errors.As(exposed, &raw) {
+		t.Fatal("timeout view exposed raw error type")
 	}
 }

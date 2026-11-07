@@ -339,7 +339,11 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 		}
 	}
 
-	queryCtx, queryCancel := context.WithTimeout(ctx, cfg.effectiveQueryTimeout())
+	queryCtx := ctx
+	queryCancel := func() {}
+	if cfg.queryTimeout > 0 {
+		queryCtx, queryCancel = context.WithTimeout(ctx, cfg.queryTimeout)
+	}
 	resolvedEng, err := e.resolveTarget(queryCtx, cfg.runner)
 	queryCancel()
 	if err != nil {

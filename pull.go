@@ -409,6 +409,15 @@ func (c *config) ensureImage(ctx context.Context, image string) error {
 	return err
 }
 
+type imageQueryDeadlineError struct{ error }
+
+func (e imageQueryDeadlineError) Unwrap() error { return e.error }
+
+func isImageQueryDeadline(err error) bool {
+	var queryErr imageQueryDeadlineError
+	return errors.As(err, &queryErr)
+}
+
 func (c *config) inspectImage(ctx context.Context, image, platform string) (imageIdentity, bool, error) {
 	return inspectImage(ctx, c.runner, c.eng, image, platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 }
@@ -487,7 +496,7 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 			if ctx.Err() != nil {
 				return imageIdentity{}, ctx.Err()
 			}
-			if !leader && errors.Is(err, context.DeadlineExceeded) && retryableInspectError(ctx, err) {
+			if !leader && isImageQueryDeadline(err) && retryableInspectError(ctx, err) {
 				continue
 			}
 			if err != nil {
@@ -833,6 +842,9 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		if ctx.Err() == nil && errors.Is(qCtx.Err(), context.DeadlineExceeded) && !cli.IsProbeConfigurationError(contextErr) {
+			contextErr = imageQueryDeadlineError{contextErr}
+		}
 		return imageIdentity{}, false, contextErr
 	}
 	if err != nil {
@@ -842,6 +854,9 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(eng.imageInspectArgs(image, platform)), image)
 	}
 	if contextErr := commandContextError(qCtx, nil); contextErr != nil {
+		if ctx.Err() == nil && errors.Is(qCtx.Err(), context.DeadlineExceeded) && !cli.IsProbeConfigurationError(contextErr) {
+			contextErr = imageQueryDeadlineError{contextErr}
+		}
 		return imageIdentity{}, false, contextErr
 	}
 	if parser, ok := eng.(imageIdentityParser); ok {

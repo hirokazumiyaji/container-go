@@ -347,7 +347,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if retryErr := inspectRetryError(resolveCtx, err); retryErr != nil {
 				return retryErr
 			}
-			if !errors.Is(err, context.DeadlineExceeded) {
+			if !isImageQueryDeadline(err) {
 				return err
 			}
 			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {

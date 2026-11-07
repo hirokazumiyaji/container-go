@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func TestPayloadAndLifecycleOperationsPreserveLongCallerDeadline(t *testing.T) {
@@ -153,5 +155,63 @@ func TestStoppedReuseDeletePreservesCallerBudget(t *testing.T) {
 	}
 	if !observed.Equal(want) {
 		t.Fatalf("delete deadline=%v, want caller deadline=%v", observed, want)
+	}
+}
+
+func TestPullResolutionPreservesLongCallerDeadline(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	want, _ := ctx.Deadline()
+	var observed time.Time
+	runner := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		if args[0] == "context" {
+			observed, _ = ctx.Deadline()
+			return []byte(`[{"Name":"default","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`), nil, nil
+		}
+		return nil, nil, nil
+	})
+	if err := pullWith(ctx, runner, dockerEngine{}, "redis:7-alpine"); err != nil {
+		t.Fatal(err)
+	}
+	if !observed.Equal(want) {
+		t.Fatalf("resolution deadline=%v, want caller deadline=%v", observed, want)
+	}
+}
+
+func TestReusePullRunDeadlineIsTerminal(t *testing.T) {
+	for name, policy := range map[string]PullPolicy{"missing": PullMissing, "always": PullAlways} {
+		t.Run(name, func(t *testing.T) {
+			f := newTestRunner()
+			pulls := 0
+			runner := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+				if args[0] == "inspect" {
+					return nil, nil, &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: `Error: notFound: "container not found: myctr"`}
+				}
+				if len(args) > 1 && args[0] == "image" && args[1] == "pull" {
+					pulls++
+					<-ctx.Done()
+					return nil, nil, ctx.Err()
+				}
+				return f.Run(ctx, args...)
+			})
+			cfg := newConfig()
+			cfg.eng = appleEngine{}
+			cfg.runner = runner
+			cfg.name = "myctr"
+			cfg.pullPolicy = policy
+			cfg.runTimeout = 10 * time.Millisecond
+			cfg.reusePollInterval = time.Millisecond
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			_, err := reuseEnsureContainer(ctx, "redis:7-alpine", cfg)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("err=%v, want run deadline", err)
+			}
+			if pulls != 1 {
+				t.Fatalf("pulls=%d, want one terminal fetch", pulls)
+			}
+		})
 	}
 }

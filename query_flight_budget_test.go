@@ -453,3 +453,58 @@ func TestReusePreservesSlowPullFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestImageResolutionJoinerDoesNotRetryFetchDeadline(t *testing.T) {
+	f := newTestRunner()
+	pulling, joined := make(chan struct{}), make(chan struct{})
+	var pulls int
+	var mu sync.Mutex
+	runner := timeoutTestRunner(func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		if len(args) > 1 && args[0] == "image" && args[1] == "pull" {
+			mu.Lock()
+			pulls++
+			if pulls == 1 {
+				close(pulling)
+			}
+			mu.Unlock()
+			<-joined
+			<-ctx.Done()
+			return nil, nil, ctx.Err()
+		}
+		return f.Run(ctx, args...)
+	})
+	imageResolutionFlights.mu.Lock()
+	oldHook := imageResolutionFlights.onJoin
+	var once sync.Once
+	imageResolutionFlights.onJoin = func(string) { once.Do(func() { close(joined) }) }
+	imageResolutionFlights.mu.Unlock()
+	defer func() {
+		imageResolutionFlights.mu.Lock()
+		imageResolutionFlights.onJoin = oldHook
+		imageResolutionFlights.mu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	configFor := func(budget time.Duration) *config {
+		cfg := newConfig()
+		cfg.eng = appleEngine{}
+		cfg.runner = runner
+		cfg.runTimeout = budget
+		return cfg
+	}
+	go func() { _, err := configFor(10*time.Millisecond).ensureImageRef(ctx, "redis:7-alpine"); done <- err }()
+	<-pulling
+	_, err := configFor(100*time.Millisecond).ensureImageRef(ctx, "redis:7-alpine")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("joiner err=%v, want fetch deadline", err)
+	}
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("leader err=%v, want fetch deadline", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if pulls != 1 {
+		t.Fatalf("pulls=%d, want one terminal shared fetch", pulls)
+	}
+}

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 func TestPruneDeleteArgsProtectRunningContainers(t *testing.T) {
@@ -266,5 +268,41 @@ func TestRedactedJoinedVetoPreventsAbsence(t *testing.T) {
 		if isNotFoundFor(eng, err) || isNotFoundForOperation(eng, err, "inspect", "candidate") {
 			t.Fatalf("%s discarded redacted TLS veto", eng.name())
 		}
+	}
+}
+
+func TestRedactedNotFoundKeepsDistinctTargets(t *testing.T) {
+	for _, stderr := range []string{"Error: No such container: secret-b", "Error: No such container: secret-a"} {
+		t.Run(stderr, func(t *testing.T) {
+			raw := &cli.CLIError{Binary: "docker", Args: []string{"inspect", "secret-a"}, ExitCode: 1, Stderr: stderr}
+			redactor := cli.NewRedactor("secret-a", "secret-b")
+			safe := cli.WithRedactor(raw, redactor)
+			want := stderr == "Error: No such container: secret-a"
+			for name, classify := range map[string]func(error) bool{
+				"generic":   isNotFound,
+				"backend":   func(err error) bool { return isNotFoundFor(dockerEngine{}, err) },
+				"operation": func(err error) bool { return isNotFoundForOperation(dockerEngine{}, err, "inspect", "secret-a") },
+			} {
+				for _, wrapped := range []error{safe, fmt.Errorf("outer: %w", safe), errors.Join(safe), cli.WithRedactor(fmt.Errorf("inner: %w", safe), redactor)} {
+					if got := classify(wrapped); got != want {
+						t.Errorf("%s = %v, want %v", name, got, want)
+					}
+					if strings.Contains(wrapped.Error(), "secret-a") || strings.Contains(wrapped.Error(), "secret-b") {
+						t.Fatal("classification mutated safe diagnostics")
+					}
+					vetoed := errors.Join(wrapped, cli.WithRedactor(errors.New("TLS certificate verification failed secret-b"), redactor))
+					if classify(vetoed) {
+						t.Errorf("%s discarded joined TLS veto", name)
+					}
+				}
+			}
+			got := waitTargetError(safe)
+			if errors.Is(got, wait.ErrTargetNotFound) != want {
+				t.Errorf("wait target classification = %v, want %v", got, want)
+			}
+			if strings.Contains(got.Error(), "secret-a") || strings.Contains(got.Error(), "secret-b") {
+				t.Fatal("wait diagnostic exposed a secret")
+			}
+		})
 	}
 }

@@ -460,6 +460,10 @@ func isBareContainerNotFound(err error) bool {
 // exist. It is retained for callers that do not have an engine context;
 // the concrete backend and command still have to pass their own matcher.
 func isNotFound(err error) bool {
+	return cli.MatchError(err, isNotFoundRaw)
+}
+
+func isNotFoundRaw(err error) bool {
 	if err == nil || isContextError(err) {
 		return false
 	}
@@ -490,6 +494,10 @@ func isNotFound(err error) bool {
 // separate from isNotFound prevents a Docker error from being accepted by
 // an Apple operation (and vice versa) when callers do have engine context.
 func isNotFoundFor(eng engine, err error) bool {
+	return cli.MatchError(err, func(err error) bool { return isNotFoundForRaw(eng, err) })
+}
+
+func isNotFoundForRaw(eng engine, err error) bool {
 	if err == nil || isContextError(err) {
 		return false
 	}
@@ -516,6 +524,10 @@ func isNotFoundFor(eng engine, err error) bool {
 }
 
 func isNotFoundForOperation(eng engine, err error, operation string, targets ...string) bool {
+	return cli.MatchError(err, func(err error) bool { return isNotFoundForOperationRaw(eng, err, operation, targets...) })
+}
+
+func isNotFoundForOperationRaw(eng engine, err error, operation string, targets ...string) bool {
 	if err == nil || isContextError(err) {
 		return false
 	}

@@ -314,6 +314,40 @@ func redactErrorValue(err error, r *Redactor) error {
 	}
 }
 
+// MatchError keeps diagnostic redaction from changing classification identities.
+// The predicate must return only a verdict, never retain the raw error.
+func MatchError(err error, predicate func(error) bool) bool {
+	return predicate(classificationErrorTree(err))
+}
+
+type classificationError struct {
+	error
+	children []error
+}
+
+func (e classificationError) Unwrap() []error      { return e.children }
+func (e classificationError) Is(target error) bool { return errors.Is(e.error, target) }
+
+func classificationErrorTree(err error) error {
+	children := append([]error(nil), rawChildren(err)...)
+	_, joined := err.(interface{ Unwrap() []error })
+	_, wrapped := err.(interface{ Unwrap() error })
+	if !joined && !wrapped && len(children) == 1 {
+		if _, raw := err.(interface{ UnwrapRaw() error }); raw {
+			return classificationErrorTree(children[0])
+		}
+	}
+	changed := false
+	for i, child := range children {
+		children[i] = classificationErrorTree(child)
+		changed = changed || !sameError(children[i], child)
+	}
+	if changed {
+		return classificationError{error: err, children: children}
+	}
+	return err
+}
+
 func redactorsIn(err error) []*Redactor {
 	var redactors []*Redactor
 	var walk func(error)

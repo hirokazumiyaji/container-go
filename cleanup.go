@@ -590,6 +590,12 @@ func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *
 func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup string) (Runner, engine, error) {
 	runner := cfg.runnerFor(eng)
 	if de, ok := eng.(dockerEngine); ok {
+		// Package prune follows the child's Docker environment, where a host
+		// overrides the ambient context; discovery must not retarget the runner.
+		if host, _, _, _ := de.targetSelection(runner); host != "" {
+			de.host, de.explicitHost = host, true
+			de.explicitContext = false
+		}
 		timeout := cfg.queryTimeout
 		if timeout <= 0 {
 			timeout = queryTimeout
@@ -605,7 +611,6 @@ func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup
 			return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))
 		}
 		eng = resolved
-		runner = pinRunnerTargetEnv(eng, runner)
 	}
 	return runner, eng, nil
 }

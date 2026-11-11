@@ -186,7 +186,7 @@ func TestDockerMetadataCacheLeaderCancellationDoesNotFailJoiners(t *testing.T) {
 	leaderCtx, cancelLeader := context.WithCancel(context.Background())
 	leaderErr := make(chan error, 1)
 	go func() {
-		_, err := cache.lookup(leaderCtx, "shared", fn)
+		_, err := cache.lookup(leaderCtx, "shared", queryTimeout, fn)
 		leaderErr <- err
 	}()
 	<-started
@@ -196,7 +196,7 @@ func TestDockerMetadataCacheLeaderCancellationDoesNotFailJoiners(t *testing.T) {
 	var got string
 	var gotErr error
 	go func() {
-		got, gotErr = cache.lookup(context.Background(), "shared", fn)
+		got, gotErr = cache.lookup(context.Background(), "shared", queryTimeout, fn)
 		close(joinerDone)
 	}()
 	close(release)

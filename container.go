@@ -763,8 +763,10 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if err == nil {
 			break
 		}
-		if !isNotFoundFor(cfg.eng, err) && !transientReuseInspectError(err) {
-			return fmt.Errorf("verify created container %s: %w", c.id, err)
+		if !isNotFoundFor(cfg.eng, err) {
+			if err := inspectRetryError(verifyCtx, err); err != nil {
+				return fmt.Errorf("verify created container %s: %w", c.id, err)
+			}
 		}
 		if err := waitForReusePoll(verifyCtx, cfg.effectiveReusePollInterval()); err != nil {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
@@ -1158,6 +1160,7 @@ const waitExitPollInterval = 100 * time.Millisecond
 
 // Wait blocks until the container reaches StateStopped and returns its exit code.
 // If the container is already stopped, it returns its exit code immediately.
+// Retrying individual query deadlines requires a deadline on ctx.
 func (c *Container) Wait(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -1175,7 +1178,14 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 			// A daemon that is briefly unreachable or busy must not fail a
 			// wait that is still within its context; only a terminal inspect
 			// error ends the wait.
-			if !transientReuseInspectError(err) {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			_, bounded := ctx.Deadline()
+			if retryErr := inspectRetryError(ctx, err); retryErr != nil {
+				return 0, retryErr
+			}
+			if !bounded && errors.Is(err, context.DeadlineExceeded) {
 				return 0, err
 			}
 		} else if info.state == StateStopped {
@@ -1819,8 +1829,10 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if contextErr := commandContextError(delCtx, err); contextErr != nil {
-		return contextErr
+	if err != nil {
+		if contextErr := commandContextError(delCtx, err); contextErr != nil {
+			return contextErr
+		}
 	}
 	if err == nil || isNotFoundForOperation(c.eng, err, c.deleteOperation(), target, c.id) {
 		unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, target)
@@ -2539,7 +2551,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		return nil, identityError("Apple handle has no valid creation generation")
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	qCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)

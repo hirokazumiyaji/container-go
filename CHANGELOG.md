@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve non-CLI configuration and ambiguous-object vetoes at any wrapper depth
   when classifying CLI absence errors.
 
+- Bound image-presence caches to 256 image/store/platform entries, evicting
+  the earliest-expiring entry when inserting at capacity.
+- Build diagnostic value indexes once when first used and share them with
+  streams. Streams retain their explicit-value protection when the source
+  redactor is closed.
+
+
 ## [0.3.0] - 2026-10-26
 
 This section describes only the tagged `v0.3.0` release. The root

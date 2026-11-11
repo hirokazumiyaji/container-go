@@ -393,11 +393,9 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 		}
 		return lifecycle.cancel()
 	}
-	safeStderr := NewRedactor().NewStream(maxStderr)
 	cmd.Stdout = stdoutW
-	cmd.Stderr = io.MultiWriter(stderrW, safeStderr)
-	// If the process ignores the kill long enough to hold pipes open,
-	// give up waiting shortly after.
+	cmd.Stderr = stderrW
+	// Bound pipe draining when descendants retain inherited output handles.
 	cmd.WaitDelay = 3 * time.Second
 
 	start := hooks.start
@@ -407,7 +405,7 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	if err := start(cmd); err != nil {
 		lifecycle.failStart()
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+			contextErr := commandContextError(bin, args, ctxErr)
 			return markRunStatus(errors.Join(contextErr, err), lifecycle.status())
 		}
 		return markRunStatus(err, lifecycle.status())
@@ -440,7 +438,7 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	stdout, stderr := captured()
 	commandErr := commandError(ctx, bin, identity, args, stdout, stderr, err)
 	if commandErr == nil && ctx.Err() != nil && status.TerminatedByCancellation {
-		commandErr = fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+		commandErr = commandContextError(bin, args, ctx.Err())
 	}
 	return markRunStatus(commandErr, status)
 }
@@ -456,7 +454,7 @@ func commandError(ctx context.Context, bin, identity string, args []string, stdo
 			// A Unix signal has no usable application status. Preserve the
 			// context contract while the lifecycle status records whether
 			// local cancellation actually terminated the process.
-			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+			return commandContextError(bin, args, ctxErr)
 		}
 		cliErr := &CLIError{
 			Binary:   identity,
@@ -468,15 +466,25 @@ func commandError(ctx context.Context, bin, identity string, args []string, stdo
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// The process did produce an exit status, but cancellation
 			// raced with its completion. Keep both facts observable.
-			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), errors.Join(commandErr, ctxErr))
+			return errors.Join(commandErr, ctxErr)
 		}
 		return commandErr
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+		contextErr := commandContextError(bin, args, ctxErr)
 		return errors.Join(contextErr, err)
 	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return commandContextError(bin, args, err)
+	}
+
 	return err
+}
+
+func commandContextError(bin string, args []string, err error) error {
+	redactor := NewRedactor()
+	message := fmt.Sprintf("%s %s", redactor.Text(bin), strings.Join(redactor.Args(args), " "))
+	return fmt.Errorf("%s: %w", message, err)
 }
 
 // commandRunError is the historical helper name retained for tests that

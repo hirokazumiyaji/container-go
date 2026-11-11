@@ -955,7 +955,9 @@ callers must reuse that Option across `Run`s; a fresh call creates an
 empty cache. The cache holds only "present" answers - a cached absence
 would have to be invalidated by the pull it triggered - and is keyed by
 backend, image store (Docker client-config env for Docker), image, and
-platform, since those stores are independent.
+platform, since those stores are independent. Each cache holds at most 256
+entries. At capacity a new entry evicts the earliest-expiring answer, so
+TTL is an upper bound on retention rather than a guaranteed cache lifetime.
 On Docker, `PullNever` always inspects: its contract is to fail when the image is
 absent, so a cached answer must not stand in for the check.
 

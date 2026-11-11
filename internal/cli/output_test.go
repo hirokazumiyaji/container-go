@@ -240,3 +240,30 @@ func TestCountingWriterStopsWritingAfterSinkError(t *testing.T) {
 		t.Fatal("snapshot error = nil, want first sink error")
 	}
 }
+
+type cancelAfterStderrLimit struct {
+	cancel context.CancelFunc
+	bytes  int
+}
+
+func (w *cancelAfterStderrLimit) Write(p []byte) (int, error) {
+	w.bytes += len(p)
+	if w.bytes > maxStderr {
+		w.cancel()
+	}
+	return len(p), nil
+}
+
+func TestExecRunnerRunToCancellationOmitsTruncatedRawStderr(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'password=' >&2; head -c 131072 /dev/zero | tr '\000' S >&2; exec sleep 10`)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stderr := &cancelAfterStderrLimit{cancel: cancel}
+	stats, err := r.RunTo(ctx, io.Discard, stderr, "exec", "target")
+	if stats.StderrBytes <= maxStderr {
+		t.Fatalf("stderr bytes = %d, want truncated capture", stats.StderrBytes)
+	}
+	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), strings.Repeat("S", 32)) {
+		t.Fatalf("unsafe cancellation diagnostic: %.200v", err)
+	}
+}

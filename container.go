@@ -997,7 +997,7 @@ func (c *Container) deleteOperation() string {
 // fresh inspect so wait fail-fast-on-stop and other lifecycle checks are
 // not delayed by the short dynamic-inspect TTL.
 func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectLifecycle(ctx)
+	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
@@ -1121,7 +1121,7 @@ func (i *InspectInfo) Ports() []PortBinding {
 
 // Inspect returns a fresh snapshot of the container's metadata and runtime state.
 func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
-	info, err := c.inspectLifecycle(ctx)
+	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1158,11 +1158,25 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 // error and an omitted backend exit code match ErrExitCodeUnavailable.
 // Apple CLI versions that omit status.exitCode cannot provide a process result.
 func (c *Container) ExitCode(ctx context.Context) (int, error) {
-	info, err := c.inspectLifecycle(ctx)
+	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
-		return 0, err
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return 0, err
+		}
+		redacted := c.redactError(err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, exitCodeDeadlineError{redacted}
+		}
+		return 0, redacted
 	}
 	return reportedExitCode(info)
+}
+
+// Keep the deadline visible to callers classifying redacted inspect failures.
+type exitCodeDeadlineError struct{ error }
+
+func (e exitCodeDeadlineError) Unwrap() []error {
+	return []error{e.error, context.DeadlineExceeded}
 }
 
 func reportedExitCode(info *engineInfo) (int, error) {
@@ -1180,8 +1194,7 @@ const waitExitPollInterval = 100 * time.Millisecond
 // Wait blocks until the container reaches StateStopped and returns its exit code.
 // If the container is already stopped, it returns immediately. A missing backend
 // exit code returns ErrExitCodeUnavailable rather than an assumed zero result.
-func (c *Container) Wait(ctx context.Context) (code int, err error) {
-	defer func() { err = c.redactError(err) }()
+func (c *Container) Wait(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -1193,7 +1206,6 @@ func (c *Container) Wait(ctx context.Context) (code int, err error) {
 			return 0, ctx.Err()
 		case <-timer.C:
 		}
-		// Retry classification needs raw diagnostics; redact only the final public error.
 		info, err := c.inspectDynamicFresh(ctx)
 		if err != nil {
 			// A daemon that is briefly unreachable or busy must not fail a
@@ -2079,11 +2091,6 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 		}
 	}
 	return c.refreshDynamic(ctx)
-}
-
-func (c *Container) inspectLifecycle(ctx context.Context) (*engineInfo, error) {
-	info, err := c.inspectDynamicFresh(ctx)
-	return info, c.redactError(err)
 }
 
 // inspectDynamicFresh always performs an identity-checked inspect and

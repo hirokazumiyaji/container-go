@@ -246,7 +246,7 @@ func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) 
 }
 
 func waitTargetError(err error) error {
-	if err == nil || (!errors.Is(err, ErrContainerNotFound) && !isNotFound(err)) || errors.Is(err, wait.ErrTargetNotFound) {
+	if err == nil || !isNotFound(err) || errors.Is(err, wait.ErrTargetNotFound) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", wait.ErrTargetNotFound, err)

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -754,35 +753,5 @@ func TestWaitTargetHealthInspectRateStaysAtLifecycleCadence(t *testing.T) {
 	}
 	if inspects > 2 {
 		t.Fatalf("inspects = %d over 1.2s, want at most one per lifecycle interval", inspects)
-	}
-}
-
-func TestWaitTargetPreservesPermanentInspectFailure(t *testing.T) {
-	for name, cause := range map[string]error{"permission": os.ErrPermission, "missing executable": os.ErrNotExist} {
-		t.Run(name, func(t *testing.T) {
-			original := &os.PathError{Op: "fork/exec", Path: "/opt/private-executable-path/docker", Err: cause}
-			runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) { return nil, nil, original })
-			ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}, sync: &lockPack{uid: strings.Repeat("a", 64)}, diagnosticRedactorValue: cli.NewHashedContextRedactor("private-executable-path")}
-			_, err := (waitTarget{c: ctr}).State(context.Background())
-			var pathErr *os.PathError
-			if !errors.As(err, &pathErr) || !errors.Is(err, cause) || !cli.PermanentStartError(err) {
-				t.Fatalf("got %T %v, want typed permanent start failure", err, err)
-			}
-			if strings.Contains(pathErr.Path, "private-executable-path") || strings.Contains(err.Error(), "private-executable-path") {
-				t.Fatalf("wait target exposes private path: %v", err)
-			}
-		})
-	}
-}
-
-func TestWaitTargetKeepsRedactedNotFoundSentinel(t *testing.T) {
-	const id = "private-wait-target"
-	cause := cli.WithRedactor(errors.Join(ErrContainerNotFound, &cli.CLIError{Binary: "docker", Args: []string{"logs", id}, ExitCode: 1, Stderr: "Error: No such container: " + id}), cli.NewHashedContextRedactor(id))
-	err := waitTargetError(cause)
-	if !errors.Is(err, wait.ErrTargetNotFound) || !errors.Is(err, ErrContainerNotFound) {
-		t.Fatalf("got %v, want wait and container missing sentinels", err)
-	}
-	if strings.Contains(err.Error(), id) {
-		t.Fatalf("error exposes target: %v", err)
 	}
 }

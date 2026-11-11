@@ -1,13 +1,10 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"reflect"
-	"syscall"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
@@ -58,14 +55,6 @@ func ComposeRedactors(redactors ...*Redactor) *Redactor {
 func WithRedactor(err error, r *Redactor) error {
 	if err == nil {
 		return nil
-	}
-	// Standard sentinels and numeric errno values contain no caller diagnostics.
-	switch err {
-	case context.Canceled, context.DeadlineExceeded, os.ErrPermission, os.ErrNotExist, os.ErrExist, exec.ErrNotFound:
-		return err
-	}
-	if _, ok := err.(syscall.Errno); ok {
-		return err
 	}
 	if r == nil {
 		r = NewRedactor()
@@ -157,13 +146,6 @@ func (e *safeError) Is(target error) bool {
 	return e != nil && errors.Is(e.err, target)
 }
 
-type safeTimeoutError struct {
-	*safeError
-	timeout bool
-}
-
-func (e *safeTimeoutError) Timeout() bool { return e.timeout }
-
 func (e *safeError) As(target any) bool {
 	if e == nil {
 		return false
@@ -195,13 +177,6 @@ func (e *safeError) as(target any, r *Redactor) bool {
 		r = NewRedactor()
 	}
 	switch ptr := target.(type) {
-	case *interface{ Timeout() bool }:
-		var timeout interface{ Timeout() bool }
-		if !errors.As(e.err, &timeout) {
-			return false
-		}
-		*ptr = &safeTimeoutError{safeError: &safeError{err: e.err, redactor: r}, timeout: timeout.Timeout()}
-		return true
 	case **CLIError:
 		raw, ok := findRawCLIError(e.err)
 		if !ok {
@@ -220,13 +195,6 @@ func (e *safeError) as(target any, r *Redactor) bool {
 			return asSafeDiagnostic(e.err, target, r)
 		}
 		*ptr = raw.withRedactor(r)
-		return true
-	case **os.PathError:
-		var raw *os.PathError
-		if !errors.As(e.err, &raw) {
-			return false
-		}
-		*ptr = &os.PathError{Op: r.Text(raw.Op), Path: r.Text(raw.Path), Err: WithRedactor(raw.Err, r)}
 		return true
 	case **exec.Error:
 		var raw *exec.Error

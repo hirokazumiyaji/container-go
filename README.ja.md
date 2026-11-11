@@ -639,7 +639,8 @@ no-network 保証ではありません。
 backend のストアが安定していると分かっている場合、
 `WithImagePresenceCache` は TTL の間 "present" の答えを再利用し、同じ
 image の後続 `Run` では inspect を省略する。Option は一度作って再利用する —
-`WithImagePresenceCache` を呼ぶたびに別の空キャッシュになる:
+`WithImagePresenceCache` を呼ぶたびに別の空キャッシュになる。
+キャッシュは image/store/platform の組を最大256件保持する。上限では失効時刻が最も早いエントリを削除するため、TTL 内でも再 inspect する場合がある:
 
 ```go
 package docexample

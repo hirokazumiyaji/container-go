@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,
   platform, and port settings.
+- Bound image-presence caches to 256 image/store/platform entries, evicting
+  the earliest-expiring entry when inserting at capacity.
+- Build diagnostic value indexes once when first used and share them with
+  streams. Streams retain their explicit-value protection when the source
+  redactor is closed.
 
 ## [0.3.0] - 2026-10-26
 

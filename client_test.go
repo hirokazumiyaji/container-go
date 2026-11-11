@@ -992,6 +992,44 @@ func (r *failingContextRunner) Run(_ context.Context, args ...string) ([]byte, [
 	return nil, []byte(r.detail), &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: r.detail}
 }
 
+func TestNewClientReportsDockerContextFailureOnce(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	const failure = "context store is corrupt"
+	for _, tc := range []struct {
+		name, contextName, option string
+	}{
+		{name: "active", option: "context"},
+		{name: "named", contextName: "private-context", option: "WithContext"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := []ClientOption{
+				WithClientBackend("docker"),
+				WithClientRunner(&failingContextRunner{detail: failure}),
+			}
+			if tc.contextName != "" {
+				opts = append(opts, WithClientDockerContext(tc.contextName))
+			}
+			_, err := NewClient(opts...)
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("NewClient error = %v, want ErrInvalidConfig", err)
+			}
+			if strings.Count(err.Error(), failure) != 1 {
+				t.Errorf("NewClient error should report the failure once: %v", err)
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) || configErr.Option != tc.option || !strings.Contains(configErr.Detail, failure) {
+				t.Errorf("NewClient configuration error = %#v, want option %q and failure detail", configErr, tc.option)
+			}
+			var cliErr *cli.CLIError
+			if !errors.As(err, &cliErr) || cliErr.Stderr != failure {
+				t.Errorf("NewClient CLI error = %#v, want stderr %q", cliErr, failure)
+			}
+		})
+	}
+}
+
 func TestPullRedactsDockerTargetValues(t *testing.T) {
 	const contextName = "secret-context-name"
 	t.Setenv(backendEnv, "docker")

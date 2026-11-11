@@ -1439,7 +1439,13 @@ func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneReuseGroupWithConfig(ctx, cfg.runnerFor(eng), eng, group, cfg)
+	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
+	defer overallCancel()
+	runner, eng, err := cfg.prepareTarget(overallCtx, eng, group)
+	if err != nil {
+		return nil, err
+	}
+	return pruneReuseGroupWithConfig(overallCtx, runner, eng, group, cfg)
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string, opts ...PruneOption) ([]string, error) {

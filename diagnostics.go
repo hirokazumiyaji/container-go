@@ -35,7 +35,7 @@ func (c *config) diagnosticValues() []string {
 	if c.dockerHost != nil {
 		values = append(values, *c.dockerHost)
 	}
-	if c.dockerContext != nil {
+	if c.dockerContext != nil && *c.dockerContext != "default" {
 		values = append(values, *c.dockerContext)
 	}
 	if c.dockerConfigDir != nil {
@@ -48,7 +48,16 @@ func (c *config) diagnosticValues() []string {
 	// any value the bounded streaming window cannot redact instead of
 	// making every stream on this handle fail.
 	if de, ok := c.eng.(dockerEngine); ok {
-		for _, value := range []string{de.effectiveHost(), de.effectiveContext(), de.effectiveConfigDir()} {
+		targetValues := []string{de.effectiveHost(), de.effectiveConfigDir()}
+		if context := de.effectiveContext(); context != "default" {
+			targetValues = append(targetValues, context)
+		}
+		if de.resolvedTarget != nil {
+			if de.resolvedTarget.isRemote {
+				targetValues = append(targetValues, de.resolvedTarget.rawHost)
+			}
+		}
+		for _, value := range targetValues {
 			if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
 				values = append(values, value)
 			}
@@ -71,7 +80,7 @@ func (c *config) diagnosticRedactor(extra ...string) *cli.Redactor {
 	values := append([]string(nil), c.diagnosticSecrets...)
 	values = append(values, c.diagnosticValues()...)
 	values = append(values, extra...)
-	return cli.NewHashedContextRedactor(values...)
+	return cli.NewHashedContextRedactor(values...).WithBoundaryValues(c.diagnosticBoundaryValues()...)
 }
 
 func safePublicError(err error, values ...string) error {
@@ -195,4 +204,40 @@ func uniqueStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func (c *config) diagnosticBoundaryValues() []string {
+	de, ok := c.eng.(dockerEngine)
+	if !ok {
+		return nil
+	}
+	var values []string
+	if endpoint, err := parseDockerEndpoint(de.effectiveHost()); err == nil && endpoint.isRemote {
+		values = append(values, dockerEndpointBoundaryValues(endpoint)...)
+	}
+	if de.resolvedTarget != nil && de.resolvedTarget.isRemote {
+		values = append(values, dockerEndpointBoundaryValues(*de.resolvedTarget)...)
+	}
+	if c.dockerHost != nil {
+		if endpoint, err := parseDockerEndpoint(*c.dockerHost); err == nil && endpoint.isRemote {
+			values = append(values, dockerEndpointBoundaryValues(endpoint)...)
+		}
+	}
+	filtered := values[:0]
+	for _, value := range uniqueStrings(values) {
+		if len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
+func dockerEndpointBoundaryValues(endpoint dockerTargetEndpoint) []string {
+	values := make([]string, 0, 2)
+	for _, value := range []string{endpoint.host, endpoint.clientHost} {
+		if value != "docker" {
+			values = append(values, value)
+		}
+	}
+	return values
 }

@@ -86,17 +86,8 @@ func (r *Redactor) streamOverlap() int {
 	// Keep a full bounded structural window by default. Explicit values and
 	// their encodings raise the requirement rather than being silently capped.
 	overlap := MaxStreamOverlap
-	if r != nil {
-		for _, entry := range r.hashes {
-			if entry.length > overlap {
-				overlap = entry.length
-			}
-		}
-		for _, value := range r.values {
-			if len(value) > overlap {
-				overlap = len(value)
-			}
-		}
+	for _, entry := range r.hashes {
+		overlap = max(overlap, entry.length)
 	}
 	return overlap
 }

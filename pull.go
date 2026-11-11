@@ -853,12 +853,6 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 		}
 		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(eng.imageInspectArgs(image, platform)), image)
 	}
-	if contextErr := commandContextError(qCtx, nil); contextErr != nil {
-		if ctx.Err() == nil && errors.Is(qCtx.Err(), context.DeadlineExceeded) && !cli.IsProbeConfigurationError(contextErr) {
-			contextErr = imageQueryDeadlineError{contextErr}
-		}
-		return imageIdentity{}, false, contextErr
-	}
 	if parser, ok := eng.(imageIdentityParser); ok {
 		identity, exists := parser.parseImageIdentity(stdout, image, platform)
 		return identity, exists, nil

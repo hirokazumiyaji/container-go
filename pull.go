@@ -91,7 +91,9 @@ func WithAllowMutableImageTag() Option {
 
 // WithImagePresenceCache reuses the answer to "is this image already in
 // the local store?" for up to ttl, so a second Run of the same image does
-// not spawn an `image inspect` against the daemon.
+// not spawn an `image inspect` against the daemon. Each cache holds at most
+// 256 image/store/platform entries; inserting at capacity evicts the entry
+// that expires earliest, even if its TTL has not elapsed.
 //
 // Off by default: Run's default PullMissing policy inspects on every
 // call, and caching that answer means an image removed out of band (by

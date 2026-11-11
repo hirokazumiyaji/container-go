@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other deletion failures are still returned. Reuse-group prune remains forceful.
 - Prune results exclude candidates already removed by another actor, including
   Docker force-delete no-ops with empty successful output.
+- Classify redacted CLI errors using their original command and target identities.
+  Wait, prune, and terminate now recognize confirmed container absence, and
+  returned diagnostics stay redacted.
 
 ### Fixed
 

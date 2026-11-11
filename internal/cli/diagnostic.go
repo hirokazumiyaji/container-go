@@ -323,7 +323,7 @@ func MatchError(err error, predicate func(error) bool) bool {
 // ClassificationBranches keeps redaction from merging distinct backend targets.
 // Its raw diagnostics must remain inside backend classification.
 func ClassificationBranches(err error, binary string) []ErrorBranch {
-	branches := ErrorBranches(classificationErrorTree(err), binary)
+	branches := collectCLIErrorBranches(classificationErrorTree(err), binary)
 	if redactors := redactorsIn(err); len(redactors) > 0 {
 		redactor := ComposeRedactors(redactors...)
 		for i := range branches {

@@ -623,7 +623,7 @@ func probeRelevantError(err error, probe Probe) error {
 	}
 
 	var branches []error
-	for _, branch := range ErrorBranches(err, probe.Binary) {
+	for _, branch := range ClassificationBranches(err, probe.Binary) {
 		if CommandOperation(branch.Error.Args) == operation {
 			branches = append(branches, branch.Cause)
 		}
@@ -670,25 +670,13 @@ type ErrorBranch struct {
 	Cause  error
 }
 
-func ErrorBranches(err error, binary string) []ErrorBranch {
+func collectCLIErrorBranches(err error, binary string) []ErrorBranch {
 	var branches []ErrorBranch
 	stdoutByError := make(map[*CLIError]string)
 	index := make(map[*CLIError]int)
 	var walk func(error)
 	walk = func(current error) {
 		if current == nil {
-			return
-		}
-		if safe, ok := current.(*safeError); ok {
-			for _, branch := range ErrorBranches(safe.err, binary) {
-				var redacted *CLIError
-				branch.Error.asRedacted(&redacted, safe.redactor)
-				branches = append(branches, ErrorBranch{
-					Error:  redacted,
-					Stdout: safe.redactor.Text(branch.Stdout),
-					Cause:  WithRedactor(branch.Cause, safe.redactor),
-				})
-			}
 			return
 		}
 		if joined, ok := current.(interface{ Unwrap() []error }); ok {

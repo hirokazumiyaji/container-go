@@ -776,7 +776,9 @@ The image-existence check is a daemon round trip on every `Run`. When the
 backend's store is known to be stable for the length of the test run,
 `WithImagePresenceCache` reuses a "present" answer for a TTL so later
 `Run`s of the same image skip it. Create the option once and reuse it —
-each call to `WithImagePresenceCache` owns a distinct cache:
+each call to `WithImagePresenceCache` owns a distinct cache. Each cache holds
+at most 256 image/store/platform entries and evicts the earliest-expiring
+entry at capacity, so an answer can be re-inspected before its TTL expires:
 
 ```go
 package docexample

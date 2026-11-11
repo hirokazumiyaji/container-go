@@ -283,12 +283,11 @@ func TestPackagePruneRedactsResolvedContextEndpoint(t *testing.T) {
 
 func TestPruneContextResolutionUsesQueryAndOverallBudgets(t *testing.T) {
 	for _, tc := range []struct {
-		name                 string
-		query, overall, want time.Duration
+		name          string
+		overall, want time.Duration
 	}{
 		{name: "default", overall: time.Hour, want: queryTimeout},
-		{name: "configured", query: 5 * time.Second, overall: time.Hour, want: 5 * time.Second},
-		{name: "overall", query: time.Minute, overall: time.Second, want: time.Second},
+		{name: "overall", overall: time.Second, want: time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DOCKER_HOST", "")
@@ -305,7 +304,7 @@ func TestPruneContextResolutionUsesQueryAndOverallBudgets(t *testing.T) {
 				remaining = time.Until(deadline)
 				return []byte(`[{"Name":"default","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`), nil, nil
 			})
-			cfg := pruneConfig{timeout: tc.overall, queryTimeout: tc.query, runner: r}
+			cfg := pruneConfig{timeout: tc.overall, runner: r}
 			if _, _, err := cfg.prepareTarget(context.Background(), dockerEngine{}, ""); err != nil {
 				t.Fatal(err)
 			}
@@ -474,21 +473,14 @@ func TestPruneContextLookupBudgetsKeepFailurePolicy(t *testing.T) {
 		<-ctx.Done()
 		return nil, nil, ctx.Err()
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	cfg := pruneConfig{timeout: time.Second, queryTimeout: time.Millisecond, runner: r}
-	if _, _, err := cfg.prepareTarget(ctx, dockerEngine{}, ""); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("explicit budget=%v", err)
-	}
+	cfg := pruneConfig{timeout: time.Millisecond, runner: r}
 	canceled, stop := context.WithCancel(context.Background())
 	stop()
-	cfg.queryTimeout = 0
 	if _, _, err := cfg.prepareTarget(canceled, dockerEngine{}, ""); !errors.Is(err, context.Canceled) {
 		t.Fatalf("parent cancellation=%v", err)
 	}
-	cfg.runner = timeoutTestRunner(func(context.Context, ...string) ([]byte, []byte, error) { return nil, nil, context.DeadlineExceeded })
 	if _, _, err := cfg.prepareTarget(context.Background(), dockerEngine{}, ""); err != nil {
-		t.Fatalf("implicit unavailable lookup=%v", err)
+		t.Fatalf("implicit context lookup timeout=%v", err)
 	}
 }
 

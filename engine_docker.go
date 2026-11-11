@@ -942,6 +942,13 @@ func (e *dockerContextUnavailableError) Error() string {
 
 func (e *dockerContextUnavailableError) Unwrap() error { return e.cause }
 
+type dockerContextInspectError struct {
+	*ConfigError
+	cause error
+}
+
+func (e *dockerContextInspectError) Unwrap() []error { return []error{e.ConfigError, e.cause} }
+
 func isDockerContextUnavailable(err error, stderr string) bool {
 	if err == nil {
 		return false
@@ -987,14 +994,16 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 		if isDockerContextUnavailable(err, errMsg) {
 			return "", "", &dockerContextUnavailableError{detail: errMsg, cause: err}
 		}
-		if contextName != "" {
-			return "", "", fmt.Errorf("%w: %w", &ConfigError{
-				Backend: "docker",
-				Option:  "WithContext",
-				Detail:  fmt.Sprintf("unknown Docker context %q: %s", contextName, errMsg),
-			}, err)
+		configErr := &ConfigError{
+			Backend: "docker",
+			Option:  "context",
+			Detail:  fmt.Sprintf("failed to inspect active Docker context: %s", errMsg),
 		}
-		return "", "", fmt.Errorf("%w: %w", &ConfigError{Backend: "docker", Option: "context", Detail: fmt.Sprintf("failed to inspect active Docker context: %s", errMsg)}, err)
+		if contextName != "" {
+			configErr.Option = "WithContext"
+			configErr.Detail = fmt.Sprintf("unknown Docker context %q: %s", contextName, errMsg)
+		}
+		return "", "", &dockerContextInspectError{ConfigError: configErr, cause: err}
 	}
 
 	if len(strings.TrimSpace(string(stdout))) == 0 {

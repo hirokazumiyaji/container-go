@@ -212,10 +212,8 @@ func (c *config) diagnosticBoundaryValues() []string {
 		return nil
 	}
 	var values []string
-	for _, raw := range []string{de.effectiveHost()} {
-		if endpoint, err := parseDockerEndpoint(raw); err == nil && endpoint.isRemote {
-			values = append(values, dockerEndpointBoundaryValues(endpoint)...)
-		}
+	if endpoint, err := parseDockerEndpoint(de.effectiveHost()); err == nil && endpoint.isRemote {
+		values = append(values, dockerEndpointBoundaryValues(endpoint)...)
 	}
 	if de.resolvedTarget != nil && de.resolvedTarget.isRemote {
 		values = append(values, dockerEndpointBoundaryValues(*de.resolvedTarget)...)

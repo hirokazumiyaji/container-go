@@ -81,13 +81,12 @@ func StrictCleanup(tb testing.TB, ctr *Container) {
 type PruneOption func(*pruneConfig) error
 
 type pruneConfig struct {
-	timeout      time.Duration
-	queryTimeout time.Duration
-	parallelism  int
-	runner       Runner
-	binary       string
-	olderThan    time.Duration
-	now          func() time.Time
+	timeout     time.Duration
+	parallelism int
+	runner      Runner
+	binary      string
+	olderThan   time.Duration
+	now         func() time.Time
 }
 
 const defaultPruneParallelism = 4
@@ -573,13 +572,11 @@ func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *
 	if _, ok := eng.(dockerEngine); ok {
 		for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"} {
 			if value, ok := runnerEnvLookup(runner, key); ok && value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) && (key != "DOCKER_CONTEXT" || value != "default") {
+				values = append(values, value)
 				if key == "DOCKER_HOST" {
-					values = append(values, value)
 					if endpoint, err := parseDockerEndpoint(value); err == nil && endpoint.isRemote {
 						boundaryValues = append(boundaryValues, dockerEndpointBoundaryValues(endpoint)...)
 					}
-				} else {
-					values = append(values, value)
 				}
 			}
 		}
@@ -600,17 +597,14 @@ func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup
 			de.host, de.explicitHost = host, true
 			de.explicitContext = false
 		}
-		timeout := cfg.queryTimeout
-		if timeout <= 0 {
-			timeout = queryTimeout
-		}
-		queryCtx, cancel := context.WithTimeout(ctx, min(cfg.timeout, timeout))
+		queryCtx, cancel := context.WithTimeout(ctx, min(cfg.timeout, queryTimeout))
 		defer cancel()
 		resolved, err := de.resolveTarget(queryCtx, runner)
 		if err != nil {
 			host, contextName, _, _ := de.targetSelection(runner)
+			implicitTarget := implicitContext && host == ""
 			var unavailable *dockerContextUnavailableError
-			if ctx.Err() == nil && (cfg.queryTimeout <= 0 || queryCtx.Err() == nil) && host == "" && (contextName == "" || errors.As(err, &unavailable)) && !de.explicitHost && implicitContext {
+			if ctx.Err() == nil && implicitTarget && (contextName == "" || errors.As(err, &unavailable)) {
 				return runner, eng, nil
 			}
 			return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))

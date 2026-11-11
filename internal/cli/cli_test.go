@@ -1474,3 +1474,21 @@ func TestExecRunnerIdentityDefaultsToBinary(t *testing.T) {
 		t.Fatalf("identity = %q, want container", got)
 	}
 }
+
+func TestCommandErrorPreservesWaitDelayContext(t *testing.T) {
+	err := commandError(context.Background(), "backend-wrapper", "docker", []string{"inspect", "target"}, nil, []byte(strings.Repeat("secret-fragment", maxStderr)), exec.ErrWaitDelay)
+	if !errors.Is(err, exec.ErrWaitDelay) || err.Error() != "backend-wrapper inspect target: "+exec.ErrWaitDelay.Error() {
+		t.Fatalf("error = %v, want safe command context and WaitDelay only", err)
+	}
+}
+
+func TestCommandErrorCancellationRaceDoesNotDuplicateDiagnostic(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 7")
+	exitErr := cmd.Run()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := commandError(ctx, "docker", "docker", []string{"inspect", "target"}, nil, []byte("actionable diagnostic"), exitErr)
+	if !errors.Is(err, context.Canceled) || strings.Count(err.Error(), "docker inspect target") != 1 || strings.Count(err.Error(), "actionable diagnostic") != 1 {
+		t.Fatalf("duplicated cancellation diagnostic: %v", err)
+	}
+}

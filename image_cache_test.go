@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -632,5 +633,32 @@ func TestImageCacheSurvivesConcurrentRuns(t *testing.T) {
 	}
 	for range workers {
 		<-done
+	}
+}
+
+func TestImageCacheEvictsEarliestExpiry(t *testing.T) {
+	c := newImageCache(time.Hour)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	for i := range imageCacheLimit {
+		c.remember(dockerEngine{}, fmt.Sprintf("image:%d", i), "")
+		now = now.Add(time.Second)
+	}
+	c.remember(dockerEngine{}, "image:0", "")
+	if c.size() != imageCacheLimit || !c.seen(dockerEngine{}, "image:1", "") {
+		t.Fatal("refreshing an existing entry evicted another image")
+	}
+	now = now.Add(time.Second)
+	c.remember(dockerEngine{}, "new:1", "")
+	if got := c.size(); got != imageCacheLimit {
+		t.Fatalf("size = %d, want %d", got, imageCacheLimit)
+	}
+	if c.seen(dockerEngine{}, "image:1", "") {
+		t.Error("earliest-expiring image survived eviction")
+	}
+	for _, image := range []string{"image:0", "image:2", "new:1"} {
+		if !c.seen(dockerEngine{}, image, "") {
+			t.Errorf("fresh image %q missing", image)
+		}
 	}
 }

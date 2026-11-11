@@ -265,3 +265,67 @@ func (r *errorAfterReader) Read(p []byte) (int, error) {
 	}
 	return 0, r.err
 }
+
+func TestComposedRedactorsProtectTextAndStreams(t *testing.T) {
+	base := NewHashedContextRedactor("xy", "abcdef")
+	redactors := []*Redactor{
+		base.WithValues("abcdeg"),
+		base.Compose(NewHashedRedactor("abcdeg")),
+		NewHashedRedactor("xy", "abcdef", "abcdeg").WithForce(),
+	}
+	const input = "(xy) abcdef abcdeg"
+	const want = "([REDACTED]) [REDACTED] [REDACTED]"
+	for _, r := range redactors {
+		for range 2 {
+			if got := r.Text(input); got != want {
+				t.Fatalf("Text() = %q, want %q", got, want)
+			}
+			stream := newStreamProcessor(r, 1024, nil)
+			for _, chunk := range []string{"(x", "y) abc", "def abcd", "eg"} {
+				if err := stream.write([]byte(chunk)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := stream.close(); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(stream.output); got != want {
+				t.Fatalf("stream = %q, want %q", got, want)
+			}
+		}
+	}
+	if err := base.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := base.Text(input); got != input {
+		t.Fatalf("closed Text() = %q, want %q", got, input)
+	}
+}
+
+func TestStreamRetainsExplicitValuesAfterSourceClose(t *testing.T) {
+	const secret = "explicit-stream-context"
+	r := NewHashedContextRedactor(secret)
+	stream := newStreamProcessor(r, 0, nil)
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.write([]byte(secret)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(stream.output); got != Redacted {
+		t.Fatalf("stream = %q, want %q", got, Redacted)
+	}
+}
+
+func TestHashedWithValuesDoesNotRetainPlaintext(t *testing.T) {
+	r := NewHashedContextRedactor("first").WithValues("second")
+	if len(r.source) != 0 || len(r.values) != 0 {
+		t.Fatal("hashed composition retained plaintext")
+	}
+	if got := r.Text("first second"); got != Redacted+" "+Redacted {
+		t.Fatalf("Text = %q", got)
+	}
+}

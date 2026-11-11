@@ -58,6 +58,7 @@ type Redactor struct {
 	source []string
 	values []string
 	hashes []valueHash
+	index  *valueHashIndex
 	force  bool
 }
 
@@ -92,6 +93,7 @@ func newRedactor(values []string, expand, force bool) *Redactor {
 		r.values = append([]string(nil), r.source...)
 	}
 	r.hashes = hashValues(r.values)
+	r.index = newValueHashIndex(r.hashes)
 	return r
 }
 
@@ -163,8 +165,7 @@ func (r *Redactor) WithValues(values ...string) *Redactor {
 		return NewRedactor(values...)
 	}
 	combined := newRedactor(values, true, r.force)
-	combined.hashes = mergeValueHashes(r.force, r.hashes, combined.hashes)
-	return combined
+	return newHashRedactor(mergeValueHashes(r.force, r.hashes, combined.hashes), r.force)
 }
 
 // WithBoundaryValues adds context values whose token boundaries remain significant
@@ -187,9 +188,7 @@ func (r *Redactor) WithForce() *Redactor {
 	if r == nil {
 		return NewContextRedactor()
 	}
-	combined := newRedactor(nil, true, true)
-	combined.hashes = mergeValueHashes(true, r.hashes)
-	return combined
+	return newHashRedactor(mergeValueHashes(true, r.hashes), true)
 }
 
 // Compose combines redactors without mutating any of them.
@@ -209,9 +208,11 @@ func (r *Redactor) Compose(others ...*Redactor) *Redactor {
 			hashes = append(hashes, other.hashes...)
 		}
 	}
-	combined := newRedactor(nil, true, force)
-	combined.hashes = mergeValueHashes(force, hashes)
-	return combined
+	return newHashRedactor(mergeValueHashes(force, hashes), force)
+}
+
+func newHashRedactor(hashes []valueHash, force bool) *Redactor {
+	return &Redactor{hashes: hashes, index: newValueHashIndex(hashes), force: force}
 }
 
 // ComposeRedactors combines redactors in argument order.
@@ -248,11 +249,7 @@ func (r *Redactor) Text(s string) string {
 	s = redactURLCredentials(s)
 	s = redactSecretShaped(s)
 	if len(r.hashes) > 0 {
-		s = replaceHashedValues(s, r.hashes, r.force)
-	} else {
-		for _, value := range r.values {
-			s = replaceKnownValue(s, value, r.force)
-		}
+		s = r.index.replace(s, r.force)
 	}
 	return Sanitize(s)
 }
@@ -895,42 +892,6 @@ func redactLabel(value string) string {
 		return Redacted
 	}
 	return key + "=" + Redacted
-}
-
-func replaceKnownValue(s, value string, force bool) string {
-	if !usefulValue(value) || value == Redacted || (!force && len(value) < minimumTokenLength) {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for start := 0; start < len(s); {
-		i := strings.Index(s[start:], value)
-		if i < 0 {
-			b.WriteString(s[start:])
-			break
-		}
-		i += start
-		end := i + len(value)
-		if marker := strings.Index(s[start:], Redacted); marker >= 0 {
-			marker += start
-			if i < marker+len(Redacted) && end > marker {
-				b.WriteString(s[start : marker+len(Redacted)])
-				start = marker + len(Redacted)
-				continue
-			}
-		}
-		boundarySafe := (!wordByte(value[0]) || i == 0 || !wordByte(s[i-1])) &&
-			(!wordByte(value[len(value)-1]) || end == len(s) || !wordByte(s[end]))
-		if force || boundarySafe {
-			b.WriteString(s[start:i])
-			b.WriteString(Redacted)
-			start = end
-		} else {
-			b.WriteString(s[start : i+1])
-			start = i + 1
-		}
-	}
-	return b.String()
 }
 
 func wordByte(b byte) bool {

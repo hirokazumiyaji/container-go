@@ -37,8 +37,7 @@ type streamProcessor struct {
 	valueCandidates   []streamValueCandidate
 	valueMatches      []streamValueMatch
 	valueOverflow     bool
-	byShortPrefix     map[uint32][]valueHash
-	byLongPrefix      map[uint32][]valueHash
+	index             *valueHashIndex
 	limit             int
 	output            []byte
 	done              bool
@@ -63,21 +62,18 @@ func newStreamProcessor(r *Redactor, limit int, emit func([]byte)) *streamProces
 	if r == nil {
 		r = NewRedactor()
 	}
+	r = &Redactor{hashes: r.hashes, index: r.index, force: r.force}
+	if r.index == nil {
+		r.index = newValueHashIndex(r.hashes)
+	}
+	r.index.initialize()
 	overlap := r.streamOverlap()
 	p := &streamProcessor{
-		redactor:      r,
-		overlap:       overlap,
-		limit:         limit,
-		emit:          emit,
-		byShortPrefix: make(map[uint32][]valueHash),
-		byLongPrefix:  make(map[uint32][]valueHash),
-	}
-	for _, entry := range r.hashes {
-		if entry.short {
-			p.byShortPrefix[entry.prefix] = append(p.byShortPrefix[entry.prefix], entry)
-		} else {
-			p.byLongPrefix[entry.prefix] = append(p.byLongPrefix[entry.prefix], entry)
-		}
+		redactor: r,
+		overlap:  overlap,
+		limit:    limit,
+		emit:     emit,
+		index:    r.index,
 	}
 	if overlap > MaxStreamOverlap {
 		p.configErr = errStreamValueTooLarge
@@ -90,17 +86,8 @@ func (r *Redactor) streamOverlap() int {
 	// Keep a full bounded structural window by default. Explicit values and
 	// their encodings raise the requirement rather than being silently capped.
 	overlap := MaxStreamOverlap
-	if r != nil {
-		for _, entry := range r.hashes {
-			if entry.length > overlap {
-				overlap = entry.length
-			}
-		}
-		for _, value := range r.values {
-			if len(value) > overlap {
-				overlap = len(value)
-			}
-		}
+	for _, entry := range r.hashes {
+		overlap = max(overlap, entry.length)
 	}
 	return overlap
 }
@@ -108,7 +95,13 @@ func (r *Redactor) streamOverlap() int {
 // StreamValueFits reports whether a value and every common escaped form fit in
 // the bounded streaming redaction window.
 func StreamValueFits(value string) bool {
-	return NewRedactor(value).streamOverlap() <= MaxStreamOverlap
+	r := &Redactor{source: []string{value}}
+	for _, expanded := range r.expandedValues() {
+		if len(expanded) > MaxStreamOverlap {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *streamProcessor) write(input []byte) error {
@@ -190,9 +183,10 @@ func (p *streamProcessor) scanValueMatches() {
 	}
 	for position := p.nextShortScan; position < pendingEnd; position++ {
 		local := int(position - p.pendingStart)
-		entries := p.byShortPrefix[shortPrefixAtBytes(p.pending, local)]
-		for _, entry := range entries {
-			if (!p.redactor.force && !entry.boundary && entry.length < minimumTokenLength) || ((!p.redactor.force || entry.boundary) && local > 0 && entry.firstWord && wordByte(p.pending[local-1])) {
+		entries := p.index.byShort[shortPrefixAtBytes(p.pending, local)]
+		for _, at := range entries {
+			entry := p.index.hashes[at]
+			if !p.redactor.force && (entry.length < minimumTokenLength || local > 0 && entry.firstWord && wordByte(p.pending[local-1])) {
 				continue
 			}
 			p.valueCandidates = append(p.valueCandidates, streamValueCandidate{start: position, value: entry})
@@ -206,9 +200,10 @@ func (p *streamProcessor) scanValueMatches() {
 	}
 	for position := p.nextValueScan; position < longEnd; position++ {
 		local := int(position - p.pendingStart)
-		entries := p.byLongPrefix[valuePrefixAtBytes(p.pending, local)]
-		for _, entry := range entries {
-			if (!p.redactor.force || entry.boundary) && local > 0 && entry.firstWord && wordByte(p.pending[local-1]) {
+		entries := p.index.byPrefix[valuePrefixAtBytes(p.pending, local)]
+		for _, at := range entries {
+			entry := p.index.hashes[at]
+			if !p.redactor.force && local > 0 && entry.firstWord && wordByte(p.pending[local-1]) {
 				continue
 			}
 			p.valueCandidates = append(p.valueCandidates, streamValueCandidate{start: position, value: entry})
@@ -337,10 +332,10 @@ func fingerprintBytes(value []byte) uint32 {
 }
 
 func hashMatchesAtBytes(s []byte, start int, entry valueHash, force bool) bool {
-	if entry.length > len(s)-start || (!force && !entry.boundary && entry.length < minimumTokenLength) {
+	if entry.length > len(s)-start || (!force && entry.length < minimumTokenLength) {
 		return false
 	}
-	if !force || entry.boundary {
+	if !force {
 		if entry.firstWord && start > 0 && wordByte(s[start-1]) {
 			return false
 		}
@@ -757,54 +752,14 @@ func (p *streamProcessor) close() error {
 	return nil
 }
 
-// StreamRedactor incrementally applies a Redactor while retaining at most a
-// bounded overlap. It is useful for command stderr, where the safe copy must
-// be capped but a secret may be split between writes.
-type StreamRedactor struct {
-	processor *streamProcessor
-}
-
-// NewStreamRedactor returns an incremental redactor whose String method
-// contains at most limit safe bytes. Write and Close return an error before
-// emitting output when an explicit value or encoding exceeds the bounded
-// safety window. A non-positive limit means unbounded output and should only
-// be used with a downstream bounded sink.
-func (r *Redactor) NewStream(limit int) *StreamRedactor {
-	return &StreamRedactor{processor: newStreamProcessor(r, limit, nil)}
-}
-
-func (s *StreamRedactor) Write(p []byte) (int, error) {
-	if s == nil || s.processor == nil {
-		return len(p), nil
-	}
-	if err := s.processor.write(p); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (s *StreamRedactor) Close() error {
-	if s != nil && s.processor != nil {
-		return s.processor.close()
-	}
-	return nil
-}
-
-func (s *StreamRedactor) String() string {
-	if s == nil || s.processor == nil {
-		return ""
-	}
-	return string(s.processor.output)
-}
-
 // RedactBounded applies a redactor to a string without first creating a
 // second full-size redacted copy. The result is capped after redaction.
 func (r *Redactor) RedactBounded(value string, limit int) string {
-	stream := r.NewStream(limit)
-	if stream.processor.configErr == nil {
-		_ = stream.processor.writeString(value)
-		_ = stream.processor.close()
-		return stream.String()
+	processor := newStreamProcessor(r, limit, nil)
+	if processor.configErr == nil {
+		_ = processor.writeString(value)
+		_ = processor.close()
+		return string(processor.output)
 	}
 	// A complete value can be redacted safely without streaming. Public
 	// callers of this convenience method have no error return, so redact
@@ -915,5 +870,4 @@ func (r *Redactor) RedactTail(src io.Reader, limit int) (string, error) {
 	return tail.String(), err
 }
 
-var _ io.Writer = (*StreamRedactor)(nil)
 var _ io.Writer = (*TailBuffer)(nil)

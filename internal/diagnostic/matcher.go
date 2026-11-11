@@ -3,6 +3,7 @@ package diagnostic
 import (
 	"crypto/sha256"
 	"strings"
+	"sync"
 )
 
 type valueHash struct {
@@ -131,20 +132,43 @@ func longestHashMatch(s string, start int, entries []valueHash, force bool) int 
 	return matched
 }
 
-func replaceHashedValues(s string, hashes []valueHash, force bool) string {
-	if len(hashes) == 0 || s == "" {
-		return s
-	}
-	byPrefix := make(map[uint32][]valueHash, len(hashes))
-	byShort := make(map[uint32][]valueHash)
-	for _, entry := range hashes {
-		if entry.short {
-			byShort[entry.prefix] = append(byShort[entry.prefix], entry)
-		} else {
-			byPrefix[entry.prefix] = append(byPrefix[entry.prefix], entry)
+type valueHashIndex struct {
+	hashes   []valueHash
+	once     sync.Once
+	byPrefix map[uint32][]int
+	byShort  map[uint32][]int
+}
+
+func newValueHashIndex(hashes []valueHash) *valueHashIndex {
+	return &valueHashIndex{hashes: hashes}
+}
+
+func (index *valueHashIndex) initialize() {
+	index.once.Do(func() {
+		index.byPrefix = make(map[uint32][]int)
+		index.byShort = make(map[uint32][]int)
+		for i, entry := range index.hashes {
+			if entry.short {
+				index.byShort[entry.prefix] = append(index.byShort[entry.prefix], i)
+			} else {
+				index.byPrefix[entry.prefix] = append(index.byPrefix[entry.prefix], i)
+			}
+		}
+	})
+}
+
+func (index *valueHashIndex) longestMatch(s string, start int, entries []int, force bool) int {
+	matched := 0
+	for _, i := range entries {
+		if n := longestHashMatch(s, start, index.hashes[i:i+1], force); n > matched {
+			matched = n
 		}
 	}
+	return matched
+}
 
+func (index *valueHashIndex) replace(s string, force bool) string {
+	index.initialize()
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); {
@@ -153,9 +177,9 @@ func replaceHashedValues(s string, hashes []valueHash, force bool) string {
 			i += len(Redacted)
 			continue
 		}
-		matched := longestHashMatch(s, i, byShort[shortPrefixAt(s, i)], force)
+		matched := index.longestMatch(s, i, index.byShort[shortPrefixAt(s, i)], force)
 		if len(s)-i >= 4 {
-			if n := longestHashMatch(s, i, byPrefix[valuePrefixAt(s, i)], force); n > matched {
+			if n := index.longestMatch(s, i, index.byPrefix[valuePrefixAt(s, i)], force); n > matched {
 				matched = n
 			}
 		}
@@ -208,6 +232,7 @@ func (r *Redactor) Close() error {
 	r.source = nil
 	r.values = nil
 	r.hashes = nil
+	r.index = nil
 	r.force = false
 	return nil
 }

@@ -1045,6 +1045,16 @@ func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
 }
 ```
 
+`WithPruneQueryTimeout(d)` caps listing and each candidate's lock, verification,
+and deletion. It overrides the Client default from `WithClientQueryTimeout(d)`.
+The cap is 30 seconds if neither option is set. `WithPruneTimeout(d)` caps the
+complete prune. The Client query timeout also caps construction and short
+inspection queries, and `WithQueryTimeout(d)` overrides it for an individual Run.
+Payload transfers, snapshot logs, lifecycle changes, and verification retries use
+the caller deadline when set and the query timeout otherwise. Image fetches use
+`WithPullTimeout`.
+`Cleanup` and `StrictCleanup` retain their independent 30-second teardown budget.
+
 `container.WithPruneOlderThan(d)` narrows that selection to candidates the
 backend reports as created before now-d. It is useful for a sweep on a
 shared or remote daemon because a concurrent job's recently stopped

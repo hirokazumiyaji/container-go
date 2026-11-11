@@ -411,6 +411,15 @@ func (c *config) ensureImage(ctx context.Context, image string) error {
 	return err
 }
 
+type imageQueryDeadlineError struct{ error }
+
+func (e imageQueryDeadlineError) Unwrap() error { return e.error }
+
+func isImageQueryDeadline(err error) bool {
+	var queryErr imageQueryDeadlineError
+	return errors.As(err, &queryErr)
+}
+
 func (c *config) inspectImage(ctx context.Context, image, platform string) (imageIdentity, bool, error) {
 	return inspectImage(ctx, c.runner, c.eng, image, platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 }
@@ -439,7 +448,7 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 				return imageIdentity{}, err
 			}
 		}
-		resolveKey := flightKey(c.eng, image, flightPull, platform) + "\x00resolve"
+		resolveKey := flightKey(c.eng, image, flightPull, platform) + "\x00resolve" + c.operationBudgetKey()
 		if c.allowMutableImageTag {
 			resolveKey += "\x00allow-mutable-tag"
 		}
@@ -460,36 +469,44 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 			// default fail-closed caller (or vice versa).
 			key += "\x00allow-mutable-tag"
 		}
-		resolved, err := imageResolutionFlights.do(ctx, key, func() (imageIdentity, error) {
-			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), c.effectiveRunTimeout())
-			defer cancel()
-			identity, exists, err := c.inspectImage(execCtx, image, platform)
+		for {
+			resolved, leader, err := imageResolutionFlights.doWithLeader(ctx, key, func() (imageIdentity, error) {
+				execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), c.effectiveRunTimeout())
+				defer cancel()
+				identity, exists, err := c.inspectImage(execCtx, image, platform)
+				if err != nil {
+					return imageIdentity{}, err
+				}
+				if exists {
+					// A record without a complete requested variant is not
+					// proof that PullMissing already has the requested
+					// platform. Pull explicitly when that policy permits;
+					// PullNever still returns the typed not-local error below.
+					if identity.notLocal && c.pullPolicy == PullMissing {
+						if err := c.pullImage(execCtx, image, platform); err != nil {
+							return imageIdentity{}, err
+						}
+						return c.resolveImage(execCtx, image, platform)
+					}
+					return c.resolveInspectedImage(execCtx, image, platform, identity)
+				}
+				if err := c.pullImage(execCtx, image, platform); err != nil {
+					return imageIdentity{}, err
+				}
+				return c.resolveImage(execCtx, image, platform)
+			})
+			if ctx.Err() != nil {
+				return imageIdentity{}, ctx.Err()
+			}
+			if !leader && isImageQueryDeadline(err) && retryableInspectError(ctx, err) {
+				continue
+			}
 			if err != nil {
 				return imageIdentity{}, err
 			}
-			if exists {
-				// A record without a complete requested variant is not
-				// proof that PullMissing already has the requested
-				// platform. Pull explicitly when that policy permits;
-				// PullNever still returns the typed not-local error below.
-				if identity.notLocal && c.pullPolicy == PullMissing {
-					if err := c.pullImage(execCtx, image, platform); err != nil {
-						return imageIdentity{}, err
-					}
-					return c.resolveImage(execCtx, image, platform)
-				}
-				return c.resolveInspectedImage(execCtx, image, platform, identity)
-			}
-			if err := c.pullImage(execCtx, image, platform); err != nil {
-				return imageIdentity{}, err
-			}
-			return c.resolveImage(execCtx, image, platform)
-		})
-		if err != nil {
-			return imageIdentity{}, err
+			c.imageCache.rememberIdentity(c.eng, image, platform, resolved)
+			return resolved, nil
 		}
-		c.imageCache.rememberIdentity(c.eng, image, platform, resolved)
-		return resolved, nil
 	}
 }
 
@@ -823,10 +840,13 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 	if qTimeout <= 0 {
 		qTimeout = queryTimeout
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
+	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		if ctx.Err() == nil && errors.Is(qCtx.Err(), context.DeadlineExceeded) && !cli.IsProbeConfigurationError(contextErr) {
+			contextErr = imageQueryDeadlineError{contextErr}
+		}
 		return imageIdentity{}, false, contextErr
 	}
 	if err != nil {
@@ -834,9 +854,6 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 			return imageIdentity{}, false, nil
 		}
 		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(eng.imageInspectArgs(image, platform)), image)
-	}
-	if contextErr := commandContextError(qCtx, nil); contextErr != nil {
-		return imageIdentity{}, false, contextErr
 	}
 	if parser, ok := eng.(imageIdentityParser); ok {
 		identity, exists := parser.parseImageIdentity(stdout, image, platform)
@@ -861,4 +878,8 @@ func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform st
 		return classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(args), image)
 	}
 	return nil
+}
+
+func (c *config) operationBudgetKey() string {
+	return fmt.Sprintf("\x00query=%d;run=%d;probe=%d", c.effectiveQueryTimeout(), c.effectiveRunTimeout(), c.effectiveProbeTimeout())
 }

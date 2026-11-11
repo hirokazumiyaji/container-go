@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -15,8 +16,9 @@ import (
 // Prune, PruneReuseGroup) consistently target the configured daemon and backend,
 // even if process-level environment variables (such as DOCKER_HOST) change later.
 type Client struct {
-	eng    engine
-	runner cli.Runner
+	queryTimeout time.Duration
+	eng          engine
+	runner       cli.Runner
 	// dockerMeta is the Docker metadata cache shared by every operation and
 	// handle this Client creates. It is keyed by the resolved target, so it
 	// never answers for another daemon.
@@ -27,6 +29,7 @@ type Client struct {
 type ClientOption func(*clientConfig) error
 
 type clientConfig struct {
+	queryTimeout    time.Duration
 	backend         string
 	binary          string
 	dockerHost      *string
@@ -157,6 +160,24 @@ func WithClientPlatform(platform string) ClientOption {
 	}
 }
 
+// WithClientQueryTimeout sets the default timeout for backend queries and control
+// operations during construction, Run, Prune, and on containers it creates.
+// Short inspection queries always respect this limit. Payload transfers, logs,
+// lifecycle changes, and verification retries preserve an existing caller deadline
+// and use this value only when the caller has none. Pull fetches use WithPullTimeout;
+// Cleanup and StrictCleanup retain their separate 30-second total teardown budget.
+// Client target discovery is best-effort without an explicit query timeout.
+// WithQueryTimeout and WithPruneQueryTimeout override it for individual operations.
+func WithClientQueryTimeout(d time.Duration) ClientOption {
+	return func(c *clientConfig) error {
+		if d <= 0 {
+			return validationErrorf("WithClientQueryTimeout", d, "timeout must be positive")
+		}
+		c.queryTimeout = d
+		return nil
+	}
+}
+
 // WithClientRunner injects a custom cli.Runner.
 func WithClientRunner(runner cli.Runner) ClientOption {
 	return func(c *clientConfig) error {
@@ -268,11 +289,18 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 	}
 
 	if de, ok := eng.(dockerEngine); ok {
-		resolved, err := de.resolveTarget(ctx, runner)
+		queryCtx := ctx
+		queryCancel := func() {}
+		if cfg.queryTimeout > 0 {
+			queryCtx, queryCancel = context.WithTimeout(ctx, cfg.queryTimeout)
+		}
+		resolved, err := de.resolveTarget(queryCtx, runner)
+		queryErr := queryCtx.Err()
+		queryCancel()
 		if err != nil {
-			// A cancellation or deadline belongs to this construction even
-			// when the Client has no explicit target to fail against.
-			if ctx.Err() != nil {
+			// Caller cancellation and explicitly configured query budgets are
+			// terminal; implicit target discovery remains best-effort by default.
+			if ctx.Err() != nil || cfg.queryTimeout > 0 && queryErr != nil {
 				return nil, safePublicError(err, cfg.targetDiagnosticValues(de, runner)...)
 			}
 			if de.effectiveContext() != "" || de.effectiveHost() != "" {
@@ -297,9 +325,10 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 	}
 
 	return &Client{
-		eng:        eng,
-		runner:     runner,
-		dockerMeta: newDockerMetadataCache(dockerMetadataTTL),
+		queryTimeout: cfg.queryTimeout,
+		eng:          eng,
+		runner:       runner,
+		dockerMeta:   newDockerMetadataCache(dockerMetadataTTL),
 	}, nil
 }
 
@@ -310,6 +339,9 @@ func (c *Client) Run(ctx context.Context, image string, opts ...Option) (*Contai
 		withRunner(cloneRunner(c.runner)),
 		withClientPinned(),
 		withClientDockerMeta(c.dockerMeta),
+	}
+	if c.queryTimeout > 0 {
+		clientOpts = append(clientOpts, WithQueryTimeout(c.queryTimeout))
 	}
 	allOpts := append(clientOpts, opts...)
 	return Run(ctx, image, allOpts...)
@@ -352,7 +384,7 @@ func (c *Client) Pull(ctx context.Context, image string, opts ...PullOption) err
 // target. PruneOption values such as WithPruneTimeout and WithPruneOlderThan
 // apply to this prune.
 func (c *Client) Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
-	cfg, err := parsePruneOptions("Client.Prune", opts)
+	cfg, err := c.parsePrune("Client.Prune", opts)
 	if err != nil {
 		return nil, safePublicError(err)
 	}
@@ -366,7 +398,7 @@ func (c *Client) PruneReuseGroup(ctx context.Context, group string, opts ...Prun
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err
 	}
-	cfg, err := parsePruneOptions("Client.PruneReuseGroup", opts)
+	cfg, err := c.parsePrune("Client.PruneReuseGroup", opts)
 	if err != nil {
 		return nil, safePublicError(err)
 	}
@@ -427,4 +459,15 @@ func (c *Client) IsRemote() bool {
 		return c.eng.isRemote()
 	}
 	return false
+}
+
+func (c *Client) parsePrune(name string, opts []PruneOption) (pruneConfig, error) {
+	cfg, err := parsePruneOptions(name, opts)
+	if err != nil {
+		return cfg, err
+	}
+	if cfg.queryTimeout == 0 {
+		cfg.queryTimeout = c.queryTimeout
+	}
+	return cfg, nil
 }

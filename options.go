@@ -373,9 +373,11 @@ func WithRunTimeout(d time.Duration) Option {
 	}
 }
 
-// WithQueryTimeout sets the timeout for backend queries and control operations
-// (such as inspect, stop, state, and copy). A positive d overrides the default
-// 30-second timeout. Non-positive durations are rejected.
+// WithQueryTimeout sets the limit for short backend inspection queries and the
+// default budget for other operations. Payload transfers, logs, lifecycle changes,
+// and verification retries preserve an existing caller deadline. A positive d
+// overrides the default 30-second value.
+// Non-positive durations are rejected.
 func WithQueryTimeout(d time.Duration) Option {
 	return func(c *config) error {
 		if d <= 0 {

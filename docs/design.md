@@ -1175,6 +1175,24 @@ a former numeric PGID is never signaled after the child is reaped or when
 the stopped-state check fails. Windows terminates only the direct child
 through the retained process handle. Descendant cleanup is not claimed.
 
+## Process exit codes
+
+`Container.ExitCode(ctx)` requires `StateStopped` and a backend-reported exit
+code. A non-stopped container returns `ErrContainerNotStopped`, which also
+matches `ErrExitCodeUnavailable`. `Wait(ctx)` waits for `StateStopped` and
+returns `ErrExitCodeUnavailable` if the backend omitted the code. Callers that
+previously treated `0, nil` as success must handle these errors.
+
+`InspectInfo.ExitCode()` retains the backend value, defaulting to zero when
+omitted. Snapshot callers must check `State()` and `ExitCodeReported()` before
+interpreting zero as a successful process exit.
+
+Apple's optional `status.exitCode` is absent from the captured CLI 1.2.2 and
+1.3.0 fixtures. Actual process exit reporting has not been verified against a
+running Apple service; absent data returns an unavailable error. Docker `dead`
+containers retain their reported process exit code, which does not establish
+that daemon teardown succeeded.
+
 ## Error handling
 
 Root and backend errors are discriminable with `errors.Is`/`errors.As`.

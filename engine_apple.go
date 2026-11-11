@@ -566,6 +566,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		if c.Status.ExitCode != nil {
 			info.exitCode = *c.Status.ExitCode
+			info.exitCodeReported = true
 		}
 		for _, p := range c.Configuration.PublishedPorts {
 			info.bound = append(info.bound, boundPort{

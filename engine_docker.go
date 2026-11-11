@@ -1316,7 +1316,7 @@ type dockerInspect struct {
 	// network or volume inspect objects.
 	State *struct {
 		Status     string `json:"Status"`
-		ExitCode   int    `json:"ExitCode"`
+		ExitCode   *int   `json:"ExitCode"`
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
 		// Health is null when the image defines no HEALTHCHECK.
@@ -1485,7 +1485,10 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	info.runOptions.extraHosts = parseDockerExtraHosts(c.HostConfig.ExtraHosts)
 	info.createdAt = parseInspectTime(c.Created)
 	if c.State != nil {
-		info.exitCode = c.State.ExitCode
+		if c.State.ExitCode != nil {
+			info.exitCode = *c.State.ExitCode
+			info.exitCodeReported = true
+		}
 		info.startedAt = parseInspectTime(c.State.StartedAt)
 		info.finishedAt = parseInspectTime(c.State.FinishedAt)
 		if c.State.Health != nil {

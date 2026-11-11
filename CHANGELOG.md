@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ErrExitCodeUnavailable`, `ErrContainerNotStopped`, and `InspectInfo.ExitCodeReported`
+  distinguish unavailable process status from a reported zero exit code.
 - Add `WithClientQueryTimeout` for Client construction, Run queries, container
   control operations, and prune defaults, and `WithPruneQueryTimeout` for an
   individual prune's listing and candidate budgets.
@@ -30,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
+  an exit code. `ExitCode` also rejects containers that have not stopped. Callers
+  relying on `0, nil` must handle these errors; snapshot users must check
+  `ExitCodeReported` and `State` before interpreting `InspectInfo.ExitCode`.
+- Apple CLI versions that omit `status.exitCode` report `ErrExitCodeUnavailable`;
+  a stopped state alone does not establish whether the process succeeded.
 - Bound image-presence caches to 256 image/store/platform entries, evicting
   the earliest-expiring entry when inserting at capacity.
 - Build diagnostic value indexes once when first used and share them with

@@ -610,6 +610,21 @@ still propagate.
 specifications. Use `errors.Is(err, wait.ErrInvalidConfiguration)` to
 classify either configuration error without matching its message.
 
+## Process exit codes
+
+`Container.ExitCode(ctx)` returns a result only after the container stops and
+its backend reports an exit code. `ErrContainerNotStopped` identifies a process
+that has not stopped; it also matches `ErrExitCodeUnavailable`. `Wait(ctx)` waits
+for the stopped state and returns `ErrExitCodeUnavailable` if no code was reported.
+For inspect snapshots, check `State()` and `ExitCodeReported()` before treating
+`InspectInfo.ExitCode() == 0` as success.
+
+Apple's `status.exitCode` is optional and is absent from the captured CLI 1.2.2
+and 1.3.0 inspect fixtures. When omitted, a stopped state cannot establish process
+success, so `ExitCode` and `Wait` report `ErrExitCodeUnavailable`. Docker `dead`
+containers retain the daemon-reported process exit code; this result does not
+claim that daemon teardown succeeded.
+
 ## Exec timeout and long-running commands
 
 `Container.Exec` is a finite, buffered operation. When the caller's
@@ -1029,6 +1044,16 @@ func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
     }
 }
 ```
+
+`WithPruneQueryTimeout(d)` caps listing and each candidate's lock, verification,
+and deletion. It overrides the Client default from `WithClientQueryTimeout(d)`.
+The cap is 30 seconds if neither option is set. `WithPruneTimeout(d)` caps the
+complete prune. The Client query timeout also caps construction and short
+inspection queries, and `WithQueryTimeout(d)` overrides it for an individual Run.
+Payload transfers, snapshot logs, lifecycle changes, and verification retries use
+the caller deadline when set and the query timeout otherwise. Image fetches use
+`WithPullTimeout`.
+`Cleanup` and `StrictCleanup` retain their independent 30-second teardown budget.
 
 `container.WithPruneOlderThan(d)` narrows that selection to candidates the
 backend reports as created before now-d. It is useful for a sweep on a

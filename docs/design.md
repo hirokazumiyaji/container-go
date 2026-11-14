@@ -1147,9 +1147,12 @@ terminal CLI failure is delivered by `Read`; callers must read the stream
 to observe `CLIError` details. `Close` and context cancellation are
 intentional terminal paths and may instead produce EOF or a context error.
 
-**Apply operation-specific deadlines**. Most query-like operations
-(inspect, copy, snapshot logs, delete, and prune) as well as public `Exec` use a 30-second
-default when the caller has no deadline. `Run` and explicit image
+**Apply operation-specific deadlines**. Short inspection queries use a 30-second
+limit (or `WithQueryTimeout`) even inside a longer caller or Run budget. Prune
+also caps each candidate's lock, verification, and deletion with its query budget.
+Payload transfers, snapshot logs, lifecycle changes, deletion, and verification
+retry loops preserve an existing caller deadline and apply the query default only
+when no deadline exists. Public `Exec` uses a 30-second default without a caller deadline. `Run` and explicit image
 fetches use a 10-minute pull/create budget. A shared pull leader is
 intentionally detached from an individual caller's cancellation so one
 caller cannot abort the pull for other waiters; each waiter still stops
@@ -1157,9 +1160,18 @@ waiting when its own context is cancelled. `FollowLogs` passes the caller's cont
 without adding a library deadline; `Exec` applies a 30-second default when the caller
 has no deadline, and an `Exec` infrastructure check may use a bounded
 follow-up context. `WithExecTimeout(0)` is the explicit escape hatch for an intentional
-long-running command. When a library default is applied to an operation
-that is not a shared pull leader, an existing caller deadline is
-preserved. Timeout classification uses structured context,
+long-running command. An existing caller deadline remains authoritative for the overall operation;
+individual short inspection queries may have an earlier query limit. Client
+construction preserves best-effort implicit target discovery when no query timeout
+is explicitly configured; caller cancellation or an explicit query-budget expiry
+fails construction. Verification and reuse loops retry a per-query deadline only
+while their outer operation context remains live. `Wait` requires an overall caller
+deadline to retry individual query expiries. PullMissing keeps one shared fetch
+across execution budgets; joiners retry a leader deadline with their own budget.
+Reuse flights separate query, probe, run, and attach budgets as applicable.
+Docker metadata flights use the configured query limit instead of a fixed detached
+30-second cap, while successful cache entries remain independent of that limit.
+Timeout classification uses structured context,
 `Timeout() bool`, or signal evidence; arbitrary workload stderr is never
 interpreted as a timeout. On cancellation the direct CLI child is killed
 and reaped. Unix may also best-effort `SIGKILL` descendants that remain in
@@ -1167,6 +1179,24 @@ the CLI process group while that child is owned; they are not reaped, and
 a former numeric PGID is never signaled after the child is reaped or when
 the stopped-state check fails. Windows terminates only the direct child
 through the retained process handle. Descendant cleanup is not claimed.
+
+## Process exit codes
+
+`Container.ExitCode(ctx)` requires `StateStopped` and a backend-reported exit
+code. A non-stopped container returns `ErrContainerNotStopped`, which also
+matches `ErrExitCodeUnavailable`. `Wait(ctx)` waits for `StateStopped` and
+returns `ErrExitCodeUnavailable` if the backend omitted the code. Callers that
+previously treated `0, nil` as success must handle these errors.
+
+`InspectInfo.ExitCode()` retains the backend value, defaulting to zero when
+omitted. Snapshot callers must check `State()` and `ExitCodeReported()` before
+interpreting zero as a successful process exit.
+
+Apple's optional `status.exitCode` is absent from the captured CLI 1.2.2 and
+1.3.0 fixtures. Actual process exit reporting has not been verified against a
+running Apple service; absent data returns an unavailable error. Docker `dead`
+containers retain their reported process exit code, which does not establish
+that daemon teardown succeeded.
 
 ## Error handling
 

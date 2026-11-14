@@ -272,6 +272,13 @@ var ErrEnvFileUnsupported = errors.New("secure environment files are not support
 // a failure after the stream has started is reported by Read.
 var ErrContainerNotFound = wait.ErrContainerNotFound
 
+// ErrExitCodeUnavailable reports that a container has not stopped or its backend
+// did not report an exit code.
+var ErrExitCodeUnavailable = errors.New("container exit code is unavailable")
+
+// ErrContainerNotStopped reports that a process has not reached StateStopped.
+var ErrContainerNotStopped = errors.New("container has not stopped")
+
 // ErrGenerationReplaced reports that a handle's immutable identity or
 // generation no longer matches the live container. Read, state, endpoint,
 // and destructive operations refuse to act on the replacement.

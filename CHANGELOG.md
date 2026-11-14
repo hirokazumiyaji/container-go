@@ -7,16 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,
+  platform, and port settings.
+- `ErrExitCodeUnavailable`, `ErrContainerNotStopped`, and `InspectInfo.ExitCodeReported`
+  distinguish unavailable process status from a reported zero exit code.
+- Add `WithClientQueryTimeout` for Client construction, Run queries, container
+  control operations, and prune defaults, and `WithPruneQueryTimeout` for an
+  individual prune's listing and candidate budgets.
+
+### Fixed
+
+- Retry inspection-query deadlines while the enclosing verification or reuse
+  budget remains live, and isolate shared query work across different budgets.
+- Honor configured long Docker metadata query budgets without a separate fixed
+  30-second leader cap.
+- Honor short inspection-query timeouts inside a longer Run or caller deadline,
+  while payload transfers, logs, lifecycle changes, deletion, and verification
+  retries retain the caller's overall operation budget.
+- Preserve successful prune and container deletions when cancellation arrives just
+  after the backend command completes.
+- Retain best-effort implicit Client target discovery without an explicitly
+  configured query timeout; configured budget expiry and caller cancellation
+  still fail construction.
+
 ### Changed
 
 - Reuse requires matching creation fingerprints and reuse groups, including when
   fingerprinted options are omitted. Recreate existing reuse containers before
   attaching with this version; environment values retain their attach semantics.
-
-### Added
-
-- `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,
-  platform, and port settings.
+- **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
+  an exit code. `ExitCode` also rejects containers that have not stopped. Callers
+  relying on `0, nil` must handle these errors; snapshot users must check
+  `ExitCodeReported` and `State` before interpreting `InspectInfo.ExitCode`.
+- Apple CLI versions that omit `status.exitCode` report `ErrExitCodeUnavailable`;
+  a stopped state alone does not establish whether the process succeeded.
 - Bound image-presence caches to 256 image/store/platform entries, evicting
   the earliest-expiring entry when inserting at capacity.
 - Build diagnostic value indexes once when first used and share them with

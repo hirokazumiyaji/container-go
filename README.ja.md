@@ -749,6 +749,19 @@ local に addressable な tag または alias を使うか、明示的な mutabl
 新規作成直後の container は再 inspect し、root、platform、選択された variant が異なる場合は `Run` が返す前にロールバックします。
 local build の Apple image に利用可能な local digest 参照がない場合は `WithAllowMutableImageTag` が必要になることがあります。
 
+## プロセスの終了コード
+
+`Container.ExitCode(ctx)` は、コンテナが停止し、バックエンドが終了コードを報告した場合に値を返します。
+停止前は `ErrContainerNotStopped` を返し、このエラーは `ErrExitCodeUnavailable` にも一致します。
+`Wait(ctx)` は停止まで待ち、停止後に終了コードが未報告なら `ErrExitCodeUnavailable` を返します。
+`InspectInfo.ExitCode() == 0` を成功と解釈する前に、`State()` と `ExitCodeReported()` を確認してください。
+以前の `0, nil` を成功としていた呼び出し側は、これらのエラーを処理する必要があります。
+
+Apple の `status.exitCode` は任意項目で、保存済みの CLI 1.2.2・1.3.0 の inspect fixture には含まれていません。
+省略された場合、停止状態だけでは正常終了を判断できません。
+実際に動作した Apple コンテナの終了コードは、サービス未稼働のため検証できていません。
+Docker の `dead` 状態では報告されたプロセス終了コードを返しますが、デーモンによる後処理の成功は示しません。
+
 ## Exec のタイムアウトと長時間実行
 
 `Container.Exec` は有限時間・バッファリングされる操作です。caller の
@@ -910,6 +923,14 @@ func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
     }
 }
 ```
+
+`WithPruneQueryTimeout(d)` は一覧取得と、各候補のロック待ち・検証・削除の時間を制限します。
+Client の `WithClientQueryTimeout(d)` より優先され、どちらも指定しない場合は30秒です。
+`WithPruneTimeout(d)` は prune 全体の時間を制限します。
+Client の query timeout は Client 構築と短い inspect にも適用されます。個別の Run では `WithQueryTimeout(d)` で上書きできます。
+転送、スナップショットログ、ライフサイクル変更、検証の再試行には、呼び出し側が設定した期限が適用されます。期限がなければ query timeout が適用されます。
+イメージ取得には `WithPullTimeout` が適用されます。
+`Cleanup` と `StrictCleanup` には、処理全体に独立した30秒の制限があります。
 
 `container.WithPruneOlderThan(d)` は、backend が報告する作成時刻が
 now-d より前の candidate だけに対象を絞ります。共有 daemon や remote

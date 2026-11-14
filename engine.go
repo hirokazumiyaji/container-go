@@ -118,11 +118,12 @@ type engineInfo struct {
 	defaultNetwork string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
-	bound      []boundPort
-	exitCode   int
-	createdAt  time.Time
-	startedAt  time.Time
-	finishedAt time.Time
+	bound            []boundPort
+	exitCode         int
+	exitCodeReported bool
+	createdAt        time.Time
+	startedAt        time.Time
+	finishedAt       time.Time
 	// runOptions is the creation-time resource and security configuration
 	// the backend reported. Reuse compares it with the requested options so
 	// an existing container cannot silently differ from what the caller

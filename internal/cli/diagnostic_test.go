@@ -232,3 +232,61 @@ func TestClassifyPreservesOriginalAndProbeChains(t *testing.T) {
 		t.Fatalf("errors.As CLIError is unsafe: error=%q stderr=%q", got.Error(), got.Stderr)
 	}
 }
+
+func TestClassificationTreePreservesWrapperShapeAndIdentity(t *testing.T) {
+	leaf := errors.New("private-value")
+	safe := WithRedactor(leaf, NewRedactor("private-value"))
+	wrapper := fmt.Errorf("TLS certificate verification failed: %w", safe)
+	tree := classificationErrorTree(wrapper)
+	single, ok := tree.(interface{ Unwrap() error })
+	if !ok || single.Unwrap() != leaf {
+		t.Fatalf("classification changed single wrapper shape: %T", tree)
+	}
+	if !errors.Is(tree, wrapper) || !errors.Is(tree, leaf) {
+		t.Fatal("classification lost wrapper identity")
+	}
+	if !IsDefinitiveNonLivenessError(tree) {
+		t.Fatal("classification lost wrapper TLS text")
+	}
+	if strings.Contains(wrapper.Error(), "private-value") {
+		t.Fatal("classification changed safe diagnostics")
+	}
+}
+
+func TestClassificationTreeClonesMutableJoinedChildren(t *testing.T) {
+	leaf := errors.New("private-value")
+	safe := WithRedactor(leaf, NewRedactor("private-value"))
+	original := errors.Join(safe, errors.New("other"))
+	children := original.(interface{ Unwrap() []error }).Unwrap()
+	tree := classificationErrorTree(original)
+	if children[0] != safe {
+		t.Fatal("classification mutated original children")
+	}
+	classified := tree.(interface{ Unwrap() []error }).Unwrap()
+	if classified[0] != leaf || !errors.Is(tree, original) {
+		t.Fatal("classification lost joined identity")
+	}
+	classified[0] = errors.New("replacement")
+	if children[0] != safe {
+		t.Fatal("classification aliases original child slice")
+	}
+}
+
+type timeoutClassificationJoin struct{ children []error }
+
+func (e *timeoutClassificationJoin) Error() string   { return errors.Join(e.children...).Error() }
+func (e *timeoutClassificationJoin) Unwrap() []error { return e.children }
+func (*timeoutClassificationJoin) Timeout() bool     { return true }
+
+func TestClassificationTreePreservesJoinedWrapperType(t *testing.T) {
+	safe := WithRedactor(errors.New("private-value"), NewRedactor("private-value"))
+	wrapper := &timeoutClassificationJoin{children: []error{safe}}
+	tree := classificationErrorTree(wrapper)
+	var original *timeoutClassificationJoin
+	if !errors.As(tree, &original) || original != wrapper {
+		t.Fatal("classification lost joined wrapper type")
+	}
+	if !IsDefinitiveNonLivenessError(tree) {
+		t.Fatal("classification lost joined wrapper timeout veto")
+	}
+}

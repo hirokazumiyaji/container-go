@@ -233,6 +233,8 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 ]`, name, name, variantDigest, platformJSON, sessionID(), f.creations[name])
 		}
 		return []byte(json), nil, nil
+	case "rm":
+		return []byte(args[len(args)-1] + "\n"), nil, nil
 	default:
 		return nil, nil, nil
 	}

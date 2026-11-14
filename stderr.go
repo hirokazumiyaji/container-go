@@ -34,67 +34,14 @@ type cliErrorBranch struct {
 // joined parents and siblings never lend their diagnostics to another
 // branch.
 func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
-	if err == nil {
-		return nil
-	}
 	var branches []cliErrorBranch
-	stdoutByCLIError := make(map[*cli.CLIError]string)
-	branchIndex := make(map[*cli.CLIError]int)
-	var walk func(error)
-	walk = func(cur error) {
-		if cur == nil {
-			return
-		}
-		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
-			for _, child := range joined.Unwrap() {
-				walk(child)
-			}
-			return
-		}
-		if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" {
-			var owner *cli.CLIError
-			if errors.As(cur, &owner) {
-				stdoutByCLIError[owner] = stdout
-			}
-		}
-		if cliErr, ok := cur.(*cli.CLIError); ok {
-			// Empty Binary is the historical `container` executable, so a
-			// Docker classifier never accepts an error without an explicit
-			// Docker binary. ExecRunner always records the executable name.
-			if backend != "" && !cliBinaryMatches(cliErr.Binary, backend) {
-				return
-			}
-			operation := commandOperation(cliErr.Args)
-			stdout := stdoutByCLIError[cliErr]
-			cause := error(cliErr)
-			if stdout != "" {
-				cause = cli.WithStdout(cliErr, stdout)
-			}
-			if index, ok := branchIndex[cliErr]; ok {
-				if stdout != "" {
-					branches[index].stdout = stdout
-					branches[index].cause = cause
-				}
-				return
-			}
-			branchIndex[cliErr] = len(branches)
-			branches = append(branches, cliErrorBranch{
-				ctx: cliErrorContext{
-					err:       cliErr,
-					operation: operation,
-					target:    commandTarget(cliErr.Args, operation),
-				},
-				stdout: stdout,
-				stderr: cliErr.Stderr,
-				cause:  cause,
-			})
-			return
-		}
-		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
-			walk(wrapped.Unwrap())
-		}
+	for _, branch := range cli.ClassificationBranches(err, backend) {
+		operation := cli.CommandOperation(branch.Error.Args)
+		branches = append(branches, cliErrorBranch{
+			ctx:    cliErrorContext{err: branch.Error, operation: operation, target: commandTarget(branch.Error.Args, operation)},
+			stdout: branch.Stdout, stderr: branch.Error.Stderr, cause: branch.Cause,
+		})
 	}
-	walk(err)
 	return branches
 }
 
@@ -187,30 +134,6 @@ func hasParsedCLITarget(ctx cliErrorContext) bool {
 	return strings.TrimSpace(ctx.target) != ""
 }
 
-func cliBinaryMatches(got, want string) bool {
-	got = strings.TrimSpace(strings.ToLower(got))
-	if got == "" {
-		return strings.EqualFold(want, "container")
-	}
-	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
-		got = got[i+1:]
-	}
-	return got == strings.ToLower(want)
-}
-
-func commandOperation(args []string) string {
-	if len(args) == 0 {
-		return ""
-	}
-	if args[0] == "image" {
-		if len(args) > 1 {
-			return "image " + args[1]
-		}
-		return "image"
-	}
-	return args[0]
-}
-
 func commandTarget(args []string, operation string) string {
 	if len(args) == 0 {
 		return ""
@@ -300,11 +223,11 @@ func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
 	if cliErr == nil {
 		return false
 	}
-	operation := commandOperation(cliErr.Args)
-	if cliBinaryMatches(cliErr.Binary, "container") {
+	operation := cli.CommandOperation(cliErr.Args)
+	if cli.BinaryMatches(cliErr.Binary, "container") {
 		return true
 	}
-	if !cliBinaryMatches(cliErr.Binary, "docker") {
+	if !cli.BinaryMatches(cliErr.Binary, "docker") {
 		return false
 	}
 	switch operation {
@@ -349,8 +272,8 @@ func cliErrorLinePrefix(line string, cliErr *cli.CLIError) (string, bool) {
 	if cliErr == nil {
 		return "", false
 	}
-	operation := commandOperation(cliErr.Args)
-	if cliBinaryMatches(cliErr.Binary, "docker") {
+	operation := cli.CommandOperation(cliErr.Args)
+	if cli.BinaryMatches(cliErr.Binary, "docker") {
 		for _, prefix := range []string{"docker: ", "error response from daemon: "} {
 			if strings.HasPrefix(line, prefix) {
 				return prefix, true
@@ -358,7 +281,7 @@ func cliErrorLinePrefix(line string, cliErr *cli.CLIError) (string, bool) {
 		}
 		return "", false
 	}
-	if cliBinaryMatches(cliErr.Binary, "container") && appleContainerPrefixAllowed(operation) {
+	if cli.BinaryMatches(cliErr.Binary, "container") && appleContainerPrefixAllowed(operation) {
 		if strings.HasPrefix(line, "container: ") {
 			return "container: ", true
 		}
@@ -611,35 +534,13 @@ func ambiguousNoSuchLine(line string) bool {
 }
 
 func hasNonCLIAmbiguousObjectText(err error) bool {
-	if err == nil || errors.Is(err, ErrContainerNotFound) {
+	if errors.Is(err, ErrContainerNotFound) {
 		return false
 	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			if hasNonCLIAmbiguousObjectText(child) {
-				return true
-			}
+	for _, branch := range cli.CollectNonCLIErrorBranches(err) {
+		if !errors.Is(branch, ErrContainerNotFound) && ambiguousNoSuchLine(branch.Error()) {
+			return true
 		}
-		return false
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		child := wrapped.Unwrap()
-		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			return hasNonCLIAmbiguousObjectText(child)
-		}
-	}
-	if _, ok := err.(*cli.CLIError); ok {
-		return false
-	}
-	var cliErr *cli.CLIError
-	if errors.As(err, &cliErr) {
-		return false
-	}
-	if ambiguousNoSuchLine(err.Error()) {
-		return true
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return hasNonCLIAmbiguousObjectText(wrapped.Unwrap())
 	}
 	return false
 }

@@ -32,7 +32,7 @@ func (r *dockerPruneReaperRunner) Run(_ context.Context, args ...string) ([]byte
 		r.mu.Lock()
 		r.deleted = append(r.deleted, args[len(args)-1])
 		r.mu.Unlock()
-		return nil, nil, nil
+		return []byte(args[len(args)-1] + "\n"), nil, nil
 	default:
 		return nil, nil, nil
 	}

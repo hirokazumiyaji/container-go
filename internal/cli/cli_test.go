@@ -1475,6 +1475,89 @@ func TestExecRunnerIdentityDefaultsToBinary(t *testing.T) {
 	}
 }
 
+func TestCollectNonCLIThroughNestedWrappers(t *testing.T) {
+	cliErr := &CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1}
+	veto := errors.New("TLS certificate rejected")
+	err := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", errors.Join(cliErr, veto)))
+	branches := CollectNonCLIErrorBranches(err)
+	if len(branches) != 1 || !errors.Is(branches[0], veto) {
+		t.Fatalf("branches=%v, want TLS veto", branches)
+	}
+}
+
+func TestClassificationBranchesDeduplicateStdoutWrappers(t *testing.T) {
+	failure := &CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1}
+	branches := ClassificationBranches(errors.Join(failure, WithStdout(failure, "diagnostic")), "docker")
+	if len(branches) != 1 || branches[0].Stdout != "diagnostic" {
+		t.Fatalf("branches=%+v", branches)
+	}
+}
+
+func TestClassificationBranchesRecognizeRedactedCLILeaf(t *testing.T) {
+	failure := &CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1, Stderr: "Error: No such container: missing"}
+	safe := WithRedactor(failure, NewRedactor("private-target"))
+	if branches := CollectNonCLIErrorBranches(safe); len(branches) != 0 {
+		t.Fatalf("redacted CLI treated as non-CLI: %v", branches)
+	}
+	if branches := ClassificationBranches(safe, "docker"); len(branches) != 1 {
+		t.Fatalf("redacted CLI branches=%v, want one", branches)
+	}
+}
+
+func TestClassificationBranchesPreserveRedactedJoin(t *testing.T) {
+	first := &CLIError{Binary: "docker", Args: []string{"inspect", "missing"}, ExitCode: 1, Stderr: "No such container: missing"}
+	second := &CLIError{Binary: "docker", Args: []string{"inspect", "private-target"}, ExitCode: 1, Stderr: "permission denied private-target"}
+	veto := errors.New("TLS certificate verification failed private-target")
+	safe := WithRedactor(errors.Join(first, WithStdout(second, "private-target stdout"), veto), NewRedactor("private-target"))
+	nonCLI := CollectNonCLIErrorBranches(safe)
+	if len(nonCLI) != 1 || !errors.Is(nonCLI[0], veto) || strings.Contains(nonCLI[0].Error(), "private-target") {
+		t.Fatalf("non-CLI branches = %v, want safe TLS veto", nonCLI)
+	}
+	branches := ClassificationBranches(safe, "docker")
+	if len(branches) != 2 {
+		t.Fatalf("branches = %v, want both CLI failures", branches)
+	}
+	if branches[0].Error != first || branches[1].Error != second || branches[1].Stdout != "private-target stdout" {
+		t.Fatal("classification lost the original CLI failures or stdout")
+	}
+	var cliErr *CLIError
+	if !errors.As(branches[1].Cause, &cliErr) {
+		t.Fatal("safe cause lost the CLI error")
+	}
+	if strings.Contains(cliErr.RawError(), "private-target") || strings.Contains(branches[1].Cause.Error(), "private-target") {
+		t.Fatal("cause exposed a redacted value")
+	}
+	if !strings.Contains(branches[1].Cause.Error(), "stdout") {
+		t.Fatal("cause lost stdout")
+	}
+}
+
+func TestProbeRelevantErrorMatchesRedactedOperation(t *testing.T) {
+	probe := Probe{Binary: "docker", Args: []string{"inspect", "private-target"}}
+	unrelated := &CLIError{Binary: "docker", Args: []string{"run"}, ExitCode: 1}
+	failure := &CLIError{Binary: "docker", Args: probe.Args, ExitCode: 1, Stderr: "private-target failed"}
+	veto := errors.New("TLS certificate verification failed private-target")
+	safe := WithRedactor(
+		errors.Join(unrelated, WithStdout(failure, "private-target stdout"), veto),
+		NewRedactor("inspect", "private-target"),
+	)
+
+	got := probeRelevantError(safe, probe)
+	if !errors.Is(got, failure) || !errors.Is(got, veto) || errors.Is(got, unrelated) {
+		t.Fatalf("probe error = %v, want inspect failure and TLS veto only", got)
+	}
+	var cliErr *CLIError
+	if !errors.As(got, &cliErr) {
+		t.Fatalf("probe error = %v, want CLI error", got)
+	}
+	if strings.Contains(cliErr.RawError(), "private-target") || strings.Contains(got.Error(), "private-target") {
+		t.Fatal("probe error exposed a redacted value")
+	}
+	if !strings.Contains(got.Error(), "stdout") {
+		t.Fatal("probe error lost stdout")
+	}
+}
+
 func TestCommandErrorPreservesWaitDelayContext(t *testing.T) {
 	err := commandError(context.Background(), "backend-wrapper", "docker", []string{"inspect", "target"}, nil, []byte(strings.Repeat("secret-fragment", maxStderr)), exec.ErrWaitDelay)
 	if !errors.Is(err, exec.ErrWaitDelay) || err.Error() != "backend-wrapper inspect target: "+exec.ErrWaitDelay.Error() {

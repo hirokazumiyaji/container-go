@@ -32,6 +32,9 @@ func (r *pruneQueryDeadlineRunner) Run(ctx context.Context, args ...string) ([]b
 			}
 			return []byte(fmt.Sprintf(`[{"id":"prune-timeout-candidate","configuration":{"labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:%q}},"status":{"state":"stopped"}}]`, managedLabel, reuseLabel, creationLabel, reuseGroupLabel, r.group)), nil, nil
 		}
+		if op == "rm" {
+			return []byte(cleanupDockerIDOne + "\n"), nil, nil
+		}
 		return nil, nil, nil
 	}
 	return r.fakeRunner.Run(ctx, args...)

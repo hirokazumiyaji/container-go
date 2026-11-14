@@ -470,6 +470,10 @@ func isBareContainerNotFound(err error) bool {
 // exist. It is retained for callers that do not have an engine context;
 // the concrete backend and command still have to pass their own matcher.
 func isNotFound(err error) bool {
+	return cli.MatchError(err, isNotFoundRaw)
+}
+
+func isNotFoundRaw(err error) bool {
 	if err == nil || isContextError(err) {
 		return false
 	}
@@ -500,6 +504,10 @@ func isNotFound(err error) bool {
 // separate from isNotFound prevents a Docker error from being accepted by
 // an Apple operation (and vice versa) when callers do have engine context.
 func isNotFoundFor(eng engine, err error) bool {
+	return cli.MatchError(err, func(err error) bool { return isNotFoundForRaw(eng, err) })
+}
+
+func isNotFoundForRaw(eng engine, err error) bool {
 	if err == nil || isContextError(err) {
 		return false
 	}
@@ -526,6 +534,10 @@ func isNotFoundFor(eng engine, err error) bool {
 }
 
 func isNotFoundForOperation(eng engine, err error, operation string, targets ...string) bool {
+	return cli.MatchError(err, func(err error) bool { return isNotFoundForOperationRaw(eng, err, operation, targets...) })
+}
+
+func isNotFoundForOperationRaw(eng engine, err error, operation string, targets ...string) bool {
 	if err == nil || isContextError(err) {
 		return false
 	}
@@ -552,8 +564,7 @@ func isNotFoundForOperation(eng engine, err error, operation string, targets ...
 	for _, branch := range selected {
 		parts = append(parts, branch.cause)
 	}
-	var nonCLI []error
-	collectNonCLIErrorBranches(err, &nonCLI)
+	nonCLI := cli.CollectNonCLIErrorBranches(err)
 	parts = append(parts, nonCLI...)
 	return isNotFoundFor(eng, errors.Join(parts...))
 }
@@ -596,10 +607,10 @@ func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict
 	}
 	var cliErr *cli.CLIError
 	if errors.As(err, &cliErr) {
-		if !cliBinaryMatches(cliErr.Binary, eng.binary()) {
+		if !cli.BinaryMatches(cliErr.Binary, eng.binary()) {
 			return false, true
 		}
-		operation := commandOperation(cliErr.Args)
+		operation := cli.CommandOperation(cliErr.Args)
 		if operation != "inspect" {
 			// Probe or unrelated CLI branches joined after Classify must
 			// not veto a confirmed inspect absence.
@@ -622,7 +633,7 @@ func engineForCLIError(err *cli.CLIError) engine {
 	if err == nil {
 		return nil
 	}
-	if cliBinaryMatches(err.Binary, "docker") {
+	if cli.BinaryMatches(err.Binary, "docker") {
 		return dockerEngine{}
 	}
 	return appleEngine{}
@@ -654,32 +665,10 @@ func sameCLIErrorContext(a, b cliErrorBranch) bool {
 }
 
 func hasNonCLIDefinitiveErrorText(err error) bool {
-	if err == nil {
-		return false
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			if hasNonCLIDefinitiveErrorText(child) {
-				return true
-			}
+	for _, branch := range cli.CollectNonCLIErrorBranches(err) {
+		if cli.IsDefinitiveNonLivenessError(branch) {
+			return true
 		}
-		return false
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		child := wrapped.Unwrap()
-		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			return hasNonCLIDefinitiveErrorText(child)
-		}
-	}
-	var cliErr *cli.CLIError
-	if errors.As(err, &cliErr) {
-		return false
-	}
-	if cli.IsDefinitiveNonLivenessError(err) {
-		return true
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return hasNonCLIDefinitiveErrorText(wrapped.Unwrap())
 	}
 	return false
 }
@@ -689,16 +678,17 @@ func hasNonCLIDefinitiveErrorText(err error) bool {
 // "not found" (for example, a missing volume plugin) as a missing
 // container.
 func cliCommandParts(err error) (command string, args []string, ok bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) || len(cliErr.Args) == 0 {
+	branches := backendCLIErrorBranches(err, "")
+	if len(branches) == 0 || len(branches[0].ctx.err.Args) == 0 {
 		return "", nil, false
 	}
-	return strings.ToLower(cliErr.Args[0]), cliErr.Args[1:], true
+	args = branches[0].ctx.err.Args
+	return strings.ToLower(args[0]), args[1:], true
 }
 
 func cliErrorBelongsTo(err error, backend string) bool {
-	var cliErr *cli.CLIError
-	return errors.As(err, &cliErr) && cliBinaryMatches(cliErr.Binary, backend)
+	branches := backendCLIErrorBranches(err, "")
+	return len(branches) > 0 && cli.BinaryMatches(branches[0].ctx.err.Binary, backend)
 }
 
 func cliCommandTarget(command string, args []string) string {
@@ -801,10 +791,11 @@ func cliReadOptionTakesValue(option string) bool {
 // as backend evidence; arbitrary application/configuration prefixes remain
 // visible and cannot satisfy an anchored backend matcher.
 func cliErrorLines(err error) ([]string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	branches := backendCLIErrorBranches(err, "")
+	if len(branches) == 0 {
 		return nil, false
 	}
+	cliErr := branches[0].ctx.err
 	allowGenericError := genericErrorWrapperAllowed(cliErr)
 	var lines []string
 	for _, line := range strings.Split(cliErr.Stderr, "\n") {
@@ -912,12 +903,11 @@ func classifyErrorForWithProbe(ctx context.Context, r cli.Runner, err error, eng
 	}
 	allBranches := backendCLIErrorBranches(err, "")
 	selected := branch.cause
-	var nonCLI []error
-	collectNonCLIErrorBranches(err, &nonCLI)
+	nonCLI := cli.CollectNonCLIErrorBranches(err)
 	parts := make([]error, 0, len(allBranches)+len(nonCLI))
 	parts = append(parts, selected)
 	for _, related := range allBranches {
-		if related.ctx.err == branch.ctx.err || !cliBinaryMatches(related.ctx.err.Binary, eng.binary()) ||
+		if related.ctx.err == branch.ctx.err || !cli.BinaryMatches(related.ctx.err.Binary, eng.binary()) ||
 			!sameCLIErrorContext(related, branch) {
 			continue
 		}
@@ -950,28 +940,4 @@ func classifyErrorForWithProbe(ctx context.Context, r cli.Runner, err error, eng
 		return classified
 	}
 	return errors.Join(classified, err)
-}
-
-func collectNonCLIErrorBranches(err error, out *[]error) {
-	if err == nil {
-		return
-	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			collectNonCLIErrorBranches(child, out)
-		}
-		return
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		child := wrapped.Unwrap()
-		if _, joined := child.(interface{ Unwrap() []error }); joined {
-			collectNonCLIErrorBranches(child, out)
-			return
-		}
-	}
-	var cliErr *cli.CLIError
-	if errors.As(err, &cliErr) {
-		return
-	}
-	*out = append(*out, err)
 }

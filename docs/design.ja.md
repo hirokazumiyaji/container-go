@@ -594,7 +594,21 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 ストリームを返した後の CLI 終了エラーは `Read` から返るため、呼び出し側は必ず EOF まで読む必要がある。
 `Close` とコンテキスト取消は意図的な終了経路なので、EOF またはコンテキストエラーになることがある。
 
-**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作、および public `Exec` は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。コンテキスト取消時は直接の CLI 子プロセスを kill して回収する。Unix は所有中の CLI process group に残った descendant へベストエフォートの `SIGKILL` を送ることがあるが、回収はせず、停止状態を確認できない場合や回収後は古い数値 PGID に signal を送らない。Windows は保持した process handle で直接の子だけを終了する。子孫の回収は保証しない。
+**操作ごとに期限を決める**。短い inspect query は、呼び出し側や Run の予算が長くても `WithQueryTimeout`（既定30秒）で制限する。Prune は各候補のロック・検証・削除にも query 予算を適用する。転送、スナップショットログ、ライフサイクル変更、削除、検証の再試行は既存の caller deadline を保持し、deadline がない場合だけ query の既定値を使う。public `Exec` は呼び出し側の deadline がない場合に通常30秒の既定を使う。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。操作全体の既存の caller deadline は保持するが、短い inspect query にはそれより早い上限を適用できる。Client 構築で query timeout を明示しない場合、暗黙 target の検出はベストエフォートのままとし、caller のキャンセルと明示した query 予算の期限切れは構築を失敗させる。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。コンテキスト取消時は直接の CLI 子プロセスを kill して回収する。Unix は所有中の CLI process group に残った descendant へベストエフォートの `SIGKILL` を送ることがあるが、回収はせず、停止状態を確認できない場合や回収後は古い数値 PGID に signal を送らない。Windows は保持した process handle で直接の子だけを終了する。子孫の回収は保証しない。
+
+## プロセスの終了コード
+
+`Container.ExitCode(ctx)` は `StateStopped` と backend が報告した終了コードを要求する。
+停止していないコンテナでは `ErrContainerNotStopped` を返し、このエラーは `errors.Is` で `ErrExitCodeUnavailable` にも一致する。
+`Wait(ctx)` は `StateStopped` まで待ち、終了コードが省略されていれば `ErrExitCodeUnavailable` を返す。
+従来 `0, nil` を成功として扱っていた呼び出し側は、これらのエラーを処理する必要がある。
+
+`InspectInfo.ExitCode()` は backend の値を返し、省略時にはゼロを返す。
+スナップショットからゼロを正常終了と判定する前に、`State()` と `ExitCodeReported()` を確認する。
+
+Apple の任意フィールド `status.exitCode` は、取得済みの CLI 1.2.2 と 1.3.0 の fixture には含まれない。
+稼働中の Apple service で実際の終了コード報告は未検証であり、フィールドがなければ利用不可のエラーを返す。
+Docker の `dead` 状態では報告済みのプロセス終了コードを保持するが、その値は daemon による後処理の成功を保証しない。
 
 ## エラー処理
 

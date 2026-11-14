@@ -763,8 +763,10 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if err == nil {
 			break
 		}
-		if !isNotFoundFor(cfg.eng, err) && !transientReuseInspectError(err) {
-			return fmt.Errorf("verify created container %s: %w", c.id, err)
+		if !isNotFoundFor(cfg.eng, err) {
+			if err := inspectRetryError(verifyCtx, err); err != nil {
+				return fmt.Errorf("verify created container %s: %w", c.id, err)
+			}
 		}
 		if err := waitForReusePoll(verifyCtx, cfg.effectiveReusePollInterval()); err != nil {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
@@ -1046,20 +1048,21 @@ func (c *Container) Image() string {
 
 // InspectInfo represents a point-in-time snapshot of container state and metadata.
 type InspectInfo struct {
-	id         string
-	name       string
-	uid        string
-	image      string
-	imageID    string
-	state      State
-	exitCode   int
-	createdAt  time.Time
-	startedAt  time.Time
-	finishedAt time.Time
-	labels     map[string]string
-	ip         string
-	platform   string
-	ports      []PortBinding
+	id               string
+	name             string
+	uid              string
+	image            string
+	imageID          string
+	state            State
+	exitCode         int
+	exitCodeReported bool
+	createdAt        time.Time
+	startedAt        time.Time
+	finishedAt       time.Time
+	labels           map[string]string
+	ip               string
+	platform         string
+	ports            []PortBinding
 }
 
 // ID returns the logical container name, which is the handle's address and
@@ -1080,7 +1083,13 @@ func (i *InspectInfo) ContainerID() string { return i.uid }
 func (i *InspectInfo) Image() string   { return i.image }
 func (i *InspectInfo) ImageID() string { return i.imageID }
 func (i *InspectInfo) State() State    { return i.state }
-func (i *InspectInfo) ExitCode() int   { return i.exitCode }
+
+// ExitCode returns the backend value, or zero when no value was reported.
+// Check State and ExitCodeReported before interpreting zero as process success.
+func (i *InspectInfo) ExitCode() int { return i.exitCode }
+
+// ExitCodeReported distinguishes a reported process result from an omitted value.
+func (i *InspectInfo) ExitCodeReported() bool { return i.exitCodeReported }
 
 // CreatedAt returns the backend-reported creation time. The zero time is the
 // documented unknown marker: the backend omitted the field or reported a form
@@ -1128,28 +1137,56 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 		}
 	}
 	return &InspectInfo{
-		id:         c.id,
-		name:       info.name,
-		uid:        info.uid,
-		image:      info.image,
-		imageID:    info.imageID,
-		state:      info.state,
-		exitCode:   info.exitCode,
-		createdAt:  info.createdAt,
-		startedAt:  info.startedAt,
-		finishedAt: info.finishedAt,
-		labels:     info.labels,
-		ip:         info.ip,
-		platform:   info.platform,
-		ports:      ports,
+		id:               c.id,
+		name:             info.name,
+		uid:              info.uid,
+		image:            info.image,
+		imageID:          info.imageID,
+		state:            info.state,
+		exitCode:         info.exitCode,
+		exitCodeReported: info.exitCodeReported,
+		createdAt:        info.createdAt,
+		startedAt:        info.startedAt,
+		finishedAt:       info.finishedAt,
+		labels:           info.labels,
+		ip:               info.ip,
+		platform:         info.platform,
+		ports:            ports,
 	}, nil
 }
 
-// ExitCode returns the exit code from a fresh container inspect.
+// ExitCode returns the reported exit code of a stopped container.
+// ErrContainerNotStopped indicates that the process has not stopped. Both that
+// error and an omitted backend exit code match ErrExitCodeUnavailable.
+// Apple CLI versions that omit status.exitCode cannot provide a process result.
 func (c *Container) ExitCode(ctx context.Context) (int, error) {
 	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
-		return 0, err
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return 0, err
+		}
+		redacted := c.redactError(err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, exitCodeDeadlineError{redacted}
+		}
+		return 0, redacted
+	}
+	return reportedExitCode(info)
+}
+
+// Keep the deadline visible to callers classifying redacted inspect failures.
+type exitCodeDeadlineError struct{ error }
+
+func (e exitCodeDeadlineError) Unwrap() []error {
+	return []error{e.error, context.DeadlineExceeded}
+}
+
+func reportedExitCode(info *engineInfo) (int, error) {
+	if info.state != StateStopped {
+		return 0, fmt.Errorf("%w: %w: container state is %s", ErrContainerNotStopped, ErrExitCodeUnavailable, info.state)
+	}
+	if !info.exitCodeReported {
+		return 0, ErrExitCodeUnavailable
 	}
 	return info.exitCode, nil
 }
@@ -1157,7 +1194,9 @@ func (c *Container) ExitCode(ctx context.Context) (int, error) {
 const waitExitPollInterval = 100 * time.Millisecond
 
 // Wait blocks until the container reaches StateStopped and returns its exit code.
-// If the container is already stopped, it returns its exit code immediately.
+// If the container is already stopped, it returns immediately. A missing backend
+// exit code returns ErrExitCodeUnavailable rather than an assumed zero result.
+// Retrying individual query deadlines requires a deadline on ctx.
 func (c *Container) Wait(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -1175,11 +1214,18 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 			// A daemon that is briefly unreachable or busy must not fail a
 			// wait that is still within its context; only a terminal inspect
 			// error ends the wait.
-			if !transientReuseInspectError(err) {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			_, bounded := ctx.Deadline()
+			if retryErr := inspectRetryError(ctx, err); retryErr != nil {
+				return 0, retryErr
+			}
+			if !bounded && errors.Is(err, context.DeadlineExceeded) {
 				return 0, err
 			}
 		} else if info.state == StateStopped {
-			return info.exitCode, nil
+			return reportedExitCode(info)
 		}
 		timer.Reset(waitExitPollInterval)
 	}
@@ -1819,8 +1865,10 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if contextErr := commandContextError(delCtx, err); contextErr != nil {
-		return contextErr
+	if err != nil {
+		if contextErr := commandContextError(delCtx, err); contextErr != nil {
+			return contextErr
+		}
 	}
 	if err == nil || isNotFoundForOperation(c.eng, err, c.deleteOperation(), target, c.id) {
 		unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, target)
@@ -2539,7 +2587,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		return nil, identityError("Apple handle has no valid creation generation")
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	qCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)

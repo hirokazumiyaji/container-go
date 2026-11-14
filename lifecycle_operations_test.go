@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +15,47 @@ import (
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
+
+func TestLifecyclePreservesInspectDeadline(t *testing.T) {
+	type timeouter interface{ Timeout() bool }
+
+	const secret = "private-inspect-timeout-value"
+	f := newDockerTestRunner()
+	ctr := runTestContainer(t, f, withEngine(dockerEngine{}), WithLabels(map[string]string{"purpose": secret}))
+	diagnostic := &cli.CLIError{Binary: "docker", ExitCode: 1, Stderr: secret}
+	ctr.runner = waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		return nil, nil, errors.Join(diagnostic, context.DeadlineExceeded)
+	})
+
+	for name, operation := range map[string]func(context.Context) error{
+		"State":    func(ctx context.Context) error { _, err := ctr.State(ctx); return err },
+		"Inspect":  func(ctx context.Context) error { _, err := ctr.Inspect(ctx); return err },
+		"Wait":     func(ctx context.Context) error { _, err := ctr.Wait(ctx); return err },
+		"ExitCode": func(ctx context.Context) error { _, err := ctr.ExitCode(ctx); return err },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := operation(context.Background())
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+			}
+			var cliError *cli.CLIError
+			if !errors.Is(err, diagnostic) || !errors.As(err, &cliError) || cliError.ExitCode != 1 {
+				t.Fatalf("error = %v, want retained CLI error", err)
+			}
+			if name == "ExitCode" && (strings.Contains(err.Error(), secret) || strings.Contains(cliError.Stderr, secret)) {
+				t.Fatal("ExitCode deadline exposed configured diagnostic value")
+			}
+			var networkError net.Error
+			if !errors.As(err, &networkError) || !networkError.Timeout() {
+				t.Errorf("error = %T %v, want net.Error timeout", err, err)
+			}
+			var timeout timeouter
+			if !errors.As(err, &timeout) || !timeout.Timeout() {
+				t.Errorf("error = %T %v, want named Timeout interface", err, err)
+			}
+		})
+	}
+}
 
 func TestInspectSnapshotAndGetters(t *testing.T) {
 	f := newTestRunner()
@@ -73,12 +115,8 @@ func TestInspectSnapshotAndGetters(t *testing.T) {
 	if ctr.Image() != ctr.image.reference {
 		t.Errorf("ctr.Image() = %q, want %q", ctr.Image(), ctr.image.reference)
 	}
-	exitCode, err := ctr.ExitCode(context.Background())
-	if err != nil {
-		t.Fatalf("ctr.ExitCode(): %v", err)
-	}
-	if exitCode != 0 {
-		t.Errorf("ctr.ExitCode() = %d, want 0", exitCode)
+	if _, err := ctr.ExitCode(context.Background()); !errors.Is(err, ErrExitCodeUnavailable) {
+		t.Fatalf("running container ExitCode error = %v, want ErrExitCodeUnavailable", err)
 	}
 }
 

@@ -263,7 +263,7 @@ const logTailLimit = 1024 * 1024
 // total log size. Resolving the target first keeps a deleted or replaced
 // same-name container from contributing unrelated logs to the error.
 func (c *Container) logTailWithError(ctx context.Context, extra ...string) (string, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
+	qCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {

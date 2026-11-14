@@ -553,7 +553,7 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil
 	case "rm", "delete":
 		r.deleteCalls++
-		return nil, nil, nil
+		return []byte(args[len(args)-1] + "\n"), nil, nil
 	default:
 		return nil, nil, nil
 	}

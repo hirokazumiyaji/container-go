@@ -842,7 +842,8 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 	}
 	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
 	defer cancel()
-	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
+	args := eng.imageInspectArgs(image, platform)
+	stdout, _, err := r.Run(qCtx, args...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
 		if ctx.Err() == nil && errors.Is(qCtx.Err(), context.DeadlineExceeded) && !cli.IsProbeConfigurationError(contextErr) {
 			contextErr = imageQueryDeadlineError{contextErr}
@@ -853,7 +854,7 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 		if eng.imageMissingForTarget(err, image) || imageMissingError(eng, err) {
 			return imageIdentity{}, false, nil
 		}
-		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(eng.imageInspectArgs(image, platform)), image)
+		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, cli.CommandOperation(args), image)
 	}
 	if parser, ok := eng.(imageIdentityParser); ok {
 		identity, exists := parser.parseImageIdentity(stdout, image, platform)
@@ -875,7 +876,7 @@ func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform st
 	args := eng.pullImageArgs(image, platform)
 	_, _, err := r.Run(ctx, args...)
 	if err != nil {
-		return classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(args), image)
+		return classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, cli.CommandOperation(args), image)
 	}
 	return nil
 }

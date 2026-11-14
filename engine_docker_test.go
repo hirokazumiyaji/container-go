@@ -1352,6 +1352,8 @@ func (d *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []by
 			)), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "No such container"}
+	case "rm":
+		return []byte(args[len(args)-1] + "\n"), nil, nil
 	default:
 		return nil, nil, nil
 	}

@@ -194,7 +194,10 @@ func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
 				t.Fatalf("rm calls = %v, want 2", deletes)
 			}
 			for _, call := range deletes {
-				want := []string{"rm", "--force", "--volumes", call[len(call)-1]}
+				want := []string{"rm", "--volumes", call[len(call)-1]}
+				if tc.name == "reuse group" {
+					want = []string{"rm", "--force", "--volumes", call[len(call)-1]}
+				}
 				if !slices.Equal(call, want) {
 					t.Errorf("rm call = %v, want %v", call, want)
 				}
@@ -240,8 +243,8 @@ func TestDockerPruneAcceptsPreciseContainerNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	if !slices.Equal(removed, []string{id}) {
-		t.Fatalf("removed = %v, want [%s]", removed, id)
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want no successful removals", removed)
 	}
 }
 
@@ -534,7 +537,7 @@ func (r *pruneAgeDockerRunner) Run(_ context.Context, args ...string) ([]byte, [
 		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/prune-age",%s"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`,
 			id, created, managedLabel, creationLabel)), nil, nil
 	case "rm":
-		return nil, nil, nil
+		return []byte(args[len(args)-1] + "\n"), nil, nil
 	default:
 		return nil, nil, nil
 	}
@@ -731,7 +734,7 @@ func (b *blockingPruneRunner) Run(ctx context.Context, args ...string) ([]byte, 
 		b.mu.Lock()
 		b.calls = append(b.calls, args)
 		b.mu.Unlock()
-		return nil, nil, nil
+		return []byte(args[len(args)-1] + "\n"), nil, nil
 	}
 	return b.fakeRunner.Run(ctx, args...)
 }
@@ -857,7 +860,7 @@ func (r *inspectDeadlinePruneRunner) Run(ctx context.Context, args ...string) ([
 		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`,
 			cleanupDockerIDOne, managedLabel, reuseLabel, creationLabel)), nil, nil
 	case "rm":
-		return nil, nil, nil
+		return []byte(args[len(args)-1] + "\n"), nil, nil
 	default:
 		return r.fakeRunner.Run(ctx, args...)
 	}

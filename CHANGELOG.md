@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve non-CLI configuration and ambiguous-object vetoes at any wrapper depth
+  when classifying CLI absence errors.
 - Retry inspection-query deadlines while the enclosing verification or reuse
   budget remains live, and isolate shared query work across different budgets.
 - Honor configured long Docker metadata query budgets without a separate fixed
@@ -32,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** Ordinary prune uses non-force deletion so candidates restarted
+  after inspection are retained. A verified restart is skipped without an error;
+  other deletion failures are still returned. Reuse-group prune remains forceful.
+- Prune results exclude candidates already removed by another actor, including
+  Docker force-delete no-ops with empty successful output.
+- Classify redacted CLI errors using their original command and target identities.
+  Wait, prune, and terminate now recognize confirmed container absence, and
+  returned diagnostics stay redacted.
+
 - **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
   an exit code. `ExitCode` also rejects containers that have not stopped. Callers
   relying on `0, nil` must handle these errors; snapshot users must check
@@ -43,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Build diagnostic value indexes once when first used and share them with
   streams. Streams retain their explicit-value protection when the source
   redactor is closed.
+
 
 ## [0.3.0] - 2026-10-26
 

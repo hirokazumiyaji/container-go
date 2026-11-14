@@ -364,7 +364,7 @@ func TestConfiguredBinaryKeepsBackendIdentity(t *testing.T) {
 			// The identity is what classification compares, so the backend must
 			// keep recognizing errors its CLI produced under the override.
 			cliErr := &cli.CLIError{Binary: runner.Identity, Args: []string{"inspect", "abc"}, ExitCode: 1}
-			if !cliBinaryMatches(cliErr.Binary, (dockerEngine{}).binary()) {
+			if !cli.BinaryMatches(cliErr.Binary, (dockerEngine{}).binary()) {
 				t.Fatalf("CLIError binary %q did not match the backend", cliErr.Binary)
 			}
 		})

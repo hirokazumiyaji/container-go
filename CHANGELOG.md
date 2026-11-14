@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,
+  platform, and port settings.
 - `ErrExitCodeUnavailable`, `ErrContainerNotStopped`, and `InspectInfo.ExitCodeReported`
   distinguish unavailable process status from a reported zero exit code.
 - Add `WithClientQueryTimeout` for Client construction, Run queries, container
@@ -34,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reuse requires matching creation fingerprints and reuse groups, including when
+  fingerprinted options are omitted. Recreate existing reuse containers before
+  attaching with this version; environment values retain their attach semantics.
 - **Breaking:** Ordinary prune uses non-force deletion so candidates restarted
   after inspection are retained. A verified restart is skipped without an error;
   other deletion failures are still returned. Reuse-group prune remains forceful.

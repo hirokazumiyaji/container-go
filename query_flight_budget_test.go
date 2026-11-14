@@ -288,7 +288,7 @@ func TestInspectRetryLoopsPreserveOuterDeadline(t *testing.T) {
 			case "reuse":
 				_, err = reuseEnsureContainer(ctx, "redis:7-alpine", cfg)
 			case "refresh":
-				_, err = reuseInfoForCaller(ctx, cfg, ctr)
+				_, err = reuseInfoForCaller(ctx, cfg, ctr, imageIdentity{reference: "redis:7-alpine"}, "redis:7-alpine")
 			case "ownership":
 				err = verifyCreatedOwnership(ctx, ctr, cfg)
 			}

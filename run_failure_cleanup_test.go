@@ -91,7 +91,7 @@ func ownedReuseInspectJSON(name string) string {
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
         "com.github.hirokazumiyaji.container-go.session": %q,
-        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.reuse": "true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`",
         "com.github.hirokazumiyaji.container-go.creation": "__CONTAINER_CREATION__"
       }
     },

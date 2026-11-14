@@ -2,11 +2,12 @@ package domain
 
 // Label constants applied by container-go to track managed containers.
 const (
-	LabelManaged    = "com.github.hirokazumiyaji.container-go"
-	LabelSession    = "com.github.hirokazumiyaji.container-go.session"
-	LabelCreation   = "com.github.hirokazumiyaji.container-go.creation"
-	LabelReuse      = "com.github.hirokazumiyaji.container-go.reuse"
-	LabelReuseGroup = "com.github.hirokazumiyaji.container-go.reuse-group"
+	LabelManaged     = "com.github.hirokazumiyaji.container-go"
+	LabelSession     = "com.github.hirokazumiyaji.container-go.session"
+	LabelCreation    = "com.github.hirokazumiyaji.container-go.creation"
+	LabelReuse       = "com.github.hirokazumiyaji.container-go.reuse"
+	LabelReuseConfig = "com.github.hirokazumiyaji.container-go.reuse-config"
+	LabelReuseGroup  = "com.github.hirokazumiyaji.container-go.reuse-group"
 )
 
 // LabelConfig holds the fields needed to construct standard container-go labels.
@@ -23,7 +24,7 @@ type LabelConfig struct {
 // for ownership and cleanup decisions.
 func reservedLabel(key string) bool {
 	switch key {
-	case LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup:
+	case LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup, LabelReuseConfig:
 		return true
 	default:
 		return false

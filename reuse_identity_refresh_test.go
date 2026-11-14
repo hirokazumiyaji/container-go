@@ -59,7 +59,7 @@ func reuseTestInspectJSON(uid, generation string, bound bool) string {
 		"Name":"/shared",
 		"Config":{"Image":"redis:7-alpine","Labels":{
 			"com.github.hirokazumiyaji.container-go":"true",
-			"com.github.hirokazumiyaji.container-go.reuse":"true",
+			"com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`",
 			"com.github.hirokazumiyaji.container-go.creation":%q
 		}},
 		"State":{"Status":"running"},
@@ -102,7 +102,7 @@ func TestReuseCallerRefreshRejectsReplacedIdentity(t *testing.T) {
 	waiterResult := make(chan error, 1)
 	go func() {
 		_, err := Run(ctx, "redis:7-alpine",
-			WithName("shared"), WithReuse(), WithExposedPorts("6379/tcp"),
+			WithName("shared"), WithReuse(),
 			withRunner(runner), withEngine(dockerEngine{}))
 		waiterResult <- err
 	}()
@@ -157,7 +157,7 @@ func TestReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 				eng:    dockerEngine{},
 				name:   "shared",
 			}
-			info, err := reuseInfoForCaller(context.Background(), cfg, base)
+			info, err := reuseInfoForCaller(context.Background(), cfg, base, imageIdentity{reference: "redis:7-alpine"}, "redis:7-alpine")
 			if !errors.Is(err, ErrGenerationReplaced) {
 				t.Fatalf("info = %+v, error = %v, want ErrGenerationReplaced", info, err)
 			}
@@ -181,7 +181,7 @@ func (createdRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			"Name":"/shared",
 			"Config":{"Image":"redis:7-alpine","Labels":{
 				"com.github.hirokazumiyaji.container-go":"true",
-				"com.github.hirokazumiyaji.container-go.reuse":"true",
+				"com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`",
 				"com.github.hirokazumiyaji.container-go.creation":%q
 			}},
 			"State":{"Status":"created"},
@@ -274,7 +274,7 @@ func TestReuseCallerRefreshTimeoutPreservesDeadlineExceeded(t *testing.T) {
 	waiterResult := make(chan error, 1)
 	go func() {
 		_, err := Run(ctx, "redis:7-alpine",
-			WithName("shared"), WithReuse(), WithExposedPorts("6379/tcp"),
+			WithName("shared"), WithReuse(),
 			withRunner(runner), withEngine(dockerEngine{}))
 		waiterResult <- err
 	}()

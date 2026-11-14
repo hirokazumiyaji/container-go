@@ -48,6 +48,9 @@ var ErrInvalidConfiguration = wait.ErrInvalidConfiguration
 // backend cannot honor. Run returns it as a *ConfigError.
 var ErrInvalidConfig = errors.New("invalid container configuration")
 
+// ErrReuseMismatch reports creation options that differ from an existing reuse container.
+var ErrReuseMismatch = errors.New("reuse configuration mismatch")
+
 // ConfigError describes an invalid option combination before container
 // creation. Callers can use errors.As to inspect the backend, network,
 // and option involved.

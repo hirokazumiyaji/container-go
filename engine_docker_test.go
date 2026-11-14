@@ -2088,9 +2088,10 @@ func TestDockerReuseRejectsNetworkModeMismatch(t *testing.T) {
 	cfg := dockerTestConfig(t, WithName("myctr"), WithReuse(), WithNetwork("bridge"))
 	info := &engineInfo{
 		labels: map[string]string{
-			managedLabel:  "true",
-			reuseLabel:    "true",
-			creationLabel: "0123456789abcdef",
+			managedLabel:     "true",
+			reuseLabel:       "true",
+			reuseConfigLabel: defaultReuseFingerprint,
+			creationLabel:    "0123456789abcdef",
 		},
 		uid:          dockerFixtureID,
 		image:        "redis:7-alpine",
@@ -2482,9 +2483,10 @@ func TestDockerReuseRejectsOmittedNetworkWildcard(t *testing.T) {
 			}
 			info := &engineInfo{
 				labels: map[string]string{
-					managedLabel:  "true",
-					reuseLabel:    "true",
-					creationLabel: "0123456789abcdef",
+					managedLabel:     "true",
+					reuseLabel:       "true",
+					reuseConfigLabel: defaultReuseFingerprint,
+					creationLabel:    "0123456789abcdef",
 				},
 				uid:          dockerFixtureID,
 				image:        "redis:7-alpine",
@@ -2514,9 +2516,10 @@ func TestDockerReuseCanonicalizesDaemonDefaultNetwork(t *testing.T) {
 			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
 			info := &engineInfo{
 				labels: map[string]string{
-					managedLabel:  "true",
-					reuseLabel:    "true",
-					creationLabel: "0123456789abcdef",
+					managedLabel:     "true",
+					reuseLabel:       "true",
+					reuseConfigLabel: defaultReuseFingerprint,
+					creationLabel:    "0123456789abcdef",
 				},
 				uid:            dockerFixtureID,
 				image:          "redis:7-alpine",
@@ -2545,9 +2548,10 @@ func TestDockerOmittedNetworkRejectsUserDefinedPlatformName(t *testing.T) {
 			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
 			info := &engineInfo{
 				labels: map[string]string{
-					managedLabel:  "true",
-					reuseLabel:    "true",
-					creationLabel: "0123456789abcdef",
+					managedLabel:     "true",
+					reuseLabel:       "true",
+					reuseConfigLabel: defaultReuseFingerprint,
+					creationLabel:    "0123456789abcdef",
 				},
 				uid:            dockerFixtureID,
 				image:          "redis:7-alpine",
@@ -2570,9 +2574,10 @@ func TestDockerReuseRejectsRemoteLoopbackBinding(t *testing.T) {
 	)
 	info := &engineInfo{
 		labels: map[string]string{
-			managedLabel:  "true",
-			reuseLabel:    "true",
-			creationLabel: "0123456789abcdef",
+			managedLabel:     "true",
+			reuseLabel:       "true",
+			reuseConfigLabel: defaultReuseFingerprint,
+			creationLabel:    "0123456789abcdef",
 		},
 		uid:          dockerFixtureID,
 		image:        "redis:7-alpine",

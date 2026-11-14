@@ -3,6 +3,8 @@ package container
 import (
 	"maps"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // allLabels must carry every internal label exactly once and keep
@@ -17,12 +19,13 @@ func TestAllLabelsSetsEachInternalLabelOnce(t *testing.T) {
 
 	got := cfg.allLabels()
 	want := map[string]string{
-		"user":          "value",
-		managedLabel:    "true",
-		sessionLabel:    sessionID(),
-		creationLabel:   "abc123",
-		reuseLabel:      "true",
-		reuseGroupLabel: "grp",
+		"user":                  "value",
+		domain.LabelReuseConfig: cfg.reuseConfigHash(),
+		managedLabel:            "true",
+		sessionLabel:            sessionID(),
+		creationLabel:           "abc123",
+		reuseLabel:              "true",
+		reuseGroupLabel:         "grp",
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("allLabels() = %v, want %v", got, want)

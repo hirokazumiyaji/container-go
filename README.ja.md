@@ -1040,8 +1040,11 @@ func TestReuse(t *testing.T) {
   `WithExposedPorts` の宣言が残らないため、それを比較できません。Apple では
   新しい handle ごとに自分の exposed-port 宣言を共有コンテナ IP へ適用するので、
   宣言を分離したい場合は名前を変えてください。
-- `env` / `cmd` / `mounts` の差は既存へ黙って attach します。重要な設定は
-  別の名前を使ってください。`WithFiles` は attach caller を含むすべての reuse
+- memory、user、working directory、entrypoint、cmd、mounts、custom labels は、
+  省略時も含め作成時の fingerprint と一致する必要があります。
+  reuse group も一致しなければ `ErrReuseMismatch` を返します。
+  fingerprint のない既存コンテナは再作成してください。
+  `env` の差は attach 時に無視するため、重要なら別の名前を使ってください。`WithFiles` は attach caller を含むすべての reuse
   caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずに
   error を返します。`PullAlways` は attach 前にも各 caller で実行されます。
 - 各作成は generation label を持ちます。`Terminate`、stopped 再作成経路、

@@ -19,6 +19,7 @@ import (
 type reuseCreateRunner struct {
 	*fakeRunner
 	created atomic.Bool
+	labels  map[string]string
 }
 
 func newReuseCreateRunner() *reuseCreateRunner {
@@ -43,14 +44,29 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		name := args[len(args)-1]
 		r.mu.Lock()
 		creation := r.creations[name]
+		labels := r.labels
 		r.mu.Unlock()
 		if creation == "" {
 			creation = "0123456789abcdef"
 		}
-		return []byte(reuseInspectJSONForCreation(name, "running", "redis:7-alpine", creation)), nil, nil
+		return reuseInspectWithLabels([]byte(reuseInspectJSONForCreation(name, "running", "redis:7-alpine", creation)), labels), nil, nil
 	}
 	if args[0] == "run" {
-		r.created.Store(true)
+		labels := map[string]string{}
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				key, value, _ := strings.Cut(args[i+1], "=")
+				labels[key] = value
+			}
+		}
+		out, stderr, err := r.fakeRunner.Run(ctx, args...)
+		if err == nil {
+			r.mu.Lock()
+			r.labels = labels
+			r.mu.Unlock()
+			r.created.Store(true)
+		}
+		return out, stderr, err
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }
@@ -224,7 +240,7 @@ func reuseInspectJSONForCreationWithDigest(id, state, image, creation, digest st
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.reuse": "true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`",
         "com.github.hirokazumiyaji.container-go.creation": %q
       }
     },
@@ -619,9 +635,9 @@ func TestImagesCompatible(t *testing.T) {
 }
 
 func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
-	const lsJSON = `[
-  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
-  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
+	lsJSON := `[
+  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "` + defaultReuseFingerprint + `","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
+  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "` + defaultReuseFingerprint + `","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}

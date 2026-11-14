@@ -180,7 +180,7 @@ func (r *freshReuseAttachRunner) Run(_ context.Context, args ...string) ([]byte,
 		if len(platformParts) == 3 {
 			platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
 		}
-		return []byte(fmt.Sprintf(`[{"id":"fresh-reuse","configuration":{"id":"fresh-reuse","platform":%s,"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`, platformJSON, variantDigest)), nil, nil
+		return []byte(fmt.Sprintf(`[{"id":"fresh-reuse","configuration":{"id":"fresh-reuse","platform":%s,"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true", "com.github.hirokazumiyaji.container-go.reuse-config": "`+defaultReuseFingerprint+`","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`, platformJSON, variantDigest)), nil, nil
 	default:
 		return nil, nil, nil
 	}

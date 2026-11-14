@@ -43,7 +43,7 @@ func (r *blockingExternalRunner) Run(ctx context.Context, args ...string) ([]byt
 		if len(platformParts) == 3 {
 			platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
 		}
-		return []byte(fmt.Sprintf(`[{"id":"pre-shared","configuration":{"id":"pre-shared","platform":%s,"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{%q:"true",%q:%q,%q:"true",%q:"pre-group",%q:"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`, platformJSON, variantDigest, managedLabel, sessionLabel, sessionID(), reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
+		return []byte(fmt.Sprintf(`[{"id":"pre-shared","configuration":{"id":"pre-shared","platform":%s,"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{"com.github.hirokazumiyaji.container-go.reuse-config":"`+defaultReuseFingerprint+`",%q:"true",%q:%q,%q:"true",%q:"pre-group",%q:"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`, platformJSON, variantDigest, managedLabel, sessionLabel, sessionID(), reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
 	default:
 		return nil, nil, nil
 	}

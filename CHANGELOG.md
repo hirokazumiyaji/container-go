@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Redact structural secrets in CLI diagnostics before trimming them. `CLIError`
+  keeps a bounded trailing stderr window so a password prefix or private-key PEM
+  header outside the rendered 64 KiB tail still reaches the redaction rules, and
+  `Run`, `RunTo`, and streaming terminal errors all render the redacted tail.
+
 ### Added
 
 - `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,

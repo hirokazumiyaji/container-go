@@ -93,15 +93,15 @@ func TestExecRunnerPreservesFailureStdout(t *testing.T) {
 func TestExecRunnerCapsStderr(t *testing.T) {
 	// Emit ~1MiB of stderr, far beyond the 64KiB cap, then finish with
 	// the diagnostic that classification needs.
-	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_BYTES_SENTINEL\n' >&2; i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; printf 'Error response from daemon: No such container: terminal\n' >&2; exit 1`)}
+	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_BYTES_SENTINEL\n' >&2; head -c 2097152 /dev/zero >&2; printf '\nError response from daemon: No such container: terminal\n' >&2; exit 1`)}
 
 	stdout, stderr, err := r.Run(context.Background(), "run")
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
 		t.Fatalf("error = %v, want *CLIError", err)
 	}
-	if len(cliErr.Stderr) > maxStderr {
-		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	if len(cliErr.Stderr) > maxStderrContext {
+		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderrContext)
 	}
 	if !strings.Contains(cliErr.Stderr, "No such container: terminal") {
 		t.Errorf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)
@@ -145,8 +145,8 @@ func TestExecRunnerPreservesLargeFailureOutput(t *testing.T) {
 	if len(stderr) != 131072 {
 		t.Errorf("len(returned stderr) = %d, want 131072", len(stderr))
 	}
-	if len(cliErr.Stderr) > maxStderr {
-		t.Errorf("len(CLIError.Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	if len(cliErr.Stderr) > maxStderrContext {
+		t.Errorf("len(CLIError.Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderrContext)
 	}
 	if stdoutDiagnostic, _, ok := DiagnosticText(err); !ok || len(stdoutDiagnostic) > maxStderr {
 		t.Errorf("len(stdout diagnostic) = %d (ok=%t), want <= %d", len(stdoutDiagnostic), ok, maxStderr)

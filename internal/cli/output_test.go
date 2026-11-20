@@ -189,7 +189,7 @@ func TestCountingWriterRetainsOneRepeatedWriterError(t *testing.T) {
 }
 
 func TestExecRunnerRunToKeepsFailureDiagnosticBounded(t *testing.T) {
-	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_DIAGNOSTIC_MARKER\\n'; head -c 131072 /dev/zero >&2; printf 'LAST_DIAGNOSTIC_MARKER\\n' >&2; exit 7`)}
+	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_DIAGNOSTIC_MARKER\n'; head -c 131072 /dev/zero >&2; printf '\nLAST_DIAGNOSTIC_MARKER\n' >&2; exit 7`)}
 
 	_, err := r.RunTo(context.Background(), io.Discard, io.Discard, "exec")
 	var cliErr *CLIError
@@ -199,8 +199,8 @@ func TestExecRunnerRunToKeepsFailureDiagnosticBounded(t *testing.T) {
 	if cliErr.ExitCode != 7 {
 		t.Errorf("ExitCode = %d, want 7", cliErr.ExitCode)
 	}
-	if len(cliErr.Stderr) != maxStderr {
-		t.Errorf("len(CLIError.Stderr) = %d, want %d", len(cliErr.Stderr), maxStderr)
+	if len(cliErr.Stderr) > maxStderrContext {
+		t.Errorf("len(CLIError.Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderrContext)
 	}
 	if !strings.Contains(cliErr.Stderr, "LAST_DIAGNOSTIC_MARKER") {
 		t.Errorf("CLIError.Stderr does not retain the terminal diagnostic")

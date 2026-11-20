@@ -798,7 +798,7 @@ func cliErrorLines(err error) ([]string, bool) {
 	cliErr := branches[0].ctx.err
 	allowGenericError := genericErrorWrapperAllowed(cliErr)
 	var lines []string
-	for _, line := range strings.Split(cliErr.Stderr, "\n") {
+	for _, line := range splitCLIErrorLines(cliErr.Stderr) {
 		line = normalizeCLIErrorLine(line, cliErr, allowGenericError)
 		if line != "" {
 			lines = append(lines, line)

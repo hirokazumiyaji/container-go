@@ -1899,7 +1899,7 @@ func dockerImageOperationalFailure(stderr string) bool {
 
 func dockerImageMissingStderr(branch cliErrorBranch) bool {
 	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
-	for _, raw := range strings.Split(branch.stderr, "\n") {
+	for _, raw := range splitCLIErrorLines(branch.stderr) {
 		line := trimCLIErrorWrapper(raw, branch.ctx.err, allowGenericError)
 		lower := strings.ToLower(line)
 		if strings.HasPrefix(lower, "manifest unknown:") {

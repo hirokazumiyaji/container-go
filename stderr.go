@@ -202,14 +202,14 @@ func firstPositional(args []string, start int, valueOptions ...string) string {
 
 func branchLines(branch cliErrorBranch, includeStdout bool) (stderr, stdout []string) {
 	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
-	for _, line := range strings.Split(branch.stderr, "\n") {
+	for _, line := range splitCLIErrorLines(branch.stderr) {
 		line = normalizeCLIErrorLine(line, branch.ctx.err, allowGenericError)
 		if line != "" {
 			stderr = append(stderr, line)
 		}
 	}
 	if includeStdout {
-		for _, line := range strings.Split(branch.stdout, "\n") {
+		for _, line := range splitCLIErrorLines(branch.stdout) {
 			line = normalizeCLIErrorLine(line, branch.ctx.err, allowGenericError)
 			if line != "" {
 				stdout = append(stdout, line)
@@ -236,6 +236,13 @@ func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
 	default:
 		return false
 	}
+}
+
+// splitCLIErrorLines splits backend diagnostics on both newline and
+// carriage return. Progress display overwrites its line with carriage returns,
+// so the decisive error line can follow one without a newline.
+func splitCLIErrorLines(text string) []string {
+	return strings.FieldsFunc(text, func(r rune) bool { return r == '\r' || r == '\n' })
 }
 
 // trimCLIErrorWrapper removes only verified CLI wrappers while preserving
@@ -312,7 +319,7 @@ func hasBranchLine(branch cliErrorBranch, match func(string) bool) bool {
 
 func hasBranchImageLine(branch cliErrorBranch, prefix, target string, exact bool) bool {
 	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
-	for _, raw := range strings.Split(branch.stderr, "\n") {
+	for _, raw := range splitCLIErrorLines(branch.stderr) {
 		line := trimCLIErrorWrapper(raw, branch.ctx.err, allowGenericError)
 		lower := strings.ToLower(line)
 		if !strings.HasPrefix(lower, prefix) {
@@ -423,7 +430,7 @@ func hasAppleContainerizationErrorPath(
 ) bool {
 	for _, branch := range backendCLIErrorBranches(err, "container") {
 		allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
-		for _, raw := range strings.Split(branch.stderr, "\n") {
+		for _, raw := range splitCLIErrorLines(branch.stderr) {
 			line := trimCLIErrorWrapper(raw, branch.ctx.err, allowGenericError)
 			if line == "" {
 				continue

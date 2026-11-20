@@ -189,7 +189,7 @@ func TestUnixCancellationPreservesGenuinePositiveExit(t *testing.T) {
 		ctx:       ctx,
 		binary:    "docker",
 		args:      []string{"logs", "--follow", "x"},
-		stderr:    &tailBuffer{},
+		stderr:    newTailBuffer(maxStderr),
 		cancelled: true,
 	}
 	ps.drainCompleted.Store(true)

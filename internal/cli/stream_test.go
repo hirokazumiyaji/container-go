@@ -162,8 +162,8 @@ func TestStreamRetainsTerminalStderrTail(t *testing.T) {
 	if !errors.As(readErr, &cliErr) {
 		t.Fatalf("read error = %v, want *CLIError", readErr)
 	}
-	if len(cliErr.Stderr) > maxStderr {
-		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	if len(cliErr.Stderr) > maxStderrContext {
+		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderrContext)
 	}
 	if !strings.Contains(cliErr.Stderr, "No such container: terminal") {
 		t.Errorf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)
@@ -215,7 +215,7 @@ func TestTerminalErrorResultJoinsContextAndExit(t *testing.T) {
 		ctx:    ctx,
 		binary: "docker",
 		args:   []string{"logs", "--follow", "x"},
-		stderr: &tailBuffer{},
+		stderr: newTailBuffer(maxStderr),
 	}
 	ps.drainCompleted.Store(true)
 	ps.stateMu.Lock()
@@ -287,7 +287,7 @@ func TestDrainTimeoutWaitsForPumpsBeforeReturning(t *testing.T) {
 	ps := &processStream{
 		ReadCloser: publicRead,
 		output:     publicWrite,
-		stderr:     &tailBuffer{},
+		stderr:     newTailBuffer(maxStderr),
 		stderrRead: sourceRead,
 		pumpsDone:  make(chan struct{}),
 	}
@@ -582,7 +582,7 @@ func TestTerminalErrorRetainsSettledProcessErrorWithoutPositiveTermination(t *te
 		ctx:                 ctx,
 		binary:              "docker",
 		args:                []string{"logs", "--follow", "x"},
-		stderr:              &tailBuffer{},
+		stderr:              newTailBuffer(maxStderr),
 		cancelled:           true,
 		terminationSignaled: false,
 	}
@@ -609,7 +609,7 @@ func TestTerminalErrorReturnsContextOnlyAfterPositiveTermination(t *testing.T) {
 		ctx:                 ctx,
 		binary:              "docker",
 		args:                []string{"logs", "--follow", "x"},
-		stderr:              &tailBuffer{},
+		stderr:              newTailBuffer(maxStderr),
 		cancelled:           true,
 		terminationSignaled: true,
 	}
@@ -631,7 +631,7 @@ func TestTerminalErrorDoesNotTurnSuccessfulSettledProcessIntoCancellation(t *tes
 		ctx:       ctx,
 		binary:    "docker",
 		args:      []string{"logs", "--follow", "x"},
-		stderr:    &tailBuffer{},
+		stderr:    newTailBuffer(maxStderr),
 		cancelled: true,
 	}
 	ps.drainCompleted.Store(true)
@@ -650,7 +650,7 @@ func TestCancelCallbackDoesNotSynthesizeFailureForSettledChild(t *testing.T) {
 		ctx:        ctx,
 		binary:     "docker",
 		args:       []string{"logs", "--follow", "x"},
-		stderr:     &tailBuffer{},
+		stderr:     newTailBuffer(maxStderr),
 		startDone:  startDone,
 		started:    true,
 		terminateTree: func(*exec.Cmd) terminationResult {

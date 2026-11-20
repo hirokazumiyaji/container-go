@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"reflect"
+	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
@@ -129,7 +130,84 @@ func (e *safeError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	return e.redactor.Text(e.err.Error())
+	return formatErrorWith(e.err, e.redactor)
+}
+
+// formatErrorWith renders CLI diagnostics with the caller's redactor before
+// their diagnostic tail is trimmed. Applying the redactor afterwards could
+// miss a caller value that spans the rendered boundary. Wrapped and joined
+// errors replace each rendered diagnostic node in place, preserving wrapper
+// formatting with one final control-character pass.
+func formatErrorWith(err error, r *Redactor) string {
+	switch value := err.(type) {
+	case *CLIError:
+		return formatCLIError(value, r)
+	case *diagnosticError:
+		return value.errorWith(r)
+	case *safeError:
+		return formatErrorWith(value.err, value.redactor.Compose(r))
+	}
+	leaves := collectDiagnosticLeaves(err, r, nil)
+	if len(leaves) == 0 {
+		return r.Text(err.Error())
+	}
+	message := err.Error()
+	var rendered strings.Builder
+	last := 0
+	for _, leaf := range leaves {
+		raw := leaf.node.Error()
+		if raw == "" {
+			continue
+		}
+		offset := strings.Index(message[last:], raw)
+		if offset < 0 {
+			// An unexpected wrapper layout: fall back to redacting the
+			// complete message rather than risk emitting a raw segment.
+			return r.Text(message)
+		}
+		offset += last
+		rendered.WriteString(r.Text(message[last:offset]))
+		rendered.WriteString(leaf.render)
+		last = offset + len(raw)
+	}
+	rendered.WriteString(r.Text(message[last:]))
+	return rendered.String()
+}
+
+// diagnosticLeaf is one rendered node whose text appears in its parent's
+// error message.
+type diagnosticLeaf struct {
+	node   error
+	render string
+}
+
+func collectDiagnosticLeaves(err error, r *Redactor, leaves []diagnosticLeaf) []diagnosticLeaf {
+	if err == nil {
+		return leaves
+	}
+	switch value := err.(type) {
+	case *CLIError:
+		return append(leaves, diagnosticLeaf{node: value, render: formatCLIError(value, r)})
+	case *diagnosticError:
+		return append(leaves, diagnosticLeaf{node: value, render: value.errorWith(r)})
+	case *safeError:
+		return append(leaves, diagnosticLeaf{
+			node:   value,
+			render: formatErrorWith(value.err, value.redactor.Compose(r)),
+		})
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			leaves = collectDiagnosticLeaves(child, r, leaves)
+		}
+		return leaves
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if inner := wrapped.Unwrap(); inner != nil && inner != err {
+			return collectDiagnosticLeaves(inner, r, leaves)
+		}
+	}
+	return leaves
 }
 
 // UnwrapRaw is the explicit opt-in path to the source error. It is not named
@@ -186,7 +264,7 @@ func (e *safeError) as(target any, r *Redactor) bool {
 			Binary:   r.Text(raw.Binary),
 			Args:     r.Args(raw.Args),
 			ExitCode: raw.ExitCode,
-			Stderr:   r.Text(raw.Stderr),
+			Stderr:   redactedStderr(r, raw.Stderr),
 		}
 		return true
 	case **SystemNotRunningError:
@@ -290,7 +368,7 @@ func (e *CLIError) asRedacted(target any, r *diagnostic.Redactor) bool {
 	}
 	*ptr = &CLIError{
 		Binary: r.Text(e.Binary), Args: r.Args(e.Args),
-		ExitCode: e.ExitCode, Stderr: r.Text(e.Stderr),
+		ExitCode: e.ExitCode, Stderr: redactedStderr(r, e.Stderr),
 	}
 	return true
 }

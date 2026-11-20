@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 func assertCommandArgumentValidationError(t *testing.T, err error, option string) {
@@ -157,5 +160,30 @@ func TestExecAcceptsValidArguments(t *testing.T) {
 
 	if _, _, err := ctr.Exec(context.Background(), []string{"echo", ""}); err != nil {
 		t.Fatalf("Exec rejected valid command arguments: %v", err)
+	}
+}
+
+func TestForExecRejectsInvalidCommandArgumentsWithoutRetry(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.calls = nil
+
+	strategy := wait.ForExec([]string{"echo", "bad\x00"}).
+		WithStartupTimeout(5 * time.Second).
+		WithPollInterval(10 * time.Millisecond)
+	start := time.Now()
+	err := strategy.WaitUntilReady(context.Background(), waitTarget{c: ctr})
+	if err == nil {
+		t.Fatal("ForExec accepted an invalid command argument")
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		t.Fatalf("ForExec retried for %v, want immediate configuration failure", elapsed)
+	}
+	if !errors.Is(err, wait.ErrInvalidConfiguration) {
+		t.Fatalf("error = %v, want ErrInvalidConfiguration", err)
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("error = %T %v, want *ValidationError in the chain", err, err)
 	}
 }

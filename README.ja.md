@@ -199,8 +199,9 @@ infrastructure、cancellation、launch、missing-container エラー時も
 partial reader と truncation state を返します。`FollowLogs` は長期
 ストリームなので自動 byte 上限はありません。`wait.ForExec` は各 poll の
 出力を `io.Discard` へ送り、失敗診断のログは固定長 1MiB の末尾リングに
-保持します。internal `CLIError` は失敗した invocation ごとに stderr の
-末尾最大 64KiB だけを診断用に保持します。これは `Run` の全量出力や
+保持します。internal `CLIError` は失敗した invocation ごとに分類用の
+末尾 stderr ウィンドウを有界に保持し、`Error` はそのウィンドウを
+秘匿化してから末尾最大 64KiB を描画します。これは `Run` の全量出力や
 caller-owned sink の上限ではありません。
 
 `Logs`、`WithExecMaxBytes` を指定しない `Exec`、`MaxBytes == 0` は

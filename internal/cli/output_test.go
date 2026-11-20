@@ -199,8 +199,8 @@ func TestExecRunnerRunToKeepsFailureDiagnosticBounded(t *testing.T) {
 	if cliErr.ExitCode != 7 {
 		t.Errorf("ExitCode = %d, want 7", cliErr.ExitCode)
 	}
-	if len(cliErr.Stderr) != maxStderr {
-		t.Errorf("len(CLIError.Stderr) = %d, want %d", len(cliErr.Stderr), maxStderr)
+	if len(cliErr.Stderr) > maxStderrContext {
+		t.Errorf("len(CLIError.Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderrContext)
 	}
 	if !strings.Contains(cliErr.Stderr, "LAST_DIAGNOSTIC_MARKER") {
 		t.Errorf("CLIError.Stderr does not retain the terminal diagnostic")

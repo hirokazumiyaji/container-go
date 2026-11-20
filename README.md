@@ -220,8 +220,9 @@ container cannot make the host allocate an unbounded response:
 - `wait.ForExec` discards command output for every poll, and wait-failure
   diagnostics use a fixed 1 MiB trailing log buffer. That diagnostic tail
   is separate from the public prefix cap. The internal ExecRunner
-  `CLIError` keeps at most the trailing 64 KiB of stderr per failed
-  invocation; this diagnostic limit does not bound `Run` output or a
+  `CLIError` keeps a bounded trailing stderr window per failed invocation
+  for classification; `Error` redacts that window and renders at most the
+  trailing 64 KiB. This diagnostic limit does not bound `Run` output or a
   caller-owned sink.
 
 `Logs`, `Exec` without `WithExecMaxBytes`, and `MaxBytes == 0` retain

@@ -250,7 +250,7 @@ CLI の出力には、全量を保持する互換モードと、caller の sink 
 
 wait adapter は `ForExec` の出力を `ExecTo` で `io.Discard` へ送り、失敗診断のログだけを backend の bounded tail の末尾 1MiB として redact して保持する。CLI runner は `RunTo` で直接 streaming を提供する。旧 `Run` しか実装しない runner は互換 adapter を使うが、`Run` が戻る前に大きな slice を作るため peak memory の上限は保証できない。大きな出力の integration test は bounded forwarding と draining を確認するだけで、peak host memory を測定するものではない。RSS の測定には外部 sampler が必要である。
 
-`LogsOptions` に `Tail` と `Since` に加えて `MaxBytes` を追加した。Go の構造体にはフィールドを追加しても旧 unkeyed literal を維持する仕組みがないため、この pre-1.0 リリースでは source break を明示的に受け入れる。呼び出しは keyed `LogsOptions` literal へ移行する。微妙に異なる二重の options 表現を維持するより、この選択の方が明確である。internal CLI diagnostic はさらに別で、各失敗 invocation の `CLIError` には stderr の末尾最大 64KiB だけを保持し、`Run` の全量出力と caller-owned `RunTo` sink の動作は変えない。
+`LogsOptions` に `Tail` と `Since` に加えて `MaxBytes` を追加した。Go の構造体にはフィールドを追加しても旧 unkeyed literal を維持する仕組みがないため、この pre-1.0 リリースでは source break を明示的に受け入れる。呼び出しは keyed `LogsOptions` literal へ移行する。微妙に異なる二重の options 表現を維持するより、この選択の方が明確である。internal CLI diagnostic はさらに別で、各失敗 invocation の `CLIError` には分類用の末尾 stderr ウィンドウを有界に保持し、描画時に秘匿化したうえで末尾最大 64KiB を出力する。`Run` の全量出力と caller-owned `RunTo` sink の動作は変えない。
 
 ## 接続エンドポイントの設計
 
@@ -626,7 +626,7 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる。
 - `ErrReuseMismatch`：再利用時の設定、image、platform、network、port、reuse group の不一致。Docker の一時的な port binding の未反映は再試行し、attach 予算の終了時は `context.DeadlineExceeded` にも一致する。Apple の明示的な publication の欠落は即座に不一致とする。呼び出し元の取消や所有権・世代の検証失敗は構成不一致に分類しない。
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。reuse は readiness 後の再 inspect で置き換えを検出し、handle を返さない。
-- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
+- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、分類用の有界な末尾 stderr ウィンドウを保持する（描画時の診断は秘匿化され 64KiB 上限）。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
 - `ErrContainerNotFound` と `ErrGenerationReplaced` も現在の開発版追加である。
 - `ErrEnvFileUnsupported`：空でない環境変数指定には安全な env ファイルが必要だが、現在のプラットフォームではユーザー単位の秘密性を確保できない
 - `ErrCopyFileNotRegular`：Docker の copy-out 結果が regular file でない

@@ -86,7 +86,7 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		identity:   r.identity(),
 		args:       append([]string(nil), args...),
 		output:     pw,
-		stderr:     &tailBuffer{},
+		stderr:     newTailBuffer(maxStderrContext),
 		// Keep both names as aliases for package-local compatibility;
 		// they intentionally refer to the same ordered endpoint.
 		stdoutRead:     childRead,

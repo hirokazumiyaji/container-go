@@ -481,9 +481,10 @@ literals, so this pre-1.0 release makes the source break explicit:
 callers must use keyed `LogsOptions` literals. This is preferable to
 maintaining a second, subtly different options representation. The
 internal ExecRunner diagnostic is separate again: each failed
-invocation keeps at most the trailing 64 KiB of stderr for `CLIError`,
-while `Run` and caller-owned `RunTo` sinks retain their own documented
-behavior.
+invocation keeps a bounded trailing stderr window for `CLIError`
+classification, and `Error` redacts that window before rendering at most
+the trailing 64 KiB. `Run` and caller-owned `RunTo` sinks retain their
+own documented behavior.
 
 `Exec` returns the exit code and combined stdout+stderr. A command
 that runs in a running container and exits non-zero is a result rather
@@ -1235,9 +1236,10 @@ and cancellation paths.
   same-name replacement. Reuse re-inspects after readiness and rejects a
   replacement rather than returning the handle.
 - `*CLIError`: a backend CLI exited non-zero. It carries the binary,
-  arguments, exit code, and stderr (the diagnostic stderr copy is
-  capped at 64KiB). The root `CLIError` alias is a current-development
-  addition and is not part of `v0.2.0`.
+  arguments, exit code, and a bounded trailing stderr window for
+  classification; the rendered diagnostic is redacted and capped at
+  64KiB. The root `CLIError` alias is a current-development addition and
+  is not part of `v0.2.0`.
 - `ErrContainerNotFound` and `ErrGenerationReplaced` are also
   current-development additions.
 - `ErrOutputDelivery`: a caller-owned output sink rejected CLI output;

@@ -162,8 +162,8 @@ func TestStreamRetainsTerminalStderrTail(t *testing.T) {
 	if !errors.As(readErr, &cliErr) {
 		t.Fatalf("read error = %v, want *CLIError", readErr)
 	}
-	if len(cliErr.Stderr) > maxStderr {
-		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	if len(cliErr.Stderr) > maxStderrContext {
+		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderrContext)
 	}
 	if !strings.Contains(cliErr.Stderr, "No such container: terminal") {
 		t.Errorf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)

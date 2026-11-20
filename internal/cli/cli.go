@@ -20,6 +20,13 @@ import (
 // maxStderr bounds each diagnostic stream copied into a CLI failure.
 const maxStderr = 64 * 1024
 
+// maxStderrContext is the raw stderr window retained in CLIError for
+// classification and for rendering. Structural redaction needs the prefix of
+// a secret (for example "password=" or a private-key PEM header) that may sit
+// outside the rendered tail, so streamed diagnostics keep one structural
+// window. formatCLIError redacts this window before trimming it to maxStderr.
+const maxStderrContext = maxStderr + MaxStreamOverlap
+
 // ErrSystemNotRunning reports that a backend CLI command returned a
 // non-zero exit status and its follow-up liveness probe also failed.
 // Missing or unlaunchable CLI binaries remain launch errors and are not
@@ -137,6 +144,10 @@ func (r *ExecRunner) ExternalBinary() string { return r.Binary }
 
 // CLIError is a non-zero exit from a backend CLI.
 //
+// Stderr holds a bounded trailing window of the CLI's stderr. It stays raw so
+// classifiers and RawError can inspect the original lines; Error redacts that
+// window before trimming the rendered diagnostic.
+//
 // Keep this struct's four-field shape stable. Callers have historically
 // used unkeyed CLIError literals; stdout is therefore carried by the
 // internal diagnosticError wrapper below instead of being added here.
@@ -188,10 +199,30 @@ func formatCLIError(e *CLIError, r *Redactor) string {
 	}
 	args := r.Args(e.Args)
 	msg := fmt.Sprintf("%s %s: exit code %d", r.Text(bin), strings.Join(args, " "), e.ExitCode)
-	if stderr := r.RedactBounded(e.Stderr, maxStderr); stderr != "" {
-		msg += ": " + strings.TrimSpace(stderr)
+	// Redact the retained window before trimming it. The stored window is
+	// larger than the rendered tail so a password prefix or PEM header that
+	// sits outside the tail still reaches the structural rules.
+	if e.Stderr != "" {
+		if stderr := redactedDiagnosticTail(r, e.Stderr); stderr != "" {
+			msg += ": " + strings.TrimSpace(stderr)
+		}
 	}
 	return msg
+}
+
+// redactedDiagnosticTail renders at most the trailing maxStderr bytes of a
+// stored stderr window after redaction. Values too large for the streaming
+// window fall back to a complete redaction so no raw text is emitted.
+func redactedDiagnosticTail(r *Redactor, stderr string) string {
+	safe, err := r.RedactTail(strings.NewReader(stderr), maxStderr)
+	if err == nil {
+		return safe
+	}
+	safe = r.Text(stderr)
+	if len(safe) > maxStderr {
+		safe = safe[len(safe)-maxStderr:]
+	}
+	return safe
 }
 
 // diagnosticError keeps stdout available to classifiers without changing
@@ -355,7 +386,7 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 	}
 	stdoutCount := &countingWriter{dst: stdout}
 	stderrCount := &countingWriter{dst: stderr}
-	diagnostic := &tailBuffer{}
+	diagnostic := newTailBuffer(maxStderrContext)
 	runErr := r.execute(ctx, runHooks{}, stdoutCount, &diagnosticWriter{output: stderrCount, diagnostic: diagnostic}, func() ([]byte, []byte) {
 		return nil, []byte(diagnostic.String())
 	}, args)
@@ -523,33 +554,49 @@ func truncateOutput(s string) string {
 	return s[:head] + marker + s[len(s)-tail:]
 }
 
-// truncateStderr bounds the stderr diagnostic copy kept in CLIError.
+// truncateStderr bounds the raw stderr window kept in CLIError. It keeps one
+// structural window beyond the rendered diagnostic so formatCLIError can see
+// a secret prefix or PEM header that sits outside the final tail.
 func truncateStderr(s string) string {
-	return tailString(s)
+	return tailString(s, maxStderrContext)
 }
 
-func tailString(s string) string {
-	if len(s) <= maxStderr {
+func tailString(s string, limit int) string {
+	if len(s) <= limit {
 		return s
 	}
-	return string([]byte(s[len(s)-maxStderr:]))
+	return string([]byte(s[len(s)-limit:]))
 }
 
 // tailBuffer is a bounded rolling diagnostic buffer. It always reports
-// complete writes, even when older bytes are discarded.
+// complete writes, even when older bytes are discarded. A zero limit keeps
+// the historical maxStderr capacity.
 type tailBuffer struct {
-	mu   sync.Mutex
-	data []byte
+	mu    sync.Mutex
+	limit int
+	data  []byte
+}
+
+func newTailBuffer(limit int) *tailBuffer {
+	return &tailBuffer{limit: limit}
+}
+
+func (b *tailBuffer) capacity() int {
+	if b.limit > 0 {
+		return b.limit
+	}
+	return maxStderr
 }
 
 func (b *tailBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(p) >= maxStderr {
-		b.data = append(b.data[:0], p[len(p)-maxStderr:]...)
+	limit := b.capacity()
+	if len(p) >= limit {
+		b.data = append(b.data[:0], p[len(p)-limit:]...)
 		return len(p), nil
 	}
-	if overflow := len(b.data) + len(p) - maxStderr; overflow > 0 {
+	if overflow := len(b.data) + len(p) - limit; overflow > 0 {
 		copy(b.data, b.data[overflow:])
 		b.data = b.data[:len(b.data)-overflow]
 	}

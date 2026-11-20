@@ -602,9 +602,31 @@ func validateEnvironmentEntry(option, description, key, value string) error {
 	return nil
 }
 
+// validateCommandArguments rejects argv elements the backend cannot carry.
+// A NUL byte cannot cross an exec boundary and invalid UTF-8 cannot be
+// reproduced by the JSON diagnostics, so both must fail before any backend
+// work starts. The rejected element is not included in the error because
+// command arguments may contain credentials.
+func validateCommandArguments(option string, cmd []string) error {
+	for i, arg := range cmd {
+		if strings.ContainsRune(arg, 0) {
+			return newValidationErrorWithField(option, "arg", nil,
+				fmt.Errorf("%s argument %d must not contain NUL bytes", option, i))
+		}
+		if !utf8.ValidString(arg) {
+			return newValidationErrorWithField(option, "arg", nil,
+				fmt.Errorf("%s argument %d must be valid UTF-8", option, i))
+		}
+	}
+	return nil
+}
+
 // WithCmd overrides the arguments passed to the image's entrypoint.
 func WithCmd(cmd ...string) Option {
 	return func(c *config) error {
+		if err := validateCommandArguments("WithCmd", cmd); err != nil {
+			return err
+		}
 		c.cmd = cmd
 		return nil
 	}
@@ -615,7 +637,8 @@ func WithCmd(cmd ...string) Option {
 // WithCmd.
 func WithEntrypoint(entrypoint string) Option {
 	return func(c *config) error {
-		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\n\x00") {
+		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") ||
+			strings.ContainsAny(entrypoint, "\r\n\x00") || !utf8.ValidString(entrypoint) {
 			return validationErrorf("WithEntrypoint", entrypoint, "invalid entrypoint %q", entrypoint)
 		}
 		c.entrypoint = entrypoint
@@ -1045,8 +1068,9 @@ func WithUser(u string) Option {
 // WithWorkingDir sets the working directory of the init process.
 func WithWorkingDir(dir string) Option {
 	return func(c *config) error {
-		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return validationErrorf("WithWorkingDir", dir, "working directory %q must be an absolute path", dir)
+		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\r\n\x00") || !utf8.ValidString(dir) {
+			return validationErrorf("WithWorkingDir", dir,
+				"working directory %q must be an absolute path without control characters or invalid UTF-8", dir)
 		}
 		c.workdir = dir
 		return nil

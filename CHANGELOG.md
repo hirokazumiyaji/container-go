@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject carriage returns, NUL bytes, and invalid UTF-8 in working directories,
+  entrypoints, and command arguments with a `*ValidationError` before backend work,
+  and fail wait probes immediately instead of retrying an invalid argument.
 - Preserve non-CLI configuration and ambiguous-object vetoes at any wrapper depth
   when classifying CLI absence errors.
 - Retry inspection-query deadlines while the enclosing verification or reuse

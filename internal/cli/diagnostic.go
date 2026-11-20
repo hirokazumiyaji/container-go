@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"reflect"
+	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
@@ -129,7 +130,47 @@ func (e *safeError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	return e.redactor.Text(e.err.Error())
+	return formatErrorWith(e.err, e.redactor)
+}
+
+// formatErrorWith renders CLI diagnostics with the caller's redactor before
+// their diagnostic tail is trimmed. Applying the redactor afterwards could
+// miss a caller value that spans the rendered boundary. Other errors keep the
+// historical whole-message redaction.
+func formatErrorWith(err error, r *Redactor) string {
+	switch value := err.(type) {
+	case *CLIError:
+		return formatCLIError(value, r)
+	case *diagnosticError:
+		return value.errorWith(r)
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		// Multiple wrapped errors keep formatting added by fmt.Errorf, so
+		// replace each child's rendered message in place instead of joining
+		// the children and dropping that formatting.
+		message := err.Error()
+		for _, child := range joined.Unwrap() {
+			if child == nil {
+				continue
+			}
+			raw := child.Error()
+			if raw == "" {
+				continue
+			}
+			message = strings.Replace(message, raw, formatErrorWith(child, r), 1)
+		}
+		return r.Text(message)
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		inner := wrapped.Unwrap()
+		if inner != nil && inner != err {
+			message, innerMessage := err.Error(), inner.Error()
+			if strings.HasSuffix(message, innerMessage) {
+				return r.Text(strings.TrimSuffix(message, innerMessage)) + formatErrorWith(inner, r)
+			}
+		}
+	}
+	return r.Text(err.Error())
 }
 
 // UnwrapRaw is the explicit opt-in path to the source error. It is not named

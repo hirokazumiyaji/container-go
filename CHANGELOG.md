@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Redact structural secrets in CLI diagnostics before trimming them. `CLIError`
+  keeps a bounded trailing stderr window so a password prefix or private-key PEM
+  header outside the rendered 64 KiB tail still reaches the redaction rules, and
+  `Run`, `RunTo`, and streaming terminal errors all render the redacted tail.
+
 ### Added
 
 - `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,
@@ -47,10 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Classify redacted CLI errors using their original command and target identities.
   Wait, prune, and terminate now recognize confirmed container absence, and
   returned diagnostics stay redacted.
-- Redact structural secrets in CLI diagnostics before trimming them. `CLIError`
-  keeps a bounded trailing stderr window so a password prefix or private-key PEM
-  header outside the rendered 64 KiB tail still reaches the redaction rules, and
-  `Run`, `RunTo`, and streaming terminal errors all render the redacted tail.
 
 - **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
   an exit code. `ExitCode` also rejects containers that have not stopped. Callers

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os/exec"
 	"strings"
@@ -210,4 +211,107 @@ func tailOf(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+func TestSafeErrorRedactsCallerValueSplitAtRenderedTailBoundary(t *testing.T) {
+	const secret = "caller-boundary-secret"
+	stderr := strings.Repeat("p", maxStderr-len(secret)/2) + secret + strings.Repeat("q", 1024)
+	raw := &CLIError{Stderr: stderr, ExitCode: 1}
+
+	safe := WithRedactor(raw, NewContextRedactor(secret))
+	if strings.Contains(safe.Error(), secret) {
+		t.Fatalf("safe error = %q, contains a caller value split at the rendered boundary", tailOf(safe.Error(), 200))
+	}
+
+	joined := errors.Join(fmt.Errorf("context: %w", raw), errors.New("sibling diagnostic"))
+	safeJoin := WithRedactor(joined, NewContextRedactor(secret))
+	if strings.Contains(safeJoin.Error(), secret) {
+		t.Fatalf("joined safe error = %q, contains a caller value split at the rendered boundary", tailOf(safeJoin.Error(), 200))
+	}
+	if !strings.Contains(safeJoin.Error(), "sibling diagnostic") {
+		t.Fatalf("joined safe error lost a non-CLI diagnostic: %q", tailOf(safeJoin.Error(), 200))
+	}
+
+	wrapped := fmt.Errorf("runner: %w", raw)
+	safeWrapped := WithRedactor(wrapped, NewContextRedactor(secret))
+	if strings.Contains(safeWrapped.Error(), secret) {
+		t.Fatalf("wrapped safe error = %q, contains a caller value split at the rendered boundary", tailOf(safeWrapped.Error(), 200))
+	}
+	if !strings.Contains(safeWrapped.Error(), "runner:") {
+		t.Fatalf("wrapped safe error lost the wrapper context: %q", tailOf(safeWrapped.Error(), 200))
+	}
+}
+
+func TestCommandErrorDropsPartialLeadingLineAtRetainedWindowBoundary(t *testing.T) {
+	const secret = "partial-leading-secret"
+	// Put the window cut inside the password value so the prefix is gone.
+	stderr := strings.Repeat("f", maxStderrContext-5) + "password=" + secret + "\nError response from daemon: No such container: myctr\n"
+	if len(stderr) <= maxStderrContext {
+		t.Fatalf("test stderr = %d bytes, want more than %d", len(stderr), maxStderrContext)
+	}
+
+	err := commandError(context.Background(), "docker", "docker", []string{"inspect", "myctr"}, nil, []byte(stderr), &exec.ExitError{})
+	if err == nil {
+		t.Fatal("commandError returned nil for a failed command")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error = %q, contains a value with a discarded prefix", err)
+	}
+	if !strings.Contains(err.Error(), "No such container: myctr") {
+		t.Fatalf("error = %q, lost the diagnostic line after the discarded prefix", err)
+	}
+}
+
+func TestFormatCLIErrorRedactsOrphanedPEMEnd(t *testing.T) {
+	const secret = "orphaned-key-body"
+	stderr := secret + "\n" + strings.Repeat("A", maxStderr) + "\n-----END RSA PRIVATE KEY-----\nError response from daemon: No such container: myctr\n"
+
+	got := formatCLIError(&CLIError{Stderr: stderr}, NewRedactor())
+	for _, leaked := range []string{secret, strings.Repeat("A", 32), "END RSA PRIVATE KEY"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("formatted error contains %q", leaked)
+		}
+	}
+	if !strings.Contains(got, "No such container: myctr") {
+		t.Fatalf("formatted error lost the diagnostic after the orphaned key: %q", tailOf(got, 200))
+	}
+}
+
+func TestTailBufferDropsPartialLeadingLineAfterOverflow(t *testing.T) {
+	buffer := newTailBuffer(maxStderr)
+	if _, err := buffer.Write([]byte("partial-secret" + strings.Repeat("x", maxStderr+10))); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := buffer.Write([]byte("\nnext diagnostic\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got := buffer.String()
+	if strings.Contains(got, "partial-secret") {
+		t.Fatalf("tail buffer = %q, retained a value with a discarded prefix", tailOf(got, 200))
+	}
+	if !strings.Contains(got, "next diagnostic") {
+		t.Fatalf("tail buffer = %q, lost the diagnostic line after the discarded prefix", tailOf(got, 200))
+	}
+}
+
+func TestCommandErrorRedactsPEMBodySplitAtRetainedWindowBoundary(t *testing.T) {
+	const secret = "pem-split-body-marker"
+	body := strings.Repeat(secret+"\n", maxStderrContext/len(secret+"\n")+1)
+	stderr := "-----BEGIN RSA PRIVATE KEY-----\n" + body + "-----END RSA PRIVATE KEY-----\nError response from daemon: No such container: myctr\n"
+	if len(stderr) <= maxStderrContext {
+		t.Fatalf("test stderr = %d bytes, want more than %d", len(stderr), maxStderrContext)
+	}
+
+	err := commandError(context.Background(), "docker", "docker", []string{"inspect", "myctr"}, nil, []byte(stderr), &exec.ExitError{})
+	if err == nil {
+		t.Fatal("commandError returned nil for a failed command")
+	}
+	for _, leaked := range []string{secret, "BEGIN RSA PRIVATE KEY", "END RSA PRIVATE KEY"} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("error = %q, contains %q", err, leaked)
+		}
+	}
+	if !strings.Contains(err.Error(), "No such container: myctr") {
+		t.Fatalf("error = %q, lost the diagnostic after the split key", err)
+	}
 }

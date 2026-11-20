@@ -186,7 +186,7 @@ func TestCancellationEvidenceSuppressesWindowsKillExitOneOnly(t *testing.T) {
 		ctx:                  ctx,
 		binary:               "docker",
 		args:                 []string{"logs", "--follow", "x"},
-		stderr:               &tailBuffer{},
+		stderr:               newTailBuffer(maxStderr),
 		cancelled:            true,
 		syntheticTermination: true,
 	}
@@ -204,7 +204,7 @@ func TestCancellationEvidenceSuppressesWindowsKillExitOneOnly(t *testing.T) {
 		ctx:    ctx,
 		binary: "docker",
 		args:   []string{"logs", "--follow", "x"},
-		stderr: &tailBuffer{},
+		stderr: newTailBuffer(maxStderr),
 	}
 	genuine.drainCompleted.Store(true)
 	err = genuine.terminalError(exitErr)

@@ -93,7 +93,7 @@ func TestExecRunnerPreservesFailureStdout(t *testing.T) {
 func TestExecRunnerCapsStderr(t *testing.T) {
 	// Emit ~1MiB of stderr, far beyond the 64KiB cap, then finish with
 	// the diagnostic that classification needs.
-	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_BYTES_SENTINEL\n' >&2; head -c 2097152 /dev/zero >&2; printf 'Error response from daemon: No such container: terminal\n' >&2; exit 1`)}
+	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_BYTES_SENTINEL\n' >&2; head -c 2097152 /dev/zero >&2; printf '\nError response from daemon: No such container: terminal\n' >&2; exit 1`)}
 
 	stdout, stderr, err := r.Run(context.Background(), "run")
 	var cliErr *CLIError

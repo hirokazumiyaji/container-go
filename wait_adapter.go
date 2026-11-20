@@ -246,7 +246,16 @@ func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) 
 }
 
 func waitTargetError(err error) error {
-	if err == nil || !isNotFound(err) || errors.Is(err, wait.ErrTargetNotFound) {
+	if err == nil {
+		return nil
+	}
+	// A rejected public option cannot be repaired by polling. Surface it as
+	// a configuration failure so ForExec-style retries stop immediately
+	// while the original *ValidationError stays in the chain.
+	if errors.Is(err, ErrInvalidOption) && !errors.Is(err, wait.ErrInvalidConfiguration) {
+		return fmt.Errorf("%w: %w", wait.ErrInvalidConfiguration, err)
+	}
+	if !isNotFound(err) || errors.Is(err, wait.ErrTargetNotFound) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", wait.ErrTargetNotFound, err)

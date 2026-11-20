@@ -647,11 +647,18 @@ func (b *tailBuffer) String() string {
 
 // trimPartialLeadingLine removes an incomplete first line from a truncated
 // diagnostic window. A window with no line break has no safe prefix left.
+// Progress output overwrites lines with carriage returns, so both separators
+// end a line.
 func trimPartialLeadingLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[i+1:]
+	i := strings.IndexAny(s, "\r\n")
+	if i < 0 {
+		return ""
 	}
-	return ""
+	i++
+	if s[i-1] == '\r' && i < len(s) && s[i] == '\n' {
+		i++
+	}
+	return s[i:]
 }
 
 // IsCommandExit reports whether err is a CLIError from a child process

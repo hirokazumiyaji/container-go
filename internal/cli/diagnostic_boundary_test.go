@@ -222,31 +222,45 @@ func tailOf(s string, n int) string {
 }
 
 func TestSafeErrorRedactsCallerValueSplitAtRenderedTailBoundary(t *testing.T) {
-	const secret = "caller-boundary-secret"
-	stderr := strings.Repeat("p", maxStderr-len(secret)/2) + secret + strings.Repeat("q", 1024)
-	raw := &CLIError{Stderr: stderr, ExitCode: 1}
-
-	safe := WithRedactor(raw, NewContextRedactor(secret))
-	if strings.Contains(safe.Error(), secret) {
-		t.Fatalf("safe error = %q, contains a caller value split at the rendered boundary", tailOf(safe.Error(), 200))
+	const secret = "zq-caller-boundary-934"
+	// The legacy truncation keeps only the last 64 KiB, cutting the caller
+	// value in half. commandError now keeps enough context that the caller
+	// redactor can still match the complete value before trimming.
+	total := maxStderr + len(secret)/2
+	stderr := secret + " next diagnostic" +
+		strings.Repeat("q", total-len(secret)-len(" next diagnostic"))
+	err := commandError(context.Background(), "stub", "stub", []string{"exec"}, nil, []byte(stderr), &exec.ExitError{})
+	if err == nil {
+		t.Fatal("commandError returned nil for a failed command")
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %T %v, want *CLIError", err, err)
 	}
 
-	joined := errors.Join(fmt.Errorf("context: %w", raw), errors.New("sibling diagnostic"))
-	safeJoin := WithRedactor(joined, NewContextRedactor(secret))
-	if strings.Contains(safeJoin.Error(), secret) {
-		t.Fatalf("joined safe error = %q, contains a caller value split at the rendered boundary", tailOf(safeJoin.Error(), 200))
-	}
-	if !strings.Contains(safeJoin.Error(), "sibling diagnostic") {
-		t.Fatalf("joined safe error lost a non-CLI diagnostic: %q", tailOf(safeJoin.Error(), 200))
-	}
-
-	wrapped := fmt.Errorf("runner: %w", raw)
-	safeWrapped := WithRedactor(wrapped, NewContextRedactor(secret))
-	if strings.Contains(safeWrapped.Error(), secret) {
-		t.Fatalf("wrapped safe error = %q, contains a caller value split at the rendered boundary", tailOf(safeWrapped.Error(), 200))
-	}
-	if !strings.Contains(safeWrapped.Error(), "runner:") {
-		t.Fatalf("wrapped safe error lost the wrapper context: %q", tailOf(safeWrapped.Error(), 200))
+	for name, wrapped := range map[string]error{
+		"direct":        err,
+		"wrapped":       fmt.Errorf("runner: %w", err),
+		"suffixed wrap": fmt.Errorf("%w; container logs: tail", err),
+		"joined":        errors.Join(fmt.Errorf("context: %w", err), errors.New("sibling diagnostic")),
+		"nested safe":   errors.Join(WithRedactor(cliErr, NewRedactor()), errors.New("sibling diagnostic")),
+		"nested joined": errors.Join(WithRedactor(cliErr, NewRedactor(secret)), errors.New("sibling diagnostic")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			safe := WithRedactor(wrapped, NewContextRedactor(secret))
+			if strings.Contains(safe.Error(), secret) || strings.Contains(safe.Error(), secret[len(secret)/2:]) {
+				t.Fatalf("safe error = %q, contains a caller value split at the rendered boundary", tailOf(safe.Error(), 200))
+			}
+			if !strings.Contains(safe.Error(), "next diagnostic") {
+				t.Fatalf("safe error = %q, lost the diagnostic after the caller value", tailOf(safe.Error(), 200))
+			}
+			if name == "joined" && !strings.Contains(safe.Error(), "sibling diagnostic") {
+				t.Fatalf("joined safe error lost a non-CLI diagnostic: %q", tailOf(safe.Error(), 200))
+			}
+			if name == "suffixed wrap" && !strings.Contains(safe.Error(), "container logs: tail") {
+				t.Fatalf("wrapped safe error lost the wrapper context: %q", tailOf(safe.Error(), 200))
+			}
+		})
 	}
 }
 
@@ -287,10 +301,8 @@ func TestFormatCLIErrorRedactsOrphanedPEMEnd(t *testing.T) {
 
 func TestTailBufferDropsPartialLeadingLineAfterOverflow(t *testing.T) {
 	buffer := newTailBuffer(maxStderr)
-	if _, err := buffer.Write([]byte("partial-secret" + strings.Repeat("x", maxStderr+10))); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if _, err := buffer.Write([]byte("\nnext diagnostic\n")); err != nil {
+	payload := strings.Repeat("a", maxStderr) + "partial-secret\nnext diagnostic\n"
+	if _, err := buffer.Write([]byte(payload)); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	got := buffer.String()
@@ -343,5 +355,23 @@ func TestErrorsAsDoesNotExposeOrphanedPEMBody(t *testing.T) {
 	}
 	if !strings.Contains(got.Stderr, "No such container: myctr") {
 		t.Fatalf("errors.As CLIError.Stderr = %q, lost the diagnostic after the orphaned key", tailOf(got.Stderr, 200))
+	}
+}
+
+func TestCommandErrorKeepsDiagnosticAfterCarriageReturnProgress(t *testing.T) {
+	stderr := strings.Repeat("Downloading 50%\r", 8000) + "Error response from daemon: No such container: myctr\n"
+	err := commandError(context.Background(), "docker", "docker", []string{"inspect", "myctr"}, nil, []byte(stderr), &exec.ExitError{})
+	if err == nil {
+		t.Fatal("commandError returned nil for a failed command")
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %T %v, want *CLIError", err, err)
+	}
+	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
+		t.Fatalf("CLIError.Stderr = %q, lost the diagnostic after carriage-return progress", tailOf(cliErr.Stderr, 200))
+	}
+	if !strings.Contains(err.Error(), "No such container: myctr") {
+		t.Fatalf("error = %q, lost the diagnostic after carriage-return progress", tailOf(err.Error(), 200))
 	}
 }

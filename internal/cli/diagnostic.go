@@ -136,8 +136,8 @@ func (e *safeError) Error() string {
 // formatErrorWith renders CLI diagnostics with the caller's redactor before
 // their diagnostic tail is trimmed. Applying the redactor afterwards could
 // miss a caller value that spans the rendered boundary. Wrapped and joined
-// errors replace each child's rendered message in place, which preserves the
-// wrapper formatting.
+// errors replace each rendered diagnostic node in place, preserving wrapper
+// formatting with one final control-character pass.
 func formatErrorWith(err error, r *Redactor) string {
 	switch value := err.(type) {
 	case *CLIError:
@@ -145,41 +145,69 @@ func formatErrorWith(err error, r *Redactor) string {
 	case *diagnosticError:
 		return value.errorWith(r)
 	case *safeError:
-		combined := value.redactor
-		if combined == nil {
-			combined = r
-		} else if r != nil {
-			combined = combined.Compose(r)
+		return formatErrorWith(value.err, value.redactor.Compose(r))
+	}
+	leaves := collectDiagnosticLeaves(err, r, nil)
+	if len(leaves) == 0 {
+		return r.Text(err.Error())
+	}
+	message := err.Error()
+	var rendered strings.Builder
+	last := 0
+	for _, leaf := range leaves {
+		raw := leaf.node.Error()
+		if raw == "" {
+			continue
 		}
-		return formatErrorWith(value.err, combined)
+		offset := strings.Index(message[last:], raw)
+		if offset < 0 {
+			// An unexpected wrapper layout: fall back to redacting the
+			// complete message rather than risk emitting a raw segment.
+			return r.Text(message)
+		}
+		offset += last
+		rendered.WriteString(r.Text(message[last:offset]))
+		rendered.WriteString(leaf.render)
+		last = offset + len(raw)
+	}
+	rendered.WriteString(r.Text(message[last:]))
+	return rendered.String()
+}
+
+// diagnosticLeaf is one rendered node whose text appears in its parent's
+// error message.
+type diagnosticLeaf struct {
+	node   error
+	render string
+}
+
+func collectDiagnosticLeaves(err error, r *Redactor, leaves []diagnosticLeaf) []diagnosticLeaf {
+	if err == nil {
+		return leaves
+	}
+	switch value := err.(type) {
+	case *CLIError:
+		return append(leaves, diagnosticLeaf{node: value, render: formatCLIError(value, r)})
+	case *diagnosticError:
+		return append(leaves, diagnosticLeaf{node: value, render: value.errorWith(r)})
+	case *safeError:
+		return append(leaves, diagnosticLeaf{
+			node:   value,
+			render: formatErrorWith(value.err, value.redactor.Compose(r)),
+		})
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		// Multiple wrapped errors keep formatting added by fmt.Errorf, so
-		// replace each child's rendered message in place instead of joining
-		// the children and dropping that formatting.
-		message := err.Error()
 		for _, child := range joined.Unwrap() {
-			if child == nil {
-				continue
-			}
-			raw := child.Error()
-			if raw == "" {
-				continue
-			}
-			message = strings.Replace(message, raw, formatErrorWith(child, r), 1)
+			leaves = collectDiagnosticLeaves(child, r, leaves)
 		}
-		return r.Text(message)
+		return leaves
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		inner := wrapped.Unwrap()
-		if inner != nil && inner != err {
-			message, innerMessage := err.Error(), inner.Error()
-			if innerMessage != "" {
-				return r.Text(strings.Replace(message, innerMessage, formatErrorWith(inner, r), 1))
-			}
+		if inner := wrapped.Unwrap(); inner != nil && inner != err {
+			return collectDiagnosticLeaves(inner, r, leaves)
 		}
 	}
-	return r.Text(err.Error())
+	return leaves
 }
 
 // UnwrapRaw is the explicit opt-in path to the source error. It is not named

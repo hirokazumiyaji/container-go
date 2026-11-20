@@ -238,9 +238,6 @@ func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
 	}
 }
 
-// trimCLIErrorWrapper removes only verified CLI wrappers while preserving
-// the case of the diagnostic payload. Image target comparisons need that
-// case; backend phrase matching can use normalizeCLIErrorLine below.
 // splitCLIErrorLines splits backend diagnostics on both newline and
 // carriage return. Progress display overwrites its line with carriage returns,
 // so the decisive error line can follow one without a newline.
@@ -248,6 +245,9 @@ func splitCLIErrorLines(text string) []string {
 	return strings.FieldsFunc(text, func(r rune) bool { return r == '\r' || r == '\n' })
 }
 
+// trimCLIErrorWrapper removes only verified CLI wrappers while preserving
+// the case of the diagnostic payload. Image target comparisons need that
+// case; backend phrase matching can use normalizeCLIErrorLine below.
 func trimCLIErrorWrapper(line string, cliErr *cli.CLIError, allowGenericError bool) string {
 	// Streamed Docker diagnostics can prefix the decisive line with a
 	// bounded null-byte flood; trim those before wrapper matching.

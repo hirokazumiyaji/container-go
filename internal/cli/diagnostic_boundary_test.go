@@ -7,9 +7,17 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+func boundaryStderrScript(secret string, exit int) string {
+	return "head -c " + strconv.Itoa(maxStderr) + " /dev/zero | tr '\\000' ' ' >&2; " +
+		"printf 'password=" + secret + "' >&2; " +
+		"head -c " + strconv.Itoa(maxStderr-len(secret)) + " /dev/zero | tr '\\000' ' ' >&2; " +
+		"exit " + strconv.Itoa(exit)
+}
 
 func TestCommandErrorRedactsSecretSplitAtRawTailBoundary(t *testing.T) {
 	const secret = "private-boundary-value"
@@ -83,8 +91,8 @@ func TestCommandErrorStderrRetainsLineStructure(t *testing.T) {
 }
 
 func TestExecRunnerRunRedactsStructuralSecretsBeforeTruncation(t *testing.T) {
-	const secret = "private-run-value"
-	r := &ExecRunner{Binary: writeStub(t, `printf 'password=`+secret+`' >&2; head -c 131072 /dev/zero | tr '\000' ' ' >&2; exit 9`)}
+	const secret = "zq-run-boundary-934"
+	r := &ExecRunner{Binary: writeStub(t, boundaryStderrScript(secret, 9))}
 
 	_, stderr, err := r.Run(context.Background(), "exec")
 	if err == nil {
@@ -109,8 +117,8 @@ func TestExecRunnerRunRedactsStructuralSecretsBeforeTruncation(t *testing.T) {
 }
 
 func TestExecRunnerRunToRedactsStructuralSecretsBeforeTruncation(t *testing.T) {
-	const secret = "private-runto-value"
-	r := &ExecRunner{Binary: writeStub(t, `printf 'password=`+secret+`' >&2; head -c 131072 /dev/zero | tr '\000' ' ' >&2; exit 7`)}
+	const secret = "zq-runto-boundary-934"
+	r := &ExecRunner{Binary: writeStub(t, boundaryStderrScript(secret, 7))}
 
 	var sink bytes.Buffer
 	stats, err := r.RunTo(context.Background(), io.Discard, &sink, "exec")
@@ -139,8 +147,8 @@ func TestExecRunnerRunToRedactsStructuralSecretsBeforeTruncation(t *testing.T) {
 }
 
 func TestExecRunnerRunToRedactsPrivateKeyHeaderOutsideRetainedTail(t *testing.T) {
-	const secret = "private-key-runto-body"
-	r := &ExecRunner{Binary: writeStub(t, `printf -- '-----BEGIN RSA PRIVATE KEY-----\n`+secret+`\n' >&2; head -c 131072 /dev/zero | tr '\000' 'A' >&2; printf '\n-----END RSA PRIVATE KEY-----\n' >&2; exit 5`)}
+	const secret = "zq-pem-runto-body-934"
+	r := &ExecRunner{Binary: writeStub(t, `printf -- '-----BEGIN RSA PRIVATE KEY-----\n' >&2; head -c 102400 /dev/zero | tr '\000' 'A' >&2; printf '\n`+secret+`\n-----END RSA PRIVATE KEY-----\n' >&2; exit 5`)}
 
 	var sink bytes.Buffer
 	_, err := r.RunTo(context.Background(), io.Discard, &sink, "exec")
@@ -158,8 +166,8 @@ func TestExecRunnerRunToRedactsPrivateKeyHeaderOutsideRetainedTail(t *testing.T)
 }
 
 func TestStreamTerminalErrorRedactsStructuralSecretsBeforeTruncation(t *testing.T) {
-	const secret = "private-stream-value"
-	r := &ExecRunner{Binary: writeStub(t, `printf 'password=`+secret+`' >&2; head -c 131072 /dev/zero | tr '\000' ' ' >&2; exit 3`)}
+	const secret = "zq-stream-boundary-934"
+	r := &ExecRunner{Binary: writeStub(t, boundaryStderrScript(secret, 3))}
 
 	stream, err := r.Stream(context.Background(), "logs")
 	if err != nil {
@@ -296,7 +304,7 @@ func TestTailBufferDropsPartialLeadingLineAfterOverflow(t *testing.T) {
 
 func TestCommandErrorRedactsPEMBodySplitAtRetainedWindowBoundary(t *testing.T) {
 	const secret = "pem-split-body-marker"
-	body := strings.Repeat(secret+"\n", maxStderrContext/len(secret+"\n")+1)
+	body := strings.Repeat(secret+"\n", 2*maxStderrContext/len(secret+"\n")+1)
 	stderr := "-----BEGIN RSA PRIVATE KEY-----\n" + body + "-----END RSA PRIVATE KEY-----\nError response from daemon: No such container: myctr\n"
 	if len(stderr) <= maxStderrContext {
 		t.Fatalf("test stderr = %d bytes, want more than %d", len(stderr), maxStderrContext)
@@ -313,5 +321,27 @@ func TestCommandErrorRedactsPEMBodySplitAtRetainedWindowBoundary(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "No such container: myctr") {
 		t.Fatalf("error = %q, lost the diagnostic after the split key", err)
+	}
+}
+
+func TestErrorsAsDoesNotExposeOrphanedPEMBody(t *testing.T) {
+	const body = "orphan-pem-body-line-934"
+	raw := &CLIError{
+		Binary:   "docker",
+		Args:     []string{"inspect", "myctr"},
+		ExitCode: 1,
+		Stderr:   body + "\n" + strings.Repeat("A", maxStderr) + "\n-----END RSA PRIVATE KEY-----\nError response from daemon: No such container: myctr\n",
+	}
+	safe := WithRedactor(raw, NewRedactor())
+
+	var got *CLIError
+	if !errors.As(safe, &got) {
+		t.Fatal("errors.As did not find *CLIError")
+	}
+	if strings.Contains(got.Stderr, body) {
+		t.Fatalf("errors.As CLIError.Stderr = %q, contains an orphaned PEM body", tailOf(got.Stderr, 200))
+	}
+	if !strings.Contains(got.Stderr, "No such container: myctr") {
+		t.Fatalf("errors.As CLIError.Stderr = %q, lost the diagnostic after the orphaned key", tailOf(got.Stderr, 200))
 	}
 }

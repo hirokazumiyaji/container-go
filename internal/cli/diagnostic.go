@@ -135,14 +135,23 @@ func (e *safeError) Error() string {
 
 // formatErrorWith renders CLI diagnostics with the caller's redactor before
 // their diagnostic tail is trimmed. Applying the redactor afterwards could
-// miss a caller value that spans the rendered boundary. Other errors keep the
-// historical whole-message redaction.
+// miss a caller value that spans the rendered boundary. Wrapped and joined
+// errors replace each child's rendered message in place, which preserves the
+// wrapper formatting.
 func formatErrorWith(err error, r *Redactor) string {
 	switch value := err.(type) {
 	case *CLIError:
 		return formatCLIError(value, r)
 	case *diagnosticError:
 		return value.errorWith(r)
+	case *safeError:
+		combined := value.redactor
+		if combined == nil {
+			combined = r
+		} else if r != nil {
+			combined = combined.Compose(r)
+		}
+		return formatErrorWith(value.err, combined)
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		// Multiple wrapped errors keep formatting added by fmt.Errorf, so
@@ -165,8 +174,8 @@ func formatErrorWith(err error, r *Redactor) string {
 		inner := wrapped.Unwrap()
 		if inner != nil && inner != err {
 			message, innerMessage := err.Error(), inner.Error()
-			if strings.HasSuffix(message, innerMessage) {
-				return r.Text(strings.TrimSuffix(message, innerMessage)) + formatErrorWith(inner, r)
+			if innerMessage != "" {
+				return r.Text(strings.Replace(message, innerMessage, formatErrorWith(inner, r), 1))
 			}
 		}
 	}
@@ -227,7 +236,7 @@ func (e *safeError) as(target any, r *Redactor) bool {
 			Binary:   r.Text(raw.Binary),
 			Args:     r.Args(raw.Args),
 			ExitCode: raw.ExitCode,
-			Stderr:   r.Text(raw.Stderr),
+			Stderr:   redactedStderr(r, raw.Stderr),
 		}
 		return true
 	case **SystemNotRunningError:
@@ -331,7 +340,7 @@ func (e *CLIError) asRedacted(target any, r *diagnostic.Redactor) bool {
 	}
 	*ptr = &CLIError{
 		Binary: r.Text(e.Binary), Args: r.Args(e.Args),
-		ExitCode: e.ExitCode, Stderr: r.Text(e.Stderr),
+		ExitCode: e.ExitCode, Stderr: redactedStderr(r, e.Stderr),
 	}
 	return true
 }

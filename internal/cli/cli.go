@@ -22,12 +22,16 @@ import (
 // maxStderr bounds each diagnostic stream copied into a CLI failure.
 const maxStderr = 64 * 1024
 
+// stderrRedactionWindow is the extra raw stderr retained beyond the rendered
+// tail. Structural redaction needs the prefix of a secret (for example
+// "password=" or a private-key PEM header) that may sit just outside the
+// rendered tail; the window stays small so Error rendering remains cheap.
+const stderrRedactionWindow = 16 * 1024
+
 // maxStderrContext is the raw stderr window retained in CLIError for
-// classification and for rendering. Structural redaction needs the prefix of
-// a secret (for example "password=" or a private-key PEM header) that may sit
-// outside the rendered tail, so streamed diagnostics keep one structural
-// window. formatCLIError redacts this window before trimming it to maxStderr.
-const maxStderrContext = maxStderr + MaxStreamOverlap
+// classification and for rendering. formatCLIError redacts this window before
+// trimming it to maxStderr.
+const maxStderrContext = maxStderr + stderrRedactionWindow
 
 // ErrSystemNotRunning reports that a backend CLI command returned a
 // non-zero exit status and its follow-up liveness probe also failed.
@@ -205,7 +209,9 @@ func formatCLIError(e *CLIError, r *Redactor) string {
 	// larger than the rendered tail so a password prefix or PEM header that
 	// sits outside the tail still reaches the structural rules.
 	if e.Stderr != "" {
-		if stderr := redactedDiagnosticTail(r, e.Stderr); stderr != "" {
+		// Bound the work even for a CLIError constructed directly with a
+		// large Stderr. The persisted window is already bounded.
+		if stderr := redactedDiagnosticTail(r, truncateStderr(e.Stderr)); stderr != "" {
 			msg += ": " + strings.TrimSpace(stderr)
 		}
 	}
@@ -226,6 +232,13 @@ func redactedDiagnosticTail(r *Redactor, stderr string) string {
 		safe = safe[len(safe)-maxStderr:]
 	}
 	return safe
+}
+
+// redactedStderr renders a stored stderr window for a safe error clone. It
+// applies the same orphaned-PEM handling as Error so errors.As cannot expose
+// a key body whose BEGIN marker fell outside the retained window.
+func redactedStderr(r *Redactor, stderr string) string {
+	return r.Text(redactOrphanedPEM(truncateStderr(stderr)))
 }
 
 // redactOrphanedPEM hides a private-key body whose BEGIN marker was cut off

@@ -415,6 +415,7 @@ func ReleasedWaitStrategies() {
 コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
 created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF は再-open します。終了コードを伴うログストリームエラーは返却します。
 成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理されます。`ForLog` はワンショットジョブではなく、長時間稼働するサービス向けです。
+稼働中の follow ストリームでマーカーを観測した場合は追加の settle 待機をせずに受理し、CLI が既に終了しているストリームは終端エラーを隠さないよう drain してから受理します。
 `ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計します。
 待機に失敗した場合はロールバック削除し、エラーにログ末尾を添付します。
 
@@ -429,7 +430,9 @@ listen しているとは限りません。`docker-proxy` や Docker Desktop の
 forwarder が先に handshake を完了するためです。そのため
 `ForListeningPort` と `ForExposedPort` は、host 側の接続成功後に、宣言した
 コンテナ側ポートが `LISTEN` 状態であることを確認します。この確認は
-`exec` 経由で `/proc/net/tcp` と `/proc/net/tcp6` を読み取ります。確認を
+`exec` 経由で `/proc/net/tcp` と `/proc/net/tcp6` を読み取ります。テーブルは
+逐次スキャンするため、IPv4 の接続テーブルが大きくても IPv6 側が切り捨て
+られることはありません。確認を
 実行できない場合（Apple Container は VM の endpoint に直接接続するため
 不要です。distroless など `cat` を持たないイメージや、その他の未対応
 ターゲットも同様です）は、host 側の接続確認だけにフォールバックします。

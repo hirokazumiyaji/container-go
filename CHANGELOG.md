@@ -91,6 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supplied, and avoid rebuilding unchanged assignment, JWT, and sanitized text.
 - Track the earliest expiry in the image-presence and Docker metadata caches so
   inserts no longer sweep the whole map while no entry can be stale.
+- Accept a `ForLog` match from a still-running follow stream immediately instead
+  of waiting out the 100-250ms settlement idle window on every successful wait.
+  A stream whose CLI has already exited still drains and reports its terminal
+  error before readiness is accepted.
+- Stream and scan `/proc/net/tcp` and `/proc/net/tcp6` incrementally for
+  `ForListeningPort` and `ForExposedPort`: the parser allocates nothing per line,
+  returns at the first match, and no longer relies on a 1MiB capture that could
+  truncate the IPv6 table behind a large IPv4 connection table.
 
 ### Added
 
@@ -200,6 +208,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Only `*ExecRunner` is copied: a custom `Runner` that implements `SetBinary`,
   including a type embedding `ExecRunner`, is still rewritten in place and must
   not be shared between concurrent operations.
+- End a `ForLog` wait at the next lifecycle probe when that probe reports a
+  permanent error, such as an externally removed container, instead of keeping
+  a follow stream that never closes until the startup timeout.
 
 ### Changed
 

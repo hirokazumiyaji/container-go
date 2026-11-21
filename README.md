@@ -447,9 +447,12 @@ Created, restarting, unknown, and transient inspect states retry under the
 timeout; transient log stream open/EOF failures are reopened, while a
 terminal log-stream error is returned. A successful marker is accepted only
 after a bounded final lifecycle observation reports `Running`; `ForLog` is for
-long-lived services, not one-shot job completion. `ForLog` counts occurrences
-across reconnects after de-duplicating the replayed log prefix. A failed wait rolls
-the container back with a tail of its logs attached to the error.
+long-lived services, not one-shot job completion. A marker observed on a
+still-running follow stream is accepted without an extra settle delay; a
+stream whose CLI has already exited is drained first so its terminal error is
+not hidden. `ForLog` counts occurrences across reconnects after de-duplicating
+the replayed log prefix. A failed wait rolls the container back with a tail of
+its logs attached to the error.
 
 For custom strategies, `wait.Target` retains its original `Running` method.
 Implement the optional `wait.StateTarget` interface when the target can
@@ -463,12 +466,13 @@ that the container process listens: `docker-proxy` or Docker Desktop's port
 forwarder completes the handshake first. `ForListeningPort` and
 `ForExposedPort` therefore follow a successful host connection with a
 container-side check that the declared container port is in `LISTEN` state,
-read from `/proc/net/tcp` and `/proc/net/tcp6` through `exec`. When that check
-cannot run — Apple Container (which reaches the VM endpoint directly), an
-image without `cat` such as distroless, or another unsupported target — the
-strategy falls back to the host connection alone. That fallback is
-best-effort: it restores the historical host-only behavior because the
-container-side check is unavailable, not because the port is known to be
+read from `/proc/net/tcp` and `/proc/net/tcp6` through `exec`. The tables are
+scanned incrementally, so a large IPv4 connection table cannot truncate the
+IPv6 section. When that check cannot run — Apple Container (which reaches the
+VM endpoint directly), an image without `cat` such as distroless, or another
+unsupported target — the strategy falls back to the host connection alone. That
+fallback is best-effort: it restores the historical host-only behavior because
+the container-side check is unavailable, not because the port is known to be
 ready. Use `WithHostOnly()` to skip the container-side check explicitly.
 
 `ForListeningPort` and `ForExposedPort` are TCP-only readiness probes.

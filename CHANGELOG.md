@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Open environment files with `O_CLOEXEC` so a concurrent fork or exec cannot
+  inherit descriptors to secret environment files or their locks, and with
+  `O_NONBLOCK` so a FIFO swapped in at the path cannot block the open. File
+  ownership is checked against the effective UID, matching the kernel's owner
+  for setuid processes.
 - Redact structural secrets in CLI diagnostics before trimming them. `CLIError`
   keeps a bounded trailing stderr window so a password prefix or private-key PEM
   header outside the rendered 64 KiB tail still reaches the redaction rules, and

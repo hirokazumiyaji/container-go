@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
@@ -2009,5 +2011,61 @@ func TestReuseCleanupWarningDoesNotReturnInvalidHandle(t *testing.T) {
 				t.Fatalf("wrong mismatch classification: %v", err)
 			}
 		})
+	}
+}
+
+func TestOpenEnvFileNoFollowMarksDescriptorNonInheritable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "env")
+	if err := os.WriteFile(path, []byte("A=B\n"), envFileMode); err != nil {
+		t.Fatal(err)
+	}
+	f, err := openEnvFileNoFollow(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("descriptor flags = %#x, want FD_CLOEXEC", flags)
+	}
+}
+
+func TestOpenEnvFileNoFollowDoesNotBlockOnFIFO(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	type opened struct {
+		file *os.File
+		err  error
+	}
+	done := make(chan opened, 1)
+	go func() {
+		f, err := openEnvFileNoFollow(path, os.O_RDONLY, 0)
+		done <- opened{file: f, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("openEnvFileNoFollow: %v", got.err)
+		}
+		defer got.file.Close()
+		info, err := got.file.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().IsRegular() {
+			t.Fatal("FIFO was reported as a regular file")
+		}
+	case <-time.After(5 * time.Second):
+		// Opening the write end releases the blocked open so the goroutine
+		// does not outlive the test.
+		if w, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			_ = w.Close()
+		}
+		t.Fatal("openEnvFileNoFollow blocked on a FIFO")
 	}
 }

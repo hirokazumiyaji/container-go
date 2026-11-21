@@ -104,7 +104,7 @@ bench-integration:
 # go.sum that tidy creates from nothing, because `git diff` ignores untracked
 # files, and a failing run would leave a rewritten, unreviewed go.mod in the
 # tree.
-GOVULNCHECK_VERSION := v1.9.0
+GOVULNCHECK_VERSION := v1.10.0
 ACTIONLINT_VERSION := v1.7.12
 
 release-check:

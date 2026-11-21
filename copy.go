@@ -38,39 +38,59 @@ const (
 // so focused tests can use a shorter, separate staging budget.
 var copyStagingTimeout = 2 * time.Minute
 
-// File is a regular file copied into the container right after start. Set
-// exactly one of HostPath or Content. CopyToContainer may still accept a
-// directory source; WithFiles does not.
+// File is a host file or directory copied into the container right after
+// start. Set exactly one of HostPath or Content. WithFiles accepts a regular
+// file or a directory as HostPath; Content always creates one regular file.
 type File struct {
 	// HostPath is a host filesystem path. WithFiles resolves it when the
-	// option is applied.
+	// option is applied. A directory is copied as a tree, with symlinks and
+	// special files anywhere in it rejected before the backend copy runs.
 	HostPath string
 	// Content is an in-memory regular file. A non-nil empty slice copies an
 	// empty file; nil means Content is not set. Content is never included in
 	// errors, argv, or diagnostics.
 	Content []byte
-	// ContainerPath is the absolute destination path in the container.
+	// ContainerPath is the absolute destination path in the container. For a
+	// directory HostPath, the directory's contents are copied into this path;
+	// the source directory itself is not nested under it.
 	ContainerPath string
 	// Mode overrides the Unix permission bits of the private staged copy.
 	// Zero preserves a HostPath source's permissions and gives Content a 0600
 	// default, so a zero Mode cannot request mode 0000. Only permission bits
 	// (0777) are accepted; type, setuid, setgid, and sticky bits are rejected.
-	// Windows cannot represent arbitrary Unix bits and maps the read-only
-	// attribute only.
+	// A directory HostPath preserves its tree's permissions, so a non-zero
+	// Mode with a directory root is a ValidationError. Windows cannot
+	// represent arbitrary Unix bits and maps the read-only attribute only.
 	Mode fs.FileMode
 }
 
-// WithFiles copies regular files into the container after it starts. Each File
-// must set exactly one of HostPath or Content; setting both, or neither, is a
-// ValidationError when the option is applied. Host paths are resolved and
-// checked without following a final link at option evaluation; directories,
-// symlinks, and special files are rejected before any backend call. Content is
-// bounded by MaxCopyToContainerSize at option evaluation and is read when the
-// copy runs, so the caller must not modify it until Run returns. Copy failures
-// fail Run; an ordinary newly created container is rolled back. WithReuse
-// applies the copy to every caller, including callers that attach to an existing
-// shared container; an attach copy failure returns an error without deleting
-// that shared container.
+// WithFiles copies host files and directories into the container after it
+// starts. Each File must set exactly one of HostPath or Content; setting both,
+// or neither, is a ValidationError when the option is applied. Host paths are
+// resolved and checked without following a final link at option evaluation; a
+// symlink or special file root is rejected before any backend call. A directory
+// is snapshotted tree-wise when the copy runs, bounded by
+// MaxCopyToContainerEntries, MaxCopyToContainerDepth, and
+// MaxCopyToContainerSize; a symlink or special file inside it fails the copy.
+//
+// A directory's contents are copied into ContainerPath, which is always
+// treated as the destination directory itself. The source directory's basename
+// is not added, so a container path that already exists is populated rather
+// than nested under, and repeated WithReuse attaches copy the same tree to the
+// same place. Docker defines the `<staged>/.` source form as directory
+// contents. Apple Container receives the same form; the Apple integration
+// scenario covers the directory-contents and repeated-attach cases when that
+// backend is available and skips otherwise, so treat Apple's behavior as
+// verified only on hosts where that test has run. A non-zero File.Mode with a
+// directory HostPath is rejected because the source tree's permission bits are
+// preserved.
+//
+// Content is bounded by MaxCopyToContainerSize at option evaluation and is read
+// when the copy runs, so the caller must not modify it until Run returns. Copy
+// failures fail Run; an ordinary newly created container is rolled back.
+// WithReuse applies the copy to every caller, including callers that attach to
+// an existing shared container; an attach copy failure returns an error without
+// deleting that shared container.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		validated := make([]File, len(files))
@@ -91,9 +111,13 @@ func WithFiles(files ...File) Option {
 				return err
 			}
 			if f.Content == nil {
-				abs, err := validateHostPath(f.HostPath)
+				abs, info, err := validateHostPath(f.HostPath)
 				if err != nil {
 					return newValidationErrorWithField("WithFiles", "hostPath", f.HostPath, err)
+				}
+				if info.IsDir() && f.Mode != 0 {
+					return newValidationErrorWithField("WithFiles", "mode", f.Mode,
+						fmt.Errorf("mode must be zero for a directory host path; the source tree's permissions are preserved"))
 				}
 				f.HostPath = abs
 			}
@@ -170,24 +194,24 @@ func resolveHostPath(hostPath string) (string, error) {
 	return abs, nil
 }
 
-// validateHostPath resolves a host path and verifies that it is a regular
-// file. WithFiles must reject a directory, symlink, or special file when the
-// option is applied so a bad source cannot surface only after the container
-// starts. Lstat matches the copy path's O_NOFOLLOW open by refusing to follow
-// a final link here.
-func validateHostPath(hostPath string) (string, error) {
+// validateHostPath resolves a host path and verifies that it is a regular file
+// or directory. WithFiles must reject a symlink or special file when the option
+// is applied so a bad root cannot surface only after the container starts. A
+// directory's entries are checked while the snapshot is built. Lstat matches the
+// copy path's O_NOFOLLOW open by refusing to follow a final link here.
+func validateHostPath(hostPath string) (string, fs.FileInfo, error) {
 	abs, err := resolveHostPath(hostPath)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	info, err := os.Lstat(abs)
 	if err != nil {
-		return "", fmt.Errorf("host path %q: %w", hostPath, err)
+		return "", nil, fmt.Errorf("host path %q: %w", hostPath, err)
 	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("host path %q is not a regular file (mode %s)", hostPath, info.Mode().Type())
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		return "", nil, fmt.Errorf("host path %q is not a regular file or directory (mode %s)", hostPath, info.Mode().Type())
 	}
-	return abs, nil
+	return abs, info, nil
 }
 
 // CopyToContainer copies a host regular file or directory into the running
@@ -200,6 +224,10 @@ func validateHostPath(hostPath string) (string, error) {
 // ACLs, extended attributes, alternate data streams, sparse layout, or hardlink
 // identity. A directory snapshot also does not preserve a concurrent writer's
 // atomicity; the handles bound what each entry can observe.
+//
+// A directory source keeps the backend cp convention: when containerPath is
+// an existing directory, the source directory is copied under its basename.
+// Use WithFiles when the contents should land directly in the destination.
 //
 // Use CopyContentToContainer for an in-memory regular file.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
@@ -288,7 +316,7 @@ func (c *Container) copyFiles(ctx context.Context, files []File) error {
 	}
 
 	copyOne := func(runCtx context.Context, f File) error {
-		if err := c.copyFileWithTarget(runCtx, target, f, false); err != nil {
+		if err := c.copyFileWithTarget(runCtx, target, f, true, true); err != nil {
 			return newFileCopyError(f, err)
 		}
 		return nil
@@ -370,9 +398,8 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 	if err != nil {
 		return newValidationErrorWithField("CopyToContainer", "hostPath", hostPath, err)
 	}
-	// CopyToContainer, unlike WithFiles, accepts a directory. It also defers
-	// a final link or special file to the snapshot, where it is
-	// ErrCopySourceUnsupported, and a vanished source is
+	// CopyToContainer defers a final link or special file to the snapshot,
+	// where it is ErrCopySourceUnsupported, and treats a vanished source as
 	// ErrCopySourceChanged rather than a validation error. Check only
 	// existence here, without following a final link.
 	if err := copySourcePathPresent(abs); err != nil {
@@ -385,7 +412,7 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 	if err != nil {
 		return err
 	}
-	return c.copyFileWithTarget(ctx, target, File{HostPath: abs, ContainerPath: containerPath}, allowDirectory)
+	return c.copyFileWithTarget(ctx, target, File{HostPath: abs, ContainerPath: containerPath}, allowDirectory, false)
 }
 
 func (c *Container) copyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error {
@@ -410,10 +437,10 @@ func (c *Container) copyContentToContainer(ctx context.Context, content []byte, 
 	if content == nil {
 		content = []byte{}
 	}
-	return c.copyFileWithTarget(ctx, target, File{Content: content, ContainerPath: containerPath, Mode: mode}, false)
+	return c.copyFileWithTarget(ctx, target, File{Content: content, ContainerPath: containerPath, Mode: mode}, false, false)
 }
 
-func (c *Container) copyFileWithTarget(ctx context.Context, target string, f File, allowDirectory bool) (retErr error) {
+func (c *Container) copyFileWithTarget(ctx context.Context, target string, f File, allowDirectory, directoryContents bool) (retErr error) {
 	if err := validateContainerPath(f.ContainerPath); err != nil {
 		return newValidationErrorWithField("CopyToContainer", "containerPath", f.ContainerPath, err)
 	}
@@ -448,13 +475,27 @@ func (c *Container) copyFileWithTarget(ctx context.Context, target string, f Fil
 		}
 	}()
 
-	return c.runCopyCommand(ctx, target, staged, f.ContainerPath)
+	source := staged
+	if directoryContents {
+		info, err := os.Stat(staged)
+		if err != nil {
+			return fmt.Errorf("copy to container: inspect staged source: %w", err)
+		}
+		if info.IsDir() {
+			// A trailing "/." makes cp copy the directory's contents into
+			// ContainerPath instead of nesting the source directory under it.
+			// This keeps repeated WithReuse attaches from stacking a new
+			// basename level at the destination.
+			source += string(filepath.Separator) + "."
+		}
+	}
+	return c.runCopyCommand(ctx, target, source, f.ContainerPath)
 }
 
-func (c *Container) runCopyCommand(ctx context.Context, target, staged, containerPath string) error {
+func (c *Container) runCopyCommand(ctx context.Context, target, source, containerPath string) error {
 	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
-	_, _, err := c.runner.Run(cliCtx, c.eng.copyToArgs(target, staged, containerPath)...)
+	_, _, err := c.runner.Run(cliCtx, c.eng.copyToArgs(target, source, containerPath)...)
 	if err != nil {
 		classified := c.classifyOperation(ctx, err, "cp")
 		return wrapNotFoundForOperation(c.eng, classified, "cp", target, c.id)

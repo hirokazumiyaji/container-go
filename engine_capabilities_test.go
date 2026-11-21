@@ -13,11 +13,12 @@ import (
 // branches.
 func TestEngineCapabilitiesDeclareBackendContract(t *testing.T) {
 	wantDocker := engineCapabilities{
-		immutableID:              true,
-		daemonTarget:             true,
-		defaultNetwork:           true,
-		copyOutVersionCheck:      true,
-		healthcheck:              true,
+		immutableID:          true,
+		daemonTarget:         true,
+		defaultNetwork:       true,
+		copyOutVersionCheck:  true,
+		healthcheck:          true,
+		pruneLabelListFilter: true,
 	}
 	if got := (dockerEngine{}).capabilities(); got != wantDocker {
 		t.Errorf("docker capabilities = %+v, want %+v", got, wantDocker)

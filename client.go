@@ -371,8 +371,8 @@ func (c *Client) Prune(ctx context.Context, opts ...PruneOption) ([]string, erro
 }
 
 // PruneReuseGroup force-removes every container tagged with the given reuse group
-// on this Client's target. PruneOption values such as WithPruneTimeout and
-// WithPruneOlderThan apply to this prune.
+// on this Client's target. PruneOption values such as WithPruneTimeout,
+// WithPruneOlderThan, WithPruneLabel, and WithPruneDryRun apply to this prune.
 func (c *Client) PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err

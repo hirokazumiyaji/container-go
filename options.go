@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 	"unicode/utf8"
 
@@ -99,7 +101,15 @@ type config struct {
 	// reusedCreated is set only on the caller whose flight callback
 	// created the container. Other callers still apply their own files
 	// after attaching to the shared generation.
-	reusedCreated         bool
+	reusedCreated bool
+	// postReadyHooks run in option order after the container is ready and
+	// before Run returns. A failure rolls back an ordinary create and
+	// discards a WithReuse generation created by this call; an attach
+	// caller leaves the shared generation in place.
+	postReadyHooks []func(context.Context, *Container) error
+	// testLogger receives the container's log output while its test runs.
+	// It is nil unless WithTestLogger was applied.
+	testLogger            testing.TB
 	diagnosticSecrets     []string
 	waitDiagnosticSecrets []string
 	dockerHost            *string

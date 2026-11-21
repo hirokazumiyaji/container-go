@@ -209,6 +209,12 @@ container cannot make the host allocate an unbounded response:
   CLI error when both occur. Use `errors.Is(err,
   container.ErrOutputDelivery)` for the category while retaining the
   original writer error in the chain.
+- `WithExecStderr(w)` separates the exec'd process's stderr from stdout.
+  `Exec` then returns only stdout, while `ExecTo` streams stdout to its
+  output writer and stderr to `w`; `WithExecMaxBytes` bounds stdout in this
+  mode. Supplying the same comparable writer value for both streams (typically
+  the same pointer) is allowed and writes are serialized; distinct wrappers or
+  non-comparable dynamic types are not detected.
 - A bounded reader returns `ErrOutputTruncated` as its terminal read
   error, while still returning all retained bytes. Check
   `errors.Is(readErr, container.ErrOutputTruncated)` or the
@@ -625,6 +631,13 @@ and 1.3.0 inspect fixtures. When omitted, a stopped state cannot establish proce
 success, so `ExitCode` and `Wait` report `ErrExitCodeUnavailable`. Docker `dead`
 containers retain the daemon-reported process exit code; this result does not
 claim that daemon teardown succeeded.
+
+Inspect snapshots expose parsed backend metadata without another CLI call:
+`InspectInfo.Health()` returns Docker's healthcheck status and failing streak,
+`ImageDigest()` reports a digest when the backend exposes one (Docker only when
+the run reference is digest-pinned), and `NetworkMode()`, `Networks()`, and
+`NetworkAliases()` describe the attached networks. Apple Container reports
+networks but has no healthcheck, network mode, or network aliases.
 
 ## Exec timeout and long-running commands
 
@@ -1064,6 +1077,15 @@ does not report is also left in place. Ordinary `Prune` still selects only
 stopped managed containers, so a running leftover is not removed until it
 stops.
 
+`container.WithPruneLabel(key, value)` limits `Prune` and `PruneReuseGroup` to
+containers carrying the label. A non-empty value requires an exact match; an
+empty value requires only that the key is present. Repeated options require
+every label. Docker applies the filter in its `ps` query and rechecks it on the
+verified candidate; Apple Container filters the listed candidates client-side.
+`container.WithPruneDryRun()` performs the same ownership, state, age, and
+label checks and returns the IDs a real prune would remove, without deleting
+them or touching reaper state.
+
 ### Windows and remote-daemon cleanup
 
 The reaper is a local `/bin/sh` child. It is unavailable on Windows, and it
@@ -1175,6 +1197,24 @@ Contract:
   caller, including attach callers; a failed attach copy returns an error
   without deleting the shared container. `PullAlways` fetches the image for
   every caller before attach.
+- `Container.Created()` reports whether the `Run` call created the container;
+  `Container.Reused()` is its inverse. A `WithReuse` caller that attaches to
+  an existing generation reports `Reused`, while the creating caller reports
+  `Created`.
+- `WithPostReadyHook(fn)` runs after readiness and before `Run` returns.
+  A hook failure rolls back an ordinary create, and a creating `WithReuse`
+  caller discards its generation. Hooks also run for attach callers, but they
+  are not a cross-caller barrier: make initialization idempotent or have peers
+  detect completion through a wait strategy or application-level signal.
+- `WithFiles` directory roots copy the directory contents into
+  `ContainerPath`, not the source basename, so repeated reuse attaches do not
+  nest. Docker defines the `<staged>/.` source form this relies on. Apple
+  Container receives the same form and is covered by the Apple integration
+  suite, which skips when that backend is unavailable, so Apple behavior is
+  verified only on hosts where that test ran. `WithTestLogger(t)` forwards a
+  container's logs to `t.Logf` for the test's lifetime; new containers replay
+  history and Docker reuse attaches resume just before attach time to tolerate
+  clock skew (Apple has no `--since` and replays history).
 - Each creation carries a generation label; `Terminate`, the
   stopped-recreate path, and the watchdog reaper refuse to delete a replaced
   generation. Docker handles delete by the immutable ID printed by
@@ -1214,9 +1254,10 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   Apple's stricter 2–63-character name check runs before container creation.
 - `CopyToContainer` opens regular files and directories without following
   final links, then snapshots the opened handles into a per-user private
-  staging path before invoking the backend. `WithFiles` is regular-file-only
-  and rejects directories, symlinks/reparse points, and special files when the
-  option is applied, before any backend call. Snapshots are
+  staging path before invoking the backend. `WithFiles` accepts regular files
+  and directories; it rejects a symlink or special file root when the option
+  is applied, before any backend call, and rejects a symlink, reparse point, or
+  special file inside a directory while building the snapshot. Snapshots are
   bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
   `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
   (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source

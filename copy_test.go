@@ -1139,28 +1139,120 @@ func TestSnapshotCopySourceClassifiesPostOpenDisappearance(t *testing.T) {
 		t.Fatalf("error = %v, want preserved fs.ErrNotExist cause", err)
 	}
 }
-func TestWithFilesRejectsDirectoryBeforeBackend(t *testing.T) {
+func TestWithFilesAcceptsDirectory(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(filepath.Join(source, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "data.txt"), []byte("tree data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &directoryCopyRunner{fakeRunner: newTestRunner()}
+
+	runTestContainer(t, runner, WithFiles(File{HostPath: source, ContainerPath: "/tmp/tree"}))
+
+	if !runner.isDir {
+		t.Fatal("staged WithFiles source is not a directory")
+	}
+	if string(runner.contents) != "tree data" {
+		t.Errorf("copied directory contents = %q, want tree data", runner.contents)
+	}
+	if !strings.HasSuffix(runner.copiedPath, string(filepath.Separator)+".") {
+		t.Errorf("copied source = %q, want a directory-contents source ending in %q", runner.copiedPath, string(filepath.Separator)+".")
+	}
+}
+
+func TestWithFilesDirectoryUsesContentsSourceForDocker(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(filepath.Join(source, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "data.txt"), []byte("tree data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+
+	runDockerTestContainer(t, d, WithFiles(File{HostPath: source, ContainerPath: "/tmp/tree"}))
+
+	cp := d.callWith("cp")
+	if len(cp) < 3 {
+		t.Fatalf("cp call = %v, want source and destination", cp)
+	}
+	if !strings.HasSuffix(cp[1], string(filepath.Separator)+".") {
+		t.Errorf("cp source = %q, want directory contents", cp[1])
+	}
+	if cp[2] != dockerFixtureID+":/tmp/tree" {
+		t.Errorf("cp destination = %q, want %s:/tmp/tree", cp[2], dockerFixtureID)
+	}
+}
+
+func TestWithReuseDirectoryCopiesContentsOnEveryAttach(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "migrations")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "001_init.sql"), []byte("select 1;"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := newReuseCreateRunner()
+	opts := []Option{
+		WithName("myctr"), WithReuse(),
+		withRunner(f), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: source, ContainerPath: "/tmp/migrations"}),
+	}
+	if _, err := Run(context.Background(), "redis:7-alpine", opts...); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if _, err := Run(context.Background(), "redis:7-alpine", opts...); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+
+	var sources, destinations []string
+	for _, call := range f.calls {
+		if call[0] == "cp" && len(call) >= 3 {
+			sources = append(sources, call[1])
+			destinations = append(destinations, call[2])
+		}
+	}
+	if len(sources) != 2 {
+		t.Fatalf("cp calls = %v, want one per reuse caller", sources)
+	}
+	for i, sourceArg := range sources {
+		if !strings.HasSuffix(sourceArg, string(filepath.Separator)+".") {
+			t.Errorf("cp source %d = %q, want directory contents", i, sourceArg)
+		}
+		if destinations[i] != "myctr:/tmp/migrations" {
+			t.Errorf("cp destination %d = %q, want myctr:/tmp/migrations", i, destinations[i])
+		}
+	}
+}
+
+func TestWithFilesDirectoryRejectsSymlinkDuringCopy(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "tree")
 	if err := os.Mkdir(source, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Symlink(target, filepath.Join(source, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 	runner := newCountingRunner(newTestRunner())
 
-	_, err := Run(context.Background(), "redis:7-alpine",
+	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
 		WithFiles(File{HostPath: source, ContainerPath: "/tmp/tree"}))
-	if !errors.Is(err, ErrInvalidOption) {
-		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	if ctr != nil {
+		t.Fatalf("Run returned handle %v for a directory containing a symlink", ctr)
 	}
-	var validationErr *ValidationError
-	if !errors.As(err, &validationErr) || validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" {
-		t.Fatalf("error = %v, want ValidationError for WithFiles/hostPath", err)
+	if !errors.Is(err, ErrCopySourceUnsupported) {
+		t.Fatalf("error = %v, want ErrCopySourceUnsupported", err)
 	}
-	if !strings.Contains(err.Error(), "not a regular file") {
-		t.Fatalf("error = %v, want regular-file rejection", err)
-	}
-	if got := runner.count(); got != 0 {
-		t.Fatalf("backend CLI calls = %d, want 0: %v", got, runner.args)
+	if got := runner.count(); got == 0 {
+		t.Fatal("backend CLI was not invoked for the directory snapshot")
 	}
 }
 
@@ -1710,5 +1802,27 @@ func TestCopyFilesConcurrentlyReportsCancellationBetweenCopies(t *testing.T) {
 	}
 	if got, total := copied.Load(), int32(len(files)); got >= total {
 		t.Fatalf("copied = %d of %d, want fewer: the test no longer models an incomplete copy set", got, total)
+	}
+}
+
+func TestWithFilesRejectsModeForDirectoryRoot(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "tree")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := newCountingRunner(newTestRunner())
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: source, ContainerPath: "/tmp/tree", Mode: 0o755}))
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithFiles" || validationErr.Field != "mode" {
+		t.Fatalf("error = %v, want ValidationError for WithFiles/mode", err)
+	}
+	if got := runner.count(); got != 0 {
+		t.Fatalf("backend CLI calls = %d, want 0", got)
 	}
 }

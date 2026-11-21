@@ -1292,7 +1292,8 @@ type dockerInspect struct {
 		FinishedAt string `json:"FinishedAt"`
 		// Health is null when the image defines no HEALTHCHECK.
 		Health *struct {
-			Status string `json:"Status"`
+			Status        string `json:"Status"`
+			FailingStreak int    `json:"FailingStreak"`
 		} `json:"Health"`
 	} `json:"State"`
 	HostConfig struct {
@@ -1414,25 +1415,40 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	sort.Strings(networkNames)
 
+	var networkAliases []string
+	var networkAliasMap map[string][]string
+	for name, endpoint := range c.NetworkSettings.Networks {
+		aliases := append([]string(nil), endpoint.Aliases...)
+		aliases = append(aliases, endpoint.DNSNames...)
+		if len(aliases) == 0 {
+			continue
+		}
+		sort.Strings(aliases)
+		if networkAliasMap == nil {
+			networkAliasMap = make(map[string][]string, len(c.NetworkSettings.Networks))
+		}
+		networkAliasMap[name] = aliases
+	}
 	endpoint := c.NetworkSettings.Networks[c.HostConfig.NetworkMode]
-	networkAliases := append([]string(nil), endpoint.Aliases...)
+	networkAliases = append(networkAliases, endpoint.Aliases...)
 	networkAliases = append(networkAliases, endpoint.DNSNames...)
 	sort.Strings(networkAliases)
 
 	info := &engineInfo{
-		state:          dockerState(c.State.Status),
-		name:           strings.TrimPrefix(c.Name, "/"),
-		labels:         c.Config.Labels,
-		uid:            c.ID,
-		image:          c.Config.Image,
-		imageID:        c.Image,
-		imageDigest:    imageDigest(c.Config.Image),
-		platform:       c.Platform,
-		platformMeta:   platformMetadataFromString(c.Platform),
-		ip:             c.NetworkSettings.IPAddress,
-		networkMode:    c.HostConfig.NetworkMode,
-		networkNames:   networkNames,
-		networkAliases: networkAliases,
+		state:           dockerState(c.State.Status),
+		name:            strings.TrimPrefix(c.Name, "/"),
+		labels:          c.Config.Labels,
+		uid:             c.ID,
+		image:           c.Config.Image,
+		imageID:         c.Image,
+		imageDigest:     imageDigest(c.Config.Image),
+		platform:        c.Platform,
+		platformMeta:    platformMetadataFromString(c.Platform),
+		ip:              c.NetworkSettings.IPAddress,
+		networkMode:     c.HostConfig.NetworkMode,
+		networkNames:    networkNames,
+		networkAliases:  networkAliases,
+		networkAliasMap: networkAliasMap,
 	}
 	info.runOptions = engineRunOptions{
 		cpus:         c.HostConfig.NanoCpus / 1e9,
@@ -1464,6 +1480,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		info.finishedAt = parseInspectTime(c.State.FinishedAt)
 		if c.State.Health != nil {
 			info.health = c.State.Health.Status
+			info.healthFailingStreak = c.State.Health.FailingStreak
 		}
 	}
 	if info.networkMode == "" {

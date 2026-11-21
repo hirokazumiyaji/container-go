@@ -28,6 +28,7 @@ type execConfig struct {
 	timeout    time.Duration
 	timeoutSet bool
 	maxBytes   int64
+	stderr     io.Writer
 }
 
 // WithExecTimeout sets an upper bound for one Exec invocation. A
@@ -48,15 +49,40 @@ func WithExecTimeout(d time.Duration) ExecOption {
 
 // WithExecMaxBytes caps the combined stdout+stderr retained by Exec or
 // forwarded by ExecTo. It keeps the prefix observed from the CLI, not a
-// byte tail. The limit must be positive; leaving the option unset keeps
-// the historical full-output behavior. The two streams are merged in
-// arrival order.
+// byte tail. When WithExecStderr is also set, the limit bounds only stdout
+// because stderr is delivered directly to that writer. The limit must be
+// positive; leaving the option unset keeps the historical full-output
+// behavior. The two streams are merged in arrival order unless stderr is
+// separated.
 func WithExecMaxBytes(maxBytes int64) ExecOption {
 	return func(c *execConfig) error {
 		if maxBytes <= 0 {
 			return validationErrorf("WithExecMaxBytes", maxBytes, "exec MaxBytes must be greater than zero, got %d", maxBytes)
 		}
 		c.maxBytes = maxBytes
+		return nil
+	}
+}
+
+// WithExecStderr delivers the exec'd process's stderr to w instead of
+// combining it with stdout. Exec then returns only stdout, so a command that
+// writes data to stdout and warnings to stderr can be parsed without stripping
+// the warnings. ExecTo streams stdout to its output writer and stderr to w.
+// WithExecMaxBytes bounds stdout in this mode. A nil writer is rejected.
+//
+// When ExecTo's output and w are the same comparable writer value (typically
+// the same pointer), writes are serialized so the caller's Write is not called
+// concurrently. Distinct wrapper values and non-comparable dynamic types are
+// not detected as the same writer and are not serialized.
+//
+// A write failure from w is returned as ErrOutputDelivery together with the
+// command result, following the same sink contract as ExecTo.
+func WithExecStderr(w io.Writer) ExecOption {
+	return func(c *execConfig) error {
+		if nilWriter(w) {
+			return validationErrorf("WithExecStderr", nil, "stderr writer cannot be nil")
+		}
+		c.stderr = w
 		return nil
 	}
 }
@@ -131,8 +157,9 @@ func withExecTimeout(ctx context.Context, cfg *execConfig) (context.Context, con
 //
 // Output is fully retained unless WithExecMaxBytes is supplied. A bounded
 // reader holds the prefix of the combined output and reports truncation
-// through ErrOutputTruncated and TruncationReporter. Error messages redact
-// the command arguments and accepted environment values.
+// through ErrOutputTruncated and TruncationReporter. WithExecStderr keeps
+// stderr out of the returned reader and delivers it to the supplied writer.
+// Error messages redact the command arguments and accepted environment values.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
 	code, output, _, err := c.execute(ctx, cmd, opts, nil, false)
 	return code, output, err
@@ -144,7 +171,8 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 // returned stats count all bytes observed, not just bytes forwarded. A
 // sink failure is returned together with the CLI's terminal error, if
 // any, and is never reported as a successful exit. Timeout, cancellation,
-// and classification behave as they do for Exec.
+// and classification behave as they do for Exec. WithExecStderr sends
+// stderr to its writer instead; the stats still count both streams.
 func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error) {
 	code, _, stats, err := c.execute(ctx, cmd, opts, output, true)
 	return code, stats, err
@@ -237,21 +265,52 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 	case streaming:
 		var limited *limitedWriter
 		var sink io.Writer
-		tracked := newOutputTrackingWriter(out)
+		var tracked, stderrTracked *outputTrackingWriter
+		if cfg.stderr != nil && sameWriter(out, cfg.stderr) {
+			// Both streams write to the same caller writer. Share one
+			// serialized wrapper so the caller's Write is never concurrent.
+			shared := &serializedWriter{dst: out}
+			tracked = newOutputTrackingWriter(shared)
+			stderrTracked = newOutputTrackingWriter(shared)
+		} else {
+			tracked = newOutputTrackingWriter(out)
+			if cfg.stderr != nil {
+				stderrTracked = newOutputTrackingWriter(cfg.stderr)
+			}
+		}
 		sink, limited = outputSink(tracked, cfg.maxBytes)
+		stderrSink := sink
+		if stderrTracked != nil {
+			stderrSink = stderrTracked
+		}
 		var runStats cli.OutputStats
-		runStats, err = cli.RunTo(c.runner, execCtx, sink, sink, args...)
+		runStats, err = cli.RunTo(c.runner, execCtx, sink, stderrSink, args...)
 		err = preserveOutputDeliveryError(err, tracked)
+		err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
 		stats = newOutputStats(runStats, limited)
 		output = emptyExecOutput()
 	case cfg.maxBytes > 0:
 		capture := newBoundedBuffer(cfg.maxBytes)
-		_, err = cli.RunTo(c.runner, execCtx, capture, capture, args...)
+		if cfg.stderr == nil {
+			_, err = cli.RunTo(c.runner, execCtx, capture, capture, args...)
+		} else {
+			stderrTracked := newOutputTrackingWriter(cfg.stderr)
+			_, err = cli.RunTo(c.runner, execCtx, capture, stderrTracked, args...)
+			err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
+		}
 		output = capture.reader()
 	default:
-		var stdout, stderr []byte
-		stdout, stderr, err = c.runner.Run(execCtx, args...)
-		output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+		if cfg.stderr == nil {
+			var stdout, stderr []byte
+			stdout, stderr, err = c.runner.Run(execCtx, args...)
+			output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+			break
+		}
+		var stdout bytes.Buffer
+		stderrTracked := newOutputTrackingWriter(cfg.stderr)
+		_, err = cli.RunTo(c.runner, execCtx, &stdout, stderrTracked, args...)
+		err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
+		output = bytes.NewReader(stdout.Bytes())
 	}
 	// The CLI has finished reading the env file. Remove it before any
 	// result classification or caller-visible output processing. Retain

@@ -292,6 +292,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
 		reused:          true,
+		created:         cfg.reusedCreated,
 		creation:        info.labels[creationLabel],
 		image:           containerImage,
 		sync:            &lockPack{uid: info.uid, info: immutableInfo(info), defaultNetwork: info.defaultNetwork},
@@ -338,6 +339,17 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	}
 	if err := checkReuseCompatIdentity(fresh, resolvedImage, image, cfg); err != nil {
 		return nil, err
+	}
+	startTestLogger(cfg, ctr)
+	if err := runPostReadyHooks(ctx, ctr, cfg.postReadyHooks); err != nil {
+		if cfg.reusedCreated {
+			// The caller that created this generation owns its initialization.
+			// Discard the generation so a later Run does not attach to a
+			// container whose creator hook failed; peers detect the
+			// replacement through ErrGenerationReplaced.
+			err = cleanupReuseCreate(ctx, ctr, err)
+		}
+		return nil, joinEnvFileCleanupError(err, leaderWarning)
 	}
 	return ctr, nil
 }
@@ -606,6 +618,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
 		reused:          true,
+		created:         true,
 		creation:        cfg.creation,
 		image:           resolvedImage,
 		sync:            &lockPack{uid: uid},
@@ -1458,7 +1471,8 @@ func stripImageDigest(ref string) string {
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. Use it as a CI teardown
 // step; ordinary Prune still only removes stopped managed containers.
-// PruneOption values such as WithPruneOlderThan apply.
+// PruneOption values such as WithPruneOlderThan, WithPruneLabel, and
+// WithPruneDryRun apply.
 func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err

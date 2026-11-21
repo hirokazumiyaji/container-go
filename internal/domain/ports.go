@@ -6,11 +6,11 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
-
-	"github.com/hirokazumiyaji/container-go/internal/portspec"
 )
 
-// PortSpec declares a container port and transport protocol.
+// PortSpec declares a container port and transport protocol. It is the single
+// representation of a parsed "port[/proto]" specification shared by the root
+// package, the wait package, and the backend adapters.
 type PortSpec struct {
 	Port  int
 	Proto string
@@ -20,18 +20,58 @@ func (p PortSpec) String() string {
 	return strconv.Itoa(p.Port) + "/" + p.Proto
 }
 
-// ParsePortSpec parses a "port[/proto]" string.
+// ParsePortSpec parses a "port" or "port/proto" specification. A missing
+// protocol defaults to tcp; the protocol comparison is case-sensitive,
+// matching the grammar the public API documents.
 func ParsePortSpec(s string) (PortSpec, error) {
-	spec, err := portspec.Parse(s)
-	if err != nil {
-		return PortSpec{}, err
+	portPart, proto, ok := strings.Cut(s, "/")
+	if !ok {
+		proto = protocolTCP
 	}
-	return PortSpec{Port: spec.Port, Proto: spec.Protocol}, nil
+	if proto != protocolTCP && proto != protocolUDP {
+		return PortSpec{}, fmt.Errorf("invalid port %q: protocol must be tcp or udp", s)
+	}
+	return finishPortSpec(s, portPart, proto)
+}
+
+// ParseTCPPortSpec is ParsePortSpec restricted to TCP. Its reasons are phrased
+// for a TCP-only caller, because "only TCP is supported" and "protocol must be
+// tcp" are more useful there than the generic message ParsePortSpec produces
+// for any non-TCP scheme.
+func ParseTCPPortSpec(s string) (PortSpec, error) {
+	portPart, proto, ok := strings.Cut(s, "/")
+	if !ok {
+		proto = protocolTCP
+	}
+	if proto != protocolTCP {
+		reason := "protocol must be tcp"
+		if proto == protocolUDP {
+			reason = "only TCP is supported"
+		}
+		return PortSpec{}, fmt.Errorf("invalid port %q: %s", s, reason)
+	}
+	return finishPortSpec(s, portPart, proto)
+}
+
+const (
+	protocolTCP = "tcp"
+	protocolUDP = "udp"
+)
+
+func finishPortSpec(s, portPart, proto string) (PortSpec, error) {
+	n, err := strconv.Atoi(portPart)
+	if err != nil || n < 1 || n > 65535 {
+		return PortSpec{}, fmt.Errorf("invalid port %q: port must be 1-65535", s)
+	}
+	return PortSpec{Port: n, Proto: proto}, nil
 }
 
 // PublishSpec declares a host-to-container port mapping.
 type PublishSpec struct {
-	HostAddr      string
+	// HostAddr is the parsed host bind address, stored unmapped by
+	// ParsePublishSpec. The zero value means the caller did not request a
+	// specific address.
+	HostAddr      netip.Addr
 	HostPort      int
 	ContainerPort int
 	Proto         string
@@ -39,17 +79,30 @@ type PublishSpec struct {
 }
 
 // ConnectAddr returns the connect address for this publish specification.
+// An unspecified bind (0.0.0.0 or ::) maps to the same address family's
+// loopback so a client does not dial the wildcard address.
 func (p PublishSpec) ConnectAddr() string {
-	if p.HostAddr == "" {
+	addr := p.HostAddr
+	if !addr.IsValid() {
 		return "127.0.0.1"
 	}
-	if IPIsUnspecified(p.HostAddr) {
-		if IPIs4(p.HostAddr) {
+	if addr.IsUnspecified() {
+		if addr.Is4() {
 			return "127.0.0.1"
 		}
 		return "::1"
 	}
-	return CanonicalIP(p.HostAddr)
+	return addr.String()
+}
+
+// HostIP returns the host bind address as a canonical string, or "" when the
+// specification does not request one. It gives reuse keys a stable spelling
+// that does not depend on the netip zero value's rendering.
+func (p PublishSpec) HostIP() string {
+	if !p.HostAddr.IsValid() {
+		return ""
+	}
+	return p.HostAddr.String()
 }
 
 // fieldError associates a parse failure with the public option field it came
@@ -78,33 +131,34 @@ func FieldOf(err error) (string, bool) {
 // ParsePublishSpec parses a publish specification string
 // "[hostAddr:]hostPort:containerPort[/proto]".
 func ParsePublishSpec(s string) (PublishSpec, error) {
-	spec := PublishSpec{Raw: s, Proto: "tcp"}
+	spec := PublishSpec{Raw: s, Proto: protocolTCP}
 	rest := s
 	if portsPart, proto, ok := strings.Cut(s, "/"); ok {
-		if proto != "tcp" && proto != "udp" {
+		if proto != protocolTCP && proto != protocolUDP {
 			return PublishSpec{}, newFieldError("published port", "protocol must be tcp or udp")
 		}
 		spec.Proto = proto
 		rest = portsPart
 	}
 
+	hostAddr := ""
 	if strings.HasPrefix(rest, "[") {
 		end := strings.Index(rest, "]:")
 		if end < 0 {
 			return PublishSpec{}, newFieldError("published port", "bracketed IPv6 form is malformed")
 		}
-		spec.HostAddr = rest[1:end]
+		hostAddr = rest[1:end]
 		rest = rest[end+2:]
 	} else if parts := strings.Split(rest, ":"); len(parts) == 3 {
-		spec.HostAddr = parts[0]
+		hostAddr = parts[0]
 		rest = parts[1] + ":" + parts[2]
 	}
-	if spec.HostAddr != "" {
-		addr, err := netip.ParseAddr(spec.HostAddr)
+	if hostAddr != "" {
+		addr, err := netip.ParseAddr(hostAddr)
 		if err != nil {
 			return PublishSpec{}, fmt.Errorf("invalid publish spec %q: host address must be an IP: %w", s, err)
 		}
-		spec.HostAddr = addr.Unmap().String()
+		spec.HostAddr = addr.Unmap()
 	}
 
 	hostPart, ctrPart, ok := strings.Cut(rest, ":")

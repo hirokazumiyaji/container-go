@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os/exec"
 	"slices"
 	"strings"
@@ -298,7 +299,7 @@ func TestWaitTargetContainerPortStatusUsesDeclaredContainerPort(t *testing.T) {
 		id:        "myctr",
 		runner:    f,
 		eng:       dockerEngine{},
-		published: []publishSpec{{hostAddr: "127.0.0.1", hostPort: 18081, containerPort: 8081, proto: "tcp", raw: "127.0.0.1:18081:8081/tcp"}},
+		published: []publishSpec{{HostAddr: netip.MustParseAddr("127.0.0.1"), HostPort: 18081, ContainerPort: 8081, Proto: "tcp", Raw: "127.0.0.1:18081:8081/tcp"}},
 	}
 	ctr.pack().uid = dockerFixtureID
 	target := waitTarget{c: ctr}

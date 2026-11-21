@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -751,7 +752,7 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 		id:      "myctr",
 		runner:  runner,
 		eng:     dockerEngine{},
-		exposed: []portSpec{{port: 6379, proto: "tcp"}},
+		exposed: []portSpec{{Port: 6379, Proto: "tcp"}},
 		sync:    &lockPack{uid: dockerFixtureID},
 	}
 
@@ -1870,7 +1871,7 @@ func TestDockerRemoteRejectionsShareSentinel(t *testing.T) {
 		t.Errorf("bind mount err = %v, want ErrUnsupportedCapability", bindErr)
 	}
 
-	publishErr := eng.checkConfig(ctx, &config{published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}}})
+	publishErr := eng.checkConfig(ctx, &config{published: []publishSpec{{HostAddr: netip.MustParseAddr("127.0.0.1"), Raw: "127.0.0.1:18080:80"}}})
 	if !errors.Is(publishErr, ErrEndpointUnreachable) {
 		t.Errorf("loopback publish err = %v, want ErrEndpointUnreachable", publishErr)
 	}
@@ -2188,7 +2189,7 @@ func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
 			if tc.mode != "bridge" {
 				// The public API rejects declarations on host/none. Add
 				// one only to exercise the defensive endpoint resolver.
-				ctr.exposed = []portSpec{{port: 6379, proto: "tcp"}}
+				ctr.exposed = []portSpec{{Port: 6379, Proto: "tcp"}}
 			}
 			host, hostErr := ctr.Host(context.Background())
 			endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
@@ -2267,7 +2268,7 @@ func TestDockerNoneNetworkReportsModeSpecificErrors(t *testing.T) {
 	}
 	// The public API rejects declarations in none mode; add one only to
 	// exercise the defensive endpoint resolver.
-	ctr.exposed = []portSpec{{port: 6379, proto: "tcp"}}
+	ctr.exposed = []portSpec{{Port: 6379, Proto: "tcp"}}
 	_, err = ctr.Endpoint(context.Background(), "6379/tcp")
 	if !errors.Is(err, ErrNoReachableHost) || !errors.Is(err, ErrPortNotExposed) {
 		t.Fatalf("none-mode Endpoint error = %v, want port and host sentinels", err)

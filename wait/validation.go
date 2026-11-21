@@ -5,11 +5,10 @@ import (
 	"fmt"
 	"os/exec"
 	"reflect"
-	"strconv"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
-	"github.com/hirokazumiyaji/container-go/internal/portspec"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // invalidConfigf reports a static configuration error as a *ConfigError so
@@ -176,11 +175,11 @@ func canonicalPortSpec(strategy, port string) (string, error) {
 	if port == "" {
 		return "", invalidConfigf(strategy, "port specification", port, "port must not be empty")
 	}
-	spec, err := portspec.Parse(port)
+	spec, err := domain.ParsePortSpec(port)
 	if err != nil {
 		return "", invalidConfigf(strategy, "port specification", port, "%s", err)
 	}
-	return strconv.Itoa(spec.Port) + "/" + spec.Protocol, nil
+	return spec.String(), nil
 }
 
 func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error {

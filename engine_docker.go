@@ -393,14 +393,14 @@ func (e dockerEngine) probeRuntimeEnvironment(ctx context.Context, cfg *config) 
 		}
 		// hostAddr is validated and canonicalized by parsePublishSpec.
 		for _, p := range cfg.published {
-			if ipIsLoopback(p.hostAddr) {
+			if p.HostAddr.IsLoopback() {
 				err := &ConfigError{
 					Backend: "docker",
 					Network: network,
 					Option:  "WithPublishedPort",
-					Detail:  fmt.Sprintf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw),
+					Detail:  fmt.Sprintf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.Raw),
 				}
-				return newValidationError("WithPublishedPort", p.raw, errors.Join(err, ErrEndpointUnreachable))
+				return newValidationError("WithPublishedPort", p.Raw, errors.Join(err, ErrEndpointUnreachable))
 			}
 		}
 	}
@@ -1288,7 +1288,7 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 		for _, spec := range cfg.exposed {
 			published := false
 			for _, p := range cfg.published {
-				if p.containerPort == spec.port && p.proto == spec.proto {
+				if p.ContainerPort == spec.Port && p.Proto == spec.Proto {
 					published = true
 					break
 				}
@@ -1549,8 +1549,8 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 				continue
 			}
 			info.bound = append(info.bound, boundPort{
-				containerPort: spec.port,
-				proto:         spec.proto,
+				containerPort: spec.Port,
+				proto:         spec.Proto,
 				hostAddr:      canonicalIP(b.HostIP),
 				hostPort:      hostPort,
 			})

@@ -16,13 +16,16 @@ type LabelConfig struct {
 	Creation   string
 	Reuse      bool
 	ReuseGroup string
-	Custom     map[string]string
+	// ReuseConfig is the creation-fingerprint value written only when Reuse
+	// is true. Leaving it empty omits the label.
+	ReuseConfig string
+	Custom      map[string]string
 }
 
-// reservedLabel reports whether key is owned by container-go. Custom labels
+// IsReservedLabel reports whether key is owned by container-go. Custom labels
 // may not set these keys: the internal value is the only trustworthy source
 // for ownership and cleanup decisions.
-func reservedLabel(key string) bool {
+func IsReservedLabel(key string) bool {
 	switch key {
 	case LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup, LabelReuseConfig:
 		return true
@@ -38,9 +41,9 @@ func reservedLabel(key string) bool {
 // LabelReuseGroup is emitted only when Reuse is true. A caller that accepts a
 // group without reuse must reject that combination before building labels.
 func BuildLabels(cfg LabelConfig) map[string]string {
-	labels := make(map[string]string, len(cfg.Custom)+5)
+	labels := make(map[string]string, len(cfg.Custom)+6)
 	for k, v := range cfg.Custom {
-		if reservedLabel(k) {
+		if IsReservedLabel(k) {
 			continue
 		}
 		labels[k] = v
@@ -56,6 +59,9 @@ func BuildLabels(cfg LabelConfig) map[string]string {
 		labels[LabelReuse] = "true"
 		if cfg.ReuseGroup != "" {
 			labels[LabelReuseGroup] = cfg.ReuseGroup
+		}
+		if cfg.ReuseConfig != "" {
+			labels[LabelReuseConfig] = cfg.ReuseConfig
 		}
 	}
 	return labels

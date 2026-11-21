@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hirokazumiyaji/container-go/internal/portspec"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // PortListenStatus is the result of a container-side TCP listen check.
@@ -158,7 +158,7 @@ func (s *HostPortStrategy) confirmContainerListening(ctx context.Context, target
 }
 
 func validateTCPPortSpec(strategy, spec string) error {
-	_, err := portspec.ParseTCP(spec)
+	_, err := domain.ParseTCPPortSpec(spec)
 	if err == nil {
 		return nil
 	}

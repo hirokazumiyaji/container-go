@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 const (
@@ -45,17 +46,19 @@ type Target interface {
 	ExecCommand(ctx context.Context, cmd []string) (int, error)
 }
 
-// State is a container lifecycle state reported by Target.
-type State string
+// State is a container lifecycle state reported by Target. It aliases the
+// domain type so a target can return the state it already holds instead of
+// mapping between two identical enumerations.
+type State = domain.State
 
 const (
-	StateUnknown    State = "unknown"
-	StateCreated    State = "created"
-	StateRunning    State = "running"
-	StateStopping   State = "stopping"
-	StateStopped    State = "stopped"
-	StateRestarting State = "restarting"
-	StatePaused     State = "paused"
+	StateUnknown    State = domain.StateUnknown
+	StateCreated    State = domain.StateCreated
+	StateRunning    State = domain.StateRunning
+	StateStopping   State = domain.StateStopping
+	StateStopped    State = domain.StateStopped
+	StateRestarting State = domain.StateRestarting
+	StatePaused     State = domain.StatePaused
 )
 
 // StateTarget is an optional extension to Target for targets that can

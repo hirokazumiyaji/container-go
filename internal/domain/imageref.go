@@ -1,23 +1,56 @@
 package domain
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 )
+
+// ImageRef is an image reference split into its repository name, tag, and
+// digest. Name keeps the caller's registry/repository spelling; tag and digest
+// are optional.
+type ImageRef struct {
+	Name   string
+	Tag    string
+	Digest string
+}
+
+// ParseImageRef splits an image reference into its repository, tag, and
+// digest. The digest is separated first, so the ":" inside "@sha256:..." can
+// never be mistaken for a tag separator. A missing tag is left empty for the
+// caller's defaulting rule.
+func ParseImageRef(raw string) (ImageRef, error) {
+	ref := strings.TrimSpace(raw)
+	if ref == "" {
+		return ImageRef{}, errors.New("image reference is empty")
+	}
+	name, digest, _ := strings.Cut(ref, "@")
+	tag := ""
+	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
+		tag = name[i+1:]
+		name = name[:i]
+	}
+	if name == "" {
+		return ImageRef{}, fmt.Errorf("invalid image reference %q", raw)
+	}
+	return ImageRef{Name: name, Tag: tag, Digest: digest}, nil
+}
 
 // NormalizeImageRef expands Docker Hub short names to a canonical
 // registry/repo:tag form. The default registry is docker.io, the
 // default namespace for single-component repos is library, and the
-// default tag is latest.
+// default tag is latest. A digest suffix is preserved after the tag so a
+// reference such as "redis:7@sha256:..." stays a digest-pinned reference.
 func NormalizeImageRef(ref string) string {
-	tag := "latest"
-	name := ref
-	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
-		tag = name[i+1:]
-		name = name[:i]
-		if tag == "" {
-			tag = "latest"
-		}
+	parsed, err := ParseImageRef(ref)
+	if err != nil {
+		return ref
 	}
+	tag := parsed.Tag
+	if tag == "" {
+		tag = "latest"
+	}
+	name := parsed.Name
 	var registry, repo string
 	parts := strings.Split(name, "/")
 	switch {
@@ -40,7 +73,11 @@ func NormalizeImageRef(ref string) string {
 	if repo == "" {
 		repo = name
 	}
-	return registry + "/" + repo + ":" + tag
+	normalized := registry + "/" + repo + ":" + tag
+	if parsed.Digest != "" {
+		normalized += "@" + parsed.Digest
+	}
+	return normalized
 }
 
 // IsRegistry reports whether s looks like a hostname/registry prefix.
@@ -88,8 +125,11 @@ func IsHex(s string) bool {
 	return true
 }
 
-// IsBareImageDigest recognizes a digest used without a repository.
-func IsBareImageDigest(ref string) bool {
+// isDigestShaped reports whether ref has the shape of a digest without a
+// repository: a known algorithm prefix and an encoded value. It is the
+// provenance test, so a malformed encoded value is still recognized as not
+// being a repository reference.
+func isDigestShaped(ref string) bool {
 	ref = strings.TrimSpace(ref)
 	if strings.Contains(ref, "@") || strings.Contains(ref, "/") {
 		return false
@@ -112,9 +152,12 @@ func IsBareImageID(ref string) bool {
 	return len(ref) == 64 && IsHex(ref)
 }
 
-// IsBareImageReference identifies either spelling of an ID-shaped or digest-shaped value without repo.
+// IsBareImageReference identifies either spelling of an ID-shaped or
+// digest-shaped value without repository provenance. A digest-shaped value is
+// rejected here even when its encoded portion is malformed: without a
+// repository it still cannot be compared with a named image.
 func IsBareImageReference(ref string) bool {
-	return IsBareImageDigest(ref) || IsBareImageID(ref)
+	return isDigestShaped(ref) || IsBareImageID(ref)
 }
 
 // ImageReferenceBase returns a repository-bearing base for an image reference.
@@ -164,10 +207,12 @@ func ImagesCompatible(requested, actual string) bool {
 		if !strings.EqualFold(reqDigest, actDigest) {
 			return false
 		}
-		reqBase := ImageReferenceBase(requested)
-		actBase := ImageReferenceBase(actual)
-		return reqBase != "" && actBase != "" &&
-			NormalizeImageRef(reqBase) == NormalizeImageRef(actBase)
+		// A matching digest pins the same content, so the advisory tag
+		// on either side must not make the references incompatible.
+		// The repository still has to be the same.
+		reqRepo := ImageRepository(requested)
+		actRepo := ImageRepository(actual)
+		return reqRepo != "" && strings.EqualFold(reqRepo, actRepo)
 	}
 	req := ImageReferenceBase(requested)
 	act := ImageReferenceBase(actual)

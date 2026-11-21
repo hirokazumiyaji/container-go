@@ -127,7 +127,7 @@ func TestDockerHandleOperationsUseImmutableID(t *testing.T) {
 	if _, err := ctr.ContainerIP(ctx); !errors.Is(err, ErrContainerNotFound) {
 		t.Errorf("ContainerIP error = %v, want ErrContainerNotFound", err)
 	}
-	ctr.exposed = []portSpec{{port: 80, proto: "tcp"}}
+	ctr.exposed = []portSpec{{Port: 80, Proto: "tcp"}}
 	if _, err := ctr.Endpoint(ctx, "80/tcp"); !errors.Is(err, ErrContainerNotFound) {
 		t.Errorf("Endpoint error = %v, want ErrContainerNotFound", err)
 	}

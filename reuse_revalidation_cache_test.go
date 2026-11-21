@@ -214,7 +214,7 @@ func TestLazyCacheRejectsReplacementNameLookup(t *testing.T) {
 		runner:   runner,
 		eng:      dockerEngine{},
 		creation: "original-generation",
-		exposed:  []portSpec{{port: 6379, proto: "tcp"}},
+		exposed:  []portSpec{{Port: 6379, Proto: "tcp"}},
 	}
 
 	info, err := ctr.cachedInfo(context.Background())
@@ -244,7 +244,7 @@ func TestCacheKeepsIdentityAndEndpointImmutable(t *testing.T) {
 	ctr := &Container{
 		eng:      dockerEngine{},
 		creation: revalidateTestGenA,
-		exposed:  []portSpec{{port: 6379, proto: "tcp"}},
+		exposed:  []portSpec{{Port: 6379, Proto: "tcp"}},
 		sync:     &lockPack{uid: revalidateTestUIDA},
 	}
 	if err := ctr.cacheInfo(original); err != nil {

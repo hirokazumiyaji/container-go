@@ -602,7 +602,7 @@ func runWaitPorts(cfg *config) []string {
 		ports = append(ports, exposed.String())
 	}
 	for _, published := range cfg.published {
-		ports = append(ports, strconv.Itoa(published.containerPort)+"/"+published.proto)
+		ports = append(ports, strconv.Itoa(published.ContainerPort)+"/"+published.Proto)
 	}
 	return ports
 }
@@ -1913,7 +1913,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 	}
 	if c.eng.directIP() {
 		if len(c.published) > 0 {
-			return c.published[0].connectAddr(), nil
+			return c.published[0].ConnectAddr(), nil
 		}
 		if info.ip == "" {
 			c.clearDynamic()
@@ -1941,7 +1941,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		b, ok := matchingPublishedBinding(info.bound, p, c.eng)
 		if !ok {
 			c.clearDynamic()
-			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.raw, info.networkMode)
+			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.Raw, info.networkMode)
 		}
 		host, err := dockerBindingConnectHost(b, c.eng)
 		if err != nil {
@@ -1978,7 +1978,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 	var published *publishSpec
 	for i := range c.published {
 		p := &c.published[i]
-		if p.containerPort == spec.port && p.proto == spec.proto {
+		if p.ContainerPort == spec.Port && p.Proto == spec.Proto {
 			published = p
 			break
 		}
@@ -1997,13 +1997,13 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 	}
 	if c.eng.directIP() {
 		if published != nil {
-			return published.connectAddr(), published.hostPort, nil
+			return published.ConnectAddr(), published.HostPort, nil
 		}
 		if info.ip == "" {
 			c.clearDynamic()
 			return "", 0, fmt.Errorf("container %s has no reported IP address", c.id)
 		}
-		return info.ip, spec.port, nil
+		return info.ip, spec.Port, nil
 	}
 	// Published-port mode: the backend assigned a host port at start.
 	// Docker may discard -p in host mode, so the request is never used
@@ -2021,7 +2021,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		b, ok := matchingPublishedBinding(info.bound, *published, c.eng)
 		if !ok {
 			c.clearDynamic()
-			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.raw, info.networkMode)
+			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.Raw, info.networkMode)
 		}
 		host, err := dockerBindingConnectHost(b, c.eng)
 		if err != nil {

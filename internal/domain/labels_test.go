@@ -63,12 +63,13 @@ func TestLabelNamespace(t *testing.T) {
 func TestBuildLabelsDropsReservedCustomLabels(t *testing.T) {
 	labels := BuildLabels(LabelConfig{
 		Custom: map[string]string{
-			LabelManaged:    "false",
-			LabelSession:    "forged",
-			LabelCreation:   "forged",
-			LabelReuse:      "true",
-			LabelReuseGroup: "forged",
-			"app":           "web",
+			LabelManaged:     "false",
+			LabelSession:     "forged",
+			LabelCreation:    "forged",
+			LabelReuse:       "true",
+			LabelReuseGroup:  "forged",
+			LabelReuseConfig: "forged",
+			"app":            "web",
 		},
 	})
 	want := map[string]string{
@@ -129,6 +130,38 @@ func TestBuildLabelsWritesEachLabelOnce(t *testing.T) {
 	for _, name := range []string{"LabelManaged", "LabelSession", "LabelCreation", "LabelReuse", "LabelReuseGroup"} {
 		if writes[name] != 1 {
 			t.Errorf("BuildLabels assigns %s %d times, want exactly 1", name, writes[name])
+		}
+	}
+}
+
+// The fingerprint label is owned by BuildLabels; a caller-supplied value is
+// emitted only alongside reuse.
+func TestBuildLabelsReuseConfig(t *testing.T) {
+	labels := BuildLabels(LabelConfig{Reuse: true, ReuseConfig: "cfg-hash"})
+	if labels[LabelReuseConfig] != "cfg-hash" {
+		t.Errorf("LabelReuseConfig = %q, want cfg-hash", labels[LabelReuseConfig])
+	}
+	labels = BuildLabels(LabelConfig{ReuseConfig: "cfg-hash"})
+	if _, ok := labels[LabelReuseConfig]; ok {
+		t.Errorf("LabelReuseConfig emitted without reuse: %q", labels[LabelReuseConfig])
+	}
+	labels = BuildLabels(LabelConfig{Reuse: true})
+	if _, ok := labels[LabelReuseConfig]; ok {
+		t.Errorf("empty LabelReuseConfig emitted: %q", labels[LabelReuseConfig])
+	}
+}
+
+func TestIsReservedLabel(t *testing.T) {
+	for _, key := range []string{
+		LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup, LabelReuseConfig,
+	} {
+		if !IsReservedLabel(key) {
+			t.Errorf("IsReservedLabel(%q) = false", key)
+		}
+	}
+	for _, key := range []string{"app", "", "com.github.hirokazumiyaji.container-go.other"} {
+		if IsReservedLabel(key) {
+			t.Errorf("IsReservedLabel(%q) = true", key)
 		}
 	}
 }

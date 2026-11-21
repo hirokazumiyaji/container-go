@@ -1429,9 +1429,10 @@ for the same backend, image, platform, and operation.
 
 **Apple capability differences**: `appleEngine.checkConfig` rejects
 non-Linux or malformed Apple platforms (including bare `linux` and invalid
-variants), Apple-invalid container/network names, memory below 200 MiB
-(including overflow), published port 1, overlapping publishes, and more than
-64 publish descriptors before invoking the CLI. `WithPrivileged`,
+variants), Apple-invalid container/network names, memory below 200 MiB,
+published port 1, overlapping publishes, and more than 64 publish descriptors
+before invoking the CLI. Malformed and overflowing memory sizes are rejected
+by option validation before `checkConfig` runs. `WithPrivileged`,
 `WithExtraHost`, and `WithHostname` are rejected with
 `ErrUnsupportedCapability`, and a fractional `WithCPUs` is rejected the same
 way because Apple's `--cpus` takes an integer. `WithShmSize`, `WithCapAdd`,

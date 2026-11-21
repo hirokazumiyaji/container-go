@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"net/netip"
+	"strings"
 	"testing"
 )
 
@@ -39,7 +41,6 @@ func TestParsePublishSpec(t *testing.T) {
 		{
 			input: "8080:80",
 			want: PublishSpec{
-				HostAddr:      "",
 				HostPort:      8080,
 				ContainerPort: 80,
 				Proto:         "tcp",
@@ -49,7 +50,7 @@ func TestParsePublishSpec(t *testing.T) {
 		{
 			input: "127.0.0.1:8080:80/udp",
 			want: PublishSpec{
-				HostAddr:      "127.0.0.1",
+				HostAddr:      netip.MustParseAddr("127.0.0.1"),
 				HostPort:      8080,
 				ContainerPort: 80,
 				Proto:         "udp",
@@ -59,7 +60,7 @@ func TestParsePublishSpec(t *testing.T) {
 		{
 			input: "[::1]:8080:80",
 			want: PublishSpec{
-				HostAddr:      "::1",
+				HostAddr:      netip.MustParseAddr("::1"),
 				HostPort:      8080,
 				ContainerPort: 80,
 				Proto:         "tcp",
@@ -134,5 +135,79 @@ func TestParsePublishSpecErrorFields(t *testing.T) {
 	}
 	if field, ok := FieldOf(err); ok {
 		t.Errorf("host address error field = %q, want no field", field)
+	}
+}
+
+func TestParseTCPPortSpec(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    PortSpec
+		wantErr bool
+	}{
+		{"6379", PortSpec{Port: 6379, Proto: "tcp"}, false},
+		{"6379/tcp", PortSpec{Port: 6379, Proto: "tcp"}, false},
+		{"6379/udp", PortSpec{}, true},
+		{"6379/sctp", PortSpec{}, true},
+		{"0", PortSpec{}, true},
+	}
+	for _, tt := range tests {
+		got, err := ParseTCPPortSpec(tt.input)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ParseTCPPortSpec(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			continue
+		}
+		if !tt.wantErr && got != tt.want {
+			t.Errorf("ParseTCPPortSpec(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+	if _, err := ParseTCPPortSpec("6379/udp"); err == nil || !strings.Contains(err.Error(), "only TCP is supported") {
+		t.Errorf("UDP reason = %v, want a TCP-only message", err)
+	}
+}
+
+func TestPublishSpecConnectAddr(t *testing.T) {
+	tests := []struct {
+		host string
+		want string
+	}{
+		{"", "127.0.0.1"},
+		{"0.0.0.0", "127.0.0.1"},
+		{"::", "::1"},
+		{"127.0.0.1", "127.0.0.1"},
+		{"::1", "::1"},
+		{"192.0.2.1", "192.0.2.1"},
+	}
+	for _, tt := range tests {
+		spec := PublishSpec{}
+		if tt.host != "" {
+			spec.HostAddr = netip.MustParseAddr(tt.host)
+		}
+		if got := spec.ConnectAddr(); got != tt.want {
+			t.Errorf("ConnectAddr() for %q = %q, want %q", tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestPublishSpecHostIP(t *testing.T) {
+	if got := (PublishSpec{}).HostIP(); got != "" {
+		t.Errorf("zero HostIP() = %q, want empty", got)
+	}
+	// ParsePublishSpec is the invariant-setting constructor: it stores the
+	// address unmapped, and HostIP renders that stored value.
+	tests := map[string]string{
+		"8080:80":                    "",
+		"127.0.0.1:8080:80":          "127.0.0.1",
+		"[::1]:8080:80":              "::1",
+		"[::ffff:192.0.2.1]:8080:80": "192.0.2.1",
+	}
+	for input, want := range tests {
+		spec, err := ParsePublishSpec(input)
+		if err != nil {
+			t.Errorf("ParsePublishSpec(%q): %v", input, err)
+			continue
+		}
+		if got := spec.HostIP(); got != want {
+			t.Errorf("ParsePublishSpec(%q).HostIP() = %q, want %q", input, got, want)
+		}
 	}
 }

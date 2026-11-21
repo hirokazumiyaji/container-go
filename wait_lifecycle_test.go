@@ -109,7 +109,7 @@ func TestEndpointRefreshesIncompleteCreatedInspect(t *testing.T) {
 	created := appleInspectWithNetwork("myctr", "created", "")
 	running := appleInspectWithNetwork("myctr", "running", "192.168.64.3/24")
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
-	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef", exposed: []portSpec{{port: 6379, proto: "tcp"}}}
+	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef", exposed: []portSpec{{Port: 6379, Proto: "tcp"}}}
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint should report that Created has no IP yet")
@@ -151,7 +151,7 @@ func TestEndpointRefreshesIncompleteDockerBinding(t *testing.T) {
 	created := dockerInspectWithBinding(validUID, "created", "", 0)
 	running := dockerInspectWithBinding(validUID, "running", "172.17.0.2", 49153)
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
-	ctr := &Container{id: "myctr", sync: &lockPack{uid: validUID}, runner: runner, eng: dockerEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: validUID}, runner: runner, eng: dockerEngine{}, exposed: []portSpec{{Port: 6379, Proto: "tcp"}}}
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint should report that Created has no host binding yet")

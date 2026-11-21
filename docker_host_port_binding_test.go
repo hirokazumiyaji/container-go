@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -127,7 +128,7 @@ func TestAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
 			cfg := newConfig()
 			cfg.eng = dockerEngine{}
 			cfg.name = "myctr"
-			cfg.exposed = []portSpec{{port: 6379, proto: "tcp"}}
+			cfg.exposed = []portSpec{{Port: 6379, Proto: "tcp"}}
 			args := strings.Join((dockerEngine{}).runArgs(cfg, "redis:7-alpine", ""), " ")
 			if !strings.Contains(args, "--publish 127.0.0.1::6379/tcp") {
 				t.Errorf("DOCKER_HOST=%q: run args = %s, want a loopback publish", host, args)
@@ -146,7 +147,7 @@ func TestAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
 			cfg := newConfig()
 			cfg.eng = dockerEngine{}
 			cfg.name = "myctr"
-			cfg.exposed = []portSpec{{port: 6379, proto: "tcp"}}
+			cfg.exposed = []portSpec{{Port: 6379, Proto: "tcp"}}
 			args := strings.Join((dockerEngine{}).runArgs(cfg, "redis:7-alpine", ""), " ")
 			if !strings.Contains(args, "--publish 0.0.0.0::6379/tcp") {
 				t.Errorf("DOCKER_HOST=%q: run args = %s, want an all-interfaces publish", host, args)
@@ -175,7 +176,7 @@ func TestAutoPublishBindsLoopbackLocally(t *testing.T) {
 func TestLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
 	err := (dockerEngine{}).checkConfig(context.Background(), &config{
-		published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}},
+		published: []publishSpec{{HostAddr: netip.MustParseAddr("127.0.0.1"), Raw: "127.0.0.1:18080:80"}},
 	})
 	if err == nil {
 		t.Fatal("a loopback publish on a remote ssh:// daemon was accepted")
@@ -186,7 +187,7 @@ func TestLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 
 	// A non-loopback bind is fine on the same remote daemon.
 	if err := (dockerEngine{}).checkConfig(context.Background(), &config{
-		published: []publishSpec{{hostAddr: "0.0.0.0", raw: "0.0.0.0:18080:80"}},
+		published: []publishSpec{{HostAddr: netip.MustParseAddr("0.0.0.0"), Raw: "0.0.0.0:18080:80"}},
 	}); err != nil {
 		t.Errorf("a 0.0.0.0 publish on a remote daemon was rejected: %v", err)
 	}
@@ -198,7 +199,7 @@ func TestLoopbackPublishStillAllowedLocally(t *testing.T) {
 	for _, host := range []string{"", "unix:///var/run/docker.sock", "tcp://127.0.0.1:2375"} {
 		t.Setenv("DOCKER_HOST", host)
 		if err := (dockerEngine{}).checkConfig(context.Background(), &config{
-			published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}},
+			published: []publishSpec{{HostAddr: netip.MustParseAddr("127.0.0.1"), Raw: "127.0.0.1:18080:80"}},
 		}); err != nil {
 			t.Errorf("DOCKER_HOST=%q: local loopback publish rejected: %v", host, err)
 		}

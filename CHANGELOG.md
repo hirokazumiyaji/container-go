@@ -94,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ContainerizationError` envelopes with one depth-bounded parser.
 - Accept benchmark documents that cover both Docker and Apple, and keep a
   legitimate zero-nanosecond minimum in `Summarize`.
+- Concurrent `WithReuse` callers that request the same `/dev/shm` size in
+  different spellings (for example `64M` and `67108864`) now join one shared
+  flight instead of racing separate creates.
+- Image references that carry both a tag and a digest (for example
+  `redis:7@sha256:...`) keep both parts during normalization instead of reading
+  the digest as a tag. References naming the same digest are compatible even
+  when one omits a redundant tag.
 
 ### Changed
 
@@ -143,6 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend CLI process; normalization and daemon probes stay in the shell.
 - Remove the never-set `imageIdentity.mutableAlias` field and validate creation
   and immutable container IDs through `internal/domain`.
+- **Breaking:** `wait.State` is now the same type as `container.State`. A type
+  switch that lists both types, an `any`-keyed map that distinguishes them, and
+  `%T`/`reflect` output now see one type; `wait.StateTarget` implementations and
+  explicit conversions still compile.
 
 
 ## [0.3.0] - 2026-10-26

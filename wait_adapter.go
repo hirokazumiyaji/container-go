@@ -53,13 +53,13 @@ func (t waitTarget) selectedPort(port string) (string, error) {
 		return port, nil
 	}
 	for _, exposed := range t.c.exposed {
-		if exposed.proto == "tcp" {
+		if exposed.Proto == "tcp" {
 			return exposed.String(), nil
 		}
 	}
 	for _, published := range t.c.published {
-		if published.proto == "tcp" {
-			return strconv.Itoa(published.containerPort) + "/" + published.proto, nil
+		if published.Proto == "tcp" {
+			return strconv.Itoa(published.ContainerPort) + "/" + published.Proto, nil
 		}
 	}
 	return "", ErrPortNotExposed
@@ -126,7 +126,7 @@ func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.
 	if code == 126 || code == 127 {
 		return wait.PortListenUnsupported, nil
 	}
-	listening, supported := procNetListening(out.Bytes(), spec.port)
+	listening, supported := procNetListening(out.Bytes(), spec.Port)
 	if !supported {
 		return wait.PortListenUnsupported, nil
 	}
@@ -192,22 +192,10 @@ func (t waitTarget) State(ctx context.Context) (wait.State, error) {
 	if err != nil {
 		return wait.StateUnknown, waitTargetError(err)
 	}
-	switch state {
-	case StateRunning:
-		return wait.StateRunning, nil
-	case StateStopped:
-		return wait.StateStopped, nil
-	case StateStopping:
-		return wait.StateStopping, nil
-	case StateCreated:
-		return wait.StateCreated, nil
-	case StateRestarting:
-		return wait.StateRestarting, nil
-	case StatePaused:
-		return wait.StatePaused, nil
-	default:
-		return wait.StateUnknown, nil
-	}
+	// wait.State aliases domain.State, so the adapter can report the
+	// container's state without a parallel enumeration. wait canonicalizes
+	// unrecognized values before acting on them.
+	return state, nil
 }
 
 func (t waitTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {

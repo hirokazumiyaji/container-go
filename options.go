@@ -37,12 +37,9 @@ type ExternalRunner = cli.ExternalRunner
 type Streamer = cli.Streamer
 
 const (
-	// maxMemoryBytes is a portable, backend-neutral ceiling. Individual
-	// backends may enforce a smaller capability limit in checkConfig.
-	maxMemoryBytes     uint64 = 1 << 50 // 1 PiB
-	maxVolumeNameBytes        = 255
-	maxMountPathBytes         = 4096
-	maxReuseGroupBytes        = 128
+	maxVolumeNameBytes = 255
+	maxMountPathBytes  = 4096
+	maxReuseGroupBytes = 128
 )
 
 type config struct {
@@ -65,8 +62,8 @@ type config struct {
 	files                []File
 	waitStrategy         wait.Strategy
 	cpus                 float64
-	memory               string
-	shmSize              string
+	memory               domain.ByteSize
+	shmSize              domain.ByteSize
 	privileged           bool
 	capAdd               []string
 	capDrop              []string
@@ -240,17 +237,19 @@ func (c *config) dockerTargetOption() string {
 // WithReuseGroup without WithReuse, which is also what lets BuildLabels
 // decide whether to emit the reuse-group label.
 func (c *config) allLabels() map[string]string {
-	labels := domain.BuildLabels(domain.LabelConfig{
+	cfg := domain.LabelConfig{
 		Session:    sessionID(),
 		Creation:   c.creation,
 		Reuse:      c.reuse,
 		ReuseGroup: c.reuseGroup,
 		Custom:     c.labels,
-	})
-	if c.reuse {
-		labels[domain.LabelReuseConfig] = c.reuseConfigHash()
 	}
-	return labels
+	if c.reuse {
+		// BuildLabels owns every reserved label, so the fingerprint is
+		// passed in instead of writing into the returned map.
+		cfg.ReuseConfig = c.reuseConfigHash()
+	}
+	return domain.BuildLabels(cfg)
 }
 
 // commonRunArgs builds the shared run flags after --name: labels,
@@ -267,7 +266,7 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 		args = append(args, "--env-file", envFile)
 	}
 	for _, p := range c.published {
-		args = append(args, "--publish", p.raw)
+		args = append(args, "--publish", p.Raw)
 	}
 	for _, raw := range extraPublish {
 		args = append(args, "--publish", raw)
@@ -280,11 +279,11 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 	if c.cpus > 0 {
 		args = append(args, "--cpus", strconv.FormatFloat(c.cpus, 'f', -1, 64))
 	}
-	if c.memory != "" {
-		args = append(args, "--memory", c.memory)
+	if !c.memory.IsZero() {
+		args = append(args, "--memory", c.memory.String())
 	}
-	if c.shmSize != "" {
-		args = append(args, "--shm-size", c.shmSize)
+	if !c.shmSize.IsZero() {
+		args = append(args, "--shm-size", c.shmSize.String())
 	}
 	if c.privileged {
 		args = append(args, "--privileged")
@@ -692,8 +691,7 @@ func WithLabels(labels map[string]string) Option {
 			if len(k) > 128 || !labelKeyRE.MatchString(k) {
 				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("invalid label key %q", k))
 			}
-			switch k {
-			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel, domain.LabelReuseConfig:
+			if domain.IsReservedLabel(k) {
 				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("label key %q is reserved", k))
 			}
 			// Label values may carry secrets. Do not put them in Value or
@@ -749,60 +747,14 @@ func formatCPUs(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
-// memoryRE accepts sizes like "512M" or "1G". Unit support beyond
-// this syntax is a backend capability and is checked separately.
-var memoryRE = regexp.MustCompile(`^[0-9]+[KMGTP]?$`)
-
-// parseSizeBytes parses the integer with an optional K/M/G/T/P suffix used by
-// WithMemory and WithShmSize. option and noun shape the error message so a
-// rejected value names the option the caller must change.
-func parseSizeBytes(option, noun, size string) (uint64, error) {
-	if !memoryRE.MatchString(size) {
-		return 0, validationErrorf(option, size, "invalid %s size %q", noun, size)
-	}
-
-	digits := size
-	unit := uint64(1)
-	if last := size[len(size)-1]; last < '0' || last > '9' {
-		digits = size[:len(size)-1]
-		switch last {
-		case 'K':
-			unit = 1 << 10
-		case 'M':
-			unit = 1 << 20
-		case 'G':
-			unit = 1 << 30
-		case 'T':
-			unit = 1 << 40
-		case 'P':
-			unit = 1 << 50
-		}
-	}
-	value, err := strconv.ParseUint(digits, 10, 64)
-	if err != nil {
-		return 0, newValidationError(option, size, fmt.Errorf("invalid or overflowing %s size %q: %w", noun, size, err))
-	}
-	if value == 0 {
-		return 0, validationErrorf(option, size, "%s size must be greater than zero: %q", noun, size)
-	}
-	if value > maxMemoryBytes/unit {
-		return 0, validationErrorf(option, size, "%s size overflows the %d-byte maximum: %q", noun, maxMemoryBytes, size)
-	}
-	return value * unit, nil
-}
-
-func validateMemorySize(size string) error {
-	_, err := parseSizeBytes("WithMemory", "memory", size)
-	return err
-}
-
 // WithMemory sets the VM memory size, e.g. "512M" or "1G".
 func WithMemory(size string) Option {
 	return func(c *config) error {
-		if err := validateMemorySize(size); err != nil {
-			return err
+		parsed, err := domain.ParseByteSize(size)
+		if err != nil {
+			return newValidationError("WithMemory", size, err)
 		}
-		c.memory = size
+		c.memory = parsed
 		return nil
 	}
 }
@@ -812,10 +764,11 @@ func WithMemory(size string) Option {
 // Container's --shm-size and Docker's --shm-size accept the value directly.
 func WithShmSize(size string) Option {
 	return func(c *config) error {
-		if _, err := parseSizeBytes("WithShmSize", "shm", size); err != nil {
-			return err
+		parsed, err := domain.ParseByteSize(size)
+		if err != nil {
+			return newValidationError("WithShmSize", size, err)
 		}
-		c.shmSize = size
+		c.shmSize = parsed
 		return nil
 	}
 }
@@ -1281,28 +1234,19 @@ func (m Mount) arg() string {
 	return b.String()
 }
 
-type portSpec struct {
-	port  int
-	proto string
-}
-
-func (p portSpec) String() string { return strconv.Itoa(p.port) + "/" + p.proto }
+// portSpec is the domain port value object. The alias keeps the root
+// package's unexported spelling while sharing one type with wait and the
+// backends, so a parsed specification is never copied into a parallel struct.
+type portSpec = domain.PortSpec
 
 func parsePortSpec(s string) (portSpec, error) {
-	spec, err := domain.ParsePortSpec(s)
-	if err != nil {
-		return portSpec{}, err
-	}
-	return portSpec{port: spec.Port, proto: spec.Proto}, nil
+	return domain.ParsePortSpec(s)
 }
 
-type publishSpec struct {
-	hostAddr      string
-	hostPort      int
-	containerPort int
-	proto         string
-	raw           string
-}
+// publishSpec is the domain publish value object. Its HostAddr is already
+// parsed, so resolving a connect address does not re-parse the caller's
+// string.
+type publishSpec = domain.PublishSpec
 
 func parsePublishSpec(s string) (publishSpec, error) {
 	spec, err := domain.ParsePublishSpec(s)
@@ -1312,27 +1256,7 @@ func parsePublishSpec(s string) (publishSpec, error) {
 		}
 		return publishSpec{}, err
 	}
-	return publishSpec{
-		hostAddr:      spec.HostAddr,
-		hostPort:      spec.HostPort,
-		containerPort: spec.ContainerPort,
-		proto:         spec.Proto,
-		raw:           spec.Raw,
-	}, nil
-}
-
-// connectAddr is the address clients should dial for a published port.
-// Preserve the address family when turning an unspecified bind into a
-// loopback destination.
-func (p publishSpec) connectAddr() string {
-	d := domain.PublishSpec{
-		HostAddr:      p.hostAddr,
-		HostPort:      p.hostPort,
-		ContainerPort: p.containerPort,
-		Proto:         p.proto,
-		Raw:           p.raw,
-	}
-	return d.ConnectAddr()
+	return spec, nil
 }
 
 func canonicalIP(addr string) string {

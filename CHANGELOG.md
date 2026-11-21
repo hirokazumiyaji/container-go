@@ -319,6 +319,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then only executes the selected create, attach, wait, recreate, or failure
   step. The decision table is unit-tested without a container backend; reuse
   behavior and the public API are unchanged.
+- Extract the address and port resolution behind `Host`, `MappedPort`, and
+  `Endpoint` into the pure `internal/domain.ResolveEndpoint` function. The
+  handle now performs only the identity-checked inspect, default-network
+  check, and result handoff; the resolver decides direct-IP addressing, Docker
+  host and none networking, published-over-exposed priority, and
+  loopback/unspecified normalization. The resolution table is unit-tested
+  without a container backend. The public API and resolution behavior are
+  unchanged; the resolver's default host stays pinned to the handle's
+  creation-time target, and `Endpoint` / `MappedPort` apply the handle's
+  diagnostic redactor consistently to resolver failures.
 
 
 ## [0.3.0] - 2026-10-26

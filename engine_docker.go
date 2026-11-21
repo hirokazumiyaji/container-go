@@ -173,8 +173,8 @@ const (
 	// this copy-out contract. Older cp extractors fail closed.
 	dockerCopyOutMinimumVersion = "29.7.0"
 
-	dockerNetworkHost    = "host"
-	dockerNetworkNone    = "none"
+	dockerNetworkHost    = domain.NetworkModeHost
+	dockerNetworkNone    = domain.NetworkModeNone
 	dockerNetworkDefault = "default"
 	dockerNetworkBridge  = "bridge"
 	dockerNetworkNAT     = "nat"
@@ -601,18 +601,11 @@ func firstNetworkNames(nameSets [][]string) []string {
 	return nameSets[0]
 }
 
+// dockerNetworkEndpointError is the Docker backend's spelling of the shared
+// network mode classification. Reuse compatibility and error-discrimination
+// tests classify through it.
 func dockerNetworkEndpointError(mode string) error {
-	switch strings.TrimSpace(mode) {
-	case dockerNetworkHost:
-		return fmt.Errorf("%w: Docker host networking has no library-managed host port binding; Host returns the daemon host, but Endpoint does not infer a port", ErrPortNotExposed)
-	case dockerNetworkNone:
-		return errors.Join(
-			fmt.Errorf("%w: Docker network mode %q has no network interface for a host port binding", ErrPortNotExposed, mode),
-			fmt.Errorf("%w: Docker network mode %q has no reachable host", ErrNoReachableHost, mode),
-		)
-	default:
-		return nil
-	}
+	return domain.NetworkEndpointError(mode)
 }
 
 func (dockerEngine) probe() cli.Probe {
@@ -1131,35 +1124,15 @@ func isLoopbackOrUnspecified(addr string) bool {
 	return domain.IsLoopbackOrUnspecified(addr)
 }
 
-// dockerConnectHost rewrites unspecified binds to the client-facing
-// host. On a remote daemon, loopback and unspecified addresses become
-// defaultHost(). Locally, an unspecified IPv6 bind becomes ::1 rather
-// than losing its address family; an explicit loopback is preserved.
+// dockerConnectHost is the Docker backend's spelling of the shared connect
+// address normalization. Endpoint resolution and reuse reachability both
+// delegate to the domain rule so their answers cannot diverge.
 func dockerConnectHost(addr string, eng engine) string {
-	canonical := canonicalIP(addr)
-	if canonical == "" {
-		if eng != nil {
-			return eng.defaultHost()
-		}
-		return "127.0.0.1"
-	}
-	if eng != nil && eng.isRemote() && isLoopbackOrUnspecified(canonical) {
-		return eng.defaultHost()
-	}
-	if ipIsUnspecified(canonical) {
-		if ipIs4(canonical) {
-			return "127.0.0.1"
-		}
-		return "::1"
-	}
-	return canonical
+	return domain.ConnectHost(addr, endpointBackendFor(eng))
 }
 
 func dockerBindingConnectHost(b boundPort, eng engine) (string, error) {
-	if eng != nil && eng.isRemote() && ipIsLoopback(b.hostAddr) {
-		return "", fmt.Errorf("%w: Docker port %d is bound to remote-daemon loopback %q", ErrEndpointUnreachable, b.hostPort, canonicalIP(b.hostAddr))
-	}
-	return dockerConnectHost(b.hostAddr, eng), nil
+	return domain.BindingConnectHost(domainPortBinding(b), endpointBackendFor(eng))
 }
 
 func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {

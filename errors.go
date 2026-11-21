@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -102,14 +103,14 @@ var ErrPortNotExposed = wait.ErrPortNotExposed
 
 // ErrEndpointUnreachable reports an inspected host binding that cannot
 // be reached by this client, such as loopback on a remote Docker daemon.
-var ErrEndpointUnreachable = errors.New("container endpoint is unreachable")
+var ErrEndpointUnreachable = domain.ErrEndpointUnreachable
 
 // ErrNetworkMismatch reports that the network reported by inspect does
 // not match the network requested for the handle.
 var ErrNetworkMismatch = errors.New("container network mode does not match the requested network")
 
 // ErrNoReachableHost reports a backend network that has no host endpoint.
-var ErrNoReachableHost = errors.New("container has no reachable host")
+var ErrNoReachableHost = domain.ErrNoReachableHost
 
 // ErrInvalidOption identifies an invalid public option, operation argument,
 // or option value. Callers can use errors.Is without matching the

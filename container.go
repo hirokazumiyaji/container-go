@@ -2012,45 +2012,27 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if c.eng.directIP() {
-		if len(c.published) > 0 {
-			return c.published[0].ConnectAddr(), nil
-		}
-		if info.ip == "" {
-			c.clearDynamic()
-			return "", fmt.Errorf("container %s has no reported IP address", c.id)
-		}
-		return info.ip, nil
-	}
-	if err := c.attachDefaultNetwork(ctx, info); err != nil {
-		return "", err
-	}
-	if err := c.validateNetworkInfo(info); err != nil {
-		return "", err
-	}
-	switch info.networkMode {
-	case dockerNetworkNone:
-		return "", fmt.Errorf("%w: container %s uses network mode %q", ErrNoReachableHost, c.id, info.networkMode)
-	case dockerNetworkHost:
-		if len(c.published) > 0 {
-			return "", dockerNetworkEndpointError(info.networkMode)
-		}
-		return c.TargetHost(), nil
-	}
-	if len(c.published) > 0 {
-		p := c.published[0]
-		b, ok := matchingPublishedBinding(info.bound, p, c.eng)
-		if !ok {
-			c.clearDynamic()
-			return "", fmt.Errorf("%w: published port %q has no host binding in network mode %q", ErrPortNotExposed, p.Raw, info.networkMode)
-		}
-		host, err := dockerBindingConnectHost(b, c.eng)
-		if err != nil {
+	if !c.eng.directIP() {
+		if err := c.attachDefaultNetwork(ctx, info); err != nil {
 			return "", err
 		}
-		return host, nil
+		if err := c.validateNetworkInfo(info); err != nil {
+			return "", err
+		}
 	}
-	return c.TargetHost(), nil
+	var published *publishSpec
+	if len(c.published) > 0 {
+		published = &c.published[0]
+	}
+	host, _, err := domain.ResolveEndpoint(endpointNetwork(info), c.endpointBackend(), domain.EndpointRequest{
+		Container: c.id,
+		Published: published,
+	})
+	if err != nil {
+		c.clearStaleEndpointSnapshot(err)
+		return "", err
+	}
+	return host, nil
 }
 
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
@@ -2096,49 +2078,96 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 	if err != nil {
 		return "", 0, err
 	}
-	if c.eng.directIP() {
-		if published != nil {
-			return published.ConnectAddr(), published.HostPort, nil
-		}
-		if info.ip == "" {
-			c.clearDynamic()
-			return "", 0, fmt.Errorf("container %s has no reported IP address", c.id)
-		}
-		return info.ip, spec.Port, nil
-	}
-	// Published-port mode: the backend assigned a host port at start.
-	// Docker may discard -p in host mode, so the request is never used
-	// as proof that a binding exists; inspect must confirm it.
-	if err := c.attachDefaultNetwork(ctx, info); err != nil {
-		return "", 0, err
-	}
-	if err := c.validateNetworkInfo(info); err != nil {
-		return "", 0, err
-	}
-	if err := dockerNetworkEndpointError(info.networkMode); err != nil {
-		return "", 0, err
-	}
-	if published != nil {
-		b, ok := matchingPublishedBinding(info.bound, *published, c.eng)
-		if !ok {
-			c.clearDynamic()
-			return "", 0, fmt.Errorf("%w: published port %q has no host binding in network mode %q", ErrPortNotExposed, published.Raw, info.networkMode)
-		}
-		host, err := dockerBindingConnectHost(b, c.eng)
-		if err != nil {
-			return "", 0, c.redactError(err, port)
-		}
-		return host, b.hostPort, nil
-	}
-	if b, ok := matchingExposedBinding(info.bound, spec, c.eng); ok {
-		host, err := dockerBindingConnectHost(b, c.eng)
-		if err != nil {
+	if !c.eng.directIP() {
+		// Published-port mode: the backend assigned a host port at start.
+		// Docker may discard -p in host mode, so the request is never used
+		// as proof that a binding exists; inspect must confirm it.
+		if err := c.attachDefaultNetwork(ctx, info); err != nil {
 			return "", 0, err
 		}
-		return host, b.hostPort, nil
+		if err := c.validateNetworkInfo(info); err != nil {
+			return "", 0, err
+		}
 	}
-	c.clearDynamic()
-	return "", 0, fmt.Errorf("%w: %s has no host binding in network mode %q", ErrPortNotExposed, spec, info.networkMode)
+	host, mapped, err := domain.ResolveEndpoint(endpointNetwork(info), c.endpointBackend(), domain.EndpointRequest{
+		Container: c.id,
+		Port:      spec,
+		Published: published,
+	})
+	if err != nil {
+		c.clearStaleEndpointSnapshot(err)
+		return "", 0, c.redactError(err, port)
+	}
+	return host, mapped, nil
+}
+
+// endpointNetwork adapts an inspect snapshot to the pure endpoint resolver.
+func endpointNetwork(info *engineInfo) domain.EndpointNetwork {
+	return domain.EndpointNetwork{
+		IP:       info.ip,
+		Mode:     info.networkMode,
+		Bindings: domainPortBindings(info.bound),
+	}
+}
+
+// domainPortBindings adapts inspect bindings to the shared domain value. The
+// endpoint resolver and reuse compatibility checks select bindings from the
+// same table; keeping one converter here prevents the two paths from drifting.
+func domainPortBindings(bound []boundPort) []domain.PortBinding {
+	if len(bound) == 0 {
+		return nil
+	}
+	bindings := make([]domain.PortBinding, len(bound))
+	for i, binding := range bound {
+		bindings[i] = domainPortBinding(binding)
+	}
+	return bindings
+}
+
+func domainPortBinding(binding boundPort) domain.PortBinding {
+	return domain.PortBinding{
+		ContainerPort: binding.containerPort,
+		Proto:         binding.proto,
+		HostAddr:      binding.hostAddr,
+		HostPort:      binding.hostPort,
+	}
+}
+
+func boundPortFromDomain(binding domain.PortBinding) boundPort {
+	return boundPort{
+		containerPort: binding.ContainerPort,
+		proto:         binding.Proto,
+		hostAddr:      binding.HostAddr,
+		hostPort:      binding.HostPort,
+	}
+}
+
+// endpointBackendFor describes the backend without a handle snapshot. Reuse
+// compatibility uses it so its reachability check selects and validates the
+// same bindings the endpoint resolver does.
+func endpointBackendFor(eng engine) domain.EndpointBackend {
+	return domain.EndpointBackend{
+		DirectIP:    eng.directIP(),
+		Remote:      eng.isRemote(),
+		DefaultHost: eng.defaultHost(),
+	}
+}
+
+func (c *Container) endpointBackend() domain.EndpointBackend {
+	backend := endpointBackendFor(c.eng)
+	// DefaultHost stays pinned to the handle's creation-time target. A later
+	// DOCKER_HOST or context change must not redirect an existing handle's
+	// endpoint to a different daemon.
+	backend.DefaultHost = c.TargetHost()
+	return backend
+}
+
+// clearStaleEndpointSnapshot drops the short-TTL cache when resolution failed
+// only because the snapshot lacked the address or binding.
+func (c *Container) clearStaleEndpointSnapshot(err error) {
+	if domain.EndpointSnapshotStale(err) {
+		c.clearDynamic()
+	}
 }
 
 // validateNetworkInfo prevents a requested network mode from being

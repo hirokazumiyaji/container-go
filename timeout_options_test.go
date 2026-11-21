@@ -247,7 +247,7 @@ func TestWithQueryTimeoutAppliedToImageInspection(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, _, _ = cfg.inspectImage(context.Background(), "redis:alpine", "")
+	_, _ = cfg.inspectImage(context.Background(), "redis:alpine", "")
 	if observedDeadline.IsZero() {
 		t.Fatal("expected deadline to be set on context")
 	}

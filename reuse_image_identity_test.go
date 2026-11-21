@@ -229,10 +229,11 @@ func TestReuseCleansUpAfterIdentityValidationFailure(t *testing.T) {
 
 func TestDockerForeignRepoDigestFallsBackToID(t *testing.T) {
 	data := []byte(`[{"Id":"` + reuseImageID + `","RepoDigests":["evil.example/library/redis@` + reuseOtherDigest + `"]}]`)
-	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists || identity.mismatch {
-		t.Fatalf("identity = %+v, exists = %v, want ID fallback", identity, exists)
+	lookup := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	if !lookup.found() || lookup.availability != imageAvailable {
+		t.Fatalf("lookup = %+v, found = %v, want ID fallback", lookup, lookup.found())
 	}
+	identity := lookup.identity
 	if identity.reference != reuseImageID || identity.id != reuseImageID || !identity.pinned {
 		t.Fatalf("identity = %+v, want pinned Docker image ID %q", identity, reuseImageID)
 	}
@@ -240,16 +241,16 @@ func TestDockerForeignRepoDigestFallsBackToID(t *testing.T) {
 
 func TestDockerExplicitPinnedRepoConflictIsMismatch(t *testing.T) {
 	data := []byte(`[{"Id":"` + reuseImageID + `","RepoDigests":["evil.example/library/redis@` + reuseOtherDigest + `"]}]`)
-	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+reuseOtherDigest, "")
-	if !exists || !identity.mismatch {
-		t.Fatalf("identity = %+v, exists = %v, want explicit pinned conflict", identity, exists)
+	lookup := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+reuseOtherDigest, "")
+	if !lookup.found() || lookup.availability != imageMismatch {
+		t.Fatalf("lookup = %+v, found = %v, want explicit pinned conflict", lookup, lookup.found())
 	}
 
 	// A differing digest is also a conflict when the repository is
 	// foreign; the ID fallback is reserved for unpinned local aliases.
-	identity, exists = (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+reuseImageDigest, "")
-	if !exists || !identity.mismatch {
-		t.Fatalf("identity = %+v, exists = %v, want digest conflict", identity, exists)
+	lookup = (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+reuseImageDigest, "")
+	if !lookup.found() || lookup.availability != imageMismatch {
+		t.Fatalf("lookup = %+v, found = %v, want digest conflict", lookup, lookup.found())
 	}
 }
 

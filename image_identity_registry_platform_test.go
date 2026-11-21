@@ -261,9 +261,9 @@ func TestRejectsKnownDifferentDockerImageIDs(t *testing.T) {
 	}
 	data := []byte(`[{"Id":"sha256:` + strings.Repeat("3", 64) + `"}]`)
 	requested := "sha256:" + strings.Repeat("1", 64)
-	identity, exists := (dockerEngine{}).parseImageIdentity(data, requested, "")
-	if !exists || !identity.mismatch {
-		t.Fatalf("identity = %+v exists=%v, want known-different ID mismatch", identity, exists)
+	lookup := (dockerEngine{}).parseImageIdentity(data, requested, "")
+	if !lookup.found() || lookup.availability != imageMismatch {
+		t.Fatalf("lookup = %+v, found=%v, want known-different ID mismatch", lookup, lookup.found())
 	}
 }
 

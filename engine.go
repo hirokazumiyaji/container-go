@@ -16,6 +16,11 @@ import (
 // run; digest and id record the identities behind that argument. pinned
 // records verified content identity.
 //
+// The value carries only normal identity data. Whether the lookup was
+// present, absent, not local, or a mismatch is reported separately by
+// imageLookupResult, so callers cannot observe a flag combination the
+// backend never produces.
+//
 // id is intentionally reserved for a verified backend local image ID
 // (currently Docker's Id). A caller-supplied sha256:... value is not an
 // ID merely because it has that shape: Apple does not use Docker's image
@@ -46,21 +51,82 @@ type imageIdentity struct {
 	// registry-addressable pull target; the resolver must try its local tag
 	// only as an explicit mutable fallback.
 	appleSynthetic bool
-	// notLocal means the backend returned an image record but could not
-	// prove that the requested platform variant is locally addressable.
-	// It is deliberately distinct from an absent image or an unavailable
-	// identity.
-	notLocal       bool
-	notLocalReason string
-	// unreadable means image inspect returned output the parser could not
-	// decode. It is not evidence that the image is absent, so identity
-	// resolution keeps it unavailable instead of fetching; it is also not
-	// evidence that the image is present, so imageExists rejects it.
-	unreadable bool
-	// mismatch means the backend returned an identity for a different
+}
+
+// imageAvailability classifies the outcome of an image lookup.
+type imageAvailability uint8
+
+const (
+	// imageAbsent means the backend has no record for the reference.
+	imageAbsent imageAvailability = iota
+	// imageAvailable means the backend returned a record. Its identity may
+	// still be unpinned when the backend reported no usable immutable value.
+	imageAvailable
+	// imageNotLocal means the backend holds the image but not the requested
+	// platform variant at a locally addressable reference.
+	imageNotLocal
+	// imageMismatch means the backend returned an identity for a different
 	// image than the one requested. It must never be downgraded to the
 	// mutable-tag fallback.
-	mismatch bool
+	imageMismatch
+	// imageUnreadable means image inspect returned output the parser could
+	// not decode. It is not evidence that the image is absent, so identity
+	// resolution keeps it unavailable instead of fetching; it is also not
+	// evidence that the image is present, so imageExists rejects it.
+	imageUnreadable
+)
+
+// imageLookupResult is the outcome of one image lookup: the normal identity
+// value plus the availability state and, for a not-local result, an
+// explanation of which proof was missing.
+type imageLookupResult struct {
+	identity     imageIdentity
+	availability imageAvailability
+	reason       string
+}
+
+// found reports whether the backend returned an image record. Unreadable
+// output counts as found so it cannot trigger a fetch.
+func (r imageLookupResult) found() bool {
+	return r.availability != imageAbsent
+}
+
+// notLocalReason returns the backend's explanation for a not-local result, or
+// the generic fallback when the parser did not provide one.
+func (r imageLookupResult) notLocalReason() string {
+	if r.reason != "" {
+		return r.reason
+	}
+	return "the requested platform variant is not locally addressable"
+}
+
+// availableImage builds the result for an inspected record, including records
+// whose identity is unusable (an unpinned imageIdentity).
+func availableImage(identity imageIdentity) imageLookupResult {
+	return imageLookupResult{identity: identity, availability: imageAvailable}
+}
+
+// absentImage builds the result for a reference the backend does not know.
+func absentImage() imageLookupResult {
+	return imageLookupResult{availability: imageAbsent}
+}
+
+// notLocalImage builds the result for a record that does not prove the
+// requested platform variant is locally addressable.
+func notLocalImage(identity imageIdentity, reason string) imageLookupResult {
+	return imageLookupResult{identity: identity, availability: imageNotLocal, reason: reason}
+}
+
+// mismatchedImage builds the result for a record whose identity belongs to a
+// different image than the requested one.
+func mismatchedImage() imageLookupResult {
+	return imageLookupResult{availability: imageMismatch}
+}
+
+// unreadableImage builds the result for inspect output the parser could not
+// decode.
+func unreadableImage() imageLookupResult {
+	return imageLookupResult{availability: imageUnreadable}
 }
 
 // engineInfo is the backend-neutral view of one inspected container.
@@ -333,9 +399,9 @@ type engine interface {
 	// individual scope method on the wrapper is not consulted.
 	target() engineTarget
 
-	// parseImageIdentity extracts the verified image identity from image
-	// inspect output.
-	parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool)
+	// parseImageIdentity extracts the image lookup result from image inspect
+	// output.
+	parseImageIdentity(data []byte, image, platform string) imageLookupResult
 	// imageIdentityComplete reports whether a parsed identity carries every
 	// metadata field this backend requires for a pinned reference.
 	imageIdentityComplete(identity imageIdentity, platform string) bool

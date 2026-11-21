@@ -191,23 +191,23 @@ func (r *imageInspectMissingThenPresentRunner) Run(ctx context.Context, args ...
 }
 
 func TestParseImageIdentityExistence(t *testing.T) {
-	if _, exists := (dockerEngine{}).parseImageIdentity([]byte(`[]`), "", ""); exists {
+	if lookup := (dockerEngine{}).parseImageIdentity([]byte(`[]`), "", ""); lookup.found() {
 		t.Error("docker: empty array means absent")
 	}
-	if _, exists := (dockerEngine{}).parseImageIdentity([]byte(`[{"Id":"sha256:x"}]`), "", ""); !exists {
+	if lookup := (dockerEngine{}).parseImageIdentity([]byte(`[{"Id":"sha256:x"}]`), "", ""); !lookup.found() {
 		t.Error("docker: non-empty array means present")
 	}
-	if _, exists := (appleEngine{}).parseImageIdentity([]byte(`[]`), "", ""); exists {
+	if lookup := (appleEngine{}).parseImageIdentity([]byte(`[]`), "", ""); lookup.found() {
 		t.Error("apple: empty array means absent")
 	}
-	if _, exists := (appleEngine{}).parseImageIdentity([]byte(testImageInspectJSON), "", ""); !exists {
+	if lookup := (appleEngine{}).parseImageIdentity([]byte(testImageInspectJSON), "", ""); !lookup.found() {
 		t.Error("apple: non-empty array means present")
 	}
 }
 
 // Malformed image inspect output is not proof that the image is absent, so
 // identity resolution must not fetch; it is also not proof of presence, so the
-// identity is marked unreadable and imageExists reports false.
+// lookup is marked unreadable and imageExists reports false.
 func TestParseImageIdentityMarksUnreadableOutput(t *testing.T) {
 	for _, eng := range []engine{appleEngine{}, dockerEngine{}} {
 		t.Run(eng.name(), func(t *testing.T) {
@@ -215,13 +215,58 @@ func TestParseImageIdentityMarksUnreadableOutput(t *testing.T) {
 				`{not json`,
 				`{"Id":"sha256:x"}`,
 			} {
-				identity, exists := eng.parseImageIdentity([]byte(data), "", "")
-				if !exists {
+				lookup := eng.parseImageIdentity([]byte(data), "", "")
+				if !lookup.found() {
 					t.Errorf("parseImageIdentity(%q) reported absence; unreadable output must not trigger a pull", data)
 				}
-				if !identity.unreadable {
-					t.Errorf("parseImageIdentity(%q) did not mark the identity unreadable", data)
+				if lookup.availability != imageUnreadable {
+					t.Errorf("parseImageIdentity(%q) availability = %v, want unreadable", data, lookup.availability)
 				}
+			}
+		})
+	}
+}
+
+// TestImageLookupResultReportsAvailability pins each lookup outcome to exactly
+// one availability value and preserves the observed identity and reason.
+func TestImageLookupResultReportsAvailability(t *testing.T) {
+	identity := imageIdentity{reference: "redis:7-alpine"}
+	for _, tc := range []struct {
+		name             string
+		result           imageLookupResult
+		wantAvailability imageAvailability
+		wantFound        bool
+		wantIdentity     bool
+		wantReason       string
+	}{
+		{name: "absent", result: absentImage(), wantAvailability: imageAbsent},
+		{name: "available", result: availableImage(identity), wantAvailability: imageAvailable, wantFound: true, wantIdentity: true},
+		{name: "not local", result: notLocalImage(identity, "no matching variant"), wantAvailability: imageNotLocal, wantFound: true, wantIdentity: true, wantReason: "no matching variant"},
+		{
+			name:             "not local default reason",
+			result:           notLocalImage(identity, ""),
+			wantAvailability: imageNotLocal,
+			wantFound:        true,
+			wantIdentity:     true,
+			wantReason:       "the requested platform variant is not locally addressable",
+		},
+		{name: "mismatch", result: mismatchedImage(), wantAvailability: imageMismatch, wantFound: true},
+		{name: "unreadable", result: unreadableImage(), wantAvailability: imageUnreadable, wantFound: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.result.availability != tc.wantAvailability {
+				t.Errorf("availability = %v, want %v", tc.result.availability, tc.wantAvailability)
+			}
+			if got := tc.result.found(); got != tc.wantFound {
+				t.Errorf("found = %v, want %v", got, tc.wantFound)
+			}
+			if tc.wantAvailability == imageNotLocal {
+				if got := tc.result.notLocalReason(); got != tc.wantReason {
+					t.Errorf("reason = %q, want %q", got, tc.wantReason)
+				}
+			}
+			if got := tc.result.identity == identity; got != tc.wantIdentity {
+				t.Errorf("identity preserved = %v, want %v", got, tc.wantIdentity)
 			}
 		})
 	}

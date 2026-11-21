@@ -268,12 +268,12 @@ func TestAppleParseImageIdentityPlatform(t *testing.T) {
 		{platform: "darwin", wantLocal: false},
 		{platform: "", wantLocal: true},
 	} {
-		identity, exists := (appleEngine{}).parseImageIdentity(data, "", tc.platform)
-		if !exists {
-			t.Fatalf("platform %q: parser must report existence for a non-empty inspect", tc.platform)
+		lookup := (appleEngine{}).parseImageIdentity(data, "", tc.platform)
+		if !lookup.found() {
+			t.Fatalf("platform %q: parser must report a record for a non-empty inspect", tc.platform)
 		}
-		if gotLocal := !identity.notLocal; gotLocal != tc.wantLocal {
-			t.Errorf("platform %q local = %v, want %v (notLocal=%v)", tc.platform, gotLocal, tc.wantLocal, identity.notLocal)
+		if gotLocal := lookup.availability != imageNotLocal; gotLocal != tc.wantLocal {
+			t.Errorf("platform %q local = %v, want %v (availability=%v)", tc.platform, gotLocal, tc.wantLocal, lookup.availability)
 		}
 	}
 }
@@ -297,11 +297,11 @@ func TestApplePlatformVariantMatchingNormalizesAliases(t *testing.T) {
 				variant = fmt.Sprintf(`,"variant":%q`, parts[2])
 			}
 			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q%s}}]}]`, testImageIdentityOld, testImageIdentityNew, parts[0], parts[1], variant))
-			identity, exists := (appleEngine{}).parseImageIdentity(data, "", tc.requested)
-			if !exists {
-				t.Fatalf("platform %q: parser must report existence", tc.requested)
+			lookup := (appleEngine{}).parseImageIdentity(data, "", tc.requested)
+			if !lookup.found() {
+				t.Fatalf("platform %q: parser must report a record", tc.requested)
 			}
-			if identity.notLocal {
+			if lookup.availability == imageNotLocal {
 				t.Fatalf("platform %q did not match inspected %q", tc.requested, tc.actual)
 			}
 		})
@@ -311,16 +311,16 @@ func TestApplePlatformVariantMatchingNormalizesAliases(t *testing.T) {
 func TestAppleParseImageIdentityVariantMismatch(t *testing.T) {
 	// Variant-less image must not satisfy a variant-pinned request.
 	data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm"}}]}]`, testImageIdentityOld, testImageIdentityNew))
-	identity, exists := (appleEngine{}).parseImageIdentity(data, "", "linux/arm/v7")
-	if !exists {
-		t.Fatal("variant-less arm inspect must report existence")
+	lookup := (appleEngine{}).parseImageIdentity(data, "", "linux/arm/v7")
+	if !lookup.found() {
+		t.Fatal("variant-less arm inspect must report a record")
 	}
-	if !identity.notLocal {
+	if lookup.availability != imageNotLocal {
 		t.Error("variant-less arm must not match linux/arm/v7")
 	}
 	dataV7 := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm","variant":"v7"}}]}]`, testImageIdentityOld, testImageIdentityNew))
-	identity, exists = (appleEngine{}).parseImageIdentity(dataV7, "", "linux/arm/v7")
-	if !exists || identity.notLocal {
+	lookup = (appleEngine{}).parseImageIdentity(dataV7, "", "linux/arm/v7")
+	if !lookup.found() || lookup.availability == imageNotLocal {
 		t.Error("v7 must match linux/arm/v7")
 	}
 }
@@ -342,11 +342,11 @@ func TestAppleBareArmelSelectorDefaultsToV6(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			parts := strings.Split(tc.actual, "/")
 			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q,"variant":%q}}]}]`, testImageIdentityOld, testImageIdentityNew, parts[0], parts[1], parts[2]))
-			identity, exists := (appleEngine{}).parseImageIdentity(data, "", tc.selector)
-			if !exists {
-				t.Fatalf("parseImageIdentity(%q) against %q reported no existence", tc.selector, tc.actual)
+			lookup := (appleEngine{}).parseImageIdentity(data, "", tc.selector)
+			if !lookup.found() {
+				t.Fatalf("parseImageIdentity(%q) against %q reported no record", tc.selector, tc.actual)
 			}
-			if got := !identity.notLocal; got != tc.wantMatch {
+			if got := lookup.availability != imageNotLocal; got != tc.wantMatch {
 				t.Errorf("parseImageIdentity(%q) against %q match = %v, want %v", tc.selector, tc.actual, got, tc.wantMatch)
 			}
 		})
@@ -365,6 +365,30 @@ func TestAppleBareArmelSelectorDefaultsToV6(t *testing.T) {
 	}
 }
 
+func TestAppleParseImageIdentityNotLocalReasons(t *testing.T) {
+	// An old ID-only record proves local content but not an addressable
+	// platform variant.
+	idOnly := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine"}}]`, strings.Repeat("a", 64)))
+	lookup := (appleEngine{}).parseImageIdentity(idOnly, "redis:7-alpine", "linux/arm64")
+	if lookup.availability != imageNotLocal {
+		t.Fatalf("id-only availability = %v, want not local", lookup.availability)
+	}
+	if want := "Apple image inspect has no platform variant metadata"; lookup.reason != want {
+		t.Errorf("id-only reason = %q, want %q", lookup.reason, want)
+	}
+
+	// A variant list without the requested platform cannot satisfy the
+	// request even when the root descriptor is known.
+	variantless := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm"}}]}]`, testImageIdentityOld, testImageIdentityNew))
+	lookup = (appleEngine{}).parseImageIdentity(variantless, "", "linux/arm/v7")
+	if lookup.availability != imageNotLocal {
+		t.Fatalf("variantless availability = %v, want not local", lookup.availability)
+	}
+	if want := "Apple image inspect has no complete matching platform variant"; lookup.reason != want {
+		t.Errorf("variantless reason = %q, want %q", lookup.reason, want)
+	}
+}
+
 func TestImageExistsRejectsUnreadableInspectOutput(t *testing.T) {
 	for _, eng := range []engine{appleEngine{}, dockerEngine{}} {
 		t.Run(eng.name(), func(t *testing.T) {
@@ -375,6 +399,68 @@ func TestImageExistsRejectsUnreadableInspectOutput(t *testing.T) {
 			}
 			if exists {
 				t.Fatal("imageExists = true for unreadable inspect output")
+			}
+		})
+	}
+}
+
+// TestImageExistsReportsAvailabilityStates pins how each lookup availability
+// maps to imageExists. A known-different identity still proves the reference
+// is present; an unreadable payload and a not-local variant do not.
+func TestImageExistsReportsAvailabilityStates(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		eng      engine
+		image    string
+		platform string
+		stdout   string
+		want     bool
+	}{
+		{
+			name:   "available",
+			eng:    dockerEngine{},
+			image:  "redis:7-alpine",
+			stdout: `[{"Id":"` + testImageIdentityOld + `","RepoDigests":["docker.io/library/redis@` + testImageIdentityNew + `"]}]`,
+			want:   true,
+		},
+		{
+			name:   "mismatch",
+			eng:    dockerEngine{},
+			image:  testImageIdentityOld,
+			stdout: `[{"Id":"` + testImageIdentityNew + `"}]`,
+			want:   true,
+		},
+		{
+			name:     "not local",
+			eng:      appleEngine{},
+			image:    "redis:7-alpine",
+			platform: "linux/arm/v7",
+			stdout:   fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm"}}]}]`, testImageIdentityOld, testImageIdentityNew),
+			want:     false,
+		},
+		{
+			name:   "unreadable",
+			eng:    dockerEngine{},
+			image:  "redis:7-alpine",
+			stdout: `{not json`,
+			want:   false,
+		},
+		{
+			name:   "absent",
+			eng:    dockerEngine{},
+			image:  "redis:7-alpine",
+			stdout: `[]`,
+			want:   false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &contextRaceRunner{stdout: []byte(tc.stdout)}
+			got, err := imageExists(context.Background(), runner, tc.eng, tc.image, tc.platform)
+			if err != nil {
+				t.Fatalf("imageExists: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("imageExists = %v, want %v", got, tc.want)
 			}
 		})
 	}

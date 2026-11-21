@@ -46,7 +46,7 @@ func (s *AllStrategy) validate() error {
 }
 
 func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
-	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
+	defer func() { retErr = safeStrategyError(retErr, s) }()
 	if err := s.validate(); err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (s *AnyStrategy) validate() error {
 }
 
 func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
-	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
+	defer func() { retErr = safeStrategyError(retErr, s) }()
 	if err := s.validate(); err != nil {
 		return err
 	}
@@ -279,7 +279,7 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			return errors.Join(append([]error{terminalErr}, append(errs, childErrs...)...)...)
 		}
 	}
-	return safeDiagnosticError(errors.Join(errs...), s.DiagnosticValues()...)
+	return safeStrategyError(errors.Join(errs...), s)
 }
 
 func finalLifecycleCheck(ctx context.Context, target Target, what string) error {

@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove a one-off fallback staging parent together with the operation's
   private staging directory instead of leaking it on every copy, and remove it
   when its ownership or DACL cannot be verified.
+- Match secret field names by identifier components during diagnostic
+  redaction, so ordinary log lines such as `signal=SIGTERM`, `passed=true`, and
+  `stdout: ...` are no longer redacted, while unseparated names such as
+  `PGPASSWORD` and qualified ones such as `MYSQL_PWD` still are. Multi-line
+  continuation follows only credential-named fields and only across lines that
+  look like a wrapped base64 or PEM body, so following log lines and stack
+  traces stay visible.
+- Register only secret values from HTTP wait strategies: request method, path
+  without a query, port, and header names are no longer treated as secrets.
+  Values of secret-named query parameters are redacted everywhere; other query
+  values are redacted only as whole tokens and are skipped when shorter than
+  four characters or `true`/`false`. Dotted `Bearer` tokens are redacted whole.
 
 ### Performance
 
@@ -82,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wait.DiagnosticBoundaryValues` returns the strategy values that are redacted
+  only at token boundaries, so a caller that composes the wait strategies into a
+  handle can apply the same boundary-aware redaction.
 - `ErrCleanupFailed` classifies a `*CleanupError`, including when the cleanup
   cause itself is unavailable.
 - `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,

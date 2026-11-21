@@ -18,6 +18,9 @@ const MaxStreamOverlap = diagnostic.MaxStreamOverlap
 
 func StreamValueFits(value string) bool { return diagnostic.StreamValueFits(value) }
 
+// IsSecretName reports whether a field name marks its value as a secret.
+func IsSecretName(name string) bool { return diagnostic.IsSecretName(name) }
+
 // NewRedactor creates a boundary-aware redactor for values supplied by a
 // caller.
 func NewRedactor(values ...string) *Redactor {

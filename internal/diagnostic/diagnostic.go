@@ -42,7 +42,7 @@ var (
 	shortSeparateRE = regexp.MustCompile(`(^|[ \t])(-[evpfl])([ \t]+)("[^"]*"|'[^']*'|[^\s,;]+)`)
 	headerBlockRE   = regexp.MustCompile(`(?im)(^|[ \t])([A-Za-z][A-Za-z0-9-]*[ \t]*:[ \t]*)([^\r\n]*(?:(?:\r?\n)[ \t]+[^\r\n]*)*)`)
 	headerRE        = regexp.MustCompile(`(?im)(^|[ \t])([A-Za-z][A-Za-z0-9-]*[ \t]*:[ \t]*)([^\r\n]*)`)
-	basicRE         = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(Basic|Bearer)([ \t]+)([A-Za-z0-9+/=_-]+)`)
+	basicRE         = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(Basic|Bearer)([ \t]+)([A-Za-z0-9+/=._-]+)`)
 	secretShapedRE  = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])[A-Za-z0-9_-]*(?:password|passwd|secret|token|api[-_.]?key|access[-_.]?key|private[-_.]?key|client[-_.]?secret|credential|authorization|signature|jwt)[A-Za-z0-9_-]*($|[^A-Za-z0-9_-])`)
 	pemRE           = regexp.MustCompile(`(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----`)
 	urlCredentialRE = regexp.MustCompile(`(?i)((?:[a-z][a-z0-9+.-]*://|//))([^/\s@]*)(@)`)
@@ -494,10 +494,17 @@ func redactHeaders(s string) string {
 func redactAuth(s string) string {
 	return basicRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := basicRE.FindStringSubmatch(match)
-		if len(parts) != 5 || len(parts[4]) < minimumTokenLength {
+		if len(parts) != 5 {
 			return match
 		}
-		return parts[1] + parts[2] + parts[3] + Redacted
+		// A trailing dot is usually sentence punctuation, not part of the
+		// token. Keep it outside the replacement, and apply the minimum
+		// length to the token itself.
+		token := strings.TrimRight(parts[4], ".")
+		if len(token) < minimumTokenLength {
+			return match
+		}
+		return parts[1] + parts[2] + parts[3] + Redacted + parts[4][len(token):]
 	})
 }
 
@@ -604,8 +611,8 @@ func redactUnquotedAssignments(s string) string {
 			continue
 		}
 		if (isSecretName(name) || isOpaqueName(name)) && s[valueStart:valueEnd] != Redacted {
-			if isSecretName(name) {
-				valueEnd = extendMultilineSecret(s, valueEnd)
+			if isMultilineSecretName(name) {
+				valueEnd = extendMultilineSecret(s, valueStart, valueEnd)
 			}
 			if !replaced {
 				b.Grow(len(s))
@@ -629,27 +636,87 @@ func redactUnquotedAssignments(s string) string {
 	return b.String()
 }
 
-func extendMultilineSecret(s string, end int) int {
+// extendMultilineSecret continues a credential value only across lines that
+// look like a wrapped base64, base64url, or PEM body, so a following log message or stack
+// trace stays visible.
+func extendMultilineSecret(s string, valueStart, end int) int {
+	prevEncoded := isEncodedSecretLine(strings.TrimSpace(s[valueStart:end]))
 	pos := end
 	for lines := 0; lines < 64 && pos < len(s); lines++ {
-		if s[pos] != '\r' && s[pos] != '\n' {
-			break
-		}
-		for pos < len(s) && (s[pos] == '\r' || s[pos] == '\n') {
+		switch {
+		case strings.HasPrefix(s[pos:], "\r\n"):
+			pos += 2
+		case s[pos] == '\r' || s[pos] == '\n':
 			pos++
+		default:
+			return end
 		}
 		lineEnd := pos
 		for lineEnd < len(s) && s[lineEnd] != '\r' && s[lineEnd] != '\n' {
 			lineEnd++
 		}
 		line := strings.TrimSpace(s[pos:lineEnd])
-		if line == "" || looksLikeAssignmentLine(line) {
+		if !isEncodedSecretLine(line) {
+			// A wrapped body commonly ends with a short padded fragment;
+			// accept one only directly after an encoded line.
+			if prevEncoded && isFinalEncodedSecretLine(line) {
+				end = lineEnd
+			}
 			break
 		}
 		end = lineEnd
 		pos = lineEnd
+		prevEncoded = true
 	}
 	return end
+}
+
+// isFinalEncodedSecretLine recognizes the short last line of a wrapped
+// base64 body. Padding keeps ordinary words such as Done and ok visible.
+func isFinalEncodedSecretLine(line string) bool {
+	if line == "" || len(line) >= 16 || !strings.HasSuffix(line, "=") {
+		return false
+	}
+	body := strings.TrimRight(line, "=")
+	if body == "" {
+		return false
+	}
+	for i := 0; i < len(body); i++ {
+		if c := body[i]; !isBase64URLByte(c) && c != '+' && c != '/' {
+			return false
+		}
+	}
+	return true
+}
+
+func isEncodedSecretLine(line string) bool {
+	if line == "" {
+		return false
+	}
+	// PEM headers are unambiguous. Other lines must be long enough to be a
+	// wrapped body; a single ordinary word such as "Done" or "exiting" is
+	// not a continuation.
+	if strings.HasPrefix(line, "-----BEGIN ") || strings.HasPrefix(line, "-----END ") {
+		return true
+	}
+	if len(line) < 16 {
+		return false
+	}
+	body := strings.TrimRight(line, "=")
+	if body == "" || len(line)-len(body) > 2 {
+		return false
+	}
+	hasAlphaNumeric := false
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if !isBase64URLByte(c) && c != '+' && c != '/' {
+			return false
+		}
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			hasAlphaNumeric = true
+		}
+	}
+	return hasAlphaNumeric
 }
 
 func looksLikeAssignmentLine(line string) bool {
@@ -867,25 +934,110 @@ func isOpaqueName(name string) bool {
 	}
 }
 
+// strongSecretMarkers are long enough to be matched as a suffix of an
+// identifier component, which keeps unseparated names such as PGPASSWORD,
+// SECRETKEY, and githubtoken secret without matching words like tokenizer.
+var strongSecretMarkers = []string{
+	"password", "passwords", "passwd", "passwds", "passphrase", "passcode",
+	"secret", "secrets", "secretkey", "token", "apikey", "accesskey",
+	"privatekey", "credential", "credentials", "signature", "signatures",
+}
+
+// componentSecretMarkers are short or common words that only mark a secret as
+// a complete component, so signal, passed, sidebar, author, and sessionless
+// stay ordinary.
+var componentSecretMarkers = map[string]struct{}{
+	"pass": {}, "oauth": {}, "auth": {}, "authentication": {}, "authorization": {},
+	"bearer": {}, "cookie": {}, "cookies": {}, "session": {}, "sessionid": {},
+	"connectsid": {}, "jsessionid": {}, "phpsessid": {}, "sid": {}, "jwt": {},
+	"tokens": {}, "sig": {}, "hmac": {},
+}
+
+// IsSecretName reports whether a field name marks its value as a secret.
+func IsSecretName(name string) bool { return isSecretName(name) }
+
 func isSecretName(name string) bool {
-	normalized := normalizeName(name)
-	if normalized == "" {
-		return false
+	tokens := identifierTokens(name)
+	// A bare pwd is the working directory; a qualified one such as
+	// MYSQL_PWD is a password.
+	if len(tokens) > 1 && tokens[len(tokens)-1] == "pwd" {
+		return true
 	}
-	// Match complete components and common prefixed/suffixed spellings,
-	// including api_key, x_signature, and client-secret.
-	markers := []string{
-		"password", "passwd", "pwd", "passphrase", "secret", "token", "apikey", "accesskey", "privatekey",
-		"credential", "credentials", "oauth", "auth", "authorization", "bearer", "cookie", "session", "sessionid", "connectsid", "jsessionid", "sid", "jwt",
-		"signature", "sig", "hmac", "clientsecret", "refreshtoken", "accesstoken", "idtoken", "csrftoken", "pass", "stderr", "stdout",
-	}
-	for _, marker := range markers {
-		if normalized == marker || strings.HasPrefix(normalized, marker) || strings.HasSuffix(normalized, marker) {
+	for _, window := range identifierWindows(tokens) {
+		if _, ok := componentSecretMarkers[window]; ok || hasStrongSecretSuffix(window) {
 			return true
 		}
 	}
 	return false
 }
+
+// isMultilineSecretName limits value continuation to credential-shaped keys;
+// broad markers such as auth, sid, and session never consume following lines.
+func isMultilineSecretName(name string) bool {
+	for _, window := range identifierWindows(identifierTokens(name)) {
+		if hasStrongSecretSuffix(window) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasStrongSecretSuffix(window string) bool {
+	for _, marker := range strongSecretMarkers {
+		if strings.HasSuffix(window, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// identifierWindows joins up to three adjacent components without their
+// separator, so api_key, x-api-key, and apikey all reach the same marker.
+func identifierWindows(tokens []string) []string {
+	var windows []string
+	for start := range tokens {
+		for end := start + 1; end <= len(tokens) && end-start <= 3; end++ {
+			windows = append(windows, strings.Join(tokens[start:end], ""))
+		}
+	}
+	return windows
+}
+
+// identifierTokens splits a field name into lower-case word components.
+// Separators other than letters and digits end a component, and camelCase
+// and digit boundaries start a new one.
+func identifierTokens(name string) []string {
+	var tokens []string
+	for i := 0; i < len(name); {
+		if !isIdentifierByte(name[i]) {
+			i++
+			continue
+		}
+		start := i
+		i++
+		for i < len(name) && isIdentifierByte(name[i]) {
+			current, previous := name[i], name[i-1]
+			boundary := isDigitIdentifierByte(current) != isDigitIdentifierByte(previous) ||
+				isUpperIdentifierByte(current) && (isLowerIdentifierByte(previous) ||
+					isDigitIdentifierByte(previous) ||
+					isUpperIdentifierByte(previous) && i+1 < len(name) && isLowerIdentifierByte(name[i+1]))
+			if boundary {
+				break
+			}
+			i++
+		}
+		tokens = append(tokens, strings.ToLower(name[start:i]))
+	}
+	return tokens
+}
+
+func isIdentifierByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isDigitIdentifierByte(c)
+}
+
+func isLowerIdentifierByte(c byte) bool { return c >= 'a' && c <= 'z' }
+func isUpperIdentifierByte(c byte) bool { return c >= 'A' && c <= 'Z' }
+func isDigitIdentifierByte(c byte) bool { return c >= '0' && c <= '9' }
 
 func normalizeName(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))

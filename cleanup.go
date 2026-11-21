@@ -326,12 +326,9 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 		return nil, nil
 	}
 
-	var listed map[string]pruneCandidate
-	if eng.name() == "apple" {
-		listed, err = applePruneCandidates(stdout)
-		if err != nil {
-			return nil, err
-		}
+	listed, err := eng.parsePruneCandidates(stdout)
+	if err != nil {
+		return nil, err
 	}
 
 	// parsePruneOptions rejects a non-positive parallelism, so cfg.parallelism
@@ -370,7 +367,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 				}
 				var didRemove bool
 				var opErr error
-				if eng.name() == "apple" {
+				if eng.capabilities().pruneCandidateMetadata {
 					candidate, ok := listed[job.id]
 					if !ok {
 						opErr = fmt.Errorf("%s %s: list candidate metadata missing", errKind, job.id)
@@ -378,7 +375,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, ages, cfg.queryTimeout)
 					}
 				} else {
-					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages, cfg.queryTimeout)
+					didRemove, opErr = pruneIDAddressedCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages, cfg.queryTimeout)
 				}
 				mu.Lock()
 				attemptedAt[job.index] = true
@@ -421,7 +418,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	return removed, errors.Join(errs...)
 }
 
-func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
+func pruneIDAddressedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
 	if !domain.IsImmutableContainerID(id) {
 		return false, nil
 	}
@@ -543,7 +540,7 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 }
 
 func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
-	if eng.name() != "apple" || !pruneCandidateEligible(candidate, reuseGroup) {
+	if !eng.capabilities().pruneCandidateMetadata || !pruneCandidateEligible(candidate, reuseGroup) {
 		return false, nil
 	}
 	// The list-time timestamp can keep a known-recent candidate from taking
@@ -632,47 +629,24 @@ func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *
 	cfg := &config{eng: eng, reuseGroup: reuseGroup}
 	values := cfg.diagnosticValues()
 	boundaryValues := cfg.diagnosticBoundaryValues()
-	if _, ok := eng.(dockerEngine); ok {
-		for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"} {
-			if value, ok := runnerEnvLookup(runner, key); ok && value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) && (key != "DOCKER_CONTEXT" || value != "default") {
-				values = append(values, value)
-				if key == "DOCKER_HOST" {
-					if endpoint, err := parseDockerEndpoint(value); err == nil && endpoint.isRemote {
-						boundaryValues = append(boundaryValues, dockerEndpointBoundaryValues(endpoint)...)
-					}
-				}
-			}
+	runnerValues, runnerBoundary := eng.runnerDiagnosticValues(runner)
+	for _, value := range runnerValues {
+		if len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
+			values = append(values, value)
 		}
 	}
+	// Boundary values are intentionally not filtered by the stream window
+	// above. They only extend redaction and a boundary value that never
+	// appears changes nothing, so keeping them can never weaken redaction.
+	boundaryValues = append(boundaryValues, runnerBoundary...)
 	return cli.NewHashedContextRedactor(values...).WithBoundaryValues(boundaryValues...)
 }
 
 func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup string) (Runner, engine, error) {
 	runner := cfg.runnerFor(eng)
-	if de, ok := eng.(dockerEngine); ok {
-		implicitContext := !de.explicitContext
-		if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); implicitContext && ok && entry == "DOCKER_CONTEXT" {
-			de.context, de.explicitContext = "", true
-		}
-		// Package prune follows the child's Docker environment, where a host
-		// overrides the ambient context; discovery must not retarget the runner.
-		if host, _, _, _ := de.targetSelection(runner); host != "" {
-			de.host, de.explicitHost = host, true
-			de.explicitContext = false
-		}
-		queryCtx, cancel := context.WithTimeout(ctx, min(cfg.timeout, queryTimeout))
-		defer cancel()
-		resolved, err := de.resolveTarget(queryCtx, runner)
-		if err != nil {
-			host, contextName, _, _ := de.targetSelection(runner)
-			implicitTarget := implicitContext && host == ""
-			var unavailable *dockerContextUnavailableError
-			if ctx.Err() == nil && implicitTarget && (contextName == "" || errors.As(err, &unavailable)) {
-				return runner, eng, nil
-			}
-			return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))
-		}
-		eng = resolved
+	resolved, err := preparedPruneTarget(ctx, eng, runner, cfg.timeout)
+	if err != nil {
+		return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))
 	}
-	return runner, eng, nil
+	return runner, resolved, nil
 }

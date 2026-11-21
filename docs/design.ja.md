@@ -653,7 +653,10 @@ backend の `run` が成功した後に非 reuse `Run` が失敗した場合、�
 
 以下は中核となる構成であり、ファイル一覧ではない。
 ルートパッケージは公開 API とバックエンド中立のライフサイクルコードを持つ。
-バックエンド実装は argv の組み立てと inspect の正規化を担う。
+バックエンド実装は argv の組み立てと inspect の正規化を担う。共有ライフサイクルコードは
+具象バックエンド型のアサーションやバックエンド名の比較ではなく、
+`engine.capabilities()` と engine の target-scope / image identity / network compatibility
+メソッドを通じてバックエンドのポリシーを問い合わせる。
 
 ```
 container-go/
@@ -671,8 +674,11 @@ container-go/
 ├── errors.go         // 公開エラー値
 ├── backend.go        // バックエンド選択
 ├── engine.go         // バックエンド interface と正規化情報
+├── engine_capabilities.go // バックエンド capability と target-scope の契約
 ├── engine_apple.go   // Apple Container の argv / inspect 適合
 ├── engine_docker.go  // Docker の argv / inspect 適合
+├── engine_*_target.go   // backend の target scope と診断ポリシー
+├── engine_*_identity.go // backend の image identity と network 互換ポリシー
 ├── namelock.go       // 協調プロセス用の名前 lock
 ├── flight.go         // プロセス内 single-flight helper
 ├── internal/cli/     // CLI runner、streaming、エラー分類

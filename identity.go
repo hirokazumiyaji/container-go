@@ -6,21 +6,13 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
-// immutableIDBackend is an optional backend capability. Docker is the
-// backend that must never fall back to a logical name when its immutable
-// identity is unavailable.
-type immutableIDBackend interface {
-	requiresImmutableID() bool
-}
-
+// requiresImmutableID reports whether the backend must never fall back to a
+// logical name when its immutable identity is unavailable.
 func requiresImmutableID(eng engine) bool {
 	if eng == nil {
 		return false
 	}
-	if backend, ok := eng.(immutableIDBackend); ok {
-		return backend.requiresImmutableID()
-	}
-	return eng.name() == "docker"
+	return eng.capabilities().immutableID
 }
 
 func validCreationID(generation string) bool {
@@ -54,7 +46,7 @@ func identityError(message string) error {
 func verifiedDeleteTarget(eng engine, info *engineInfo, fallback string) (string, error) {
 	if requiresImmutableID(eng) {
 		if info == nil || !validImmutableID(eng, info.uid) {
-			return "", identityError("Docker inspect returned no valid immutable container ID")
+			return "", identityError(fmt.Sprintf("%s inspect returned no valid immutable container ID", eng.name()))
 		}
 		return info.uid, nil
 	}
@@ -82,7 +74,7 @@ func sameContainerIdentity(eng engine, expected, fresh *engineInfo) error {
 	}
 	if requiresImmutableID(eng) {
 		if !validImmutableID(eng, expected.uid) {
-			return identityError("Docker inspect ID is missing or invalid")
+			return identityError(fmt.Sprintf("%s inspect ID is missing or invalid", eng.name()))
 		}
 	} else if expected.uid != "" {
 		return identityError("backend identity changed")
@@ -108,7 +100,7 @@ func sameContainerIdentity(eng engine, expected, fresh *engineInfo) error {
 	case domain.OwnershipFailureIdentity:
 		if requiresImmutableID(eng) {
 			if !validImmutableID(eng, fresh.uid) {
-				return identityError("Docker inspect ID is missing or invalid")
+				return identityError(fmt.Sprintf("%s inspect ID is missing or invalid", eng.name()))
 			}
 			return identityError("immutable container ID changed")
 		}

@@ -45,6 +45,56 @@ func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
 	return branches
 }
 
+// probeUnavailable reports whether err proves the backend service is
+// unavailable rather than misconfigured. Only branches belonging to the
+// probe operation count; a configuration/TLS diagnosis on the probe branch or
+// on joined non-CLI probe output vetoes liveness. The liveness matcher sees
+// normalized CLI branch lines and lowercased joined non-CLI probe text.
+func probeUnavailable(err error, backend, operation string, liveness func(string) bool) bool {
+	if isContextError(err) {
+		return false
+	}
+	var operationBranches []cliErrorBranch
+	for _, branch := range backendCLIErrorBranches(err, backend) {
+		if branch.ctx.operation == operation {
+			operationBranches = append(operationBranches, branch)
+		}
+	}
+	if len(operationBranches) == 0 {
+		return false
+	}
+	for _, branch := range operationBranches {
+		if cli.IsProbeConfigurationError(branch.cause) {
+			return false
+		}
+	}
+	nonCLI := cli.CollectNonCLIErrorBranches(err)
+	for _, extra := range nonCLI {
+		if cli.IsProbeConfigurationError(extra) {
+			return false
+		}
+	}
+	for _, branch := range operationBranches {
+		stderr, stdout := branchLines(branch, true)
+		for _, line := range stderr {
+			if liveness(line) {
+				return true
+			}
+		}
+		for _, line := range stdout {
+			if liveness(line) {
+				return true
+			}
+		}
+	}
+	for _, extra := range nonCLI {
+		if liveness(strings.ToLower(extra.Error())) {
+			return true
+		}
+	}
+	return false
+}
+
 func matchingCLIErrorBranches(err error, backend, operation string, targets ...string) []cliErrorBranch {
 	branches := backendCLIErrorBranches(err, backend)
 	operationBranches := make([]cliErrorBranch, 0, len(branches))

@@ -158,9 +158,9 @@ func parsePullOptions(name string, opts []PullOption) (pullConfig, error) {
 	return cfg, nil
 }
 
-// dockerTargetOption names the option that set a Docker target override so a
+// daemonTargetOption names the option that set a Docker target override so a
 // validation error points at the option the caller must change.
-func (c pullConfig) dockerTargetOption() string {
+func (c pullConfig) daemonTargetOption() string {
 	if c.dockerContext != nil {
 		return "WithPullDockerContext"
 	}
@@ -168,26 +168,15 @@ func (c pullConfig) dockerTargetOption() string {
 }
 
 // applyDockerTarget applies explicit Docker target options to eng and rejects
-// them for a non-Docker backend.
+// them for a backend without daemon target overrides.
 func (c pullConfig) applyDockerTarget(eng engine) (engine, error) {
 	if c.dockerHost == nil && c.dockerContext == nil {
 		return eng, nil
 	}
-	de, ok := eng.(dockerEngine)
-	if !ok {
-		return eng, validationErrorf(c.dockerTargetOption(), nil, "Docker target options require Docker backend")
+	if !eng.capabilities().daemonTarget {
+		return eng, validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
-	if c.dockerHost != nil {
-		de.host = *c.dockerHost
-		de.explicitHost = true
-		de.explicitTarget = true
-	}
-	if c.dockerContext != nil {
-		de.context = *c.dockerContext
-		de.explicitContext = true
-		de.explicitTarget = true
-	}
-	return de, nil
+	return eng.configureTarget(engineTargetOverride{host: c.dockerHost, context: c.dockerContext}), nil
 }
 
 // operationConfig builds the config pullWithConfig consumes.
@@ -368,32 +357,17 @@ var imageFlights flightGroup[struct{}]
 // public Pull API keeps sharing it with PullAlways.
 var imageResolutionFlights flightGroup[imageIdentity]
 
-// imageIdentityParser is an optional backend capability. Keeping it
-// separate from engine lets older/injected engines retain the existence
-// check while the default Run policy fails closed without an identity.
-type imageIdentityParser interface {
-	parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool)
-}
-
-type localImageIdentityChecker interface {
-	imageIdentityNeedsLocalCheck() bool
-}
-
-func imageIdentityNeedsLocalCheck(eng engine) bool {
-	checker, ok := eng.(localImageIdentityChecker)
-	return ok && checker.imageIdentityNeedsLocalCheck()
-}
-
 // imageIdentityNeedsLocalAddressCheck identifies pinned references that
 // must be proven addressable before they are passed to a backend without
-// a runtime pull-never switch. PullNever always checks. Apple has no
-// run-time no-fetch switch, so every pinned Apple reference—not only an
-// ID-derived one—is checked for PullMissing and PullAlways as well.
+// a runtime pull-never switch. PullNever always checks. A backend with the
+// strict image identity capability has no run-time no-fetch switch, so
+// every pinned reference—not only an ID-derived one—is checked for
+// PullMissing and PullAlways as well.
 func imageIdentityNeedsLocalAddressCheck(eng engine, identity imageIdentity, policy PullPolicy) bool {
 	if !identity.pinned || eng == nil {
 		return false
 	}
-	if eng.name() == "apple" || imageIdentityNeedsLocalCheck(eng) {
+	if eng.capabilities().strictImageIdentity {
 		return true
 	}
 	return policy == PullNever
@@ -533,7 +507,7 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 	if err != nil {
 		return imageIdentity{}, err
 	}
-	complete := c.eng.name() != "apple" || appleImageIdentityComplete(pinned, platform)
+	complete := c.eng.imageIdentityComplete(pinned, platform)
 	if !imageIdentityNeedsLocalAddressCheck(c.eng, pinned, c.pullPolicy) ||
 		(pinned.reference == image && pinned.pinned && !pinned.appleSynthetic && complete) {
 		return pinned, nil
@@ -564,7 +538,7 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 			if c.canUseMutableFallback(image) {
 				return mutableImageReference(image, pinned), nil
 			}
-			return imageIdentity{}, fmt.Errorf("%w: Apple synthetic index %s is not locally addressable", ErrImageIdentityNotLocal, pinned.reference)
+			return imageIdentity{}, fmt.Errorf("%w: synthetic index %s is not locally addressable", ErrImageIdentityNotLocal, pinned.reference)
 		}
 		pullErr := c.pullImage(ctx, pinned.reference, platform)
 		if pullErr != nil {
@@ -608,59 +582,36 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 		}
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not report an immutable identity", ErrImageIdentityUnavailable, pinned.reference)
 	}
-	if c.eng.name() == "apple" {
-		if !appleImageIdentityMetadataPresent(checked, platform) {
-			return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not return complete Apple platform metadata", ErrImageIdentityUnavailable, pinned.reference)
-		}
-		if platform != "" && !applePlatformMetadataCompatible(platform, checked.platform) {
-			return imageIdentity{}, fmt.Errorf("%w: pinned reference %s resolved for a different platform", ErrImageIdentityMismatch, pinned.reference)
-		}
-		if !appleImageIdentityComplete(checked, platform) {
-			return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not return a complete Apple platform identity", ErrImageIdentityUnavailable, pinned.reference)
-		}
+	if err := c.eng.verifyPinnedImageIdentity(pinned, checked, platform); err != nil {
+		return imageIdentity{}, err
 	}
 	if !requestedImageIdentitiesCompatible(pinned, checked) {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s changed before run", ErrImageIdentityMismatch, pinned.reference)
 	}
-	if c.eng.name() == "apple" {
-		reconciled := checked
-		// The exact inspect is the authoritative identity observation, but
-		// the caller-selected reference is the stable run argument. Keep
-		// that spelling while carrying the verified root, repository,
-		// platform, variant, and synthetic metadata forward.
-		if pinned.reference != "" {
-			reconciled.reference = pinned.reference
-		}
-		if reconciled.rootDigest == "" {
-			reconciled.rootDigest = reconciled.digest
-		}
-		reconciled.appleSynthetic = pinned.appleSynthetic || reconciled.appleSynthetic
-		return reconciled, nil
-	}
-	return pinned, nil
+	return c.eng.reconcileImageIdentity(pinned, checked), nil
 }
 
-// verifyAppleCreatedImage closes the final Apple addressability window. A
-// pinned image reference can disappear or be replaced after the last
-// pre-create inspect; the container's own inspect must therefore report the
-// same root identity and, when known, the selected platform variant. Any
-// mismatch is returned before the new container is exposed to the caller;
-// Run/reuse then roll it back.
-func verifyAppleCreatedImage(ctx context.Context, c *Container, expected imageIdentity) error {
-	if c == nil || c.eng == nil || c.eng.name() != "apple" || !expected.pinned {
+// verifyStrictCreatedImage closes the final addressability window for a
+// backend with strict image identity. A pinned image reference can disappear
+// or be replaced after the last pre-create inspect; the container's own
+// inspect must therefore report the same root identity and, when known, the
+// selected platform variant. Any mismatch is returned before the new
+// container is exposed to the caller; Run/reuse then roll it back.
+func verifyStrictCreatedImage(ctx context.Context, c *Container, expected imageIdentity) error {
+	if !c.eng.capabilities().strictImageIdentity || !expected.pinned {
 		return nil
 	}
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
-		return fmt.Errorf("verify Apple image after create: %w", err)
+		return fmt.Errorf("verify created image: %w", err)
 	}
 	actual := imageFromInfo(info)
 	if !actual.pinned || !imageRootsCompatible(expected, actual) {
-		return fmt.Errorf("%w: Apple container created from a different image identity", ErrImageIdentityMismatch)
+		return fmt.Errorf("%w: container created from a different image identity", ErrImageIdentityMismatch)
 	}
 	if expected.platform != "" {
-		if actual.platform == "" || !applePlatformMetadataCompatible(expected.platform, actual.platform) {
-			return fmt.Errorf("%w: Apple container created for a different platform", ErrImageIdentityMismatch)
+		if actual.platform == "" || !platformMetadataCompatible(expected.platform, actual.platform) {
+			return fmt.Errorf("%w: container created for a different platform", ErrImageIdentityMismatch)
 		}
 	}
 	if expected.variantDigest != "" {
@@ -672,15 +623,15 @@ func verifyAppleCreatedImage(ctx context.Context, c *Container, expected imageId
 			}
 			checked, exists, inspectErr := inspectImage(ctx, c.runner, c.eng, imageReference, actual.platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 			if inspectErr != nil {
-				return fmt.Errorf("verify Apple image variant after create: %w", inspectErr)
+				return fmt.Errorf("verify created image variant: %w", inspectErr)
 			}
 			if !exists || !checked.pinned || !imageRootsCompatible(expected, checked) {
-				return fmt.Errorf("%w: Apple container did not retain the requested image variant", ErrImageIdentityMismatch)
+				return fmt.Errorf("%w: container did not retain the requested image variant", ErrImageIdentityMismatch)
 			}
 			variantDigest = checked.variantDigest
 		}
 		if !validImageDigest(variantDigest) || !strings.EqualFold(expected.variantDigest, variantDigest) {
-			return fmt.Errorf("%w: Apple container created from a different image variant", ErrImageIdentityMismatch)
+			return fmt.Errorf("%w: container created from a different image variant", ErrImageIdentityMismatch)
 		}
 	}
 	return nil
@@ -764,13 +715,14 @@ func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, 
 		}
 		return identity, nil
 	}
-	// A successful identity-less Apple inspect cannot establish that a
-	// caller-pinned digest is the local image. Mutable tags remain
+	// A successful identity-less inspect on a backend with strict image
+	// identity cannot establish that a caller-pinned digest is the local
+	// image. Mutable tags remain
 	// available through the explicit compatibility option below; pinned
 	// inputs are verified by resolveInspectedImage before they can run.
 	immutableRequest := isBareImageReference(image) || isRepositoryDigestReference(image)
-	if c.pullPolicy == PullNever && c.eng.name() == "apple" && immutableRequest {
-		return imageIdentity{}, fmt.Errorf("%w: %s (Apple image inspect did not confirm the pinned identity)", ErrImageIdentityUnavailable, image)
+	if c.pullPolicy == PullNever && c.eng.capabilities().strictImageIdentity && immutableRequest {
+		return imageIdentity{}, fmt.Errorf("%w: %s (%s image inspect did not confirm the pinned identity)", ErrImageIdentityUnavailable, image, c.eng.name())
 	}
 	// A caller-supplied digest is usable only with repository provenance.
 	// A bare sha256:... is Docker's image-ID syntax, not proof that the
@@ -855,11 +807,8 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 		}
 		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, cli.CommandOperation(args), image)
 	}
-	if parser, ok := eng.(imageIdentityParser); ok {
-		identity, exists := parser.parseImageIdentity(stdout, image, platform)
-		return identity, exists, nil
-	}
-	return imageIdentity{}, eng.parseImageExists(stdout, platform), nil
+	identity, exists := eng.parseImageIdentity(stdout, image, platform)
+	return identity, exists, nil
 }
 
 // imageExists reports whether the image (and requested platform

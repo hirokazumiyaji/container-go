@@ -210,16 +210,6 @@ func canonicalizeApplePlatformSelector(platform string) string {
 	return platform
 }
 
-// materializeAppleRunPlatform records the platform Apple will use for a
-// Run with no explicit selector. Pull alone intentionally remains
-// platform-agnostic, so it must not call this helper.
-func materializeAppleRunPlatform(cfg *config) {
-	if cfg == nil || cfg.eng == nil || cfg.eng.name() != "apple" || cfg.platform != "" {
-		return
-	}
-	cfg.platform = appleHostPlatform()
-}
-
 // appleHostPlatform is the Linux platform selected by Apple's default
 // linux/<host-architecture> run settings. The variant is left implicit for
 // arm64, matching Apple's CLI while the platform matcher treats it as v8.
@@ -258,7 +248,7 @@ func appleImageIdentityComplete(identity imageIdentity, platform string) bool {
 	if !appleImageIdentityMetadataPresent(identity, platform) {
 		return false
 	}
-	return platform == "" || applePlatformMetadataCompatible(platform, identity.platform)
+	return platform == "" || platformMetadataCompatible(platform, identity.platform)
 }
 
 // validateApplePlatform mirrors the platform grammar accepted by Apple
@@ -403,49 +393,7 @@ func (appleEngine) probe() cli.Probe {
 }
 
 func appleProbeUnavailable(err error) bool {
-	if isContextError(err) {
-		return false
-	}
-	branches := backendCLIErrorBranches(err, "container")
-	var systemBranches []cliErrorBranch
-	for _, branch := range branches {
-		if branch.ctx.operation == "system" {
-			systemBranches = append(systemBranches, branch)
-		}
-	}
-	if len(systemBranches) == 0 {
-		return false
-	}
-	for _, branch := range systemBranches {
-		if cli.IsProbeConfigurationError(branch.cause) {
-			return false
-		}
-	}
-	nonCLI := cli.CollectNonCLIErrorBranches(err)
-	for _, extra := range nonCLI {
-		if cli.IsProbeConfigurationError(extra) {
-			return false
-		}
-	}
-	for _, branch := range systemBranches {
-		stderr, stdout := branchLines(branch, true)
-		for _, line := range stderr {
-			if appleProbeLivenessText(line) {
-				return true
-			}
-		}
-		for _, line := range stdout {
-			if appleProbeLivenessText(line) {
-				return true
-			}
-		}
-	}
-	for _, extra := range nonCLI {
-		if appleProbeLivenessText(strings.ToLower(extra.Error())) {
-			return true
-		}
-	}
-	return false
+	return probeUnavailable(err, "container", "system", appleProbeLivenessText)
 }
 
 func appleProbeLivenessText(line string) bool {
@@ -615,7 +563,7 @@ func appleState(state string) State {
 }
 
 func (appleEngine) startArgs(id string) []string {
-	return []string{"start", id}
+	return startArgsFor(id)
 }
 
 func (appleEngine) restartArgs(id string, timeout *time.Duration) ([]string, error) {
@@ -623,10 +571,7 @@ func (appleEngine) restartArgs(id string, timeout *time.Duration) ([]string, err
 }
 
 func (appleEngine) killArgs(id string, signal string) []string {
-	if signal != "" {
-		return []string{"kill", "--signal", signal, id}
-	}
-	return []string{"kill", id}
+	return killArgsFor(id, signal)
 }
 
 func (appleEngine) pauseArgs(id string) ([]string, error) {
@@ -646,11 +591,11 @@ func (appleEngine) deleteArgs(id string) []string {
 }
 
 func (appleEngine) copyToArgs(id, hostPath, containerPath string) []string {
-	return []string{"cp", hostPath, id + ":" + containerPath}
+	return copyToArgsFor(id, hostPath, containerPath)
 }
 
 func (appleEngine) copyFromArgs(id, containerPath, hostPath string) []string {
-	return []string{"cp", id + ":" + containerPath, hostPath}
+	return copyFromArgsFor(id, containerPath, hostPath)
 }
 
 // Apple Container's public cp command has no mode that preserves source
@@ -671,22 +616,11 @@ func (appleEngine) reaperSubcommand() string { return "delete" }
 func (appleEngine) reaperDeleteFlags() []string { return nil }
 
 func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {
-	args := []string{"exec"}
-	if envFile != "" {
-		args = append(args, "--env-file", envFile)
-	}
-	if cfg.user != "" {
-		args = append(args, "--user", cfg.user)
-	}
-	if cfg.workdir != "" {
-		args = append(args, "--workdir", cfg.workdir)
-	}
-	args = append(args, id)
-	return append(args, cmd...)
+	return execArgsFor(id, cfg, envFile, cmd)
 }
 
 func (appleEngine) logsFollowArgs(id string) []string {
-	return []string{"logs", "--follow", id}
+	return logsFollowArgsFor(id)
 }
 
 // logsFollowResumeArgs ignores since: Apple Container truncates stdio.log
@@ -768,15 +702,12 @@ type appleImageInspectRecord struct {
 	Variants []appleImageVariant `json:"variants"`
 }
 
-func (appleEngine) imageInspectArgs(image, _ string) []string {
-	return []string{"image", "inspect", image}
+func (appleEngine) imageInspectArgs(image, platform string) []string {
+	return imageInspectArgsFor(image, platform, false)
 }
 
 func (appleEngine) pullImageArgs(image, platform string) []string {
-	if platform != "" {
-		return []string{"image", "pull", "--platform", platform, image}
-	}
-	return []string{"image", "pull", image}
+	return pullImageArgsFor([]string{"image", "pull"}, image, platform)
 }
 
 // imageMissing matches backend-specific image-absence reasons. Apple
@@ -882,13 +813,6 @@ func appleImageOperationalFailure(stderr string) bool {
 		}
 	}
 	return false
-}
-
-func (appleEngine) imageIdentityNeedsLocalCheck() bool { return true }
-
-func (appleEngine) parseImageExists(data []byte, platform string) bool {
-	identity, exists := (appleEngine{}).parseImageIdentity(data, "", platform)
-	return exists && !identity.notLocal
 }
 
 // parseImageIdentity reads the root index descriptor exposed by current

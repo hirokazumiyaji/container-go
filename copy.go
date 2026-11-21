@@ -984,7 +984,7 @@ func cleanupCopyStagingDir(dir string) error {
 // retries them. Concurrent copies share the check through copyVersionMu; a
 // waiting caller's context still bounds the wait.
 func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error {
-	if c.eng.name() != "docker" {
+	if !c.eng.capabilities().copyOutVersionCheck {
 		return c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()})
 	}
 	p := c.pack()

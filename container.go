@@ -374,33 +374,16 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	// cfg.validate cannot see this combination before the engine is selected:
 	// with no explicit engine it runs while cfg.eng is still nil.
 	if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil {
-		if _, isDocker := cfg.eng.(dockerEngine); !isDocker {
+		if !cfg.eng.capabilities().daemonTarget {
 			return nil, validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
 		}
 	}
-	if de, ok := cfg.eng.(dockerEngine); ok {
-		if cfg.dockerHost != nil {
-			de.host = *cfg.dockerHost
-			de.explicitHost = true
-			de.explicitTarget = true
-		}
-		if cfg.dockerContext != nil {
-			de.context = *cfg.dockerContext
-			de.explicitContext = true
-			de.explicitTarget = true
-		}
-		if cfg.dockerConfigDir != nil {
-			de.configDir = *cfg.dockerConfigDir
-			de.explicitConfigDir = true
-			de.explicitTarget = true
-		}
-		if cfg.platform != "" {
-			de.defaultPlatform = cfg.platform
-			de.explicitDefaultPlatform = true
-			de.explicitTarget = true
-		}
-		cfg.eng = de
-	}
+	cfg.eng = configuredTarget(cfg.eng, engineTargetOverride{
+		host:      cfg.dockerHost,
+		context:   cfg.dockerContext,
+		configDir: cfg.dockerConfigDir,
+		platform:  targetOverrideString(cfg.platform),
+	})
 	applyEngineBinary(cfg)
 	applyEngineRunnerEnv(cfg)
 	// Fail closed before the backend is asked anything if this platform
@@ -436,7 +419,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			}
 		}
 	}
-	materializeAppleRunPlatform(cfg)
+	materializeRunPlatform(cfg)
 	if cfg.reuse {
 		if err := runCtx.Err(); err != nil {
 			return nil, err
@@ -511,7 +494,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 
 	uid := cfg.eng.parseRunID(stdout)
 	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
-		identityErr := identityError("Docker run returned no valid immutable container ID")
+		identityErr := identityError(fmt.Sprintf("%s run returned no valid immutable container ID", cfg.eng.name()))
 		if cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr); cleanupErr != nil {
 			return nil, joinEnvFileCleanupError(withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 		}
@@ -560,7 +543,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			_ = registerWithGlobalReaperTarget(target.reaperKey, target.binary, target.subcommand, target.deleteFlags, target.env, uid, "")
 		}
 	}
-	if err := verifyAppleCreatedImage(ctx, c, resolvedImage); err != nil {
+	if err := verifyStrictCreatedImage(ctx, c, resolvedImage); err != nil {
 		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 	}
 	// Start the attached stream before the env-cleanup early return. Log
@@ -636,9 +619,7 @@ func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
 		env = eenv.ExternalEnv()
 	}
 	if len(env) == 0 {
-		if de, ok := cfg.eng.(dockerEngine); ok {
-			env = de.pinnedTargetEnv()
-		}
+		env = cfg.eng.pinnedTargetEnv()
 	}
 	reaperKey := binary
 	if cfg.eng != nil && cfg.eng.targetID() != "" {
@@ -678,7 +659,7 @@ func unregisterContainerReaper(cfg *config, name, creation, uid string) {
 	if !ok {
 		return
 	}
-	if uid != "" && cfg.eng.name() == "docker" {
+	if uid != "" && cfg.eng.capabilities().immutableID {
 		_ = unregisterWithGlobalReaperKey(target.reaperKey, uid, "")
 	}
 	if name != "" {
@@ -702,7 +683,7 @@ func protectReuseReaper(cfg *config) {
 // lock could not be acquired, so callers must not run failed-create
 // cleanup for a command that was never issued.
 func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, stderr []byte, attempted bool, err error) {
-	if cfg.eng.name() != "apple" {
+	if !cfg.eng.capabilities().nameAddressed {
 		stdout, stderr, err = cfg.runner.Run(ctx, args...)
 		return stdout, stderr, true, err
 	}
@@ -733,12 +714,13 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 	}
 	verifyCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
+	caps := cfg.eng.capabilities()
 
 	var info *engineInfo
 	for {
 		var err error
 		inspectContainer := c
-		if cfg.eng.name() == "docker" {
+		if caps.immutableID {
 			uid := c.immutableID()
 			if !domain.IsImmutableContainerID(uid) {
 				return fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, uid)
@@ -746,13 +728,13 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout, sync: &lockPack{uid: uid}}
 		}
 		unlock := func() {}
-		if cfg.eng.name() == "apple" {
+		if caps.nameAddressed {
 			unlock, err = lockName(verifyCtx, c.id)
 			if err != nil {
 				return fmt.Errorf("verify created container %s: lock name: %w", c.id, err)
 			}
 		}
-		if cfg.eng.name() == "apple" {
+		if caps.nameAddressed {
 			info, err = inspectContainer.inspectFreshLocked(verifyCtx)
 		} else {
 			info, err = inspectContainer.inspectFresh(verifyCtx)
@@ -782,14 +764,14 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		RequireReuse:   cfg.reuse,
 		ReuseGroup:     cfg.reuseGroup,
 	}
-	if cfg.eng.name() == "docker" {
+	if caps.immutableID {
 		expected.UID = c.immutableID()
 		expected.RequireImmutableID = true
 	} else {
 		expected.RequireNoImmutableID = true
 	}
 	if failure := domain.VerifyOwnership(expected, ownershipObserved(info)); failure != domain.OwnershipFailureNone {
-		return fmt.Errorf("verify created container %s: %s", c.id, createdOwnershipFailure(failure, cfg.eng.name() == "docker"))
+		return fmt.Errorf("verify created container %s: %s", c.id, createdOwnershipFailure(failure, caps.immutableID))
 	}
 	c.pack().mu.Lock()
 	c.pack().info = info
@@ -800,7 +782,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 
 // createdOwnershipFailure keeps the post-create diagnostics specific to the
 // operation while the matching rule stays in domain.VerifyOwnership.
-func createdOwnershipFailure(failure domain.OwnershipFailure, docker bool) string {
+func createdOwnershipFailure(failure domain.OwnershipFailure, immutableID bool) string {
 	switch failure {
 	case domain.OwnershipFailureSession:
 		return "session ownership label does not match"
@@ -811,7 +793,7 @@ func createdOwnershipFailure(failure domain.OwnershipFailure, docker bool) strin
 	case domain.OwnershipFailureReuseGroup:
 		return "reuse group label does not match"
 	case domain.OwnershipFailureIdentity:
-		if docker {
+		if immutableID {
 			return "immutable ID does not match"
 		}
 		return "unexpected immutable ID"
@@ -942,10 +924,10 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 func (c *Container) ID() string { return c.id }
 
 // operationTarget returns the immutable target for backend operations.
-// Docker handles prefer the ID returned by run/inspect; name-based handles
-// (including Apple Container) retain the original name.
+// Backends with immutable container IDs prefer the ID returned by
+// run/inspect; name-addressed handles retain the original name.
 func (c *Container) operationTarget() string {
-	if c.eng != nil && c.eng.name() == "docker" {
+	if c.eng != nil && c.eng.capabilities().immutableID {
 		if uid := c.immutableUID(); uid != "" {
 			return uid
 		}
@@ -953,24 +935,26 @@ func (c *Container) operationTarget() string {
 	return c.id
 }
 
-// immutableUID returns the Docker immutable ID, or "" on name-based backends.
+// immutableUID returns the backend's immutable ID, or "" on name-addressed
+// backends.
 func (c *Container) immutableUID() string {
-	if c.eng == nil || c.eng.name() != "docker" {
+	if c.eng == nil || !c.eng.capabilities().immutableID {
 		return ""
 	}
 	return c.immutableID()
 }
 
-// setImmutableUID promotes a Docker immutable ID. Name-based backends ignore it.
+// setImmutableUID promotes an immutable backend ID. Name-addressed backends
+// ignore it.
 func (c *Container) setImmutableUID(uid string) {
-	if c.eng == nil || c.eng.name() != "docker" {
+	if c.eng == nil || !c.eng.capabilities().immutableID {
 		return
 	}
 	c.setImmutableID(uid)
 }
 
-func (c *Container) dockerGenerationMatches(info *engineInfo) bool {
-	return c.eng != nil && c.eng.name() == "docker" && c.creation != "" &&
+func (c *Container) immutableIDGenerationMatches(info *engineInfo) bool {
+	return c.eng != nil && c.eng.capabilities().immutableID && c.creation != "" &&
 		info != nil && info.labels[creationLabel] == c.creation
 }
 
@@ -990,8 +974,8 @@ func (c *Container) classifyOperation(ctx context.Context, err error, operation 
 }
 
 func (c *Container) deleteOperation() string {
-	if c.eng != nil && c.eng.name() == "docker" {
-		return "rm"
+	if c.eng != nil {
+		return c.eng.reaperSubcommand()
 	}
 	return "delete"
 }
@@ -1818,16 +1802,16 @@ func (c *Container) Terminate(ctx context.Context) error {
 		}
 		return c.delete(ctx, target)
 	}
-	if c.eng.name() == "apple" {
+	if c.eng.capabilities().nameAddressed {
 		uid, creation, err := c.identitySnapshot(ctx)
 		if err != nil {
 			return err
 		}
 		if uid != "" {
-			return identityError("Apple inspect unexpectedly returned a container ID")
+			return identityError(fmt.Sprintf("%s inspect unexpectedly returned a container ID", c.eng.name()))
 		}
 		if !validCreationID(creation) {
-			return identityError("Apple handle has no valid creation generation")
+			return identityError(fmt.Sprintf("%s handle has no valid creation generation", c.eng.name()))
 		}
 		unlock, err := lockName(ctx, c.id)
 		if err != nil {
@@ -1929,7 +1913,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 	}
 	switch info.networkMode {
 	case dockerNetworkNone:
-		return "", fmt.Errorf("%w: container %s uses Docker network mode %q", ErrNoReachableHost, c.id, info.networkMode)
+		return "", fmt.Errorf("%w: container %s uses network mode %q", ErrNoReachableHost, c.id, info.networkMode)
 	case dockerNetworkHost:
 		if len(c.published) > 0 {
 			return "", dockerNetworkEndpointError(info.networkMode)
@@ -1941,7 +1925,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		b, ok := matchingPublishedBinding(info.bound, p, c.eng)
 		if !ok {
 			c.clearDynamic()
-			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.Raw, info.networkMode)
+			return "", fmt.Errorf("%w: published port %q has no host binding in network mode %q", ErrPortNotExposed, p.Raw, info.networkMode)
 		}
 		host, err := dockerBindingConnectHost(b, c.eng)
 		if err != nil {
@@ -2021,7 +2005,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		b, ok := matchingPublishedBinding(info.bound, *published, c.eng)
 		if !ok {
 			c.clearDynamic()
-			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.Raw, info.networkMode)
+			return "", 0, fmt.Errorf("%w: published port %q has no host binding in network mode %q", ErrPortNotExposed, published.Raw, info.networkMode)
 		}
 		host, err := dockerBindingConnectHost(b, c.eng)
 		if err != nil {
@@ -2037,14 +2021,15 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		return host, b.hostPort, nil
 	}
 	c.clearDynamic()
-	return "", 0, fmt.Errorf("%w: %s has no host binding in Docker network mode %q", ErrPortNotExposed, spec, info.networkMode)
+	return "", 0, fmt.Errorf("%w: %s has no host binding in network mode %q", ErrPortNotExposed, spec, info.networkMode)
 }
 
 // validateNetworkInfo prevents a requested network mode from being
-// mistaken for the mode the daemon actually used. Apple Container does
-// not report networkMode, so this check is intentionally Docker-specific.
+// mistaken for the mode the daemon actually used. A backend without the
+// default-network capability does not report the mode, so this check is
+// intentionally Docker-specific.
 func (c *Container) validateNetworkInfo(info *engineInfo) error {
-	if c.eng.name() != "docker" {
+	if !c.eng.capabilities().defaultNetwork {
 		return nil
 	}
 	requested := c.network
@@ -2445,16 +2430,16 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error)
 	creation := c.creation
 	if requiresImmutableID(c.eng) {
 		if !validImmutableID(c.eng, uid) {
-			return "", identityError("Docker operation has no valid immutable container ID")
+			return "", identityError(fmt.Sprintf("%s operation has no valid immutable container ID", c.eng.name()))
 		}
 		return uid, nil
 	}
-	if c.eng.name() == "apple" {
+	if c.eng.capabilities().nameAddressed {
 		if uid != "" {
-			return "", identityError("Apple handle unexpectedly carries a container ID")
+			return "", identityError(fmt.Sprintf("%s handle unexpectedly carries a container ID", c.eng.name()))
 		}
 		if !validCreationID(creation) {
-			return "", identityError("Apple operation has no valid creation generation")
+			return "", identityError(fmt.Sprintf("%s operation has no valid creation generation", c.eng.name()))
 		}
 	}
 	if c.id == "" {
@@ -2464,12 +2449,12 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error)
 }
 
 func configNeedsDefaultNetwork(cfg *config) bool {
-	return cfg != nil && cfg.eng != nil && cfg.eng.name() == "docker" &&
+	return cfg != nil && cfg.eng != nil && cfg.eng.capabilities().defaultNetwork &&
 		(!cfg.networkExplicit || cfg.network == dockerNetworkDefault)
 }
 
 func (c *Container) needsDefaultNetwork() bool {
-	return c.eng.name() == "docker" &&
+	return c.eng.capabilities().defaultNetwork &&
 		(!c.networkExplicit || c.network == dockerNetworkDefault)
 }
 
@@ -2588,14 +2573,14 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	uid := c.immutableID()
 	if requiresImmutableID(c.eng) {
 		if uid != "" && !validImmutableID(c.eng, uid) {
-			return nil, identityError("Docker handle has an invalid immutable container ID")
+			return nil, identityError(fmt.Sprintf("%s handle has an invalid immutable container ID", c.eng.name()))
 		}
 		if uid == "" && !c.nameInspect {
-			return nil, identityError("refusing Docker name inspect without a verified immutable ID")
+			return nil, identityError(fmt.Sprintf("refusing %s name inspect without a verified immutable ID", c.eng.name()))
 		}
 	}
-	if !c.nameInspect && c.eng.name() == "apple" && !validCreationID(c.creation) {
-		return nil, identityError("Apple handle has no valid creation generation")
+	if !c.nameInspect && c.eng.capabilities().nameAddressed && !validCreationID(c.creation) {
+		return nil, identityError(fmt.Sprintf("%s handle has no valid creation generation", c.eng.name()))
 	}
 
 	qCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
@@ -2617,18 +2602,18 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	}
 	if requiresImmutableID(c.eng) {
 		if !validImmutableID(c.eng, info.uid) {
-			return nil, identityError("Docker inspect returned no valid immutable container ID")
+			return nil, identityError(fmt.Sprintf("%s inspect returned no valid immutable container ID", c.eng.name()))
 		}
 		if uid != "" && uid != info.uid {
-			return nil, identityError("Docker inspect returned a different immutable container ID")
+			return nil, identityError(fmt.Sprintf("%s inspect returned a different immutable container ID", c.eng.name()))
 		}
 	}
-	if !c.nameInspect && c.eng.name() == "apple" {
+	if !c.nameInspect && c.eng.capabilities().nameAddressed {
 		if info.uid != "" {
-			return nil, identityError("Apple inspect unexpectedly returned a container ID")
+			return nil, identityError(fmt.Sprintf("%s inspect unexpectedly returned a container ID", c.eng.name()))
 		}
 		if !validCreationID(c.creation) || !validCreationID(info.labels[creationLabel]) || info.labels[creationLabel] != c.creation {
-			return nil, identityError("Apple inspect returned a different creation generation")
+			return nil, identityError(fmt.Sprintf("%s inspect returned a different creation generation", c.eng.name()))
 		}
 	}
 	// A name-addressed discovery deliberately returns the inspected UID to

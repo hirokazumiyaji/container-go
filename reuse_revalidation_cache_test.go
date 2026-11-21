@@ -187,7 +187,7 @@ func TestReuseRejectsUnmanagedOrUngeneratedAdoption(t *testing.T) {
 	}
 	for name, labels := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := checkReuseOwned(&engineInfo{labels: labels}, "redis:7-alpine", &config{name: "shared"})
+			err := checkReuseOwned(&engineInfo{labels: labels}, "redis:7-alpine", &config{name: "shared", eng: dockerEngine{}})
 			if err == nil {
 				t.Fatal("checkReuseOwned accepted an unverifiable adoption")
 			}

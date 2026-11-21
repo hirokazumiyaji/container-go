@@ -52,6 +52,11 @@ type imageIdentity struct {
 	// identity.
 	notLocal       bool
 	notLocalReason string
+	// unreadable means image inspect returned output the parser could not
+	// decode. It is not evidence that the image is absent, so identity
+	// resolution keeps it unavailable instead of fetching; it is also not
+	// evidence that the image is present, so imageExists rejects it.
+	unreadable bool
 	// mismatch means the backend returned an identity for a different
 	// image than the one requested. It must never be downgraded to the
 	// mutable-tag fallback.

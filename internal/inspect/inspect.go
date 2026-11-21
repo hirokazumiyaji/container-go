@@ -45,7 +45,9 @@ type Configuration struct {
 
 // Resources is the inspected resource allocation.
 type Resources struct {
-	CPUS int64 `json:"cpus"`
+	// CPUS is nil when the backend did not report a CPU allocation, which
+	// is distinct from a reported zero (no limit).
+	CPUS *float64 `json:"cpus"`
 }
 
 // InitProcess is the inspected process configuration.

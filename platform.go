@@ -185,6 +185,11 @@ func platformMetadataMatches(selector string, actual platformMetadata) bool {
 	return valid && matches
 }
 
+// platformSelectorUnverifiable reports whether the inspected platform
+// metadata is structurally unreadable, so the selector cannot be
+// evaluated at all. A well-formed platform that reports a different value
+// is a verified mismatch, not an unverifiable one; callers distinguish the
+// two diagnoses.
 func platformSelectorUnverifiable(selector, actual string) bool {
 	if selector == "" {
 		return false
@@ -194,8 +199,8 @@ func platformSelectorUnverifiable(selector, actual string) bool {
 		return true
 	}
 	have := platformMetadataFromString(actual)
-	_, matches, valid := have.has(want)
-	return !valid || !matches
+	_, _, valid := have.has(want)
+	return !valid
 }
 
 // dockerPlatformMatches uses the same fail-closed rule as the other

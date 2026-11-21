@@ -1298,8 +1298,8 @@ type dockerInspect struct {
 	} `json:"State"`
 	HostConfig struct {
 		NetworkMode string   `json:"NetworkMode"`
-		NanoCpus    float64  `json:"NanoCpus"`
-		ShmSize     int64    `json:"ShmSize"`
+		NanoCpus    *int64   `json:"NanoCpus"`
+		ShmSize     *int64   `json:"ShmSize"`
 		Privileged  bool     `json:"Privileged"`
 		CapAdd      []string `json:"CapAdd"`
 		CapDrop     []string `json:"CapDrop"`
@@ -1451,15 +1451,17 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		networkAliasMap: networkAliasMap,
 	}
 	info.runOptions = engineRunOptions{
-		cpus:         c.HostConfig.NanoCpus / 1e9,
-		cpusReported: c.HostConfig.NanoCpus != 0,
-		privileged:   c.HostConfig.Privileged,
-		capAdd:       c.HostConfig.CapAdd,
-		capDrop:      c.HostConfig.CapDrop,
-		hostname:     c.Config.Hostname,
+		privileged: c.HostConfig.Privileged,
+		capAdd:     c.HostConfig.CapAdd,
+		capDrop:    c.HostConfig.CapDrop,
+		hostname:   c.Config.Hostname,
 	}
-	if c.HostConfig.ShmSize > 0 {
-		info.runOptions.shmSizeBytes = uint64(c.HostConfig.ShmSize)
+	if c.HostConfig.NanoCpus != nil {
+		info.runOptions.cpus = float64(*c.HostConfig.NanoCpus) / 1e9
+		info.runOptions.cpusReported = true
+	}
+	if c.HostConfig.ShmSize != nil {
+		info.runOptions.shmSizeBytes = uint64(*c.HostConfig.ShmSize)
 		info.runOptions.shmSizeReported = true
 	}
 	for _, limit := range c.HostConfig.Ulimits {
@@ -1902,8 +1904,10 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 	if err := json.Unmarshal(data, &images); err != nil {
 		// A successful CLI invocation with malformed JSON is not proof
 		// that the image is absent. Treat it as identity-unavailable so
-		// PullMissing cannot turn a parser failure into a fetch.
-		return imageIdentity{}, true
+		// PullMissing cannot turn a parser failure into a fetch, and mark
+		// it unreadable so imageExists does not report the image as
+		// present.
+		return imageIdentity{unreadable: true}, true
 	}
 	if len(images) == 0 {
 		return imageIdentity{}, false

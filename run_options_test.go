@@ -707,6 +707,123 @@ func TestAppleParseInspectRunOptions(t *testing.T) {
 	}
 }
 
+// An inspect response that explicitly reports zero CPUs or a zero shm size
+// means "no limit configured", not "the backend did not report the resource".
+// Reuse must therefore report a mismatch rather than an unverifiable limit.
+func TestParseInspectReportsExplicitZeroResources(t *testing.T) {
+	fixtures := []struct {
+		name string
+		eng  engine
+		data []byte
+	}{
+		{
+			name: "apple",
+			eng:  appleEngine{},
+			data: []byte(`[{
+				"id": "myctr",
+				"configuration": {
+					"image": {"reference": "redis:7-alpine"},
+					"labels": {},
+					"resources": {"cpus": 0},
+					"shmSize": 0
+				},
+				"status": {"state": "running", "networks": []}
+			}]`),
+		},
+		{
+			name: "docker",
+			eng:  dockerEngine{},
+			data: []byte(`[{
+				"Id": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+				"Name": "/myctr",
+				"State": {"Status": "running"},
+				"Config": {"Image": "redis:7-alpine", "Labels": {}},
+				"HostConfig": {"NetworkMode": "bridge", "NanoCpus": 0, "ShmSize": 0}
+			}]`),
+		},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			info, err := fixture.eng.parseInspect(fixture.data, "myctr")
+			if err != nil {
+				t.Fatalf("parseInspect: %v", err)
+			}
+			opts := info.runOptions
+			if !opts.cpusReported || opts.cpus != 0 {
+				t.Errorf("cpus = %v reported=%v, want a reported zero", opts.cpus, opts.cpusReported)
+			}
+			if !opts.shmSizeReported || opts.shmSizeBytes != 0 {
+				t.Errorf("shm = %d reported=%v, want a reported zero", opts.shmSizeBytes, opts.shmSizeReported)
+			}
+			for _, requested := range []struct {
+				name  string
+				apply Option
+			}{
+				{name: "cpus", apply: WithCPUs(0.5)},
+				{name: "shm", apply: WithShmSize("256M")},
+			} {
+				cfg := newConfig()
+				cfg.eng = fixture.eng
+				cfg.name = "myctr"
+				if err := requested.apply(cfg); err != nil {
+					t.Fatal(err)
+				}
+				err := checkReuseRunOptions(info, cfg)
+				if err == nil || !strings.Contains(err.Error(), "does not match") {
+					t.Fatalf("%s: error = %v, want a reported mismatch", requested.name, err)
+				}
+				if strings.Contains(err.Error(), "could not be verified") {
+					t.Fatalf("%s: explicit zero was reported as unreported: %v", requested.name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestParseInspectLeavesOmittedResourcesUnreported(t *testing.T) {
+	fixtures := []struct {
+		name string
+		eng  engine
+		data []byte
+	}{
+		{
+			name: "apple",
+			eng:  appleEngine{},
+			data: []byte(`[{
+				"id": "myctr",
+				"configuration": {
+					"image": {"reference": "redis:7-alpine"},
+					"labels": {}
+				},
+				"status": {"state": "running", "networks": []}
+			}]`),
+		},
+		{
+			name: "docker",
+			eng:  dockerEngine{},
+			data: []byte(`[{
+				"Id": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+				"Name": "/myctr",
+				"State": {"Status": "running"},
+				"Config": {"Image": "redis:7-alpine", "Labels": {}},
+				"HostConfig": {"NetworkMode": "bridge"}
+			}]`),
+		},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			info, err := fixture.eng.parseInspect(fixture.data, "myctr")
+			if err != nil {
+				t.Fatalf("parseInspect: %v", err)
+			}
+			opts := info.runOptions
+			if opts.cpusReported || opts.shmSizeReported {
+				t.Fatalf("omitted resources reported: cpus=%v shm=%v", opts.cpusReported, opts.shmSizeReported)
+			}
+		})
+	}
+}
+
 func TestWithUlimitUnlimited(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -364,3 +364,18 @@ func TestAppleBareArmelSelectorDefaultsToV6(t *testing.T) {
 		}
 	}
 }
+
+func TestImageExistsRejectsUnreadableInspectOutput(t *testing.T) {
+	for _, eng := range []engine{appleEngine{}, dockerEngine{}} {
+		t.Run(eng.name(), func(t *testing.T) {
+			runner := &contextRaceRunner{stdout: []byte("{not json")}
+			exists, err := imageExists(context.Background(), runner, eng, "redis:7-alpine", "")
+			if err != nil {
+				t.Fatalf("imageExists: %v", err)
+			}
+			if exists {
+				t.Fatal("imageExists = true for unreadable inspect output")
+			}
+		})
+	}
+}

@@ -10,11 +10,26 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
+// isolateNameLockDir points the name lock at a per-test directory. Tests that
+// plant unsafe lock files or count lock files must not observe the shared
+// per-user cache, and the spawned helper processes inherit the override.
+func isolateNameLockDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "locks")
+	if err := os.Mkdir(dir, nameLockDirPerm); err != nil {
+		t.Fatalf("create test lock directory: %v", err)
+	}
+	t.Setenv("CONTAINERGO_LOCK_DIR", dir)
+	return dir
+}
+
 func TestLockNameSerializesHolders(t *testing.T) {
+	isolateNameLockDir(t)
 	name := "lock-" + newContainerName()
 	unlock, err := lockName(context.Background(), name)
 	if err != nil {
@@ -36,6 +51,11 @@ func TestLockNameSerializesHolders(t *testing.T) {
 }
 
 func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
+	// Exercise the default per-user cache path, not the override.
+	t.Setenv("CONTAINERGO_LOCK_DIR", "")
+	cacheRoot := t.TempDir()
+	t.Setenv("HOME", cacheRoot)
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
 	name := "lock-" + newContainerName()
 	first, err := nameLockPath(name)
 	if err != nil {
@@ -50,12 +70,13 @@ func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
 	if first != second {
 		t.Fatalf("nameLockPath changed with TMPDIR: %q != %q", first, second)
 	}
-	if strings.Contains(filepath.Base(first), name) {
-		t.Fatalf("lock filename %q contains the un-hashed name", filepath.Base(first))
+	if strings.Contains(first, name) {
+		t.Fatalf("lock path %q exposes the container name", first)
 	}
 }
 
 func TestNameLockRejectsSymlink(t *testing.T) {
+	isolateNameLockDir(t)
 	name := "lock-" + newContainerName()
 	path, err := nameLockPath(name)
 	if err != nil {
@@ -81,6 +102,7 @@ func TestNameLockRejectsSymlink(t *testing.T) {
 }
 
 func TestNameLockRejectsWrongPermissions(t *testing.T) {
+	isolateNameLockDir(t)
 	name := "lock-" + newContainerName()
 	path, err := nameLockPath(name)
 	if err != nil {
@@ -98,6 +120,7 @@ func TestNameLockRejectsWrongPermissions(t *testing.T) {
 }
 
 func TestNameLockReusesStaleFile(t *testing.T) {
+	isolateNameLockDir(t)
 	name := "lock-" + newContainerName()
 	unlock, err := lockName(context.Background(), name)
 	if err != nil {
@@ -127,6 +150,7 @@ func TestNameLockReusesStaleFile(t *testing.T) {
 }
 
 func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
+	isolateNameLockDir(t)
 	name := "lock-" + newContainerName()
 	unlock, err := lockName(context.Background(), name)
 	if err != nil {
@@ -151,6 +175,7 @@ func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
 }
 
 func TestTerminateContainerHonorsContextDeadline(t *testing.T) {
+	isolateNameLockDir(t)
 	name := "lock-" + newContainerName()
 	unlock, err := lockName(context.Background(), name)
 	if err != nil {
@@ -176,6 +201,7 @@ func TestTerminateContainerHonorsContextDeadline(t *testing.T) {
 }
 
 func TestCleanupBoundsNameLockWait(t *testing.T) {
+	isolateNameLockDir(t)
 	oldTimeout := terminateTimeout
 	terminateTimeout = 100 * time.Millisecond
 	t.Cleanup(func() { terminateTimeout = oldTimeout })
@@ -232,6 +258,7 @@ func TestNameLockHelperProcess(t *testing.T) {
 }
 
 func TestNameLockSerializesAcrossProcessesWithDifferentTempDirs(t *testing.T) {
+	isolateNameLockDir(t)
 	name := "lock-" + newContainerName()
 	unlock, err := lockName(context.Background(), name)
 	if err != nil {
@@ -264,5 +291,223 @@ func TestNameLockSerializesAcrossProcessesWithDifferentTempDirs(t *testing.T) {
 	output = runHelper(t.TempDir(), "1s")
 	if !strings.Contains(output, "locked") {
 		t.Fatalf("released lock helper output = %q, want locked", output)
+	}
+}
+
+func TestNameLockDirUsesPerUserCache(t *testing.T) {
+	// Force the default path even if the developer's shell sets an override.
+	t.Setenv("CONTAINERGO_LOCK_DIR", "")
+	cacheRoot := t.TempDir()
+	t.Setenv("HOME", cacheRoot)
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := nameLockDir()
+	if err != nil {
+		t.Fatalf("nameLockDir: %v", err)
+	}
+	want := filepath.Join(cacheDir, "containergo", "locks")
+	if dir != want {
+		t.Fatalf("nameLockDir = %q, want per-user cache path %q", dir, want)
+	}
+	for _, path := range []string{dir, filepath.Dir(dir)} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if info.Mode().Perm() != nameLockDirPerm {
+			t.Fatalf("%s permissions = %04o, want %04o", path, info.Mode().Perm(), nameLockDirPerm)
+		}
+	}
+}
+
+func TestNameLockDirRejectsWorldWritableCacheBase(t *testing.T) {
+	t.Setenv("CONTAINERGO_LOCK_DIR", "")
+	cacheRoot := t.TempDir()
+	t.Setenv("HOME", cacheRoot)
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cacheDir, nameLockDirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cacheDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nameLockDir(); err == nil {
+		t.Fatal("nameLockDir accepted a group- or world-writable cache base")
+	}
+}
+
+func TestNameLockDirRejectsSubstitutedAppDir(t *testing.T) {
+	t.Setenv("CONTAINERGO_LOCK_DIR", "")
+	cacheRoot := t.TempDir()
+	t.Setenv("HOME", cacheRoot)
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cacheDir, nameLockDirPerm); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "substituted")
+	if err := os.Mkdir(target, nameLockDirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(cacheDir, "containergo")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := nameLockDir(); err == nil {
+		t.Fatal("nameLockDir accepted a substituted lock directory")
+	}
+}
+
+func TestLockNameKeepsLockDirectoryBounded(t *testing.T) {
+	dir := isolateNameLockDir(t)
+	for i := 0; i < nameLockBucketCount*2; i++ {
+		name := fmt.Sprintf("bounded-%d", i)
+		unlock, err := lockName(context.Background(), name)
+		if err != nil {
+			t.Fatalf("lockName(%s): %v", name, err)
+		}
+		unlock()
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("lockName created no lock files")
+	}
+	if len(entries) > nameLockBucketCount {
+		t.Fatalf("lock directory holds %d files after %d names, want at most %d",
+			len(entries), nameLockBucketCount*2, nameLockBucketCount)
+	}
+}
+
+func TestNameLockBucketCollisionSerializes(t *testing.T) {
+	isolateNameLockDir(t)
+	byPath := make(map[string]string)
+	var first, second string
+	for i := 0; i < nameLockBucketCount*4 && second == ""; i++ {
+		name := fmt.Sprintf("collision-%d", i)
+		path, err := nameLockPath(name)
+		if err != nil {
+			t.Fatalf("nameLockPath(%s): %v", name, err)
+		}
+		other, ok := byPath[path]
+		switch {
+		case ok && other != name:
+			first, second = other, name
+		case !ok:
+			byPath[path] = name
+		}
+	}
+	if second == "" {
+		t.Fatalf("no bucket collision among %d names", nameLockBucketCount*4)
+	}
+	unlock, err := lockName(context.Background(), first)
+	if err != nil {
+		t.Fatalf("lockName(%s): %v", first, err)
+	}
+	defer unlock()
+
+	// A bucket collision must only add serialization; the second name
+	// must not be able to run beside the first.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := lockName(ctx, second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lockName(%s) while %s shares its bucket: err = %v, want deadline exceeded", second, first, err)
+	}
+}
+
+func TestReaperNameLockPathMatchesLockName(t *testing.T) {
+	isolateNameLockDir(t)
+	name := "reaper-" + newContainerName()
+	path, err := reaperNameLockPath(name)
+	if err != nil {
+		t.Fatalf("reaperNameLockPath: %v", err)
+	}
+	want, err := nameLockPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != want {
+		t.Fatalf("reaperNameLockPath = %q, nameLockPath = %q", path, want)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("stat reaper lock file: %v", err)
+	}
+	if info.Mode().Perm() != nameLockFilePerm {
+		t.Fatalf("reaper lock file permissions = %04o, want %04o", info.Mode().Perm(), nameLockFilePerm)
+	}
+}
+
+func TestReaperNameLockPathRejectsUnsafeLockFile(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{"world-readable file", func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.Mkdir(path, nameLockFilePerm); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateNameLockDir(t)
+			name := "reaper-" + newContainerName()
+			path, err := nameLockPath(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(t, path)
+			if _, err := reaperNameLockPath(name); err == nil {
+				t.Fatalf("reaperNameLockPath accepted a %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestReaperNameLockPathRejectsFIFO(t *testing.T) {
+	isolateNameLockDir(t)
+	name := "reaper-" + newContainerName()
+	path, err := nameLockPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(path, nameLockFilePerm); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	// The pre-open Lstat check rejects the FIFO; the timeout also catches a
+	// regression back to a blocking open.
+	done := make(chan error, 1)
+	go func() {
+		_, err := reaperNameLockPath(name)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("reaperNameLockPath accepted a FIFO")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reaperNameLockPath blocked on a FIFO")
 	}
 }

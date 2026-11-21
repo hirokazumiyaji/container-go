@@ -3,6 +3,8 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -86,7 +88,9 @@ func TestWithBinaryOverridesDefaultEngineBinary(t *testing.T) {
 }
 
 func TestWithBinaryCombinedWithWithRunner(t *testing.T) {
-	// Case 1: WithRunner before WithBinary
+	// Case 1: WithRunner before WithBinary. The configured binary belongs to
+	// the operation, so the caller-owned runner must not be rewritten: it may
+	// be shared with concurrent operations.
 	cfg1 := newConfig()
 	cfg1.eng = dockerEngine{}
 	execR1 := &ExecRunner{}
@@ -97,8 +101,11 @@ func TestWithBinaryCombinedWithWithRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 	applyEngineBinary(cfg1)
-	if execR1.Binary != "/override/bin" {
-		t.Errorf("execR1.Binary = %q, want /override/bin", execR1.Binary)
+	if got := cfg1.runner.(*ExecRunner).Binary; got != "/override/bin" {
+		t.Errorf("cfg.runner binary = %q, want /override/bin", got)
+	}
+	if execR1.Binary != "" {
+		t.Errorf("caller runner was mutated: binary = %q", execR1.Binary)
 	}
 
 	// Case 2: WithBinary before WithRunner
@@ -112,8 +119,11 @@ func TestWithBinaryCombinedWithWithRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 	applyEngineBinary(cfg2)
-	if execR2.Binary != "/override/bin" {
-		t.Errorf("execR2.Binary = %q, want /override/bin", execR2.Binary)
+	if got := cfg2.runner.(*ExecRunner).Binary; got != "/override/bin" {
+		t.Errorf("cfg.runner binary = %q, want /override/bin", got)
+	}
+	if execR2.Binary != "" {
+		t.Errorf("caller runner was mutated: binary = %q", execR2.Binary)
 	}
 
 	// Case 3: Custom runner implementing SetBinary
@@ -459,5 +469,126 @@ func TestRunStampsEngineIdentity(t *testing.T) {
 	}
 	if configured.Identity != "" {
 		t.Fatalf("caller runner was mutated: identity = %q", configured.Identity)
+	}
+}
+
+// A binary override configures the operation's runner, never the caller's.
+// Callers share one *ExecRunner across concurrent operations, so rewriting it
+// here would be a data race and would leak one operation's binary into the
+// next.
+func TestRunnerBinaryOptionsDoNotMutateSharedExecRunner(t *testing.T) {
+	shared := &ExecRunner{Binary: "docker"}
+
+	cfg := newConfig()
+	if err := WithRunner(shared)(cfg); err != nil {
+		t.Fatalf("WithRunner: %v", err)
+	}
+	if err := WithBinary("/opt/docker-wrapper")(cfg); err != nil {
+		t.Fatalf("WithBinary: %v", err)
+	}
+	if got := cfg.runner.(*ExecRunner).Binary; got != "/opt/docker-wrapper" {
+		t.Fatalf("config runner binary = %q, want the override", got)
+	}
+
+	pull := &pullConfig{}
+	if err := WithPullRunner(shared)(pull); err != nil {
+		t.Fatalf("WithPullRunner: %v", err)
+	}
+	if err := WithPullBinary("/opt/docker-wrapper")(pull); err != nil {
+		t.Fatalf("WithPullBinary: %v", err)
+	}
+	if got := pull.runner.(*ExecRunner).Binary; got != "/opt/docker-wrapper" {
+		t.Fatalf("pull runner binary = %q, want the override", got)
+	}
+
+	prune := &pruneConfig{}
+	if err := WithPruneRunner(shared)(prune); err != nil {
+		t.Fatalf("WithPruneRunner: %v", err)
+	}
+	if err := WithPruneBinary("/opt/docker-wrapper")(prune); err != nil {
+		t.Fatalf("WithPruneBinary: %v", err)
+	}
+	if got := prune.runner.(*ExecRunner).Binary; got != "/opt/docker-wrapper" {
+		t.Fatalf("prune runner binary = %q, want the override", got)
+	}
+
+	if shared.Binary != "docker" {
+		t.Fatalf("shared runner was mutated: binary = %q", shared.Binary)
+	}
+	if shared.Identity != "" {
+		t.Fatalf("shared runner was mutated: identity = %q", shared.Identity)
+	}
+}
+
+// effectiveRunner resolves the per-operation binary on a copy as well.
+func TestEffectiveRunnerLeavesCallerRunnerUntouched(t *testing.T) {
+	shared := &ExecRunner{Binary: "docker", Env: []string{"DOCKER_HOST=tcp://daemon:2375"}}
+
+	resolved := effectiveRunner(shared, "/opt/docker-wrapper", dockerEngine{})
+	er, ok := resolved.(*ExecRunner)
+	if !ok {
+		t.Fatalf("runner = %T, want *ExecRunner", resolved)
+	}
+	if er == shared {
+		t.Fatal("effectiveRunner returned the caller's runner")
+	}
+	if er.Binary != "/opt/docker-wrapper" {
+		t.Fatalf("binary = %q, want the configured wrapper", er.Binary)
+	}
+	if shared.Binary != "docker" || shared.Identity != "" {
+		t.Fatalf("caller runner was mutated: %+v", shared)
+	}
+}
+
+// Concurrent operations share one runner. Applying binary options in parallel
+// must not write to that shared value; run this test with -race.
+func TestSharedRunnerBinaryOptionsConcurrent(t *testing.T) {
+	shared := &ExecRunner{Binary: "docker"}
+	const workers = 16
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			binary := fmt.Sprintf("/opt/docker-%d", i)
+
+			cfg := newConfig()
+			if err := WithRunner(shared)(cfg); err != nil {
+				t.Errorf("WithRunner: %v", err)
+				return
+			}
+			if err := WithBinary(binary)(cfg); err != nil {
+				t.Errorf("WithBinary: %v", err)
+				return
+			}
+			if got := cfg.runner.(*ExecRunner).Binary; got != binary {
+				t.Errorf("config runner binary = %q, want %q", got, binary)
+			}
+
+			pull := &pullConfig{}
+			if err := WithPullRunner(shared)(pull); err != nil {
+				t.Errorf("WithPullRunner: %v", err)
+				return
+			}
+			if err := WithPullBinary(binary)(pull); err != nil {
+				t.Errorf("WithPullBinary: %v", err)
+				return
+			}
+
+			prune := &pruneConfig{}
+			if err := WithPruneRunner(shared)(prune); err != nil {
+				t.Errorf("WithPruneRunner: %v", err)
+				return
+			}
+			if err := WithPruneBinary(binary)(prune); err != nil {
+				t.Errorf("WithPruneBinary: %v", err)
+				return
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if shared.Binary != "docker" {
+		t.Fatalf("shared runner was mutated: binary = %q", shared.Binary)
 	}
 }

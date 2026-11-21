@@ -433,7 +433,9 @@ Every leaf strategy accepts `WithStartupTimeout` (zero means 60s) and
 stream that ends before the pattern is found. `ForAll` and `ForAny` have
 no composition-wide timeout by default; a positive `WithStartupTimeout`
 bounds the whole composition, while zero or a negative value leaves it
-unbounded and lets each child strategy's timeout apply.
+unbounded and lets each child strategy's timeout apply. Builders return a new
+strategy and leave the receiver unchanged; assign the result when configuring
+an existing value (`s = s.WithHeader("X-Tenant", tenant)`).
 
 The current development checkout also adds `wait.ForHealthcheck()` for
 Docker's `HEALTHCHECK` status and `HTTPStrategy.WithResponseMatcher` for

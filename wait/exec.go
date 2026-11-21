@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 )
@@ -34,25 +35,37 @@ type ExecStrategy struct {
 // ForExec waits for cmd to succeed inside the container.
 func ForExec(cmd []string) *ExecStrategy {
 	return &ExecStrategy{
-		cmd:     cmd,
+		cmd:     slices.Clone(cmd),
 		options: options{pollInterval: defaultExecPollInterval},
 	}
 }
 
+// clone returns a strategy with an independent command slice. Builders derive
+// a new value from the receiver so a strategy shared by parallel callers cannot
+// be reconfigured through another caller's options.
+func (s *ExecStrategy) clone() *ExecStrategy {
+	cloned := *s
+	cloned.cmd = slices.Clone(s.cmd)
+	return &cloned
+}
+
 // WithExitCodeMatcher replaces the default exit-code-zero check.
 func (s *ExecStrategy) WithExitCodeMatcher(matcher func(code int) bool) *ExecStrategy {
-	s.exitMatcher = matcher
-	return s
+	cloned := s.clone()
+	cloned.exitMatcher = matcher
+	return cloned
 }
 
 func (s *ExecStrategy) WithStartupTimeout(d time.Duration) *ExecStrategy {
-	s.startupTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.startupTimeout = d
+	return cloned
 }
 
 func (s *ExecStrategy) WithPollInterval(d time.Duration) *ExecStrategy {
-	s.pollInterval = d
-	return s
+	cloned := s.clone()
+	cloned.pollInterval = d
+	return cloned
 }
 
 // WithExecTimeout bounds each ExecCommand attempt. A hung command is
@@ -62,8 +75,9 @@ func (s *ExecStrategy) WithPollInterval(d time.Duration) *ExecStrategy {
 // probing. The startup timeout still bounds the whole wait, so an explicit
 // attempt timeout never extends the caller's budget.
 func (s *ExecStrategy) WithExecTimeout(d time.Duration) *ExecStrategy {
-	s.execTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.execTimeout = d
+	return cloned
 }
 
 // attemptTimeout reports the bound applied to one ExecCommand call.

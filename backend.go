@@ -59,7 +59,7 @@ func effectiveRunner(configured Runner, binary string, eng engine) Runner {
 	if configured == nil {
 		configured = defaultRunnerFor(eng)
 	}
-	applyBinaryToRunner(configured, binary)
+	configured = runnerWithBinary(configured, binary)
 	if er, ok := configured.(*cli.ExecRunner); ok {
 		stamped := *er
 		if stamped.Binary == "" {

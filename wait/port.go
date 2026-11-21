@@ -78,22 +78,33 @@ func ForExposedPort() *HostPortStrategy {
 	return &HostPortStrategy{}
 }
 
+// clone returns a copy of the strategy. Builders derive a new value from the
+// receiver so a strategy shared by parallel callers cannot be reconfigured
+// through another caller's options.
+func (s *HostPortStrategy) clone() *HostPortStrategy {
+	cloned := *s
+	return &cloned
+}
+
 func (s *HostPortStrategy) WithStartupTimeout(d time.Duration) *HostPortStrategy {
-	s.startupTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.startupTimeout = d
+	return cloned
 }
 
 func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
-	s.pollInterval = d
-	return s
+	cloned := s.clone()
+	cloned.pollInterval = d
+	return cloned
 }
 
 // WithHostOnly skips the container-side listen check and accepts a
 // successful host connection alone. The check is already skipped
 // automatically when the target reports PortListenUnsupported.
 func (s *HostPortStrategy) WithHostOnly() *HostPortStrategy {
-	s.hostOnly = true
-	return s
+	cloned := s.clone()
+	cloned.hostOnly = true
+	return cloned
 }
 
 func (s *HostPortStrategy) DiagnosticValues() []string { return []string{s.port} }

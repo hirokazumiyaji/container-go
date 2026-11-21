@@ -242,7 +242,10 @@ func WithPullDockerContext(context string) PullOption {
 	}
 }
 
-// WithPullRunner sets the runner used for Pull.
+// WithPullRunner sets the runner used for Pull. Only a *ExecRunner is copied
+// when a binary override applies; a custom Runner that implements SetBinary,
+// including a type embedding ExecRunner, is rewritten in place and must not be
+// shared by concurrent operations.
 func WithPullRunner(r Runner) PullOption {
 	return func(c *pullConfig) error {
 		if runnerIsNil(r) {
@@ -250,13 +253,16 @@ func WithPullRunner(r Runner) PullOption {
 		}
 		c.runner = r
 		if c.binary != "" {
-			applyBinaryToRunner(c.runner, c.binary)
+			c.runner = runnerWithBinary(c.runner, c.binary)
 		}
 		return nil
 	}
 }
 
-// WithPullBinary sets the executable name or path for the container CLI during Pull.
+// WithPullBinary sets the executable name or path for the container CLI during
+// Pull. Only a *ExecRunner is copied when the override applies; a custom
+// Runner that implements SetBinary, including a type embedding ExecRunner, is
+// rewritten in place and must not be shared by concurrent operations.
 func WithPullBinary(path string) PullOption {
 	return func(c *pullConfig) error {
 		if path == "" {
@@ -266,7 +272,7 @@ func WithPullBinary(path string) PullOption {
 			return validationErrorf("WithPullBinary", path, "invalid binary path %q", path)
 		}
 		c.binary = path
-		applyBinaryToRunner(c.runner, path)
+		c.runner = runnerWithBinary(c.runner, path)
 		return nil
 	}
 }

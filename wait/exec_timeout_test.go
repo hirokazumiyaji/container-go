@@ -208,10 +208,10 @@ func TestExecAttemptTimeoutDefault(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			strategy := ForExec([]string{"probe"})
 			if tt.interval != 0 {
-				strategy.WithPollInterval(tt.interval)
+				strategy = strategy.WithPollInterval(tt.interval)
 			}
 			if tt.explicit != 0 {
-				strategy.WithExecTimeout(tt.explicit)
+				strategy = strategy.WithExecTimeout(tt.explicit)
 			}
 			if got := strategy.attemptTimeout(); got != tt.want {
 				t.Fatalf("attemptTimeout = %v, want %v", got, tt.want)

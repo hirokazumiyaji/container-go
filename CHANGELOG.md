@@ -127,6 +127,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `WithPruneLabel` to limit `Prune` and `PruneReuseGroup` to containers
   carrying a label, and `WithPruneDryRun` to report candidates without deleting
   them.
+- Add `FileFromContent` and `FileFromHost` smart constructors for `File`;
+  `FileFromContent` normalizes a nil content slice, so an empty in-memory file
+  is no longer mistaken for an unset source. Add `BindMount`, `VolumeMount`,
+  and `TmpfsMount` smart constructors for `Mount`.
 
 ### Fixed
 
@@ -190,6 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binding, so the 1-second cache previously never hit and every `Host`,
   `Endpoint`, `MappedPort`, or `ContainerIP` read spawned another `inspect`
   subprocess.
+- Apply `WithBinary`, `WithPullBinary`, and `WithPruneBinary` to a
+  per-operation copy of a caller-supplied `*ExecRunner` instead of rewriting
+  it, removing a data race between concurrent operations that share one runner.
+  Only `*ExecRunner` is copied: a custom `Runner` that implements `SetBinary`,
+  including a type embedding `ExecRunner`, is still rewritten in place and must
+  not be shared between concurrent operations.
 
 ### Changed
 
@@ -262,6 +272,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an in-flight inspect.
 - Back off `Container.Wait` lifecycle polling from 100 ms to a 1 s cap to
   bound the CLI subprocesses spawned while a long-running container exits.
+- **Breaking:** `wait` strategy builders return a new strategy instead of
+  rewriting the receiver, and `ForAll`/`ForAny` copy their child slice. Fluent
+  chains are unchanged, but a discarded result no longer configures the
+  strategy. Migrate `s.WithHeader("X-Tenant", tenant)` to
+  `s = s.WithHeader("X-Tenant", tenant)` (the same applies to every builder,
+  including `WithStartupTimeout` and `WithPollInterval`).
 
 
 ## [0.3.0] - 2026-10-26

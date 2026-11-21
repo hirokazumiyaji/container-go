@@ -191,20 +191,26 @@ func WithPruneParallelism(n int) PruneOption {
 	}
 }
 
-// WithPruneRunner sets the runner used for Prune or PruneReuseGroup.
+// WithPruneRunner sets the runner used for Prune or PruneReuseGroup. Only a
+// *ExecRunner is copied when a binary override applies; a custom Runner that
+// implements SetBinary, including a type embedding ExecRunner, is rewritten in
+// place and must not be shared by concurrent operations.
 func WithPruneRunner(r Runner) PruneOption {
 	return func(c *pruneConfig) error {
 		if runnerIsNil(r) {
 			return validationErrorf("WithPruneRunner", nil, "runner must not be nil")
 		}
 		c.runner = r
-		applyBinaryToRunner(c.runner, c.binary)
+		c.runner = runnerWithBinary(c.runner, c.binary)
 		return nil
 	}
 }
 
 // WithPruneBinary sets the executable name or path for the container CLI
-// during Prune or PruneReuseGroup.
+// during Prune or PruneReuseGroup. Only a *ExecRunner is copied when the
+// override applies; a custom Runner that implements SetBinary, including a
+// type embedding ExecRunner, is rewritten in place and must not be shared by
+// concurrent operations.
 func WithPruneBinary(path string) PruneOption {
 	return func(c *pruneConfig) error {
 		if path == "" {
@@ -214,7 +220,7 @@ func WithPruneBinary(path string) PruneOption {
 			return validationErrorf("WithPruneBinary", path, "invalid binary path %q", path)
 		}
 		c.binary = path
-		applyBinaryToRunner(c.runner, path)
+		c.runner = runnerWithBinary(c.runner, path)
 		return nil
 	}
 }

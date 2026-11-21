@@ -156,8 +156,8 @@ func TestRunValidatesWaitBeforeMissingImage(t *testing.T) {
 		strategy wait.Strategy
 	}{
 		{
-			name:     "invalid HTTP mutation",
-			strategy: wait.ForHTTP("/"),
+			name:     "invalid HTTP method",
+			strategy: wait.ForHTTP("/").WithMethod("GET\n"),
 		},
 		{
 			name:     "empty exec",
@@ -174,11 +174,6 @@ func TestRunValidatesWaitBeforeMissingImage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newTestRunner()
 			option := WithWaitStrategy(tc.strategy)
-			if httpStrategy, ok := tc.strategy.(*wait.HTTPStrategy); ok {
-				// Mutate after constructing the option to exercise Run's
-				// boundary validation, not only WithWaitStrategy's eager check.
-				httpStrategy.WithMethod("GET\n")
-			}
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithPullPolicy(PullNever), option,
 				withRunner(f), withEngine(appleEngine{}))
@@ -189,6 +184,49 @@ func TestRunValidatesWaitBeforeMissingImage(t *testing.T) {
 				t.Fatalf("backend was called before wait validation: %v", f.calls)
 			}
 		})
+	}
+}
+
+// mutableWaitStrategy models a custom Strategy that changes its embedded
+// built-in configuration after the option has validated it. WithWaitStrategy
+// calls DiagnosticValues right after Validate, so swapping the embedded
+// strategy there deterministically leaves an invalid strategy for Run's
+// boundary re-validation in container.go without depending on a race.
+type mutableWaitStrategy struct {
+	*wait.HTTPStrategy
+	invalid *wait.HTTPStrategy
+}
+
+func (s *mutableWaitStrategy) DiagnosticValues() []string {
+	values := s.HTTPStrategy.DiagnosticValues()
+	if s.invalid != nil {
+		s.HTTPStrategy, s.invalid = s.invalid, nil
+	}
+	return values
+}
+
+// The Run boundary re-validates the whole wait tree after the options are
+// applied. Built-in builders can no longer be changed in place, but a custom
+// Strategy can, so this path still needs coverage.
+func TestRunRevalidatesWaitAtBoundaryAfterStrategyChange(t *testing.T) {
+	strategy := &mutableWaitStrategy{
+		HTTPStrategy: wait.ForHTTP("/"),
+		invalid:      wait.ForHTTP("/").WithMethod("GET\n"),
+	}
+
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPullPolicy(PullNever),
+		WithWaitStrategy(strategy),
+		withRunner(f), withEngine(appleEngine{}))
+	if err == nil || !errors.Is(err, wait.ErrInvalidConfiguration) || !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("Run error = %v, want ErrInvalidConfiguration from the Run boundary", err)
+	}
+	if strategy.invalid != nil {
+		t.Fatal("the strategy change was not applied during option application; the Run boundary was not exercised")
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called before wait validation: %v", f.calls)
 	}
 }
 

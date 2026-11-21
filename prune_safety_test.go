@@ -140,7 +140,8 @@ func TestApplePruneParsersCaptureIdentityMetadata(t *testing.T) {
 	}
 	if candidate.id != "shared" || candidate.creation != creation ||
 		candidate.labels[sessionLabel] != pruneFixtureSession || candidate.state != StateStopped ||
-		!candidate.managed || !candidate.reuse || candidate.reuseGroup != "integration" {
+		candidate.labels[managedLabel] != "true" || candidate.labels[reuseLabel] != "true" ||
+		candidate.labels[reuseGroupLabel] != "integration" {
 		t.Fatalf("candidate = %+v, want complete Apple identity metadata", candidate)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 const defaultTestDockerVersion = `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`
@@ -686,7 +687,7 @@ func runDockerCopyContainer(t *testing.T, r cli.Runner) *Container {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !dockerIDRE.MatchString(ctr.immutableID()) {
+	if !domain.IsImmutableContainerID(ctr.immutableID()) {
 		t.Fatalf("published uid = %q, want a full 64-hex container ID", ctr.immutableID())
 	}
 	if ctr.immutableID() == ctr.ID() {

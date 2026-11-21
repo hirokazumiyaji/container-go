@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	backendinspect "github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
@@ -239,14 +240,11 @@ func pruneWithConfig(ctx context.Context, r cli.Runner, eng engine, cfg pruneCon
 }
 
 type pruneCandidate struct {
-	id         string
-	labels     map[string]string
-	creation   string
-	createdAt  time.Time
-	state      State
-	managed    bool
-	reuse      bool
-	reuseGroup string
+	id        string
+	labels    map[string]string
+	creation  string
+	createdAt time.Time
+	state     State
 }
 
 // pruneAgeFilter limits a prune run to candidates whose backend creation
@@ -424,7 +422,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 }
 
 func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
-	if !dockerIDRE.MatchString(id) {
+	if !domain.IsImmutableContainerID(id) {
 		return false, nil
 	}
 	// Verification and deletion share one budget so a hung inspect cannot
@@ -444,14 +442,11 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, err)
 	}
 	candidate := pruneCandidate{
-		id:         id,
-		labels:     fresh.labels,
-		creation:   fresh.labels[creationLabel],
-		createdAt:  fresh.createdAt,
-		state:      fresh.state,
-		managed:    fresh.labels[managedLabel] == "true",
-		reuse:      fresh.labels[reuseLabel] == "true",
-		reuseGroup: fresh.labels[reuseGroupLabel],
+		id:        id,
+		labels:    fresh.labels,
+		creation:  fresh.labels[creationLabel],
+		createdAt: fresh.createdAt,
+		state:     fresh.state,
 	}
 	if !pruneCandidateEligible(candidate, reuseGroup) || !ages.admits(candidate.createdAt) {
 		// In particular, ordinary prune never force-deletes a candidate
@@ -496,22 +491,27 @@ func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
 			labels[key] = value
 		}
 		candidates[c.ID] = pruneCandidate{
-			id:         c.ID,
-			labels:     labels,
-			creation:   labels[creationLabel],
-			createdAt:  parseInspectTime(c.Configuration.CreationDate),
-			state:      State(c.Status.State),
-			managed:    labels[managedLabel] == "true",
-			reuse:      labels[reuseLabel] == "true",
-			reuseGroup: labels[reuseGroupLabel],
+			id:        c.ID,
+			labels:    labels,
+			creation:  labels[creationLabel],
+			createdAt: parseInspectTime(c.Configuration.CreationDate),
+			state:     State(c.Status.State),
 		}
 	}
 	return candidates, nil
 }
 
 func pruneCandidateEligible(candidate pruneCandidate, reuseGroup string) bool {
-	if candidate.id == "" || (!nameRE.MatchString(candidate.id) && !dockerIDRE.MatchString(candidate.id)) || !candidate.managed ||
-		!creationRE.MatchString(candidate.creation) || candidate.state == "" || candidate.state == StateUnknown {
+	if candidate.id == "" || (!nameRE.MatchString(candidate.id) && !domain.IsImmutableContainerID(candidate.id)) ||
+		candidate.state == "" || candidate.state == StateUnknown {
+		return false
+	}
+	expected := domain.OwnershipExpected{RequireManaged: true, RequireCreation: true}
+	if reuseGroup != "" {
+		expected.RequireReuse = true
+		expected.ReuseGroup = reuseGroup
+	}
+	if failure := domain.VerifyOwnership(expected, domain.OwnershipObserved{Labels: candidate.labels}); failure != domain.OwnershipFailureNone {
 		return false
 	}
 	if reuseGroup == "" {
@@ -520,8 +520,7 @@ func pruneCandidateEligible(candidate pruneCandidate, reuseGroup string) bool {
 	// A group label alone does not prove that an object is a reusable
 	// generation owned by this library. Only settled running/stopped
 	// generations are eligible; transitional states remain untouched.
-	return candidate.reuse && candidate.reuseGroup == reuseGroup &&
-		(candidate.state == StateRunning || candidate.state == StateStopped)
+	return candidate.state == StateRunning || candidate.state == StateStopped
 }
 
 func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reuseGroup string) bool {
@@ -529,13 +528,10 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 		return false
 	}
 	freshCandidate := pruneCandidate{
-		id:         candidate.id,
-		labels:     fresh.labels,
-		creation:   fresh.labels[creationLabel],
-		state:      fresh.state,
-		managed:    fresh.labels[managedLabel] == "true",
-		reuse:      fresh.labels[reuseLabel] == "true",
-		reuseGroup: fresh.labels[reuseGroupLabel],
+		id:       candidate.id,
+		labels:   fresh.labels,
+		creation: fresh.labels[creationLabel],
+		state:    fresh.state,
 	}
 	if !pruneCandidateEligible(freshCandidate, reuseGroup) || freshCandidate.state != candidate.state || freshCandidate.creation != candidate.creation {
 		return false
@@ -543,12 +539,7 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 	// Compare ownership-bearing labels captured at list time. This catches
 	// a replacement that reuses the name/generation but changes the object
 	// selected by the list query.
-	for _, key := range []string{managedLabel, reuseLabel, reuseGroupLabel, sessionLabel} {
-		if candidate.labels[key] != fresh.labels[key] {
-			return false
-		}
-	}
-	return true
+	return domain.SameOwnershipLabels(candidate.labels, fresh.labels)
 }
 
 func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {

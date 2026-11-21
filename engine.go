@@ -14,8 +14,7 @@ import (
 // imageIdentity is the backend's verified image content identity when one
 // is available. reference is the exact argument that should be passed to
 // run; digest and id record the identities behind that argument. pinned
-// records verified content identity, while mutableAlias marks a reference
-// spelling that Run may execute only through the explicit mutable fallback.
+// records verified content identity.
 //
 // id is intentionally reserved for a verified backend local image ID
 // (currently Docker's Id). A caller-supplied sha256:... value is not an
@@ -47,11 +46,6 @@ type imageIdentity struct {
 	// registry-addressable pull target; the resolver must try its local tag
 	// only as an explicit mutable fallback.
 	appleSynthetic bool
-	// mutableAlias is retained for source compatibility with the internal
-	// identity model. Apple name@digest references are immutable addresses,
-	// so parsers no longer set it; it is reserved for an explicitly
-	// authorized compatibility state.
-	mutableAlias bool
 	// notLocal means the backend returned an image record but could not
 	// prove that the requested platform variant is locally addressable.
 	// It is deliberately distinct from an absent image or an unavailable

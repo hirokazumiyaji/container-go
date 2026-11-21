@@ -69,6 +69,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Build diagnostic value indexes once when first used and share them with
   streams. Streams retain their explicit-value protection when the source
   redactor is closed.
+- Centralize ownership and generation verification in the pure
+  `internal/domain.VerifyOwnership` policy so create verification,
+  failed-create cleanup, reuse adoption and rollback, terminate, and prune
+  share one rule set. A handle-identity check also rejects a generation label
+  that matches the handle but is not a well-formed generation ID; handle
+  generations are validated when created, so this only tightens corrupted
+  inspect responses.
+- Split backend configuration checks into a pure validation core and an
+  imperative runtime probe. Option errors are decided without spawning a
+  backend CLI process; normalization and daemon probes stay in the shell.
+- Remove the never-set `imageIdentity.mutableAlias` field and validate creation
+  and immutable container IDs through `internal/domain`.
 
 
 ## [0.3.0] - 2026-10-26

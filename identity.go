@@ -1,6 +1,10 @@
 package container
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
+)
 
 // immutableIDBackend is an optional backend capability. Docker is the
 // backend that must never fall back to a logical name when its immutable
@@ -20,14 +24,20 @@ func requiresImmutableID(eng engine) bool {
 }
 
 func validCreationID(generation string) bool {
-	return creationRE.MatchString(generation)
+	return domain.IsCreationID(generation)
 }
 
 func validImmutableID(eng engine, id string) bool {
 	if requiresImmutableID(eng) {
-		return dockerIDRE.MatchString(id)
+		return domain.IsImmutableContainerID(id)
 	}
 	return id == ""
+}
+
+// ownershipObserved projects an inspect result onto the pure ownership
+// policy's input. Callers pass a non-nil info.
+func ownershipObserved(info *engineInfo) domain.OwnershipObserved {
+	return domain.OwnershipObserved{UID: info.uid, Labels: info.labels}
 }
 
 // identityError is used when a backend operation cannot prove which
@@ -55,31 +65,55 @@ func verifiedDeleteTarget(eng engine, info *engineInfo, fallback string) (string
 }
 
 // sameContainerIdentity verifies the generation and backend identity of
-// two inspect results. A missing or malformed generation is never treated
-// as a wildcard.
+// two inspect results. A missing or malformed generation or backend identity
+// on either side is never treated as a wildcard. The comparison rule lives in
+// domain.VerifyOwnership; this shell keeps the operation-specific diagnostics.
 func sameContainerIdentity(eng engine, expected, fresh *engineInfo) error {
 	if expected == nil || fresh == nil {
 		return identityError("inspect returned no container identity")
 	}
+	// Verify the expectation before comparing. VerifyOwnership only makes
+	// an empty Creation or UID meaningful when the caller did not request a
+	// specific value, so an empty expected fact would otherwise match any
+	// well-formed observation.
 	expectedGeneration := expected.labels[creationLabel]
-	freshGeneration := fresh.labels[creationLabel]
-	if !validCreationID(expectedGeneration) || !validCreationID(freshGeneration) {
+	if !validCreationID(expectedGeneration) {
 		return identityError("creation generation is missing or invalid")
 	}
-	if expectedGeneration != freshGeneration {
-		return identityError("creation generation changed")
-	}
 	if requiresImmutableID(eng) {
-		if !validImmutableID(eng, expected.uid) || !validImmutableID(eng, fresh.uid) {
+		if !validImmutableID(eng, expected.uid) {
 			return identityError("Docker inspect ID is missing or invalid")
 		}
-		if expected.uid != fresh.uid {
-			return identityError("immutable container ID changed")
-		}
-		return nil
-	}
-	if expected.uid != fresh.uid {
+	} else if expected.uid != "" {
 		return identityError("backend identity changed")
 	}
-	return nil
+	expectedFacts := domain.OwnershipExpected{
+		Creation:        expectedGeneration,
+		RequireCreation: true,
+	}
+	if requiresImmutableID(eng) {
+		expectedFacts.UID = expected.uid
+		expectedFacts.RequireImmutableID = true
+	} else {
+		expectedFacts.RequireNoImmutableID = true
+	}
+	switch domain.VerifyOwnership(expectedFacts, ownershipObserved(fresh)) {
+	case domain.OwnershipFailureNone:
+		return nil
+	case domain.OwnershipFailureCreation:
+		if !validCreationID(fresh.labels[creationLabel]) {
+			return identityError("creation generation is missing or invalid")
+		}
+		return identityError("creation generation changed")
+	case domain.OwnershipFailureIdentity:
+		if requiresImmutableID(eng) {
+			if !validImmutableID(eng, fresh.uid) {
+				return identityError("Docker inspect ID is missing or invalid")
+			}
+			return identityError("immutable container ID changed")
+		}
+		return identityError("backend identity changed")
+	default:
+		return identityError("container identity changed")
+	}
 }

@@ -166,7 +166,7 @@ func TestAppleNameDigestWithTagIsPinned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !ctr.image.pinned || ctr.image.mutableAlias || r.runImage != input {
+	if !ctr.image.pinned || r.runImage != input {
 		t.Fatalf("identity = %+v run=%q, want pinned name:tag@digest", ctr.image, r.runImage)
 	}
 }

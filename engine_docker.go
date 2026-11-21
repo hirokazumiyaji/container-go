@@ -298,10 +298,23 @@ func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, ti
 // an alphanumeric first character followed by at least one name character.
 var dockerVolumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 
-// checkConfig rejects options Docker cannot honor before any image or
-// container command is issued, including volume names and publish
-// options that cannot be honored on the selected network.
+// checkConfig composes the pure option contract with the runtime probes the
+// selected daemon requires. The public behavior is unchanged: validation runs
+// first, so an invalid option never spawns a CLI child process.
 func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
+	if err := e.validateConfig(cfg); err != nil {
+		return err
+	}
+	return e.probeRuntimeEnvironment(ctx, cfg)
+}
+
+// validateConfig rejects options Docker cannot honor before any image or
+// container command is issued, including volume names and publish options that
+// cannot be honored on the selected network.
+//
+// It is the pure core of checkConfig: it reads only cfg, runs no subprocess,
+// and never mutates cfg.
+func (dockerEngine) validateConfig(cfg *config) error {
 	// Docker's local volume driver adds a minimum length to the shared name
 	// grammar. Apple Container accepts names (for example, one-character
 	// names) that Docker rejects, so this check stays backend-specific.
@@ -339,7 +352,18 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 			return dockerPublishOptionError(network, "WithExposedPorts")
 		}
 	}
+	return nil
+}
 
+// probeRuntimeEnvironment resolves the daemon target and rejects options the
+// resolved target cannot honor. This is the imperative shell around `docker
+// context inspect` and `docker network inspect`; it records the resolved
+// engine on cfg.
+func (e dockerEngine) probeRuntimeEnvironment(ctx context.Context, cfg *config) error {
+	network := cfg.network
+	if !cfg.networkExplicit {
+		network = ""
+	}
 	queryCtx := ctx
 	queryCancel := func() {}
 	if cfg.queryTimeout > 0 {
@@ -1277,12 +1301,9 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	return append(args, runCfg.commonRunArgs(image, envFile, extraPublish)...)
 }
 
-// dockerIDRE matches the full container ID `docker run --detach` prints.
-var dockerIDRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
-
 func (dockerEngine) parseRunID(stdout []byte) string {
 	id := strings.TrimSpace(string(stdout))
-	if !dockerIDRE.MatchString(id) {
+	if !domain.IsImmutableContainerID(id) {
 		return ""
 	}
 	return id
@@ -1387,9 +1408,9 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	var malformedID string
 	var malformedIDSeen bool
 	var candidateMissingState bool
-	if dockerIDRE.MatchString(target) {
+	if domain.IsImmutableContainerID(target) {
 		for i, c := range containers {
-			if dockerIDRE.MatchString(c.ID) && c.ID == target {
+			if domain.IsImmutableContainerID(c.ID) && c.ID == target {
 				if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
 					candidateMissingState = true
 					continue
@@ -1407,7 +1428,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 			// not absent: skipping it would report a container that exists
 			// as missing. An empty ID is as invalid as any other
 			// non-canonical one.
-			if !dockerIDRE.MatchString(c.ID) {
+			if !domain.IsImmutableContainerID(c.ID) {
 				if !malformedIDSeen {
 					malformedID = c.ID
 					malformedIDSeen = true
@@ -1831,7 +1852,7 @@ func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
 func parseDockerPruneIDs(data []byte) ([]string, error) {
 	ids := splitNonEmptyLines(data)
 	for _, id := range ids {
-		if !dockerIDRE.MatchString(id) {
+		if !domain.IsImmutableContainerID(id) {
 			return nil, fmt.Errorf("docker ps returned invalid container ID %q", id)
 		}
 	}

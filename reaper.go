@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -411,9 +411,6 @@ func breQuote(s string) string {
 	return b.String()
 }
 
-// creationRE validates the hex generation ID passed to the reaper.
-var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
-
 type reaperEntry struct {
 	id       string
 	creation string
@@ -478,10 +475,10 @@ func newReaper(binary, subcommand string, deleteFlags ...string) *reaper {
 }
 
 func validateReaperEntry(entry reaperEntry) error {
-	if !nameRE.MatchString(entry.id) && !dockerIDRE.MatchString(entry.id) {
+	if !nameRE.MatchString(entry.id) && !domain.IsImmutableContainerID(entry.id) {
 		return fmt.Errorf("reaper: invalid container id %q", entry.id)
 	}
-	if entry.creation != "" && !creationRE.MatchString(entry.creation) {
+	if entry.creation != "" && !domain.IsCreationID(entry.creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", entry.creation)
 	}
 	if entry.pending && entry.creation == "" {
@@ -507,14 +504,14 @@ func (r *reaper) prepareEntry(entry reaperEntry) (reaperEntry, error) {
 	}
 	// A full Docker ID is already immutable; a supplied generation is
 	// redundant and must not turn the entry into a name lookup.
-	if r.subcommand == "rm" && dockerIDRE.MatchString(entry.id) {
+	if r.subcommand == "rm" && domain.IsImmutableContainerID(entry.id) {
 		entry.creation = ""
 		entry.pending = false
 	}
 	// Apple is name-addressed, and Docker may temporarily address a
 	// generation by name before run returns its immutable ID. Both use
 	// the same lock file as Go's generation-checked name operations.
-	if r.subcommand == "delete" || !dockerIDRE.MatchString(entry.id) {
+	if r.subcommand == "delete" || !domain.IsImmutableContainerID(entry.id) {
 		lockPath, err := reaperNameLockPath(entry.id)
 		if err != nil {
 			return reaperEntry{}, fmt.Errorf("reaper: prepare name lock: %w", err)

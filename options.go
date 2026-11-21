@@ -559,10 +559,10 @@ func WithName(name string) Option {
 	}
 }
 
-// WithEnv adds environment variables. On Unix they are passed to the CLI via
-// a per-user 0600 env file so values never appear in the process table. On
-// Windows, Run returns ErrEnvFileUnsupported when this map is non-empty
-// because chmod does not provide per-user file secrecy there.
+// WithEnv adds environment variables. They are passed to the CLI via a
+// temporary env file so values never appear in the process table. On Unix the
+// file is 0600 under a 0700 per-user cache directory; on Windows it is
+// protected by a current-logon-only DACL under %LocalAppData%.
 //
 // Keys must be non-empty valid UTF-8 without '=', Unicode whitespace or
 // control characters, a leading '#', or a leading byte-order mark. Values must

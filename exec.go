@@ -62,8 +62,8 @@ func WithExecMaxBytes(maxBytes int64) ExecOption {
 }
 
 // WithExecEnv sets environment variables for the exec'd process, passed via a
-// temporary env file. It uses the same key and value validation as WithEnv.
-// Exec returns ErrEnvFileUnsupported on Windows.
+// temporary env file. It uses the same key and value validation as WithEnv and
+// the same per-platform secret storage (Unix modes, Windows DACL).
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
 		for _, k := range sortedKeys(env) {

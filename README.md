@@ -27,9 +27,9 @@ The current checkout still has these deliberate constraints:
 
 - Windows has no watchdog reaper: the reaper needs `/bin/sh`. Explicit
   `Terminate`, `Cleanup`, `TerminateContainer`, `Prune`, and the rollback
-  paths remain available there. Operations that need a secret environment file fail with
-  `ErrEnvFileUnsupported` on Windows, and Docker copy-out requires Go 1.26
-  or newer.
+  paths remain available there. `WithEnv` and `WithExecEnv` write the secret
+  env file under a current-logon-only DACL on Windows, and Docker copy-out
+  requires Go 1.26 or newer.
 - Network creation and lifecycle management are out of scope;
   `WithNetwork` attaches an existing network. Volume creation and lifecycle
   management are also out of scope; `WithMounts` accepts bind, named-volume,
@@ -1247,9 +1247,20 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   unmarked, replaced, or contains an unexpected child, cleanup fails closed
   and leaves it for manual inspection and removal. Cleanup failures are
   returned and retried before `Run`, reuse creation, or `Exec` returns.
-- Windows cannot provide the claimed per-user secrecy with Go `chmod`, so
-  `Run`/`Exec` fail with `ErrEnvFileUnsupported` when a non-empty environment
-  map requires an env file. Other Windows operations remain supported.
+- On Windows the env file is stored under `%LocalAppData%\containergo-env-v1`
+  with a protected DACL granted only to the current logon (plus
+  Administrators and LOCAL SYSTEM), the same allowlist used by copy staging.
+  The root, each directory, and every file are revalidated before use and
+  before removal, and reparse points at any component fail closed. `LockFileEx`
+  serializes creation and crash cleanup instead of POSIX advisory locks.
+  Because reparse points in the `%LocalAppData%` ancestors are rejected, a
+  profile redirected through a junction fails closed with `Run`/`Exec` rather
+  than writing the secret through the link. Cleanup removes the env file,
+  marker, and lock file in that order and stops at the first failure, so a
+  transient sharing violation leaves the marker and writer lock in place for
+  the retry. When cleanup gives up (a non-retryable failure or an exhausted
+  budget) the writer lock is released, and the next scan reclaims the
+  directory instead of leaving an unrecoverable one.
 - Env keys must be valid, non-empty UTF-8 without `=`, Unicode whitespace or
   controls, a leading `#`, or a leading BOM. Values must be valid UTF-8
   without Unicode controls, NUL, CR/LF, U+2028, or U+2029. Other non-control

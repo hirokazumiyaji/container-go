@@ -519,7 +519,17 @@ Option を `Run` 間で再利用する必要がある。新しい呼び出しは
 初期化済みディレクトリは age ではなく backend 呼び出し中ずっと保持する書き込み側ロックで生存を判断する。
 不正な marker、置き換えられたディレクトリ、許可されない子がある場合は fail closed とし、利用者が内容を確認して手動で削除する。
 cleanup 失敗は返し、deferred retry する。
-Windows の Go `chmod` は同等の秘密性を保証しないため、env ファイルが要る操作は backend を呼ぶ前に `ErrEnvFileUnsupported` で失敗する。
+Windows は別の基盤を使い、Unix の staging/tombstone の仕組みを持たない。
+ルート、各環境ディレクトリ、各ファイルを現在のログオン(および Administrators と LOCAL SYSTEM)だけに許可した保護 DACL で直接作成し、パス構成要素が reparse point なら fail closed とする。
+root と writer のロックには `LockFileEx` を使う。
+staging 名、tombstone への置き換え、pending cleanup 状態はない。
+所有者は writer lock を保持したまま env ファイルと marker を削除し、`.lock` を最後に削除してから空ディレクトリを削除する。
+stale scan は解放済みの writer lock を所有者の死亡とみなし、DACL、marker、想定される子を再検証してから回収する。
+writer lock が作られる前にクラッシュしたディレクトリは env ファイルを持ち得ず、同じ 24 時間の age gate の後だけ回収する。途中までの marker は削除可能として扱う。
+削除は逐次実行し、最初の失敗で止める。env ファイルの削除が一時的に失敗した場合は marker と writer lock を残す。
+所有者は再試行中も writer lock を保持し、再試行を諦めた時点(再試行不可の失敗、または有界の再試行予算の使い切り)で lock を解放する。ディレクトリは通常の形(env ファイルが残る場合は有効な marker もある)のままなので、同一プロセスでも別プロセスでも次の scan が回収できる。
+scan 側は一時的な失敗を skip して次回の scan に回す。
+cleanup は一時的な sharing violation / access denied を有界の指数バックオフで再試行する。
 
 **入力を検証する**。
 コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、コピー対象のパスは `/` 区切りの POSIX 絶対パスでバックスラッシュを含まず、有効な UTF-8 であることを、CLI へ渡す前に検証する。環境変数キーは空でない有効な UTF-8 で、`=`、Unicode 空白、制御文字、先頭 `#`、先頭 BOM を含まない。値は有効な UTF-8 で、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029 を含まない。制御文字でない Unicode、空白、`=` は値として許可する。制御文字(タブを含む)や不正な UTF-8 を、バックエンドが受け付ける場合でも行区切り env ファイルへ書かないという意図的な互換性変更である。CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。 `appleEngine.checkConfig` は image 解決前に platform、name、network、memory、publish の backend 固有制約も適用し、公開 `Pull` も同じ検証を通る。
@@ -628,7 +638,7 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。reuse は readiness 後の再 inspect で置き換えを検出し、handle を返さない。
 - `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、分類用の有界な末尾 stderr ウィンドウを保持する（描画時の診断は秘匿化され 64KiB 上限）。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
 - `ErrContainerNotFound` と `ErrGenerationReplaced` も現在の開発版追加である。
-- `ErrEnvFileUnsupported`：空でない環境変数指定には安全な env ファイルが必要だが、現在のプラットフォームではユーザー単位の秘密性を確保できない
+- `ErrEnvFileUnsupported`：API 互換のために残している。安全な env ファイルはすべての対応プラットフォームで利用できるため、現在は返さない
 - `ErrCopyFileNotRegular`：Docker の copy-out 結果が regular file でない
 - `ErrCopyFileFromContainerUnsupported`：選択した backend または host が型安全な copy-out を実装していない(Apple Container、Docker client/server が 29.7.0 未満、必要な open flag がない host、または Windows Go 1.23 から 1.25)
 - `ErrInvalidConfig` / `*ConfigError`：作成前に拒否した backend 非互換の option 組み合わせ

@@ -1008,9 +1008,28 @@ whole backend call bound crash cleanup. A staging directory becomes
 eligible for cleanup after 24 hours. Marker-before-lock and tombstoned
 partial-removal states are self-healing, while an unmarked, replaced, or
 unexpected entry fails closed and requires manual inspection. Cleanup
-errors are returned and retried. Windows has no equivalent secrecy
-guarantee through Go `chmod`, so operations requiring an env file return
-`ErrEnvFileUnsupported` before invoking the backend.
+errors are returned and retried. Windows uses different primitives and
+does not share the Unix staging/tombstone machinery. The root, every
+environment directory, and every file are created directly with a
+protected DACL granted only to the current logon (plus Administrators and
+LOCAL SYSTEM), every component is rejected if it is a reparse point, and
+`LockFileEx` provides the root and writer locks. There is no staging name,
+no tombstone hand-off, and no pending-cleanup state: the owner removes the
+env file and marker while still holding the writer lock, deletes the lock
+file last, and only then removes the empty directory. A stale scan treats
+a free writer lock as a dead owner, revalidates the DACL, marker, and
+expected children, and reclaims the directory while holding that lock.
+Directories that never got a writer lock (a crash during creation) cannot
+contain the env file and are reclaimed only after the same 24-hour age
+gate; a partially written marker is treated as removable. Removal is
+sequential and stops at the first failure, so a transient failure on the
+env file leaves the marker and writer lock in place. The owner keeps that
+writer lock across retries and releases it when cleanup gives up (a
+non-retryable failure or an exhausted budget), leaving the directory in
+its normal shape (a valid marker whenever the env file remains) for the
+next scan in this or another process. A scan that hits a transient failure skips the entry for a later
+scan instead of failing the Run. Cleanup retries transient sharing and
+access violations with a bounded exponential backoff.
 
 **Validate inputs**. Container names (name rule above), label keys
 (the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
@@ -1260,8 +1279,9 @@ and cancellation paths.
   not let `container run` perform an implicit fetch
 - `ErrImageIdentityMismatch`: inspect returned an identity for a
   different image; the mutable-tag fallback is not used
-- `ErrEnvFileUnsupported`: a non-empty environment map needs a secure env
-  file, but the current platform cannot provide per-user secrecy
+- `ErrEnvFileUnsupported`: retained for API compatibility; secure env
+  files are now available on every supported platform, so it is no longer
+  returned
 - `ErrCopyFileNotRegular`: a Docker copy-out destination is not a regular
   file
 - `ErrCopyFileFromContainerUnsupported`: the selected backend or host

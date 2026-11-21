@@ -72,7 +72,7 @@ func TestWindowsCopyStagingRejectsForeignDirectoryOwner(t *testing.T) {
 		)
 	})
 
-	if err := ensureWindowsPrivateCopyStagingDir(dir, false); err == nil {
+	if err := ensureWindowsPrivateDir(dir, false); err == nil {
 		t.Fatal("foreign-owned staging directory was accepted")
 	}
 }

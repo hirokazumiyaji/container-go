@@ -403,9 +403,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 	applyEngineBinary(cfg)
 	applyEngineRunnerEnv(cfg)
-	// Reject Windows before the backend is asked anything: Docker context
-	// resolution runs the CLI, and chmod's 0600/0700 bits do not provide
-	// per-user secrecy there.
+	// Fail closed before the backend is asked anything if this platform
+	// cannot store the secret environment file the run will need.
 	if len(cfg.env) > 0 {
 		if err := ensureEnvFileSecurity(); err != nil {
 			return nil, err

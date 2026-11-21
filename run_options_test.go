@@ -33,8 +33,11 @@ func TestWithShmSizeValidation(t *testing.T) {
 			if err := WithShmSize(size)(cfg); err != nil {
 				t.Fatalf("WithShmSize(%q): %v", size, err)
 			}
-			if cfg.shmSize != size {
-				t.Fatalf("shmSize = %q, want %q", cfg.shmSize, size)
+			if got := cfg.shmSize.String(); got != size {
+				t.Fatalf("shmSize = %q, want %q", got, size)
+			}
+			if cfg.shmSize.Bytes() == 0 {
+				t.Fatalf("shmSize(%q) parsed to zero bytes", size)
 			}
 		})
 	}

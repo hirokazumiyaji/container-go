@@ -14,6 +14,17 @@ import (
 
 var defaultReuseFingerprint = newConfig().reuseConfigHash()
 
+// testByteSize parses a size for a config the test builds directly instead of
+// through the public option.
+func testByteSize(t *testing.T, size string) domain.ByteSize {
+	t.Helper()
+	parsed, err := domain.ParseByteSize(size)
+	if err != nil {
+		t.Fatalf("ParseByteSize(%q): %v", size, err)
+	}
+	return parsed
+}
+
 func TestReuseConfigurationCompatibility(t *testing.T) {
 	options := map[string]Option{
 		"memory": WithMemory("512M"), "user": WithUser("1000"),
@@ -115,9 +126,39 @@ func TestReuseFlightKeyIncludesImage(t *testing.T) {
 	}
 }
 
+// Equivalent shm-size spellings must share one flight; otherwise callers that
+// ask for the same /dev/shm race separate creates instead of joining the
+// leader even though the configuration fingerprint already treats them as
+// equal.
+func TestReuseFlightKeyCanonicalizesShmSize(t *testing.T) {
+	first, second := newConfig(), newConfig()
+	for _, cfg := range []*config{first, second} {
+		cfg.eng = dockerEngine{}
+		cfg.name = "shared"
+	}
+	if err := WithShmSize("64M")(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := WithShmSize("67108864")(second); err != nil {
+		t.Fatal(err)
+	}
+	if first.reuseConfigHash() != second.reuseConfigHash() {
+		t.Fatal("equivalent shm sizes have different configuration fingerprints")
+	}
+	if reuseFlightKey(first, "image") != reuseFlightKey(second, "image") {
+		t.Fatal("equivalent shm sizes have different flight keys")
+	}
+	if err := WithShmSize("128M")(second); err != nil {
+		t.Fatal(err)
+	}
+	if reuseFlightKey(first, "image") == reuseFlightKey(second, "image") {
+		t.Fatal("different shm sizes share a flight key")
+	}
+}
+
 func TestReuseConfigurationCanonicalization(t *testing.T) {
 	first, second := newConfig(), newConfig()
-	first.memory, second.memory = "512M", "536870912"
+	first.memory, second.memory = testByteSize(t, "512M"), testByteSize(t, "536870912")
 	first.cmd, second.cmd = []string{"ab", "c"}, []string{"a", "bc"}
 	if first.reuseConfigHash() == second.reuseConfigHash() {
 		t.Fatal("different argument boundaries share a fingerprint")
@@ -179,7 +220,7 @@ func TestReuseMismatchPrecedesPortPolling(t *testing.T) {
 	cfg := newConfig()
 	cfg.eng = dockerEngine{}
 	cfg.name = "shared"
-	cfg.memory = "512M"
+	cfg.memory = testByteSize(t, "512M")
 	if err := WithExposedPorts("80")(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +425,7 @@ func TestReuseIdentityFailuresAreNotConfigurationMismatches(t *testing.T) {
 	}
 	cfg := newConfig()
 	cfg.eng = backend.eng
-	cfg.memory = "512M"
+	cfg.memory = testByteSize(t, "512M")
 	err = checkReuseCompat(info, "redis:7-alpine", cfg)
 	if !errors.Is(err, ErrReuseMismatch) || strings.Count(err.Error(), ErrReuseMismatch.Error()) != 1 {
 		t.Fatalf("got %v, want one mismatch prefix", err)

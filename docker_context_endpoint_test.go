@@ -315,7 +315,7 @@ func TestRemoteContextDoesNotReturnLoopbackEndpoint(t *testing.T) {
 		runner:     f,
 		eng:        cfg.eng,
 		targetHost: cfg.eng.defaultHost(),
-		exposed:    []portSpec{{port: 8080, proto: "tcp"}},
+		exposed:    []portSpec{{Port: 8080, Proto: "tcp"}},
 		sync:       &lockPack{uid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	}
 

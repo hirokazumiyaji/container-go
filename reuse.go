@@ -124,7 +124,7 @@ func reuseFlightKey(cfg *config, image string) string {
 		ports = append(ports, "expose="+port.String())
 	}
 	for _, port := range cfg.published {
-		ports = append(ports, fmt.Sprintf("publish=%s:%d:%d/%s", port.hostAddr, port.hostPort, port.containerPort, port.proto))
+		ports = append(ports, fmt.Sprintf("publish=%s:%d:%d/%s", port.HostIP(), port.HostPort, port.ContainerPort, port.Proto))
 	}
 	sort.Strings(ports)
 	parts = append(parts, ports...)
@@ -142,8 +142,10 @@ func (c *config) runOptionsKey() string {
 	if c.cpus > 0 {
 		parts = append(parts, "cpus="+formatCPUs(c.cpus))
 	}
-	if c.shmSize != "" {
-		parts = append(parts, "shm-size="+c.shmSize)
+	if !c.shmSize.IsZero() {
+		// Hash the normalized byte count so equivalent spellings such as
+		// "64M" and "67108864" share one flight.
+		parts = append(parts, "shm-size="+strconv.FormatUint(c.shmSize.Bytes(), 10))
 	}
 	if c.privileged {
 		parts = append(parts, "privileged")
@@ -1140,12 +1142,12 @@ func checkReusePortCompat(info *engineInfo, cfg *config) error {
 		b, ok := matchingPublishedBinding(info.bound, p, cfg.eng)
 		if !ok {
 			if cfg.eng.directIP() {
-				return fmt.Errorf("%w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, cfg.name, p.raw)
+				return fmt.Errorf("%w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, cfg.name, p.Raw)
 			}
-			return fmt.Errorf("%w: %w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, errReusePortPending, cfg.name, p.raw)
+			return fmt.Errorf("%w: %w: reuse %s: published port %s missing on existing container", ErrReuseMismatch, errReusePortPending, cfg.name, p.Raw)
 		}
 		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
-			return fmt.Errorf("%w: reuse %s: published port %s: %w", ErrReuseMismatch, cfg.name, p.raw, err)
+			return fmt.Errorf("%w: reuse %s: published port %s: %w", ErrReuseMismatch, cfg.name, p.Raw, err)
 		}
 	}
 	return nil
@@ -1174,13 +1176,9 @@ func checkReuseRunOptions(info *engineInfo, cfg *config) error {
 			return fmt.Errorf("cpus %s does not match the existing container's %s", formatCPUs(cfg.cpus), formatCPUs(reported.cpus))
 		}
 	}
-	if cfg.shmSize != "" {
-		want, err := parseSizeBytes("WithShmSize", "shm", cfg.shmSize)
-		if err != nil {
-			return err
-		}
-		if !reported.shmSizeReported || reported.shmSizeBytes != want {
-			return fmt.Errorf("shm size %q does not match the existing container", cfg.shmSize)
+	if !cfg.shmSize.IsZero() {
+		if !reported.shmSizeReported || reported.shmSizeBytes != cfg.shmSize.Bytes() {
+			return fmt.Errorf("shm size %q does not match the existing container", cfg.shmSize.String())
 		}
 	}
 	if reported.privileged != cfg.privileged {
@@ -1374,7 +1372,7 @@ func matchingExposedBinding(bound []boundPort, spec portSpec, eng engine) (bound
 	foundLoopback := false
 	remote := eng != nil && eng.isRemote()
 	for _, b := range bound {
-		if b.containerPort != spec.port || b.proto != spec.proto || b.hostPort <= 0 {
+		if b.containerPort != spec.Port || b.proto != spec.Proto || b.hostPort <= 0 {
 			continue
 		}
 		if remote && ipIsLoopback(b.hostAddr) {
@@ -1391,13 +1389,13 @@ func matchingPublishedBinding(bound []boundPort, p publishSpec, eng engine) (bou
 	foundLoopback := false
 	remote := eng != nil && eng.isRemote()
 	for _, b := range bound {
-		if b.containerPort != p.containerPort || b.proto != p.proto || b.hostPort <= 0 {
+		if b.containerPort != p.ContainerPort || b.proto != p.Proto || b.hostPort <= 0 {
 			continue
 		}
-		if p.hostPort != 0 && b.hostPort != p.hostPort {
+		if p.HostPort != 0 && b.hostPort != p.HostPort {
 			continue
 		}
-		if p.hostAddr != "" && canonicalIP(b.hostAddr) != p.hostAddr {
+		if p.HostIP() != "" && canonicalIP(b.hostAddr) != p.HostIP() {
 			continue
 		}
 		if remote && ipIsLoopback(b.hostAddr) {
@@ -1605,7 +1603,6 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 }
 
 func (c *config) reuseConfigHash() string {
-	memory, _ := parseSizeBytes("WithMemory", "memory", c.memory)
 	mounts := make([]string, 0, len(c.mounts))
 	for _, mount := range c.mounts {
 		data, _ := json.Marshal(mount)
@@ -1628,7 +1625,7 @@ func (c *config) reuseConfigHash() string {
 		Cmd        []string          `json:",omitempty"`
 		Mounts     []string          `json:",omitempty"`
 		Labels     map[string]string `json:",omitempty"`
-	}{memory, strconv.Quote(c.user), strconv.Quote(c.workdir), strconv.Quote(c.entrypoint), cmd, mounts, labels}
+	}{c.memory.Bytes(), strconv.Quote(c.user), strconv.Quote(c.workdir), strconv.Quote(c.entrypoint), cmd, mounts, labels}
 	data, _ := json.Marshal(value)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }

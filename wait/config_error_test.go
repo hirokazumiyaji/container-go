@@ -83,7 +83,7 @@ func TestAllConfigErrorsShareSentinel(t *testing.T) {
 	}
 }
 
-// The port grammar is shared with the root package through internal/portspec,
+// The port grammar is shared with the root package through internal/domain,
 // so the two cannot drift. A spec the root parser accepts must be accepted
 // here, and one it rejects must be rejected here too.
 func TestPortSpecGrammarMatchesSharedParser(t *testing.T) {

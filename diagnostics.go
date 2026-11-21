@@ -30,7 +30,7 @@ func (c *config) diagnosticValues() []string {
 		values = append(values, exposed.String())
 	}
 	for _, published := range c.published {
-		values = append(values, published.raw)
+		values = append(values, published.Raw)
 	}
 	if c.dockerHost != nil {
 		values = append(values, *c.dockerHost)
@@ -129,7 +129,7 @@ func (c *Container) diagnosticRedactor(extra ...string) *cli.Redactor {
 		values = append(values, exposed.String())
 	}
 	for _, published := range c.published {
-		values = append(values, published.raw)
+		values = append(values, published.Raw)
 	}
 	values = append(values, extra...)
 	if len(values) > 0 {

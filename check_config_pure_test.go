@@ -90,7 +90,7 @@ func TestDockerValidateConfigRejectsBeforeRuntimeProbe(t *testing.T) {
 		},
 		{
 			name:    "host network cannot publish ports",
-			cfg:     &config{network: dockerNetworkHost, networkExplicit: true, published: []publishSpec{{raw: "127.0.0.1:8080:80"}}},
+			cfg:     &config{network: dockerNetworkHost, networkExplicit: true, published: []publishSpec{{Raw: "127.0.0.1:8080:80"}}},
 			wantErr: "host",
 		},
 	}

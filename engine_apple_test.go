@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -267,25 +268,17 @@ func TestAppleCheckConfigMemory(t *testing.T) {
 		}
 	}
 
-	// WithMemory already rejects zero and overflow, so set the field
-	// directly to prove the Apple check does not depend on option order.
-	for _, size := range []string{"1K", "199M", "0M", "0", "9223372036854775807P", "999999999999999999999P"} {
-		cfg := appleCapabilityConfig(t)
-		cfg.memory = size
+	// WithMemory already rejects zero, overflow, and malformed sizes and
+	// stores a parsed domain.ByteSize, so the backend check only enforces
+	// Apple's own minimum.
+	if err := (appleEngine{}).checkConfig(context.Background(), appleCapabilityConfig(t)); err != nil {
+		t.Errorf("unset memory: %v", err)
+	}
+	for _, size := range []string{"1K", "199M"} {
+		cfg := appleCapabilityConfig(t, WithMemory(size))
 		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil {
 			t.Errorf("memory %q: want Apple memory validation error", size)
 		}
-	}
-	for _, size := range []string{
-		"18446744073709551615",
-		"18014398509481983K",
-	} {
-		if _, err := appleMemoryBytes(size); err == nil || !strings.Contains(err.Error(), "overflow") {
-			t.Errorf("memory %q: got %v, want overflow error", size, err)
-		}
-	}
-	if _, err := appleMemoryBytes("18446744073709551616"); err == nil || !strings.Contains(err.Error(), "overflow") {
-		t.Fatalf("byte overflow = %v, want overflow error", err)
 	}
 }
 
@@ -364,7 +357,7 @@ func TestAppleCheckConfigErrorsAreStructured(t *testing.T) {
 			// backend-specific check.
 			{name: "network properties", option: "WithNetwork", mutate: func(cfg *config) { cfg.network = "default,mac=02:42:ac:11:00:02" }},
 			{name: "published port", option: "WithPublishedPort", opts: []Option{WithPublishedPort("1:80")}},
-			{name: "memory", option: "WithMemory", mutate: func(cfg *config) { cfg.memory = "1K" }},
+			{name: "memory", option: "WithMemory", mutate: func(cfg *config) { size, _ := domain.ParseByteSize("1K"); cfg.memory = size }},
 			{name: "platform", option: "WithPlatform", opts: []Option{WithPlatform("windows/amd64")}},
 		}
 		for _, tt := range tests {

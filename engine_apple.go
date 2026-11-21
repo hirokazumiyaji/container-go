@@ -3,7 +3,6 @@ package container
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -51,11 +50,7 @@ const (
 // them here makes a bad request fail before any image fetch or container
 // create is attempted.
 const (
-	appleMinMemoryBytes uint64 = 200 * 1024 * 1024
-	// Apple parses the input as a Double, converts to MiB, narrows to Int64,
-	// then multiplies by 1 MiB into UInt64. MaxInt64 bytes is a conservative
-	// bound that leaves room for floating-point rounding in that path.
-	appleMaxMemoryBytes     uint64 = 1<<63 - 1
+	appleMinMemoryBytes     uint64 = 200 * 1024 * 1024
 	applePublishedPortLimit        = 64
 )
 
@@ -165,26 +160,25 @@ func (appleEngine) validateConfig(cfg *config, explicitPlatform bool) error {
 	}
 	seenPublished := make(map[string]struct{}, len(cfg.published))
 	for _, p := range cfg.published {
-		if p.hostPort <= 1 || p.containerPort <= 1 {
-			return appleValidationError("WithPublishedPort", p.raw,
-				"apple backend requires published ports to be 2-65535, got %q", p.raw)
+		if p.HostPort <= 1 || p.ContainerPort <= 1 {
+			return appleValidationError("WithPublishedPort", p.Raw,
+				"apple backend requires published ports to be 2-65535, got %q", p.Raw)
 		}
 		// Match Apple Container's PublishPort.hasOverlaps key:
 		// "\(hostPort)/\(proto)" without hostAddress. Distinct bind
 		// addresses on the same host port and protocol still overlap
 		// upstream, so include them here before the CLI is called.
-		key := fmt.Sprintf("%d/%s", p.hostPort, p.proto)
+		key := fmt.Sprintf("%d/%s", p.HostPort, p.Proto)
 		if _, exists := seenPublished[key]; exists {
-			return appleValidationError("WithPublishedPort", p.raw,
-				"apple backend published-port descriptors overlap at %q", p.raw)
+			return appleValidationError("WithPublishedPort", p.Raw,
+				"apple backend published-port descriptors overlap at %q", p.Raw)
 		}
 		seenPublished[key] = struct{}{}
 	}
 
-	if cfg.memory != "" {
-		if _, err := appleMemoryBytes(cfg.memory); err != nil {
-			return appleValidationError("WithMemory", cfg.memory, "%v", err)
-		}
+	if !cfg.memory.IsZero() && cfg.memory.Bytes() < appleMinMemoryBytes {
+		return appleValidationError("WithMemory", cfg.memory.String(),
+			"apple backend requires at least 200 MiB of memory, got %q", cfg.memory.String())
 	}
 	return nil
 }
@@ -204,54 +198,6 @@ func appleValidationError(option string, value any, format string, args ...any) 
 func appleCapabilityError(sentinel error, option, field string, value any, format string, args ...any) error {
 	validationErr := newValidationErrorWithField(option, field, value, fmt.Errorf(format, args...))
 	return fmt.Errorf("%w: %w", sentinel, validationErr)
-}
-
-// appleMemoryBytes parses the integer/unit form accepted by WithMemory and
-// applies the limits used by Apple Container's run/create path. Apple parses
-// the numeric value as a Swift Double, converts it to MiB, narrows it to
-// Int64, and multiplies by 1 MiB into UInt64. The API server requires at least
-// 200 MiB. Use MaxInt64 bytes as a conservative upper bound so values that
-// could round across the final UInt64 conversion are rejected before reaching
-// the CLI.
-func appleMemoryBytes(size string) (uint64, error) {
-	if !memoryRE.MatchString(size) {
-		return 0, fmt.Errorf("invalid Apple memory size %q: use an integer with an optional K, M, G, T, or P suffix", size)
-	}
-
-	digits := size
-	multiplier := uint64(1)
-	// memoryRE has already restricted the optional suffix to K/M/G/T/P.
-	if last := size[len(size)-1]; last < '0' || last > '9' {
-		digits = size[:len(size)-1]
-		switch last {
-		case 'K':
-			multiplier = 1 << 10
-		case 'M':
-			multiplier = 1 << 20
-		case 'G':
-			multiplier = 1 << 30
-		case 'T':
-			multiplier = 1 << 40
-		case 'P':
-			multiplier = 1 << 50
-		}
-	}
-
-	n, err := strconv.ParseUint(digits, 10, 64)
-	if err != nil {
-		if errors.Is(err, strconv.ErrRange) {
-			return 0, fmt.Errorf("apple memory size %q overflows the supported 64-bit range", size)
-		}
-		return 0, fmt.Errorf("invalid Apple memory size %q: %w", size, err)
-	}
-	if n > appleMaxMemoryBytes/multiplier {
-		return 0, fmt.Errorf("apple memory size %q overflows the supported 64-bit range", size)
-	}
-	bytes := n * multiplier
-	if bytes < appleMinMemoryBytes {
-		return 0, fmt.Errorf("apple backend requires at least 200 MiB of memory, got %q", size)
-	}
-	return bytes, nil
 }
 
 // canonicalizeApplePlatformSelector makes the default variant explicit

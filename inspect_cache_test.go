@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -110,7 +111,7 @@ func TestCachedInfoKeepsOnlyImmutableIdentity(t *testing.T) {
 		dockerInspectWithPort("49153"),
 		dockerInspectWithPort("49154"),
 	}
-	ctr := testDockerContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 
 	info, err := ctr.cachedInfo(context.Background())
 	if err != nil {
@@ -188,7 +189,7 @@ func TestAppleEndpointRefreshesChangedInspectResponse(t *testing.T) {
 		appleInspectWithIdentity("192.0.2.1/24", testAppleCreationA),
 		appleInspectWithIdentity("192.0.2.2/24", testAppleCreationA),
 	}
-	ctr := testAppleContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testAppleContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 	clock := installDynamicClock(ctr)
 
 	first, err := ctr.Endpoint(context.Background(), "6379/tcp")
@@ -214,7 +215,7 @@ func TestEndpointRefreshesChangedInspectResponse(t *testing.T) {
 		dockerInspectWithPort("49153"),
 		dockerInspectWithPort("49154"),
 	}
-	ctr := testDockerContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 	clock := installDynamicClock(ctr)
 
 	first, err := ctr.Endpoint(context.Background(), "6379/tcp")
@@ -240,7 +241,7 @@ func TestEndpointRetriesEmptyInitialBinding(t *testing.T) {
 		dockerInspectWithPort(""),
 		dockerInspectWithPort("49155"),
 	}
-	ctr := testDockerContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint succeeded without a host binding")
@@ -263,7 +264,7 @@ func TestEndpointReusesDynamicInspectWithinTTL(t *testing.T) {
 		dockerInspectWithPort("49153"),
 		dockerInspectWithPort("49154"),
 	}
-	ctr := testDockerContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 	clock := installDynamicClock(ctr)
 
 	first, err := ctr.Endpoint(context.Background(), "6379/tcp")
@@ -301,7 +302,7 @@ func TestConcurrentEndpointRefreshDoesNotReuseStaleSnapshot(t *testing.T) {
 		release:    release,
 		count:      &inspectN,
 	}
-	ctr := testDockerContainer(base, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(base, portSpec{Port: 6379, Proto: "tcp"})
 	ctr.runner = runner
 
 	errCh := make(chan error, 2)
@@ -370,7 +371,7 @@ func TestClearDynamicDropsInFlightRefresh(t *testing.T) {
 		release:    release,
 		count:      &inspectN,
 	}
-	ctr := testDockerContainer(base, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(base, portSpec{Port: 6379, Proto: "tcp"})
 	ctr.runner = runner
 
 	errCh := make(chan error, 1)
@@ -405,7 +406,7 @@ func TestEndpointReinspectsAfterDynamicTTL(t *testing.T) {
 		dockerInspectWithPort("49153"),
 		dockerInspectWithPort("49154"),
 	}
-	ctr := testDockerContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 	clock := installDynamicClock(ctr)
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
@@ -430,7 +431,7 @@ func TestStateBypassesDynamicInspectTTL(t *testing.T) {
 		dockerInspectWithPort("49153"),
 		dockerInspectWithPort("49154"),
 	}
-	ctr := testDockerContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 	_ = installDynamicClock(ctr)
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
@@ -447,7 +448,7 @@ func TestStateBypassesDynamicInspectTTL(t *testing.T) {
 func TestCanceledContextSkipsDynamicCache(t *testing.T) {
 	runner := newTestRunner()
 	runner.inspectResponses = []string{dockerInspectWithPort("49153")}
-	ctr := testDockerContainer(runner, portSpec{port: 6379, proto: "tcp"})
+	ctr := testDockerContainer(runner, portSpec{Port: 6379, Proto: "tcp"})
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
@@ -468,10 +469,10 @@ func explicitAppleContainer(r *fakeRunner) *Container {
 		eng:      appleEngine{},
 		creation: testAppleCreationA,
 		published: []publishSpec{{
-			hostAddr:      "127.0.0.1",
-			hostPort:      16379,
-			containerPort: 6379,
-			proto:         "tcp",
+			HostAddr:      netip.MustParseAddr("127.0.0.1"),
+			HostPort:      16379,
+			ContainerPort: 6379,
+			Proto:         "tcp",
 		}},
 	}
 }
@@ -553,10 +554,10 @@ func TestExplicitPublishedResolutionRejectsUIDMismatch(t *testing.T) {
 		eng:    dockerEngine{},
 		sync:   &lockPack{uid: uidA},
 		published: []publishSpec{{
-			hostAddr:      "127.0.0.1",
-			hostPort:      16379,
-			containerPort: 6379,
-			proto:         "tcp",
+			HostAddr:      netip.MustParseAddr("127.0.0.1"),
+			HostPort:      16379,
+			ContainerPort: 6379,
+			Proto:         "tcp",
 		}},
 	}
 

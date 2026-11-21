@@ -173,7 +173,7 @@ func TestEndpointNotDriftingOnEnvChange(t *testing.T) {
 		runner:     client.runner,
 		targetHost: client.eng.defaultHost(),
 		sync:       &lockPack{uid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-		exposed:    []portSpec{{proto: "tcp", port: 6379}},
+		exposed:    []portSpec{{Proto: "tcp", Port: 6379}},
 	}
 
 	ctx := context.Background()

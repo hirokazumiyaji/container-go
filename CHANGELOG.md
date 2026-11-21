@@ -252,6 +252,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hard-coding Docker or Apple, so string-matched diagnostics can change; the
   duplicated CLI argv builders, pull/prune runner selection, and probe
   unavailability classification are shared.
+- Separate the engine target scope into an `engineTarget` sub-interface returned
+  by `engine.target()`. Docker implements it; Apple Container has no externally
+  addressable target and returns nil, so shared code expresses the unsupported
+  target by a type check instead of eleven no-op methods. The internal refactor
+  leaves the public API unchanged.
 
 - **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
   an exit code. `ExitCode` also rejects containers that have not stopped. Callers

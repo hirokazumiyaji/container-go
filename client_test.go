@@ -1126,7 +1126,7 @@ func TestPinRunnerTargetEnvAnchorsPruneRunner(t *testing.T) {
 	eng := newDockerEngine("tcp://daemon-a:2375", "", "", "")
 	runner := &cli.ExecRunner{Binary: "docker"}
 
-	pinned, ok := pinRunnerTargetEnv(eng, runner).(*cli.ExecRunner)
+	pinned, ok := pinRunnerTargetEnv(eng.target(), runner).(*cli.ExecRunner)
 	if !ok {
 		t.Fatal("pinRunnerTargetEnv did not return an ExecRunner")
 	}
@@ -1141,6 +1141,40 @@ func TestPinRunnerTargetEnvAnchorsPruneRunner(t *testing.T) {
 	}
 	if len(runner.Env) != 0 {
 		t.Fatalf("pinRunnerTargetEnv mutated the caller runner: %q", runner.Env)
+	}
+}
+
+func TestPinRunnerTargetEnvWithoutTargetKeepsRunner(t *testing.T) {
+	runner := &cli.ExecRunner{Binary: "docker", Env: []string{"DOCKER_HOST=tcp://ambient:2375"}}
+
+	pinned, ok := pinRunnerTargetEnv(nil, runner).(*cli.ExecRunner)
+	if !ok || pinned != runner {
+		t.Fatalf("pinRunnerTargetEnv(nil) = %v, want the same runner", pinned)
+	}
+	if len(runner.Env) != 1 || runner.Env[0] != "DOCKER_HOST=tcp://ambient:2375" {
+		t.Fatalf("pinRunnerTargetEnv(nil) changed the runner environment: %q", runner.Env)
+	}
+}
+
+func TestClientTargetDiagnosticValuesRequiresTargetScope(t *testing.T) {
+	cfg := &clientConfig{}
+	runner := &cli.ExecRunner{Binary: "docker", Env: []string{"DOCKER_HOST=tcp://runner-secret:2375"}}
+	const secret = "tcp://runner-secret:2375"
+
+	if got := cfg.targetDiagnosticValues(nil, runner); len(got) != 0 {
+		t.Fatalf("targetDiagnosticValues(nil) = %q, want none", got)
+	}
+
+	// A backend with a target scope registers the runner's own DOCKER_*
+	// values so a failed resolution can quote them.
+	found := false
+	for _, value := range cfg.targetDiagnosticValues((dockerEngine{}).target(), runner) {
+		if value == secret {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("targetDiagnosticValues with a target did not include the runner's DOCKER_HOST")
 	}
 }
 

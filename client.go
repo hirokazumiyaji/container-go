@@ -54,25 +54,26 @@ func (c *clientConfig) diagnosticValues() []string {
 
 // targetDiagnosticValues adds the target an engine resolved from the
 // environment to the option values, mirroring config.diagnosticValues for
-// Client.Run. Environment values did not pass option validation, so skip any
-// value the bounded streaming window cannot redact.
-func (c *clientConfig) targetDiagnosticValues(eng engine, runner cli.Runner) []string {
+// Client.Run. A nil target contributes nothing beyond the options.
+// Environment values did not pass option validation, so skip any value the
+// bounded streaming window cannot redact.
+func (c *clientConfig) targetDiagnosticValues(target engineTarget, runner cli.Runner) []string {
 	values := c.diagnosticValues()
-	for _, value := range []string{eng.targetHost(), eng.targetContext(), eng.targetConfigDir()} {
+	if target == nil {
+		return uniqueStrings(values)
+	}
+	for _, value := range []string{target.targetHost(), target.targetContext(), target.targetConfigDir()} {
 		if value != "" {
 			values = append(values, value)
 		}
-	}
-	if !eng.capabilities().daemonTarget {
-		return uniqueStrings(values)
 	}
 	// A caller-supplied runner can set the target in its own environment,
 	// which the engine does not see until resolveTarget runs. Register those
 	// values too: a failed resolution quotes them before a resolved engine
 	// exists.
 	//
-	// This deliberately differs from engine.runnerDiagnosticValues, which the
-	// prune redactor uses: a Client construction error may quote the literal
+	// This deliberately differs from engineTarget.runnerDiagnosticValues, which
+	// the prune redactor uses: a Client construction error may quote the literal
 	// "default" context before resolution, so keep it here, while prune drops
 	// that common word to avoid redacting unrelated diagnostics.
 	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"} {
@@ -237,7 +238,7 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 	}
 
 	dockerOptionsSet := cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil || cfg.platform != nil
-	if dockerOptionsSet && !eng.capabilities().daemonTarget {
+	if dockerOptionsSet && eng.target() == nil {
 		return nil, validationErrorf(cfg.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
 	eng = configuredTarget(eng, engineTargetOverride{
@@ -255,7 +256,7 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 
 	runner := cfg.runner
 	if runner == nil {
-		runner = &cli.ExecRunner{Binary: binary, Env: eng.pinnedTargetEnv()}
+		runner = &cli.ExecRunner{Binary: binary, Env: targetPinnedEnv(eng)}
 	} else if er, ok := runner.(*cli.ExecRunner); ok {
 		cloned := &cli.ExecRunner{
 			Binary: er.Binary,
@@ -264,10 +265,7 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 		if cloned.Binary == "" {
 			cloned.Binary = binary
 		}
-		if targetEnv := eng.pinnedTargetEnv(); len(targetEnv) > 0 {
-			cloned.Env = pinRunnerEnv(cloned.Env, targetEnv)
-		}
-		runner = cloned
+		runner = pinRunnerTargetEnv(eng.target(), cloned)
 	}
 
 	queryCtx := ctx
@@ -282,25 +280,18 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 		// Caller cancellation and explicitly configured query budgets are
 		// terminal; implicit target discovery remains best-effort by default.
 		if ctx.Err() != nil || cfg.queryTimeout > 0 && queryErr != nil {
-			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng, runner)...)
+			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng.target(), runner)...)
 		}
-		if eng.targetContext() != "" || eng.targetHost() != "" {
-			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng, runner)...)
+		if target := eng.target(); target != nil && (target.targetContext() != "" || target.targetHost() != "") {
+			return nil, safePublicError(err, cfg.targetDiagnosticValues(target, runner)...)
 		}
 		var configErr *ConfigError
 		if errors.As(err, &configErr) {
-			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng, runner)...)
+			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng.target(), runner)...)
 		}
 	} else {
 		eng = resolved
-		if er, ok := runner.(*cli.ExecRunner); ok {
-			if targetEnv := resolved.pinnedTargetEnv(); len(targetEnv) > 0 {
-				runner = &cli.ExecRunner{
-					Binary: er.Binary,
-					Env:    pinRunnerEnv(er.Env, targetEnv),
-				}
-			}
-		}
+		runner = pinRunnerTargetEnv(resolved.target(), runner)
 	}
 
 	return &Client{
@@ -367,7 +358,7 @@ func (c *Client) Prune(ctx context.Context, opts ...PruneOption) ([]string, erro
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.operationRunner(cfg.runner, cfg.binary)), c.eng, cfg)
+	return pruneWithConfig(ctx, pinRunnerTargetEnv(c.eng.target(), c.operationRunner(cfg.runner, cfg.binary)), c.eng, cfg)
 }
 
 // PruneReuseGroup force-removes every container tagged with the given reuse group
@@ -381,7 +372,7 @@ func (c *Client) PruneReuseGroup(ctx context.Context, group string, opts ...Prun
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneReuseGroupWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.operationRunner(cfg.runner, cfg.binary)), c.eng, group, cfg)
+	return pruneReuseGroupWithConfig(ctx, pinRunnerTargetEnv(c.eng.target(), c.operationRunner(cfg.runner, cfg.binary)), c.eng, group, cfg)
 }
 
 // operationRunner selects the runner for one Client operation. A runner

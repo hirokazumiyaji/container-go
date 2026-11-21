@@ -181,7 +181,7 @@ func (c *config) validateDockerTarget() error {
 	if c.clientPinned && (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
 		return validationErrorf(c.daemonTargetOption(), nil, "cannot override Docker target options on Client.Run")
 	}
-	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && !c.eng.capabilities().daemonTarget {
+	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.target() == nil {
 		return validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
 	if c.reuseAttachTimeout > 0 && !c.reuse {

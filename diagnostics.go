@@ -48,9 +48,11 @@ func (c *config) diagnosticValues() []string {
 	// any value the bounded streaming window cannot redact instead of
 	// making every stream on this handle fail.
 	if c.eng != nil {
-		for _, value := range c.eng.diagnosticTargetValues() {
-			if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
-				values = append(values, value)
+		if target := c.eng.target(); target != nil {
+			for _, value := range target.diagnosticTargetValues() {
+				if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
+					values = append(values, value)
+				}
 			}
 		}
 	}
@@ -225,7 +227,9 @@ func uniqueStrings(values []string) []string {
 func (c *config) diagnosticBoundaryValues() []string {
 	values := wait.DiagnosticBoundaryValues(c.waitStrategy)
 	if c.eng != nil {
-		values = append(values, c.eng.diagnosticBoundaryValues()...)
+		if target := c.eng.target(); target != nil {
+			values = append(values, target.diagnosticBoundaryValues()...)
+		}
 	}
 	if c.dockerHost != nil {
 		if endpoint, err := parseDockerEndpoint(*c.dockerHost); err == nil && endpoint.isRemote {

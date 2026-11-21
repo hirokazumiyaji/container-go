@@ -14,7 +14,6 @@ import (
 func TestEngineCapabilitiesDeclareBackendContract(t *testing.T) {
 	wantDocker := engineCapabilities{
 		immutableID:          true,
-		daemonTarget:         true,
 		defaultNetwork:       true,
 		copyOutVersionCheck:  true,
 		healthcheck:          true,
@@ -31,6 +30,18 @@ func TestEngineCapabilitiesDeclareBackendContract(t *testing.T) {
 	}
 	if got := (appleEngine{}).capabilities(); got != wantApple {
 		t.Errorf("apple capabilities = %+v, want %+v", got, wantApple)
+	}
+}
+
+// TestTargetScopeIsExpressedByType pins that a backend without an externally
+// addressable target reports none: shared code branches on a nil engineTarget
+// instead of every backend supplying no-op implementations.
+func TestTargetScopeIsExpressedByType(t *testing.T) {
+	if target := (appleEngine{}).target(); target != nil {
+		t.Fatalf("apple target() = %T, want nil", target)
+	}
+	if target := (dockerEngine{}).target(); target == nil {
+		t.Fatal("docker target() = nil, want a target scope")
 	}
 }
 
@@ -105,18 +116,19 @@ func TestBackendImageArgvKeepsSubcommandSpelling(t *testing.T) {
 
 // wrappedAppleEngine models the test wrappers that embed a backend to
 // override one method. Target-scope helpers must keep the wrapper when the
-// backend does not own a daemon target.
+// backend reports no target scope.
 type wrappedAppleEngine struct{ appleEngine }
 
 // wrappedDockerEngine models a Docker wrapper. Target-scope helpers preserve it
-// only while no explicit target setting is applied: the promoted configureTarget
-// returns the embedded dockerEngine.
+// only while no explicit target setting is applied: the promoted target()
+// returns the embedded dockerEngine, and configureTarget applies to that value.
 type wrappedDockerEngine struct{ dockerEngine }
 
 func TestTargetScopeHelpersKeepWrappedEngine(t *testing.T) {
 	wrapped := wrappedAppleEngine{}
 
-	configured := configuredTarget(wrapped, engineTargetOverride{})
+	host := "tcp://remote:2375"
+	configured := configuredTarget(wrapped, engineTargetOverride{host: &host})
 	if _, ok := configured.(wrappedAppleEngine); !ok {
 		t.Fatalf("configuredTarget returned %T, want wrappedAppleEngine", configured)
 	}

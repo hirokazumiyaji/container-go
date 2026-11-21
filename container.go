@@ -380,7 +380,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	// cfg.validate cannot see this combination before the engine is selected:
 	// with no explicit engine it runs while cfg.eng is still nil.
 	if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil {
-		if !cfg.eng.capabilities().daemonTarget {
+		if cfg.eng.target() == nil {
 			return nil, validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
 		}
 	}
@@ -633,7 +633,7 @@ func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
 		env = eenv.ExternalEnv()
 	}
 	if len(env) == 0 {
-		env = cfg.eng.pinnedTargetEnv()
+		env = targetPinnedEnv(cfg.eng)
 	}
 	reaperKey := binary
 	if cfg.eng != nil && cfg.eng.targetID() != "" {

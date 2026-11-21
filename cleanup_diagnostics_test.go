@@ -558,6 +558,22 @@ func TestDockerBinaryHostnameRemainsReadable(t *testing.T) {
 	}
 }
 
+func TestPruneDiagnosticRedactorSkipsMissingTargetScope(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	runner := &cli.ExecRunner{Binary: "docker", Env: []string{"DOCKER_HOST=tcp://runner-target.internal:2375"}}
+	const secret = "tcp://runner-target.internal:2375"
+
+	// Apple Container has no target scope, so a runner's DOCKER_* values are
+	// not target diagnostics and must stay readable.
+	if got := pruneDiagnosticRedactor(appleEngine{}, runner, "").Text(secret); got != secret {
+		t.Fatalf("apple prune redactor changed %q to %q", secret, got)
+	}
+	// Docker does own the target, so the same value must be redacted.
+	if got := pruneDiagnosticRedactor(dockerEngine{}, runner, "").Text(secret); strings.Contains(got, "runner-target.internal") {
+		t.Fatalf("docker prune redactor did not redact the runner target: %q", got)
+	}
+}
+
 func TestPruneConfiguredContextFailurePreservesRedactedCause(t *testing.T) {
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
 	t.Setenv("DOCKER_CONTEXT", "private-ctx")

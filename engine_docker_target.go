@@ -4,10 +4,61 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
+
+// target returns the Docker daemon target scope.
+func (e dockerEngine) target() engineTarget { return e }
+
+// targetEnv lists the configured target components as they must appear in the
+// child environment.
+func (e dockerEngine) targetEnv() []string {
+	var env []string
+	if e.explicitHost && !e.explicitContext {
+		if host := e.effectiveHost(); host != "" {
+			env = append(env, "DOCKER_HOST="+host)
+		}
+	} else if ctx := e.effectiveContext(); ctx != "" {
+		env = append(env, "DOCKER_CONTEXT="+ctx)
+	} else if host := e.effectiveHost(); host != "" {
+		env = append(env, "DOCKER_HOST="+host)
+	}
+	if cfg := e.effectiveConfigDir(); cfg != "" {
+		env = append(env, "DOCKER_CONFIG="+cfg)
+	}
+	if plat := e.effectiveDefaultPlatform(); plat != "" {
+		env = append(env, "DOCKER_DEFAULT_PLATFORM="+plat)
+	}
+	return env
+}
+
+// pinnedTargetEnv returns the complete child environment for this target:
+// every component is either its configured value or a bare key that removes
+// the inherited entry. targetEnv only lists configured components, so an
+// unset one would let a variable exported after the target was frozen
+// repoint the child CLI at another daemon.
+//
+// Connection modifiers (DOCKER_TLS_VERIFY, DOCKER_CERT_PATH,
+// DOCKER_API_VERSION) are intentionally left inherited: they change how the
+// pinned connection is negotiated, not which daemon it reaches, and
+// stripping them would break a daemon that requires TLS.
+func (e dockerEngine) pinnedTargetEnv() []string {
+	env := e.targetEnv()
+	present := make(map[string]struct{}, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		present[key] = struct{}{}
+	}
+	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_DEFAULT_PLATFORM"} {
+		if _, ok := present[key]; !ok {
+			env = append(env, key)
+		}
+	}
+	return env
+}
 
 // configureTarget applies explicit client target settings to a Docker target.
 // The returned engine addresses the configured daemon.

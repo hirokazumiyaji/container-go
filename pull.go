@@ -173,10 +173,11 @@ func (c pullConfig) applyDockerTarget(eng engine) (engine, error) {
 	if c.dockerHost == nil && c.dockerContext == nil {
 		return eng, nil
 	}
-	if !eng.capabilities().daemonTarget {
+	target := eng.target()
+	if target == nil {
 		return eng, validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
-	return eng.configureTarget(engineTargetOverride{host: c.dockerHost, context: c.dockerContext}), nil
+	return target.configureTarget(engineTargetOverride{host: c.dockerHost, context: c.dockerContext}), nil
 }
 
 // operationConfig builds the config pullWithConfig consumes.

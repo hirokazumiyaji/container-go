@@ -404,6 +404,7 @@ func ReleasedWaitStrategies() {
 すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を受け付けます。
 `ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間です。
 `ForAll` と `ForAny` は既定では合成全体のタイムアウトを持ちません。正の `WithStartupTimeout` を指定すると合成全体を制限し、0 または負の値では制限せず各子の戦略のタイムアウトを適用します。
+ビルダーは新しい戦略を返し、レシーバを変更しません。既存の値を再設定する場合は戻り値を代入してください（`s = s.WithHeader("X-Tenant", tenant)`）。
 
 現在の開発チェックアウトは、Docker の `HEALTHCHECK` 状態を待つ
 `wait.ForHealthcheck()` と、上限付きでレスポンスボディを判定する

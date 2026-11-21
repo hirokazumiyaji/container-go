@@ -64,6 +64,33 @@ type File struct {
 	Mode fs.FileMode
 }
 
+// FileFromContent returns a File that copies content to containerPath. A nil
+// content is normalized to an empty, non-nil slice so an empty file cannot be
+// mistaken for an unset Content. Only the first mode value is used; zero keeps
+// the 0600 default.
+func FileFromContent(containerPath string, content []byte, mode ...fs.FileMode) File {
+	if content == nil {
+		content = []byte{}
+	}
+	f := File{Content: content, ContainerPath: containerPath}
+	if len(mode) > 0 {
+		f.Mode = mode[0]
+	}
+	return f
+}
+
+// FileFromHost returns a File that copies the host file or directory at
+// hostPath to containerPath. WithFiles resolves hostPath when the option is
+// applied. Only the first mode value is used; zero preserves the source's
+// permissions, and a non-zero mode is invalid when hostPath is a directory.
+func FileFromHost(hostPath, containerPath string, mode ...fs.FileMode) File {
+	f := File{HostPath: hostPath, ContainerPath: containerPath}
+	if len(mode) > 0 {
+		f.Mode = mode[0]
+	}
+	return f
+}
+
 // WithFiles copies host files and directories into the container after it
 // starts. Each File must set exactly one of HostPath or Content; setting both,
 // or neither, is a ValidationError when the option is applied. Host paths are

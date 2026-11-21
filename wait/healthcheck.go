@@ -24,14 +24,24 @@ func ForHealthcheck() *HealthcheckStrategy {
 	return &HealthcheckStrategy{options: options{stateFirst: true}}
 }
 
+// clone returns a copy of the strategy. Builders derive a new value from the
+// receiver so a strategy shared by parallel callers cannot be reconfigured
+// through another caller's options.
+func (s *HealthcheckStrategy) clone() *HealthcheckStrategy {
+	cloned := *s
+	return &cloned
+}
+
 func (s *HealthcheckStrategy) WithStartupTimeout(d time.Duration) *HealthcheckStrategy {
-	s.startupTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.startupTimeout = d
+	return cloned
 }
 
 func (s *HealthcheckStrategy) WithPollInterval(d time.Duration) *HealthcheckStrategy {
-	s.pollInterval = d
-	return s
+	cloned := s.clone()
+	cloned.pollInterval = d
+	return cloned
 }
 
 func (s *HealthcheckStrategy) validate() error {

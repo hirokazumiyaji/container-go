@@ -44,30 +44,42 @@ func ForLog(pattern string) *LogStrategy {
 	return &LogStrategy{pattern: pattern, occurrences: 1}
 }
 
+// clone returns a copy of the strategy. Builders derive a new value from the
+// receiver so a strategy shared by parallel callers cannot be reconfigured
+// through another caller's options.
+func (s *LogStrategy) clone() *LogStrategy {
+	cloned := *s
+	return &cloned
+}
+
 // AsRegexp interprets the pattern as a regular expression.
 func (s *LogStrategy) AsRegexp() *LogStrategy {
-	s.isRegexp = true
-	return s
+	cloned := s.clone()
+	cloned.isRegexp = true
+	return cloned
 }
 
 // WithOccurrence requires the pattern to appear n times. Occurrences
 // are counted across reconnects after replayed history is de-duplicated.
 // A final unterminated line at clean EOF is treated as a complete line.
 func (s *LogStrategy) WithOccurrence(n int) *LogStrategy {
-	s.occurrences = n
-	return s
+	cloned := s.clone()
+	cloned.occurrences = n
+	return cloned
 }
 
 func (s *LogStrategy) WithStartupTimeout(d time.Duration) *LogStrategy {
-	s.startupTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.startupTimeout = d
+	return cloned
 }
 
 // WithPollInterval sets the delay before reconnecting a log stream
 // that ends before the pattern is found.
 func (s *LogStrategy) WithPollInterval(d time.Duration) *LogStrategy {
-	s.pollInterval = d
-	return s
+	cloned := s.clone()
+	cloned.pollInterval = d
+	return cloned
 }
 
 func (s *LogStrategy) DiagnosticValues() []string { return []string{s.pattern} }

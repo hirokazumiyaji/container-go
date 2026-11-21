@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -17,9 +18,19 @@ type AllStrategy struct {
 	startupTimeout time.Duration
 }
 
-// ForAll waits for every strategy, in order.
+// ForAll waits for every strategy, in order. The composite owns a copy of the
+// supplied slice, so the caller cannot replace a child after construction.
 func ForAll(strategies ...Strategy) *AllStrategy {
-	return &AllStrategy{strategies: strategies}
+	return &AllStrategy{strategies: slices.Clone(strategies)}
+}
+
+// clone returns a strategy with an independent child slice. Builders derive a
+// new value from the receiver so a composite shared by parallel callers cannot
+// be reconfigured through another caller's options.
+func (s *AllStrategy) clone() *AllStrategy {
+	cloned := *s
+	cloned.strategies = slices.Clone(s.strategies)
+	return &cloned
 }
 
 // WithStartupTimeout bounds the total time spent waiting across all
@@ -27,8 +38,9 @@ func ForAll(strategies ...Strategy) *AllStrategy {
 // unbounded, relying on each strategy's own startup timeout. Negative
 // values retain the original composite-wait compatibility meaning.
 func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
-	s.startupTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.startupTimeout = d
+	return cloned
 }
 
 func (s *AllStrategy) DiagnosticValues() []string {
@@ -161,9 +173,20 @@ type AnyStrategy struct {
 	startupTimeout time.Duration
 }
 
-// ForAny waits until one of the strategies succeeds.
+// ForAny waits until one of the strategies succeeds. The composite owns a copy
+// of the supplied slice, so the caller cannot replace a child after
+// construction.
 func ForAny(strategies ...Strategy) *AnyStrategy {
-	return &AnyStrategy{strategies: strategies}
+	return &AnyStrategy{strategies: slices.Clone(strategies)}
+}
+
+// clone returns a strategy with an independent child slice. Builders derive a
+// new value from the receiver so a composite shared by parallel callers cannot
+// be reconfigured through another caller's options.
+func (s *AnyStrategy) clone() *AnyStrategy {
+	cloned := *s
+	cloned.strategies = slices.Clone(s.strategies)
+	return &cloned
 }
 
 // WithStartupTimeout bounds the total time spent waiting for any
@@ -171,8 +194,9 @@ func ForAny(strategies ...Strategy) *AnyStrategy {
 // relying on each strategy's own startup timeout. Negative values
 // retain the original composite-wait compatibility meaning.
 func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
-	s.startupTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.startupTimeout = d
+	return cloned
 }
 
 func (s *AnyStrategy) DiagnosticValues() []string {

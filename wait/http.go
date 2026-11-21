@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -46,25 +47,37 @@ func ForHTTP(path string) *HTTPStrategy {
 	return &HTTPStrategy{path: path, method: http.MethodGet}
 }
 
+// clone returns a strategy with an independent header map. Builders derive a
+// new value from the receiver so a strategy shared by parallel callers cannot
+// be reconfigured through another caller's options.
+func (s *HTTPStrategy) clone() *HTTPStrategy {
+	cloned := *s
+	cloned.headers = maps.Clone(s.headers)
+	return &cloned
+}
+
 // WithPort probes a specific declared port instead of the first one. An
 // empty value is invalid; omit WithPort to select the first declared TCP
 // port.
 func (s *HTTPStrategy) WithPort(port string) *HTTPStrategy {
-	s.port = port
-	s.portSet = true
-	return s
+	cloned := s.clone()
+	cloned.port = port
+	cloned.portSet = true
+	return cloned
 }
 
 // WithMethod sets the HTTP method to use.
 func (s *HTTPStrategy) WithMethod(method string) *HTTPStrategy {
-	s.method = method
-	return s
+	cloned := s.clone()
+	cloned.method = method
+	return cloned
 }
 
 // WithStatusCodeMatcher replaces the default 2xx acceptance check.
 func (s *HTTPStrategy) WithStatusCodeMatcher(matcher func(status int) bool) *HTTPStrategy {
-	s.statusMatcher = matcher
-	return s
+	cloned := s.clone()
+	cloned.statusMatcher = matcher
+	return cloned
 }
 
 // WithResponseMatcher accepts an HTTP response only when matcher reports
@@ -73,19 +86,21 @@ func (s *HTTPStrategy) WithStatusCodeMatcher(matcher func(status int) bool) *HTT
 // failed check. Without a matcher an accepted status ends the wait without
 // reading the body.
 func (s *HTTPStrategy) WithResponseMatcher(matcher func(io.Reader) bool) *HTTPStrategy {
-	s.responseMatcher = matcher
-	return s
+	cloned := s.clone()
+	cloned.responseMatcher = matcher
+	return cloned
 }
 
 // WithHeaders adds request headers to the readiness probe.
 func (s *HTTPStrategy) WithHeaders(headers map[string]string) *HTTPStrategy {
-	if s.headers == nil {
-		s.headers = map[string]string{}
+	cloned := s.clone()
+	if len(headers) > 0 && cloned.headers == nil {
+		cloned.headers = make(map[string]string, len(headers))
 	}
 	for k, v := range headers {
-		s.headers[k] = v
+		cloned.headers[k] = v
 	}
-	return s
+	return cloned
 }
 
 // WithHeader adds one request header to the readiness probe.
@@ -95,22 +110,25 @@ func (s *HTTPStrategy) WithHeader(key, value string) *HTTPStrategy {
 
 // WithBasicAuth sends HTTP basic auth with the readiness probe.
 func (s *HTTPStrategy) WithBasicAuth(username, password string) *HTTPStrategy {
-	s.username, s.password, s.basicAuth = username, password, true
-	return s
+	cloned := s.clone()
+	cloned.username, cloned.password, cloned.basicAuth = username, password, true
+	return cloned
 }
 
 // WithTLS probes via https with the default transport.
 func (s *HTTPStrategy) WithTLS() *HTTPStrategy {
-	s.useTLS = true
-	return s
+	cloned := s.clone()
+	cloned.useTLS = true
+	return cloned
 }
 
 // WithTLSConfig probes via https with a custom TLS config (e.g.,
 // InsecureSkipVerify for self-signed test certs).
 func (s *HTTPStrategy) WithTLSConfig(cfg *tls.Config) *HTTPStrategy {
-	s.useTLS = true
-	s.tlsConfig = cfg
-	return s
+	cloned := s.clone()
+	cloned.useTLS = true
+	cloned.tlsConfig = cfg
+	return cloned
 }
 
 // WithHTTPClient delegates transport, proxy, redirect, and timeout
@@ -118,18 +136,21 @@ func (s *HTTPStrategy) WithTLSConfig(cfg *tls.Config) *HTTPStrategy {
 // scheme; the custom client supplies the TLS config (for example
 // httptest.NewTLSServer).
 func (s *HTTPStrategy) WithHTTPClient(c *http.Client) *HTTPStrategy {
-	s.httpClient = c
-	return s
+	cloned := s.clone()
+	cloned.httpClient = c
+	return cloned
 }
 
 func (s *HTTPStrategy) WithStartupTimeout(d time.Duration) *HTTPStrategy {
-	s.startupTimeout = d
-	return s
+	cloned := s.clone()
+	cloned.startupTimeout = d
+	return cloned
 }
 
 func (s *HTTPStrategy) WithPollInterval(d time.Duration) *HTTPStrategy {
-	s.pollInterval = d
-	return s
+	cloned := s.clone()
+	cloned.pollInterval = d
+	return cloned
 }
 
 // DiagnosticValues returns the caller-provided secrets that can appear in a

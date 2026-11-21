@@ -114,7 +114,7 @@ func TestCloneRunnerIsolatesBinaryOverride(t *testing.T) {
 	if !ok {
 		t.Fatal("cloneRunner did not return an ExecRunner")
 	}
-	applyBinaryToRunner(cloned, "/usr/local/bin/other-docker")
+	cloned = runnerWithBinary(cloned, "/usr/local/bin/other-docker").(*cli.ExecRunner)
 
 	if orig.Binary != "docker" {
 		t.Fatalf("original runner binary mutated to %q", orig.Binary)

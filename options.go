@@ -502,20 +502,30 @@ func runnerIsNil(r Runner) bool {
 	return false
 }
 
-func applyBinaryToRunner(r Runner, binary string) {
+// runnerWithBinary returns a runner that runs binary. A caller-owned
+// *cli.ExecRunner is copied rather than mutated: the library supports
+// concurrent callers sharing one runner, and the binary override belongs to
+// the operation that requested it. A custom runner that exposes SetBinary is
+// updated in place because the library cannot copy an unknown implementation.
+func runnerWithBinary(r Runner, binary string) Runner {
 	if r == nil || binary == "" {
-		return
+		return r
 	}
-	if er, ok := r.(*cli.ExecRunner); ok {
-		er.Binary = binary
-		return
+	if _, ok := r.(*cli.ExecRunner); ok {
+		cloned := cloneRunner(r).(*cli.ExecRunner)
+		cloned.Binary = binary
+		return cloned
 	}
 	if bs, ok := r.(interface{ SetBinary(string) }); ok {
 		bs.SetBinary(binary)
 	}
+	return r
 }
 
-// WithRunner sets the runner used for CLI invocations.
+// WithRunner sets the runner used for CLI invocations. Only a
+// *ExecRunner is copied when a binary override applies; another Runner
+// that implements SetBinary, including a type embedding ExecRunner, is
+// rewritten in place and must not be shared by concurrent operations.
 func WithRunner(r Runner) Option {
 	return func(c *config) error {
 		if runnerIsNil(r) {
@@ -523,14 +533,17 @@ func WithRunner(r Runner) Option {
 		}
 		c.runner = r
 		if c.binary != "" {
-			applyBinaryToRunner(c.runner, c.binary)
+			c.runner = runnerWithBinary(c.runner, c.binary)
 		}
 		return nil
 	}
 }
 
 // WithBinary sets the executable name or path for the container CLI.
-// It overrides the backend's default CLI binary name.
+// It overrides the backend's default CLI binary name. Only a *ExecRunner
+// is copied when the override applies; a custom Runner that implements
+// SetBinary, including a type embedding ExecRunner, is rewritten in place and
+// must not be shared by concurrent operations.
 func WithBinary(path string) Option {
 	return func(c *config) error {
 		if path == "" {
@@ -540,7 +553,7 @@ func WithBinary(path string) Option {
 			return validationErrorf("WithBinary", path, "invalid binary path %q", path)
 		}
 		c.binary = path
-		applyBinaryToRunner(c.runner, path)
+		c.runner = runnerWithBinary(c.runner, path)
 		return nil
 	}
 }
@@ -1170,6 +1183,34 @@ type Mount struct {
 	Source   string // host path in host OS syntax (bind) or volume name (volume); empty for tmpfs
 	Target   string // absolute POSIX path inside the container
 	ReadOnly bool
+}
+
+// BindMount returns a bind mount of the absolute host source at
+// containerTarget. Only the first readOnly value is used.
+func BindMount(hostSource, containerTarget string, readOnly ...bool) Mount {
+	return Mount{
+		Type:     MountBind,
+		Source:   hostSource,
+		Target:   containerTarget,
+		ReadOnly: len(readOnly) > 0 && readOnly[0],
+	}
+}
+
+// VolumeMount returns a named-volume mount at containerTarget. Only the first
+// readOnly value is used.
+func VolumeMount(volumeName, containerTarget string, readOnly ...bool) Mount {
+	return Mount{
+		Type:     MountVolume,
+		Source:   volumeName,
+		Target:   containerTarget,
+		ReadOnly: len(readOnly) > 0 && readOnly[0],
+	}
+}
+
+// TmpfsMount returns an in-memory filesystem mount at containerTarget. A tmpfs
+// mount has no source, unlike BindMount and VolumeMount.
+func TmpfsMount(containerTarget string) Mount {
+	return Mount{Type: MountTmpfs, Target: containerTarget}
 }
 
 func mountValidationErrorf(m Mount, format string, args ...any) error {

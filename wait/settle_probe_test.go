@@ -154,3 +154,25 @@ func TestLogReconnectRetainsOnlyLatestProbeError(t *testing.T) {
 		t.Fatalf("probe calls = %d, want reconnects", target.calls.Load())
 	}
 }
+
+func TestForLogStopsWhenLifecycleProbeReportsMissingTarget(t *testing.T) {
+	// The follow stream never closes (for example when an external
+	// `docker rm -f` leaves the stream open). A permanent probe error must
+	// end the wait at the next state probe instead of hanging until the
+	// startup timeout.
+	stream := newBlockingLogStream("")
+	t.Cleanup(stream.release)
+	target := newLifecycleTarget(StateRunning)
+	target.stateErr = fmt.Errorf("%w: removed while following", ErrTargetNotFound)
+	target.logStreams = []io.ReadCloser{stream}
+
+	start := time.Now()
+	err := ForLog("ready").WithStartupTimeout(10*time.Second).WaitUntilReady(context.Background(), target)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrTargetNotFound) {
+		t.Fatalf("error = %v, want ErrTargetNotFound", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("wait took %v, want the permanent probe error to end it", elapsed)
+	}
+}

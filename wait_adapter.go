@@ -8,7 +8,6 @@ import (
 	"io"
 	"os/exec"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -79,9 +78,10 @@ func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 // it expires first.
 const procNetExecTimeout = 5 * time.Second
 
-// procNetReadLimit bounds the bytes retained from /proc/net; the exec sink
-// drains anything beyond it.
-const procNetReadLimit = 1 << 20
+// procNetMaxLineBytes bounds one retained /proc/net line. Socket rows are
+// well under 256 bytes; the cap only keeps a malformed stream from growing
+// the scanner's line buffer without bound.
+const procNetMaxLineBytes = 4096
 
 // procNetCommand reads both address families without a shell or an external
 // port tool. Images without cat (for example distroless) make the check
@@ -107,9 +107,12 @@ func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.
 	if err != nil {
 		return wait.PortListenUnsupported, err
 	}
-	var out bytes.Buffer
-	code, _, err := t.c.ExecTo(ctx, procNetCommand(), &out,
-		WithExecMaxBytes(procNetReadLimit),
+	// Stream the table into a line scanner instead of capturing a bounded
+	// prefix: a busy container's /proc/net/tcp can exceed any fixed capture
+	// limit, and that used to truncate /proc/net/tcp6 entirely and hide an
+	// IPv6-only listener.
+	scanner := newProcNetScanner(spec.Port)
+	code, _, err := t.c.ExecTo(ctx, procNetCommand(), scanner,
 		WithExecTimeout(procNetExecTimeout),
 	)
 	if err != nil {
@@ -126,11 +129,10 @@ func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.
 	if code == 126 || code == 127 {
 		return wait.PortListenUnsupported, nil
 	}
-	listening, supported := procNetListening(out.Bytes(), spec.Port)
-	if !supported {
+	if !scanner.supported {
 		return wait.PortListenUnsupported, nil
 	}
-	if listening {
+	if scanner.listening {
 		return wait.PortListenOpen, nil
 	}
 	return wait.PortListenClosed, nil
@@ -150,33 +152,146 @@ func portCheckUnavailable(err error) bool {
 	return errors.As(err, &launchErr)
 }
 
-// procNetListening parses /proc/net/tcp and /proc/net/tcp6 output. supported
-// is false when the output contains neither a header nor a socket line,
-// which is how a missing cat or an unavailable /proc/net surfaces.
-func procNetListening(data []byte, port int) (listening, supported bool) {
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
+// procNetScanner recognizes LISTEN sockets while ExecTo streams the
+// container's /proc/net/tcp and /proc/net/tcp6 tables. It keeps only the
+// current line and stops classifying after the first match, so a large
+// table neither needs a full-output buffer nor allocates a string and a
+// field slice per line.
+type procNetScanner struct {
+	port      int
+	line      []byte
+	listening bool
+	supported bool
+	skipLine  bool
+}
+
+func newProcNetScanner(port int) *procNetScanner {
+	return &procNetScanner{port: port, line: make([]byte, 0, 256)}
+}
+
+// Write consumes one output chunk. Rows are classified only when their
+// trailing newline arrives: /proc/net/tcp always terminates rows, and a
+// truncated transfer must not invent a partial final row. Bytes after a
+// found listener are drained without further parsing; the writer accepts
+// everything so the exec child is never blocked on a full pipe.
+func (s *procNetScanner) Write(p []byte) (int, error) {
+	original := len(p)
+	for len(p) > 0 && !s.listening {
+		newline := bytes.IndexByte(p, '\n')
+		if newline < 0 {
+			s.appendLine(p)
+			break
 		}
-		if fields[0] == "sl" && fields[1] == "local_address" {
-			supported = true
-			continue
+		s.appendLine(p[:newline])
+		s.classifyLine()
+		p = p[newline+1:]
+	}
+	return original, nil
+}
+
+func (s *procNetScanner) appendLine(fragment []byte) {
+	if s.skipLine || len(fragment) == 0 {
+		return
+	}
+	if len(s.line)+len(fragment) > procNetMaxLineBytes {
+		s.skipLine = true
+		s.line = s.line[:0]
+		return
+	}
+	s.line = append(s.line, fragment...)
+}
+
+func (s *procNetScanner) classifyLine() {
+	if !s.skipLine {
+		listening, socketLine, headerLine := scanProcNetLine(s.line, s.port)
+		if listening {
+			s.listening = true
 		}
-		colon := strings.LastIndexByte(fields[1], ':')
-		if colon < 0 {
-			continue
-		}
-		localPort, err := strconv.ParseUint(fields[1][colon+1:], 16, 16)
-		if err != nil {
-			continue
-		}
-		supported = true
-		if int(localPort) == port && fields[3] == "0A" {
-			listening = true
+		if socketLine || headerLine {
+			s.supported = true
 		}
 	}
-	return listening, supported
+	s.line = s.line[:0]
+	s.skipLine = false
+}
+
+var (
+	procNetHeaderFirstField  = []byte("sl")
+	procNetHeaderSecondField = []byte("local_address")
+	procNetListenStateField  = []byte("0A")
+)
+
+// scanProcNetLine classifies one table line without allocating. socketLine
+// reports a parseable socket row, headerLine reports the table header, and
+// listening requires a socket row for port in LISTEN state.
+func scanProcNetLine(line []byte, port int) (listening, socketLine, headerLine bool) {
+	var fields [4][]byte
+	count := 0
+	for index := 0; index < len(line) && count < len(fields); {
+		for index < len(line) && isProcNetSpace(line[index]) {
+			index++
+		}
+		if index >= len(line) {
+			break
+		}
+		start := index
+		for index < len(line) && !isProcNetSpace(line[index]) {
+			index++
+		}
+		fields[count] = line[start:index]
+		count++
+	}
+	if count < len(fields) {
+		return false, false, false
+	}
+	if bytes.Equal(fields[0], procNetHeaderFirstField) && bytes.Equal(fields[1], procNetHeaderSecondField) {
+		return false, false, true
+	}
+	localPort, ok := procNetLocalPort(fields[1])
+	if !ok {
+		return false, false, false
+	}
+	return localPort == port && bytes.Equal(fields[3], procNetListenStateField), true, false
+}
+
+func procNetLocalPort(field []byte) (int, bool) {
+	colon := bytes.LastIndexByte(field, ':')
+	if colon < 0 {
+		return 0, false
+	}
+	digits := field[colon+1:]
+	if len(digits) == 0 || len(digits) > 4 {
+		return 0, false
+	}
+	port := 0
+	for _, digit := range digits {
+		value, ok := procNetHexDigit(digit)
+		if !ok {
+			return 0, false
+		}
+		port = port<<4 | value
+	}
+	return port, true
+}
+
+func procNetHexDigit(c byte) (int, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0'), true
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10, true
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10, true
+	}
+	return 0, false
+}
+
+func isProcNetSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\v', '\f', '\r':
+		return true
+	}
+	return false
 }
 
 func (t waitTarget) Running(ctx context.Context) (bool, error) {

@@ -114,6 +114,7 @@ type logScanResult struct {
 	found       bool
 	committed   bool
 	err         error
+	probeErr    error
 	terminalErr error
 	state       State
 	count       int
@@ -303,7 +304,25 @@ func receiveLogScanResult(ctx context.Context, target Target, results <-chan log
 			probeCtx, probeCancel := context.WithTimeout(ctx, lifecycleProbeTimeout)
 			state, err := targetState(probeCtx, target)
 			probeCancel()
-			if ctx.Err() == nil && err == nil && terminalWaitState(state) {
+			if ctx.Err() != nil {
+				// The caller ended while the probe ran; the Done case
+				// publishes the cancellation cause and retains any settled
+				// terminal diagnostic.
+				continue
+			}
+			if err != nil {
+				// A stream that never closes must not hold the wait until
+				// the startup timeout when the target is gone for good
+				// (for example an externally removed container). The
+				// predicate matches the caller's permanent-error handling,
+				// and the cause stays attributed to the state probe rather
+				// than to the log stream.
+				if isPermanentCheckError(err) {
+					return logScanResult{probeErr: err}, true
+				}
+				continue
+			}
+			if terminalWaitState(state) {
 				return logScanResult{state: state}, true
 			}
 		case <-done:
@@ -433,12 +452,16 @@ func nextReadyLogSettle(readResults <-chan logSettleRead, done <-chan struct{}) 
 	return logSettleRead{}, false, false
 }
 
-// settleLogMatch actively consumes merged output after a readiness match.
-// A single delayed read leaves a public io.Pipe blocked, which can prevent
-// the follow process from exiting and hide its terminal diagnostic. The
-// scanner therefore keeps reading until the process reports Done, the
-// stream returns a terminal error, the caller ends, or the bounded live-
-// stream grace period expires.
+// settleLogMatch decides whether a readiness match may be published before
+// the follow CLI exits. A still-running terminal-status stream has no
+// terminal result to observe yet, so it returns immediately and the caller
+// closes the stream. A stream whose Done is already closed, or one without
+// a terminal-status channel, is drained instead: a single delayed read
+// leaves a public io.Pipe blocked, which can prevent the follow process
+// from exiting and hide its terminal diagnostic. A status-less drain stops
+// when the stream returns a terminal error, the caller ends, or the bounded
+// settle windows expire; a settled stream stops when its Done or terminal
+// evidence arrives.
 func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Reader) error {
 	status, hasStatus := stream.(interface {
 		Done() <-chan struct{}
@@ -447,6 +470,27 @@ func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Rea
 	var done <-chan struct{}
 	if hasStatus {
 		done = status.Done()
+	}
+
+	// A follow process that is still running has no terminal result to
+	// observe: Done stays open until the CLI exits, and TerminalError would
+	// block waiting for that exit. The matched line has already established
+	// readiness, so draining here could only add the idle grace period
+	// (100-250ms) to every successful ForLog wait on a live container.
+	// Streams without a terminal-status channel keep the drain below:
+	// settlement is the only way to release a pipe-backed reader that has no
+	// Done signal, and the caller's context still bounds it.
+	if done != nil {
+		select {
+		case <-done:
+			// The process has settled. Fall through to drain its terminal
+			// diagnostic before readiness is accepted.
+		default:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return nil
+		}
 	}
 
 	boundedWindow := func(max time.Duration) time.Duration {
@@ -682,7 +726,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 				return waitStoppedStateError(what, result.state, lastStreamErr, lastProbeErr)
 			}
 			terminalStreamErr := result.terminalErr
-			record(terminalStreamErr, nil)
+			record(terminalStreamErr, result.probeErr)
 			_ = stream.Close()
 			if result.found {
 				if cause := nonContextCause(terminalStreamErr); cause != nil {
@@ -721,6 +765,16 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 						return wrapWaitCause(what, filtered, lastProbeErr)
 					}
 					// Context-only: reconnect rather than return canceled.
+				}
+			}
+			if result.probeErr != nil {
+				// The scan aborted on a permanent state probe. Keep the
+				// cause attributed to the probe, not to the log stream.
+				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
+					return terminalErr
+				}
+				if filtered := nonContextCause(result.probeErr); filtered != nil {
+					return wrapWaitCause(what, filtered, lastStreamErr, lastProbeErr)
 				}
 			}
 		}

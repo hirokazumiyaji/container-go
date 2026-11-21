@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-- The root Go package contains the public container API, lifecycle helpers, and backend abstraction. Backend implementations are in `engine_apple.go` and `engine_docker.go`.
+- The root Go package contains the public container API, lifecycle helpers, and backend abstraction. Backend implementations are in `engine_apple*.go` and `engine_docker*.go`.
 - `wait/` contains readiness strategies; `internal/` contains CLI and inspection support that is not part of the public API.
 - Unit tests live beside the code they cover as `*_test.go`. Backend integration tests are at the root and use the `integration` build tag. Runnable examples are in `examples/`; fixtures are in `testdata/`; design notes are in `docs/`.
 

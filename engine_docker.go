@@ -2117,11 +2117,12 @@ func (dockerEngine) containerMissing(err error) bool {
 	if isContextError(err) || !cliErrorBelongsTo(err, "docker") {
 		return false
 	}
-	command, args, ok := cliCommandParts(err)
+	argv, ok := cliCommandParts(err)
 	if !ok {
 		return false
 	}
-	target := cliCommandTarget(command, args)
+	command := strings.ToLower(cli.CommandOperation(argv))
+	target := commandTarget(argv, command)
 	if target == "" {
 		return false
 	}

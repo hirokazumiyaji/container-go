@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ErrCleanupFailed` classifies a `*CleanupError`, including when the cleanup
+  cause itself is unavailable.
 - `ErrReuseMismatch` identifies incompatible reuse configuration, image, network,
   platform, and port settings.
 - `ErrExitCodeUnavailable`, `ErrContainerNotStopped`, and `InspectInfo.ExitCodeReported`
@@ -43,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retain best-effort implicit Client target discovery without an explicitly
   configured query timeout; configured budget expiry and caller cancellation
   still fail construction.
+- Return a `*wait.ConfigError` from every wait validation path, including
+  startup/poll options and HTTP/header checks.
+- Report Apple `checkConfig` failures and a negative `WithImagePresenceCache`
+  TTL as `*ValidationError` instead of bare errors. Apple value validation
+  matches both `ErrInvalidConfig` and `ErrInvalidOption`; Apple capability
+  errors keep their sentinel and match `ErrInvalidOption` but not
+  `ErrInvalidConfig`, unlike Docker's bare capability sentinels.
+- Make `CleanupError` safe to render and classify when no cleanup cause is
+  recorded.
+- Extract CLI targets with one implementation and parse Apple
+  `ContainerizationError` envelopes with one depth-bounded parser.
+- Accept benchmark documents that cover both Docker and Apple, and keep a
+  legitimate zero-nanosecond minimum in `Summarize`.
 
 ### Changed
 

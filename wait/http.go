@@ -145,7 +145,7 @@ func (s *HTTPStrategy) DiagnosticValues() []string {
 }
 
 func (s *HTTPStrategy) validate() error {
-	if err := s.options.validate(); err != nil {
+	if err := s.options.validate("ForHTTP"); err != nil {
 		return err
 	}
 	if s.portSet {
@@ -154,7 +154,7 @@ func (s *HTTPStrategy) validate() error {
 		}
 	}
 	if s.method == "" {
-		return invalidConfigf("HTTP method must not be empty")
+		return invalidConfigf("ForHTTP", "method", "", "must not be empty")
 	}
 	if s.path != "" &&
 		!strings.HasPrefix(s.path, "/") &&
@@ -162,22 +162,22 @@ func (s *HTTPStrategy) validate() error {
 		!strings.HasPrefix(s.path, "http://") &&
 		!strings.HasPrefix(s.path, "https://") &&
 		!strings.ContainsAny(s.path, "?#") {
-		return invalidConfigf("invalid HTTP path %q: path must start with /", s.path)
+		return invalidConfigf("ForHTTP", "path", s.path, "path must start with /")
 	}
 	for i := 0; i < len(s.path); i++ {
 		if s.path[i] <= ' ' || s.path[i] == 0x7f {
-			return invalidConfigf("invalid HTTP path %q: path contains a control or space", s.path)
+			return invalidConfigf("ForHTTP", "path", s.path, "path contains a control or space")
 		}
 	}
 	probeURL, err := buildHTTPProbeURL("http", "wait.invalid:80", s.path)
 	if err != nil {
-		return invalidConfigf("invalid HTTP path %q: %v", s.path, err)
+		return invalidConfigf("ForHTTP", "path", s.path, "%v", err)
 	}
 	if _, err := http.NewRequestWithContext(context.Background(), s.method, probeURL, nil); err != nil {
-		return invalidConfigf("invalid HTTP method or path: %v", err)
+		return invalidConfigf("ForHTTP", "method or path", "", "%v", err)
 	}
 	for key, value := range s.headers {
-		if err := validateHTTPHeader(key, value); err != nil {
+		if err := validateHTTPHeader("ForHTTP", key, value); err != nil {
 			return err
 		}
 	}
@@ -211,11 +211,11 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 		}
 		probeURL, err := buildHTTPProbeURL(scheme, endpoint, s.path)
 		if err != nil {
-			return fatalCheckError{err: invalidConfigf("invalid HTTP request: %v", err)}
+			return fatalCheckError{err: invalidConfigf("ForHTTP", "request", "", "%v", err)}
 		}
 		req, err := http.NewRequestWithContext(ctx, s.method, probeURL, nil)
 		if err != nil {
-			return fatalCheckError{err: invalidConfigf("invalid HTTP request: %v", err)}
+			return fatalCheckError{err: invalidConfigf("ForHTTP", "request", "", "%v", err)}
 		}
 		for k, v := range s.headers {
 			// net/http ignores a "Host" entry in req.Header and derives

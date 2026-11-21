@@ -91,7 +91,7 @@ func (s *ExecStrategy) DiagnosticValues() []string {
 }
 
 func (s *ExecStrategy) validate() error {
-	if err := s.options.validate(); err != nil {
+	if err := s.options.validate("ForExec"); err != nil {
 		return err
 	}
 	if s.execTimeout < 0 {

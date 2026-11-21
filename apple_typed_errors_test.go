@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -172,5 +173,61 @@ func TestAppleClassifiersStillMatchCurrentTargetBranch(t *testing.T) {
 	)
 	if !(appleEngine{}).nameConflictForTarget(err, "myctr") {
 		t.Fatal("current target name-conflict branch was not selected")
+	}
+}
+
+// One parser backs both escaped and unescaped ContainerizationError
+// spellings, preserves message case for target matching, and bounds cause
+// recursion.
+func TestAppleContainerizationErrorParserIsSharedAndBounded(t *testing.T) {
+	escaped := `internalError: "failed to get container" (cause: "notFound: \"container not found: Web\"")`
+	unescaped := `internalError: "failed to get container" (cause: "notFound: "container not found: Web"")`
+	for name, line := range map[string]string{"escaped": escaped, "unescaped": unescaped} {
+		t.Run(name, func(t *testing.T) {
+			envelope, ok := parseAppleContainerizationError(line)
+			if !ok {
+				t.Fatalf("parseAppleContainerizationError(%q) = false", line)
+			}
+			if envelope.code != "internalerror" || envelope.message != "failed to get container" {
+				t.Fatalf("root = %+v", envelope)
+			}
+			if envelope.cause == nil || envelope.cause.code != "notfound" ||
+				envelope.cause.message != "container not found: Web" {
+				t.Fatalf("cause = %+v, want case-preserving notFound message", envelope.cause)
+			}
+			lowered, ok := parseAppleContainerizationEnvelope(line)
+			if !ok || lowered.cause == nil || lowered.cause.message != "container not found: web" {
+				t.Fatalf("envelope wrapper = %+v, want lowercased wording", lowered)
+			}
+		})
+	}
+
+	// A deeply nested line must stop at the recursion bound instead of
+	// growing an unbounded cause chain or exhausting the stack.
+	line := `notFound: "container not found: myctr"`
+	for i := 0; i < 12; i++ {
+		escaped := strings.ReplaceAll(strings.ReplaceAll(line, `\`, `\\`), `"`, `\"`)
+		line = `internalError: "wrapper" (cause: "` + escaped + `")`
+	}
+	root, ok := parseAppleContainerizationError(line)
+	if !ok {
+		t.Fatal("deeply nested envelope did not parse")
+	}
+	depth := 0
+	for node := &root; node != nil; node = node.cause {
+		depth++
+	}
+	if depth > maxAppleContainerizationDepth+1 {
+		t.Fatalf("cause depth = %d, want at most %d", depth, maxAppleContainerizationDepth+1)
+	}
+
+	for _, invalid := range []string{
+		`application: notFound: "container not found: myctr"`,
+		`madeUpCode: "container not found: myctr"`,
+		`notFound: container not found: myctr`,
+	} {
+		if _, ok := parseAppleContainerizationError(invalid); ok {
+			t.Errorf("accepted invalid envelope %q", invalid)
+		}
 	}
 }

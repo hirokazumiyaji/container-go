@@ -960,11 +960,15 @@ func createRaceMissingForTarget(err error, target string) bool {
 	if isContextError(err) {
 		return false
 	}
-	command, args, ok := cliCommandParts(err)
-	if !ok || command != "run" || !cliErrorBelongsTo(err, "container") {
+	argv, ok := cliCommandParts(err)
+	if !ok {
 		return false
 	}
-	cliTarget := cliCommandTarget(command, args)
+	command := strings.ToLower(cli.CommandOperation(argv))
+	if command != "run" || !cliErrorBelongsTo(err, "container") {
+		return false
+	}
+	cliTarget := commandTarget(argv, command)
 	if cliTarget == "" || (target != "" && !strings.EqualFold(cliTarget, target)) {
 		return false
 	}

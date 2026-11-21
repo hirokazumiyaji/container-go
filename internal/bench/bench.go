@@ -249,10 +249,11 @@ func Summarize(results []Result) []Summary {
 		}
 		durations := make([]int64, 0, len(rs))
 		subprocesses := make([]int64, 0, len(rs))
-		for _, r := range rs {
+		for i, r := range rs {
 			durations = append(durations, r.DurationNS)
 			subprocesses = append(subprocesses, r.Subprocesses)
-			if s.Min == 0 || r.Duration() < s.Min {
+			// The first sample establishes Min, even when it is zero.
+			if i == 0 || r.Duration() < s.Min {
 				s.Min = r.Duration()
 			}
 			if r.Duration() > s.Max {

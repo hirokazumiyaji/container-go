@@ -44,8 +44,10 @@ var ErrLogStreamSetup = wait.ErrLogStreamSetup
 // the options supplied to Run.
 var ErrInvalidConfiguration = wait.ErrInvalidConfiguration
 
-// ErrInvalidConfig reports an option combination that the selected
-// backend cannot honor. Run returns it as a *ConfigError.
+// ErrInvalidConfig reports an option combination or backend-specific value
+// that the selected backend cannot honor. Run returns it as a *ConfigError,
+// except for Apple-specific value validation, which reports it through a
+// *ValidationError so errors.Is(ErrInvalidConfig) still holds.
 var ErrInvalidConfig = errors.New("invalid container configuration")
 
 // ErrReuseMismatch reports creation options that differ from an existing reuse container.
@@ -673,17 +675,15 @@ func hasNonCLIDefinitiveErrorText(err error) bool {
 	return false
 }
 
-// cliCommandParts returns the backend command and its arguments from a
-// CLI error. Backend matchers use this to avoid treating an unrelated
-// "not found" (for example, a missing volume plugin) as a missing
-// container.
-func cliCommandParts(err error) (command string, args []string, ok bool) {
+// cliCommandParts returns the complete argv recorded on a CLI error. Backend
+// matchers derive the operation with cli.CommandOperation and pass both to
+// commandTarget, so the target grammar has one entry point.
+func cliCommandParts(err error) (argv []string, ok bool) {
 	branches := backendCLIErrorBranches(err, "")
 	if len(branches) == 0 || len(branches[0].ctx.err.Args) == 0 {
-		return "", nil, false
+		return nil, false
 	}
-	args = branches[0].ctx.err.Args
-	return strings.ToLower(args[0]), args[1:], true
+	return branches[0].ctx.err.Args, true
 }
 
 func cliErrorBelongsTo(err error, backend string) bool {
@@ -691,66 +691,101 @@ func cliErrorBelongsTo(err error, backend string) bool {
 	return len(branches) > 0 && cli.BinaryMatches(branches[0].ctx.err.Binary, backend)
 }
 
-func cliCommandTarget(command string, args []string) string {
+// commandTarget returns the container or image operand of a CLI operation.
+// argv is the full argument list recorded in cli.CLIError.Args, including the
+// subcommand words. This is the single argument grammar shared by error
+// classification and the lifecycle not-found matchers.
+func commandTarget(argv []string, operation string) string {
+	words := strings.Fields(strings.ToLower(strings.TrimSpace(operation)))
+	if len(words) == 0 || len(argv) < len(words) {
+		return ""
+	}
+	command := strings.Join(words, " ")
+	args := argv[len(words):]
 	switch command {
 	case "run":
 		for i, arg := range args {
 			if arg == "--name" && i+1 < len(args) {
-				return strings.Trim(strings.TrimSpace(args[i+1]), `"'`)
+				return cleanCLITarget(args[i+1])
 			}
-			if strings.HasPrefix(arg, "--name=") {
-				return strings.Trim(strings.TrimSpace(strings.TrimPrefix(arg, "--name=")), `"'`)
-			}
-		}
-	case "rm", "delete":
-		for i := len(args) - 1; i >= 0; i-- {
-			if strings.HasPrefix(args[i], "-") {
-				continue
-			}
-			return strings.Trim(strings.TrimSpace(args[i]), `"'`)
-		}
-	case "stop", "start", "restart", "kill", "pause", "unpause":
-		for i := 0; i < len(args); i++ {
-			arg := args[i]
-			if !strings.HasPrefix(arg, "-") {
-				return strings.Trim(strings.TrimSpace(arg), `"'`)
-			}
-			option := arg
-			if equal := strings.IndexByte(option, '='); equal >= 0 {
-				option = option[:equal]
-			}
-			if cliOptionTakesValue(option) && !strings.Contains(arg, "=") {
-				i++
+			if value, ok := strings.CutPrefix(arg, "--name="); ok {
+				return cleanCLITarget(value)
 			}
 		}
+	case "image inspect", "image pull":
+		return firstPositional(args, "--platform")
+	case "inspect":
+		return firstPositional(args, "--format", "--type")
+	case "exec":
+		return firstPositional(args, "--env-file", "--user", "--workdir")
+	case "logs":
+		return firstPositional(args, "--tail", "--since", "--until", "-n")
+	case "pull":
+		return firstPositional(args, "--platform")
+	case "stop":
+		return firstPositional(args, "--time")
+	case "start", "restart", "kill", "pause", "unpause":
+		return firstPositional(args, "--time", "-t", "--signal", "-s")
+	case "delete", "rm":
+		return lastPositional(args)
 	case "cp":
 		for _, arg := range args {
-			if before, _, ok := strings.Cut(arg, ":"); ok && before != "" && !strings.Contains(before, string(os.PathSeparator)) && !isWindowsDriveLetter(before) {
-				return strings.Trim(strings.TrimSpace(before), `"'`)
+			target, path, ok := strings.Cut(arg, ":")
+			if !ok || target == "" || !strings.HasPrefix(path, "/") {
+				continue
 			}
+			target = cleanCLITarget(target)
+			if strings.ContainsRune(target, os.PathSeparator) || isWindowsDriveLetter(target) {
+				continue
+			}
+			return target
 		}
-	case "inspect", "exec", "logs":
-		for i := 0; i < len(args); i++ {
-			arg := args[i]
-			if !strings.HasPrefix(arg, "-") {
-				return strings.Trim(strings.TrimSpace(arg), `"'`)
-			}
+	}
+	return ""
+}
 
-			// Options that take a separate value must consume that value
-			// before the target scan. In particular, Apple logs uses
-			// `-n 1000 <id>`; returning "1000" would make a target-qualified
-			// not-found error look like a backend/container identity error.
-			option := arg
-			if equal := strings.IndexByte(option, '='); equal >= 0 {
-				option = option[:equal]
+func cleanCLITarget(value string) string {
+	return strings.Trim(strings.TrimSpace(value), `"'`)
+}
+
+// firstPositional returns the first operand, skipping options and the values
+// of the options named in valueOptions. A "--" terminator makes the next
+// argument the operand even when it starts with a dash.
+func firstPositional(args []string, valueOptions ...string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return cleanCLITarget(args[i+1])
 			}
-			if cliReadOptionTakesValue(option) && !strings.Contains(arg, "=") {
-				if i+1 >= len(args) {
-					return ""
-				}
-				i++
-			}
+			return ""
 		}
+		if strings.HasPrefix(arg, "-") {
+			if strings.Contains(arg, "=") {
+				continue
+			}
+			for _, valueOption := range valueOptions {
+				if arg == valueOption {
+					i++
+					break
+				}
+			}
+			continue
+		}
+		return cleanCLITarget(arg)
+	}
+	return ""
+}
+
+// lastPositional returns the final non-option argument. Docker and Apple
+// delete commands name exactly one container, and emitted argv places any
+// options before or after it.
+func lastPositional(args []string) string {
+	for i := len(args) - 1; i >= 0; i-- {
+		if strings.HasPrefix(args[i], "-") && args[i] != "-" {
+			continue
+		}
+		return cleanCLITarget(args[i])
 	}
 	return ""
 }
@@ -759,30 +794,6 @@ func cliCommandTarget(command string, args []string) string {
 // such as C:\tmp. Container names and IDs are never a single letter.
 func isWindowsDriveLetter(s string) bool {
 	return len(s) == 1 && ('a' <= s[0] && s[0] <= 'z' || 'A' <= s[0] && s[0] <= 'Z')
-}
-
-func cliOptionTakesValue(option string) bool {
-	switch option {
-	case "--env-file", "--user", "--workdir", "--time", "--tail", "--since", "--until",
-		"--platform", "--format", "--size", "--type", "--filter", "-n",
-		"-t", "-s", "--signal":
-		return true
-	default:
-		return false
-	}
-}
-
-// cliReadOptionTakesValue reports whether option consumes the next argv
-// element for inspect/exec/logs. The lifecycle short options -t and -s are
-// boolean shorthands in those commands (logs timestamps, exec tty, inspect
-// size), so the lifecycle value-taking set must not be applied there.
-func cliReadOptionTakesValue(option string) bool {
-	switch option {
-	case "-t", "-s", "--signal":
-		return false
-	default:
-		return cliOptionTakesValue(option)
-	}
 }
 
 // cliErrorLines returns normalized, non-empty stderr lines. Only wrappers

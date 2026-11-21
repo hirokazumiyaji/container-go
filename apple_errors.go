@@ -2,53 +2,160 @@ package container
 
 import "strings"
 
-// appleTypedError is the small, stable portion of ContainerizationError's
-// rendered form. Apple Container 1.3 prints codes and nested causes as
-// quoted strings, for example:
+// maxAppleContainerizationDepth bounds cause recursion so a malformed or
+// adversarial stderr line cannot exhaust the stack. The CLI nests at most a
+// few wrappers in practice.
+const maxAppleContainerizationDepth = 8
+
+// appleContainerizationCodes is the complete set of ContainerizationError
+// codes the CLI can print. Keeping it explicit rejects arbitrary
+// "code: \"message\"" application output that happens to look structured.
+var appleContainerizationCodes = map[string]struct{}{
+	"unknown":         {},
+	"invalidargument": {},
+	"internalerror":   {},
+	"exists":          {},
+	"notfound":        {},
+	"cancelled":       {},
+	"invalidstate":    {},
+	"empty":           {},
+	"timeout":         {},
+	"unsupported":     {},
+	"interrupted":     {},
+}
+
+// appleContainerizationError is the small, stable portion of
+// ContainerizationError's rendered form. The CLI prints codes and nested
+// causes as quoted strings, in two spellings:
 //
 //	notFound: "container not found: web"
 //	internalError: "failed to get container" (cause: "notFound: \"container not found: web\"")
-type appleTypedError struct {
+//	internalError: "failed to get container" (cause: "notFound: "container not found: web"")
+//
+// The first two come from the escape-aware 1.3 renderer; the last keeps
+// Swift's unescaped nested quotes. One parser supports both so classifiers
+// cannot disagree about the same line.
+type appleContainerizationError struct {
 	code    string
 	message string
-	cause   *appleTypedError
+	cause   *appleContainerizationError
 }
 
-func parseAppleTypedErrorLine(line string) (appleTypedError, bool) {
-	line = strings.TrimSpace(line)
+func (e appleContainerizationError) walk(match func(code, message string) bool) bool {
+	if match(e.code, e.message) {
+		return true
+	}
+	return e.cause != nil && e.cause.walk(match)
+}
+
+// parseAppleContainerizationError parses one rendered ContainerizationError
+// line. Messages retain their original case; callers that match wording
+// lowercase them explicitly.
+func parseAppleContainerizationError(line string) (appleContainerizationError, bool) {
+	return parseAppleContainerizationErrorAt(line, 0)
+}
+
+func parseAppleContainerizationErrorAt(line string, depth int) (appleContainerizationError, bool) {
+	if depth > maxAppleContainerizationDepth {
+		return appleContainerizationError{}, false
+	}
+	line = trimAppleErrorPrefix(line)
 	if line == "" || appleApplicationPrefixed(line) {
-		return appleTypedError{}, false
+		return appleContainerizationError{}, false
 	}
 	code, rest, ok := strings.Cut(line, ":")
 	if !ok {
-		return appleTypedError{}, false
+		return appleContainerizationError{}, false
 	}
 	code = strings.ToLower(strings.TrimSpace(code))
-	switch code {
-	case "notfound", "internalerror", "exists":
-	default:
-		return appleTypedError{}, false
+	if _, ok := appleContainerizationCodes[code]; !ok {
+		return appleContainerizationError{}, false
 	}
-	message, rest, ok := parseAppleQuoted(rest)
+	if envelope, ok := parseAppleEscapedEnvelope(code, rest, depth); ok {
+		return envelope, true
+	}
+	return parseAppleUnescapedEnvelope(code, rest, depth)
+}
+
+func trimAppleErrorPrefix(line string) string {
+	line = strings.TrimSpace(line)
+	const prefix = "error:"
+	if len(line) >= len(prefix) && strings.EqualFold(line[:len(prefix)], prefix) {
+		line = strings.TrimSpace(line[len(prefix):])
+	}
+	return line
+}
+
+// parseAppleEscapedEnvelope handles the escape-aware spelling, where the
+// nested cause is a properly quoted string.
+func parseAppleEscapedEnvelope(code, rest string, depth int) (appleContainerizationError, bool) {
+	message, tail, ok := parseAppleQuoted(rest)
 	if !ok || appleApplicationPrefixed(message) {
-		return appleTypedError{}, false
+		return appleContainerizationError{}, false
 	}
-	result := appleTypedError{code: code, message: message}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
+	result := appleContainerizationError{code: code, message: message}
+	tail = strings.TrimSpace(tail)
+	if tail == "" {
 		return result, true
 	}
-	if !strings.HasPrefix(strings.ToLower(rest), "(cause:") {
-		return appleTypedError{}, false
+	const causePrefix = "(cause:"
+	if !strings.HasPrefix(strings.ToLower(tail), causePrefix) {
+		return appleContainerizationError{}, false
 	}
-	causeText, tail, ok := parseAppleQuoted(strings.TrimSpace(rest[len("(cause:"):]))
-	if !ok || strings.TrimSpace(tail) != ")" {
-		return appleTypedError{}, false
+	causeText, after, ok := parseAppleQuoted(strings.TrimSpace(tail[len(causePrefix):]))
+	if !ok || strings.TrimSpace(after) != ")" {
+		return appleContainerizationError{}, false
 	}
-	if cause, ok := parseAppleTypedErrorLine(causeText); ok {
+	if cause, ok := parseAppleContainerizationErrorAt(causeText, depth+1); ok {
 		result.cause = &cause
 	}
 	return result, true
+}
+
+// parseAppleUnescapedEnvelope handles the older spelling, where Swift leaves
+// the nested cause's quotes unescaped. The explicit "(cause: " marker keeps
+// the unquoted portion bounded.
+func parseAppleUnescapedEnvelope(code, rest string, depth int) (appleContainerizationError, bool) {
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, `"`) {
+		return appleContainerizationError{}, false
+	}
+	const causeMarker = `" (cause: "`
+	if marker := strings.Index(rest, causeMarker); marker >= 0 {
+		message := rest[1:marker]
+		if appleApplicationPrefixed(message) {
+			return appleContainerizationError{}, false
+		}
+		causeText := rest[marker+len(causeMarker):]
+		if !strings.HasSuffix(causeText, `")`) {
+			return appleContainerizationError{}, false
+		}
+		causeText = strings.TrimSuffix(causeText, `")`)
+		result := appleContainerizationError{code: code, message: message}
+		if cause, ok := parseAppleContainerizationErrorAt(causeText, depth+1); ok {
+			result.cause = &cause
+		}
+		return result, true
+	}
+	if !strings.HasSuffix(rest, `"`) {
+		return appleContainerizationError{}, false
+	}
+	message := rest[1 : len(rest)-1]
+	if appleApplicationPrefixed(message) {
+		return appleContainerizationError{}, false
+	}
+	return appleContainerizationError{code: code, message: message}, true
+}
+
+// lowercaseAppleContainerizationError preserves the historical envelope
+// parser contract: wording matches are case-insensitive.
+func lowercaseAppleContainerizationError(e appleContainerizationError) appleContainerizationError {
+	result := appleContainerizationError{code: strings.ToLower(e.code), message: strings.ToLower(e.message)}
+	if e.cause != nil {
+		cause := lowercaseAppleContainerizationError(*e.cause)
+		result.cause = &cause
+	}
+	return result
 }
 
 func parseAppleQuoted(value string) (string, string, bool) {
@@ -88,7 +195,7 @@ func appleApplicationPrefixed(value string) bool {
 }
 
 func appleTypedImageMissingLine(line, target string) bool {
-	root, ok := parseAppleTypedErrorLine(line)
+	root, ok := parseAppleContainerizationError(line)
 	if !ok {
 		return false
 	}
@@ -117,7 +224,7 @@ func hasAppleTypedImageLine(branch cliErrorBranch, target string) bool {
 }
 
 func appleTypedNameConflictLine(line, target string) bool {
-	root, ok := parseAppleTypedErrorLine(line)
+	root, ok := parseAppleContainerizationError(line)
 	if !ok {
 		return false
 	}

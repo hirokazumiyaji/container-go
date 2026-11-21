@@ -112,3 +112,146 @@ func TestPortSpecGrammarMatchesSharedParser(t *testing.T) {
 		})
 	}
 }
+
+// Every validation path must return *ConfigError, not only the strategies
+// that build one inline. Before this, invalidConfigf returned a bare
+// fmt.Errorf, so errors.As could not recover the type from option and HTTP
+// validation failures.
+func TestInvalidConfigPathsReturnConfigError(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy string
+		field    string
+		run      func() error
+	}{
+		{
+			name:     "negative startup timeout",
+			strategy: "ForLog",
+			field:    "startup timeout",
+			run: func() error {
+				return Validate(ForLog("ready").WithStartupTimeout(-time.Second))
+			},
+		},
+		{
+			name:     "negative poll interval",
+			strategy: "ForExec",
+			field:    "poll interval",
+			run: func() error {
+				return Validate(ForExec([]string{"true"}).WithPollInterval(-time.Second))
+			},
+		},
+		{
+			name:     "empty HTTP method",
+			strategy: "ForHTTP",
+			field:    "method",
+			run: func() error {
+				return Validate(ForHTTP("/").WithMethod(""))
+			},
+		},
+		{
+			name:     "HTTP path without leading slash",
+			strategy: "ForHTTP",
+			field:    "path",
+			run: func() error {
+				return Validate(ForHTTP("health"))
+			},
+		},
+		{
+			name:     "HTTP path with control character",
+			strategy: "ForHTTP",
+			field:    "path",
+			run: func() error {
+				return Validate(ForHTTP("/health\x01"))
+			},
+		},
+		{
+			name:     "invalid HTTP header name",
+			strategy: "ForHTTP",
+			field:    "header name",
+			run: func() error {
+				return Validate(ForHTTP("/").WithHeader("X-Test\n", "value"))
+			},
+		},
+		{
+			name:     "invalid HTTP header value",
+			strategy: "ForHTTP",
+			field:    "header value for X-Test",
+			run: func() error {
+				return Validate(ForHTTP("/").WithHeader("X-Test", "bad\x01value"))
+			},
+		},
+		{
+			name:     "empty log pattern",
+			strategy: "ForLog",
+			field:    "pattern",
+			run: func() error {
+				return Validate(ForLog(""))
+			},
+		},
+		{
+			name:     "zero log occurrence count",
+			strategy: "ForLog",
+			field:    "occurrence count",
+			run: func() error {
+				return Validate(ForLog("ready").WithOccurrence(0))
+			},
+		},
+		{
+			name:  "nil strategy",
+			field: "strategy",
+			run: func() error {
+				return Validate(nil)
+			},
+		},
+		{
+			name:  "declared port spec",
+			field: "port specification",
+			run: func() error {
+				return ValidateWithPorts(ForListeningPort("6379/tcp"), []string{"not-a-port"})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.run()
+			if err == nil {
+				t.Fatal("want a configuration error")
+			}
+			if !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("err = %v, want ErrInvalidConfiguration", err)
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("err = %T, want *ConfigError", err)
+			}
+			if configErr.Strategy != tt.strategy {
+				t.Errorf("Strategy = %q, want %q", configErr.Strategy, tt.strategy)
+			}
+			if configErr.Field != tt.field {
+				t.Errorf("Field = %q, want %q", configErr.Field, tt.field)
+			}
+			if !strings.Contains(err.Error(), configErr.Reason) {
+				t.Errorf("err = %q, want reason %q", err, configErr.Reason)
+			}
+		})
+	}
+}
+
+// A rejected header value is not echoed: the field names the header and the
+// value stays empty because the value itself is redacted configuration.
+func TestHTTPHeaderValueErrorKeepsNameInField(t *testing.T) {
+	err := Validate(ForHTTP("/").WithHeader("X-Test", "bad\x01value"))
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("err = %T, want *ConfigError", err)
+	}
+	if configErr.Field != "header value for X-Test" {
+		t.Errorf("Field = %q, want header value for X-Test", configErr.Field)
+	}
+	if configErr.Value != "" {
+		t.Errorf("Value = %q, want empty for a redacted header value", configErr.Value)
+	}
+	if strings.Contains(err.Error(), "bad") {
+		t.Errorf("err = %q, must not echo the header value", err)
+	}
+}

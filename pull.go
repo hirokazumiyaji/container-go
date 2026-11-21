@@ -121,7 +121,7 @@ func WithAllowMutableImageTag() Option {
 func WithImagePresenceCache(ttl time.Duration) Option {
 	if ttl < 0 {
 		return func(*config) error {
-			return fmt.Errorf("invalid image presence cache ttl %v: must not be negative", ttl)
+			return validationErrorf("WithImagePresenceCache", ttl, "invalid image presence cache ttl %v: must not be negative", ttl)
 		}
 	}
 	cache := newImageCache(ttl)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -72,17 +73,17 @@ func (s *LogStrategy) WithPollInterval(d time.Duration) *LogStrategy {
 func (s *LogStrategy) DiagnosticValues() []string { return []string{s.pattern} }
 
 func (s *LogStrategy) validate() error {
-	if err := s.options.validate(); err != nil {
+	if err := s.options.validate("ForLog"); err != nil {
 		return err
 	}
 	if s.pattern == "" {
-		return invalidConfigf("log pattern must not be empty")
+		return invalidConfigf("ForLog", "pattern", "", "must not be empty")
 	}
 	if len(s.pattern) > maxLogLineSize {
 		return &ConfigError{Strategy: "ForLog", Field: "pattern", Reason: "must not exceed 1 MiB"}
 	}
 	if s.occurrences <= 0 {
-		return invalidConfigf("log occurrence count must be positive")
+		return invalidConfigf("ForLog", "occurrence count", strconv.Itoa(s.occurrences), "must be positive")
 	}
 	if s.isRegexp {
 		if _, err := regexp.Compile(s.pattern); err != nil {

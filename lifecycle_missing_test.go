@@ -113,8 +113,9 @@ func TestLifecycleCommandTargetExtraction(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.command+" "+tc.args[0], func(t *testing.T) {
-			if got := cliCommandTarget(tc.command, tc.args); got != tc.want {
-				t.Fatalf("cliCommandTarget(%q, %q) = %q, want %q", tc.command, tc.args, got, tc.want)
+			argv := append([]string{tc.command}, tc.args...)
+			if got := commandTarget(argv, tc.command); got != tc.want {
+				t.Fatalf("commandTarget(%q) = %q, want %q", argv, got, tc.want)
 			}
 		})
 	}

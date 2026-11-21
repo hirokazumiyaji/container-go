@@ -829,7 +829,7 @@ func wrapWaitCause(what string, cause error, previous ...error) error {
 // the same lifecycle policy: inspect once up front, then at a bounded cadence;
 // retain transient check and state errors for final diagnostics.
 func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error) error {
-	if err := o.validate(); err != nil {
+	if err := o.validate(""); err != nil {
 		return err
 	}
 	timeout, interval := o.effective()

@@ -134,72 +134,6 @@ func hasParsedCLITarget(ctx cliErrorContext) bool {
 	return strings.TrimSpace(ctx.target) != ""
 }
 
-func commandTarget(args []string, operation string) string {
-	if len(args) == 0 {
-		return ""
-	}
-	switch operation {
-	case "run":
-		for i := 0; i < len(args); i++ {
-			if args[i] == "--name" && i+1 < len(args) {
-				return args[i+1]
-			}
-			if value, ok := strings.CutPrefix(args[i], "--name="); ok {
-				return value
-			}
-		}
-	case "image inspect", "image pull":
-		return firstPositional(args, 2, "--platform")
-	case "inspect":
-		return firstPositional(args, 1)
-	case "exec":
-		return firstPositional(args, 1, "--env-file", "--user", "--workdir")
-	case "logs":
-		return firstPositional(args, 1, "--tail", "--since", "-n")
-	case "pull":
-		return firstPositional(args, 1, "--platform")
-	case "stop":
-		return firstPositional(args, 1, "--time")
-	case "start", "restart", "kill", "pause", "unpause":
-		return firstPositional(args, 1, "--time", "-t", "--signal", "-s")
-	case "delete", "rm":
-		return firstPositional(args, 1)
-	case "cp":
-		for _, arg := range args[1:] {
-			if target, path, ok := strings.Cut(arg, ":"); ok && target != "" && strings.HasPrefix(path, "/") {
-				return target
-			}
-		}
-	}
-	return ""
-}
-
-func firstPositional(args []string, start int, valueOptions ...string) string {
-	for i := start; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--" {
-			if i+1 < len(args) {
-				return args[i+1]
-			}
-			return ""
-		}
-		if strings.HasPrefix(arg, "-") {
-			// Only options in this operation's emitted argv schema carry
-			// values. Do not mistake a value for an unrelated flag as the
-			// backend target.
-			for _, option := range valueOptions {
-				if arg == option {
-					i++
-					break
-				}
-			}
-			continue
-		}
-		return arg
-	}
-	return ""
-}
-
 func branchLines(branch cliErrorBranch, includeStdout bool) (stderr, stdout []string) {
 	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
 	for _, line := range splitCLIErrorLines(branch.stderr) {
@@ -337,84 +271,15 @@ func hasBranchImageLine(branch cliErrorBranch, prefix, target string, exact bool
 	return false
 }
 
-const maxAppleContainerizationDepth = 8
-
-var appleContainerizationCodes = map[string]struct{}{
-	"unknown":         {},
-	"invalidargument": {},
-	"internalerror":   {},
-	"exists":          {},
-	"notfound":        {},
-	"cancelled":       {},
-	"invalidstate":    {},
-	"empty":           {},
-	"timeout":         {},
-	"unsupported":     {},
-	"interrupted":     {},
-}
-
-type appleContainerizationError struct {
-	code    string
-	message string
-	cause   *appleContainerizationError
-}
-
-// parseAppleContainerizationEnvelope parses ContainerizationError's
-// CustomStringConvertible form, with or without the CLI's generic "Error: "
-// wrapper. Swift embeds nested causes without escaping their quotes, so
-// parsing follows the explicit "(cause: " marker and strips exactly the
-// enclosing quote/parenthesis before recursing.
+// parseAppleContainerizationEnvelope returns the shared parser's tree with
+// codes and messages lowercased, matching the historical envelope contract
+// used by wording-based matchers.
 func parseAppleContainerizationEnvelope(line string) (appleContainerizationError, bool) {
-	return parseAppleContainerizationEnvelopeAt(line, 0)
-}
-
-func parseAppleContainerizationEnvelopeAt(line string, depth int) (appleContainerizationError, bool) {
-	if depth > maxAppleContainerizationDepth {
+	envelope, ok := parseAppleContainerizationError(line)
+	if !ok {
 		return appleContainerizationError{}, false
 	}
-	line = strings.ToLower(strings.TrimSpace(line))
-	line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
-	colon := strings.Index(line, ": ")
-	if colon <= 0 {
-		return appleContainerizationError{}, false
-	}
-	code := strings.ToLower(line[:colon])
-	if _, ok := appleContainerizationCodes[code]; !ok {
-		return appleContainerizationError{}, false
-	}
-	rest := line[colon+2:]
-	if !strings.HasPrefix(rest, `"`) {
-		return appleContainerizationError{}, false
-	}
-	rest = strings.TrimPrefix(rest, `"`)
-
-	const causeMarker = `" (cause: "`
-	if marker := strings.Index(rest, causeMarker); marker >= 0 {
-		causeText := rest[marker+len(causeMarker):]
-		if !strings.HasSuffix(causeText, `")`) {
-			return appleContainerizationError{}, false
-		}
-		causeText = strings.TrimSuffix(causeText, ")")
-		causeText = strings.TrimSuffix(causeText, `"`)
-		envelope := appleContainerizationError{code: code, message: rest[:marker]}
-		if cause, ok := parseAppleContainerizationEnvelopeAt(causeText, depth+1); ok {
-			envelope.cause = &cause
-		}
-		return envelope, true
-	}
-	if !strings.HasSuffix(rest, `"`) {
-		return appleContainerizationError{}, false
-	}
-	return appleContainerizationError{
-		code: code, message: strings.TrimSuffix(rest, `"`),
-	}, true
-}
-
-func (e appleContainerizationError) walk(match func(code, message string) bool) bool {
-	if match(e.code, e.message) {
-		return true
-	}
-	return e.cause != nil && e.cause.walk(match)
+	return lowercaseAppleContainerizationError(envelope), true
 }
 
 func hasAppleContainerizationError(err error, code string, match func(string) bool) bool {
@@ -435,14 +300,6 @@ func hasAppleContainerizationErrorPath(
 			if line == "" {
 				continue
 			}
-			// Prefer the escape-aware typed parser for 1.3 CLI output; fall
-			// back to the unescaped ContainerizationError grammar.
-			if typed, ok := parseAppleTypedErrorLine(line); ok {
-				if appleTypedErrorMatchesPath(typed, rootCode, matchRootMessage, code, match) {
-					return true
-				}
-				continue
-			}
 			envelope, ok := parseAppleContainerizationEnvelope(line)
 			if !ok {
 				continue
@@ -456,25 +313,6 @@ func hasAppleContainerizationErrorPath(
 			}) {
 				return true
 			}
-		}
-	}
-	return false
-}
-
-func appleTypedErrorMatchesPath(
-	root appleTypedError,
-	rootCode string,
-	matchRootMessage func(string) bool,
-	code string,
-	match func(string) bool,
-) bool {
-	if rootCode != "" && (root.code != rootCode ||
-		(matchRootMessage != nil && !matchRootMessage(strings.ToLower(root.message)))) {
-		return false
-	}
-	for node := &root; node != nil; node = node.cause {
-		if node.code == code && match(strings.ToLower(node.message)) {
-			return true
 		}
 	}
 	return false

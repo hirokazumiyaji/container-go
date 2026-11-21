@@ -13,6 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps a bounded trailing stderr window so a password prefix or private-key PEM
   header outside the rendered 64 KiB tail still reaches the redaction rules, and
   `Run`, `RunTo`, and streaming terminal errors all render the redacted tail.
+- Redact caller values in `Exec` and `ExecTo` failures, including verification,
+  environment-file, classification, and streaming errors, so exec environment
+  values and command arguments do not survive in `CLIError.Args`/`Stderr`.
+- Redact handle secrets in `Logs`, `LogsWithOptions`, `LogsTo`, `FollowLogs`, and
+  `FollowLogsTo` errors, including follower startup failures and terminal stream
+  errors returned by `Read` and `TerminalError`. A follower keeps the handle's
+  redaction from when it started, so a terminal error read after `Terminate`
+  is still redacted.
+- `Exec`, `ExecTo`, and the `Logs` family now return errors across the
+  redaction boundary, which narrows `errors.As`. `*CLIError`,
+  `*ValidationError`, `*ExecTerminationError`, and `*exec.Error` resolve to
+  redacted clones rather than the original values, and other raw causes such as
+  `*json.SyntaxError` from target verification are no longer reachable through
+  `errors.As`. `errors.Is` classification is unchanged. A writer error behind
+  `ErrOutputDelivery` stays reachable through `errors.As`, as documented, from
+  `ExecTo`, `LogsTo`, `FollowLogsTo`, and `AttachedError`.
+- Redact sensitive argv in `internal/cli` stream setup, cancellation, and terminal
+  wait diagnostics instead of embedding the raw command line.
 
 ### Added
 
@@ -29,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reject carriage returns, NUL bytes, and invalid UTF-8 in working directories,
   entrypoints, and command arguments with a `*ValidationError` before backend work,
   and fail wait probes immediately instead of retrying an invalid argument.
+- Preserve `float64` and `float32` validation values through redaction so a
+  rejected `WithCPUs` value remains inspectable on `ValidationError.Value`.
 - Preserve non-CLI configuration and ambiguous-object vetoes at any wrapper depth
   when classifying CLI absence errors.
 - Retry inspection-query deadlines while the enclosing verification or reuse

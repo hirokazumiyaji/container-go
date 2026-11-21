@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -307,7 +308,14 @@ func TestExecPropagatesInspectVerificationErrors(t *testing.T) {
 				t.Errorf("errors.Is(ErrContainerNotFound) = %t, want %t: %v", got, tc.wantNotFound, err)
 			}
 			var syntaxErr *json.SyntaxError
-			if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
+			// Exec errors cross the redaction boundary, so only the
+			// explicit UnwrapRaw escape hatch exposes the structured
+			// cause. That cause must still be the original parse error.
+			raw := err
+			if facade, ok := err.(interface{ UnwrapRaw() error }); ok {
+				raw = facade.UnwrapRaw()
+			}
+			if got := errors.As(raw, &syntaxErr); got != tc.wantSyntaxError {
 				t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
 			}
 			if tc.wantSchema != "" && (!strings.Contains(err.Error(), tc.wantSchema) || errors.Is(err, ErrContainerNotFound)) {
@@ -752,6 +760,137 @@ func TestExecPassesOptionsAndEnvFile(t *testing.T) {
 	}
 	if len(f.envFiles) != 1 || !strings.Contains(f.envFiles[0], "TOKEN=xyz\n") {
 		t.Errorf("env-file captures = %q", f.envFiles)
+	}
+}
+
+// execEchoFailureRunner fails every exec call. A CLI failure carries the
+// configured stderr; plainErr fails exec with a non-CLI backend error.
+type execEchoFailureRunner struct {
+	*fakeRunner
+	stderr   string
+	plainErr error
+}
+
+func (r *execEchoFailureRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "exec" {
+		r.recordCall(args)
+		if r.plainErr != nil {
+			return nil, nil, r.plainErr
+		}
+		return nil, []byte(r.stderr), &cli.CLIError{
+			Binary:   r.binaryName(),
+			Args:     args,
+			ExitCode: -1,
+			Stderr:   r.stderr,
+		}
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestExecRedactsCallerValuesFromFailures(t *testing.T) {
+	if envFileLocksSupported {
+		isolateEnvFileRoot(t)
+	}
+	const (
+		cmdSecret     = "exec-command-secret-329"
+		workdirSecret = "/srv/exec-workdir-secret-329"
+		envSecret     = "exec-env-secret-329"
+	)
+	execCall := func(ctr *Container, opts []ExecOption) (int, error) {
+		code, _, err := ctr.Exec(context.Background(), []string{"sh", "-c", "echo " + cmdSecret}, opts...)
+		return code, err
+	}
+	execToCall := func(ctr *Container, opts []ExecOption) (int, error) {
+		code, _, err := ctr.ExecTo(context.Background(), []string{"sh", "-c", "echo " + cmdSecret}, io.Discard, opts...)
+		return code, err
+	}
+	cliFailure := func(_ *testing.T, _ *Container, r *execEchoFailureRunner, values []string) {
+		r.stderr = "exec failed for " + strings.Join(values, " ")
+	}
+	backendFailure := func(_ *testing.T, _ *Container, r *execEchoFailureRunner, values []string) {
+		r.plainErr = errors.New("backend unavailable for " + strings.Join(values, " "))
+	}
+	// A handle without its creation generation fails operation-target
+	// verification before any backend call.
+	verifyFailure := func(_ *testing.T, ctr *Container, _ *execEchoFailureRunner, _ []string) {
+		ctr.creation = ""
+	}
+	// A cache root that is a regular file named after the command makes
+	// the env-file write fail with a path error that echoes a caller value.
+	envFileFailure := func(t *testing.T, _ *Container, _ *execEchoFailureRunner, _ []string) {
+		blocked := filepath.Join(t.TempDir(), cmdSecret)
+		if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HOME", blocked)
+		t.Setenv("XDG_CACHE_HOME", blocked)
+		t.Setenv("LocalAppData", blocked)
+	}
+	cases := []struct {
+		name    string
+		call    func(*Container, []ExecOption) (int, error)
+		arm     func(*testing.T, *Container, *execEchoFailureRunner, []string)
+		code    int
+		wantCLI bool
+		envOnly bool
+	}{
+		{name: "Exec CLI failure", call: execCall, arm: cliFailure, code: -1, wantCLI: true},
+		{name: "ExecTo CLI failure", call: execToCall, arm: cliFailure, code: -1, wantCLI: true},
+		{name: "Exec backend failure", call: execCall, arm: backendFailure},
+		{name: "ExecTo backend failure", call: execToCall, arm: backendFailure},
+		{name: "Exec verification failure", call: execCall, arm: verifyFailure},
+		{name: "ExecTo verification failure", call: execToCall, arm: verifyFailure},
+		{name: "Exec env-file failure", call: execCall, arm: envFileFailure, envOnly: true},
+		{name: "ExecTo env-file failure", call: execToCall, arm: envFileFailure, envOnly: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envOnly && !envFileLocksSupported {
+				t.Skip("secure environment files are unsupported on this platform")
+			}
+			values := []string{cmdSecret, workdirSecret}
+			opts := []ExecOption{WithExecWorkDir(workdirSecret)}
+			if envFileLocksSupported {
+				opts = append(opts, WithExecEnv(map[string]string{"TOKEN": envSecret}))
+				values = append(values, envSecret)
+			}
+			r := &execEchoFailureRunner{fakeRunner: newTestRunner()}
+			ctr := runTestContainer(t, r)
+			tc.arm(t, ctr, r, values)
+
+			code, err := tc.call(ctr, opts)
+			if code != tc.code {
+				t.Fatalf("exit code = %d, want %d", code, tc.code)
+			}
+			if err == nil {
+				t.Fatal("Exec returned no error for a failed operation")
+			}
+			if _, ok := err.(interface{ UnwrapRaw() error }); !ok {
+				t.Fatalf("error %T bypassed the redaction boundary: %v", err, err)
+			}
+			for _, value := range values {
+				if strings.Contains(err.Error(), value) {
+					t.Errorf("error = %q, leaks caller value %q", err, value)
+				}
+			}
+			var cliErr *CLIError
+			if !tc.wantCLI {
+				if errors.As(err, &cliErr) {
+					t.Fatalf("non-CLI failure exposed a CLIError: %v", err)
+				}
+				return
+			}
+			if !errors.As(err, &cliErr) {
+				t.Fatalf("errors.As did not find *CLIError: %v", err)
+			}
+			for _, value := range values {
+				if strings.Contains(cliErr.Stderr, value) ||
+					strings.Contains(strings.Join(cliErr.Args, " "), value) ||
+					strings.Contains(cliErr.Error(), value) {
+					t.Errorf("redacted CLIError = %#v, leaks caller value %q", cliErr, value)
+				}
+			}
+		})
 	}
 }
 

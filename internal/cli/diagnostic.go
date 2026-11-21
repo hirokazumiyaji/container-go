@@ -555,6 +555,18 @@ func asSafeDiagnostic(err error, target any, r *Redactor) bool {
 	if _, safe := err.(interface{ DiagnosticSafe() }); safe {
 		return errors.As(err, target)
 	}
+	// A sink failure is the caller's own writer error, not CLI output, so
+	// ErrOutputDelivery promises it stays reachable through errors.As.
+	if output, ok := err.(*OutputError); ok {
+		if ptr, ok := target.(**OutputError); ok {
+			clone := *output
+			*ptr = &clone
+			return true
+		}
+		if output.Err != nil && errors.As(output.Err, target) {
+			return true
+		}
+	}
 	for _, child := range rawChildren(err) {
 		if asSafeDiagnostic(child, target, r) {
 			return true

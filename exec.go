@@ -153,6 +153,18 @@ func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, 
 // receives the CLI's streams and the returned reader is empty; otherwise
 // the output is captured and returned as a reader.
 func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption, out io.Writer, streaming bool) (exitCode int, output io.Reader, stats OutputStats, retErr error) {
+	// Exec command lines and environment values may carry credentials.
+	// Every error leaving this method, including verification, environment
+	// file, streamed-output, and classification failures, must therefore
+	// pass the container's diagnostic redactor with the exec values known
+	// at the point of failure. cfg is mutated by the option loop below, so
+	// the deferred closure sees exactly the accepted configuration.
+	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
+	defer func() {
+		if retErr != nil {
+			retErr = c.redactError(retErr, execDiagnosticValues(cfg, cmd)...)
+		}
+	}()
 	for i, opt := range opts {
 		if opt == nil {
 			return 0, nil, OutputStats{}, validationErrorf("Exec", i, "option %d is nil", i)
@@ -164,10 +176,9 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 	if err := validateCommandArguments("Exec", cmd); err != nil {
 		return 0, nil, OutputStats{}, err
 	}
-	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
-			return 0, nil, OutputStats{}, c.redactError(optionBoundaryError(err), execDiagnosticValues(cfg, cmd)...)
+			return 0, nil, OutputStats{}, optionBoundaryError(err)
 		}
 	}
 

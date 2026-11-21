@@ -211,9 +211,145 @@ func TestFollowLogsClassificationProbeFailurePreservesTerminalNotFound(t *testin
 		t.Fatalf("terminal error = %v, want failed classification probe", terminalErr)
 	}
 	var got *CLIError
-	if !errors.As(terminalErr, &got) || got != terminal {
-		t.Fatalf("terminal error = %v, want original CLIError %v", terminalErr, terminal)
+	if !errors.As(terminalErr, &got) {
+		t.Fatalf("terminal error = %v, want a CLIError through the redaction boundary", terminalErr)
 	}
+	// The terminal failure crosses the handle's redaction boundary, so
+	// errors.As yields a clone rather than the raw CLIError while the
+	// settled exit code and stderr remain inspectable.
+	if got == terminal {
+		t.Fatalf("terminal error = %v, want a redacted CLIError clone", terminalErr)
+	}
+	if got.ExitCode != terminal.ExitCode || got.Stderr != terminal.Stderr {
+		t.Fatalf("terminal CLIError = %#v, want exit code and stderr of %#v", got, terminal)
+	}
+}
+
+// assertRedactedCLIError requires err to hide secret from its rendering and
+// from the CLIError clone returned through the redaction boundary.
+func assertRedactedCLIError(t *testing.T, err error, secret string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error = %q, leaks %q", err, secret)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("errors.As did not find *CLIError: %v", err)
+	}
+	if strings.Contains(cliErr.Stderr, secret) ||
+		strings.Contains(strings.Join(cliErr.Args, " "), secret) ||
+		strings.Contains(cliErr.Error(), secret) {
+		t.Fatalf("redacted CLIError = %#v, leaks %q", cliErr, secret)
+	}
+}
+
+func TestLogsRedactsHandleSecretsFromFailures(t *testing.T) {
+	const secret = "logs-label-secret-329"
+	calls := map[string]func(*Container) error{
+		"Logs": func(ctr *Container) error {
+			rc, err := ctr.Logs(context.Background())
+			if rc != nil {
+				_ = rc.Close()
+			}
+			return err
+		},
+		"LogsWithOptions": func(ctr *Container) error {
+			rc, err := ctr.LogsWithOptions(context.Background(), LogsOptions{MaxBytes: 8})
+			if rc != nil {
+				_ = rc.Close()
+			}
+			return err
+		},
+		"LogsTo": func(ctr *Container) error {
+			_, err := ctr.LogsTo(context.Background(), io.Discard, LogsOptions{MaxBytes: 8})
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			f := newTestRunner()
+			f.failPrefix = "logs"
+			f.failStderr = "logs request failed for token " + secret
+			ctr := runTestContainer(t, f, WithLabels(map[string]string{"com.example.token": secret}))
+
+			assertRedactedCLIError(t, call(ctr), secret)
+		})
+	}
+}
+
+func TestFollowLogsRedactsHandleSecretsFromFailures(t *testing.T) {
+	const secret = "follow-logs-label-secret-329"
+	terminal := &cli.CLIError{
+		Binary:   "container",
+		Args:     []string{"logs", "--follow", "myctr"},
+		ExitCode: 1,
+		Stderr:   "follow failed for token " + secret,
+	}
+	newHandle := func(t *testing.T, stream io.ReadCloser) *Container {
+		t.Helper()
+		runner := &singleStreamRunner{fakeRunner: newTestRunner(), stream: stream}
+		return runTestContainer(t, runner, WithLabels(map[string]string{"com.example.token": secret}))
+	}
+
+	t.Run("startup", func(t *testing.T) {
+		runner := &notFoundStreamRunner{fakeRunner: newTestRunner(), err: terminal}
+		ctr := runTestContainer(t, runner, WithLabels(map[string]string{"com.example.token": secret}))
+		_, err := ctr.FollowLogs(context.Background())
+		assertRedactedCLIError(t, err, secret)
+	})
+
+	t.Run("FollowLogsTo startup", func(t *testing.T) {
+		runner := &notFoundStreamRunner{fakeRunner: newTestRunner(), err: terminal}
+		ctr := runTestContainer(t, runner, WithLabels(map[string]string{"com.example.token": secret}))
+		assertRedactedCLIError(t, ctr.FollowLogsTo(context.Background(), io.Discard), secret)
+	})
+
+	t.Run("terminal status", func(t *testing.T) {
+		ctr := newHandle(t, newTerminalStatusReader(terminal))
+		stream, err := ctr.FollowLogs(context.Background())
+		if err != nil {
+			t.Fatalf("FollowLogs: %v", err)
+		}
+		defer stream.Close()
+		status, ok := stream.(interface{ TerminalError() error })
+		if !ok {
+			t.Fatalf("stream type %T does not expose terminal status", stream)
+		}
+		assertRedactedCLIError(t, status.TerminalError(), secret)
+	})
+
+	t.Run("terminal status after Terminate", func(t *testing.T) {
+		ctr := newHandle(t, newTerminalStatusReader(terminal))
+		stream, err := ctr.FollowLogs(context.Background())
+		if err != nil {
+			t.Fatalf("FollowLogs: %v", err)
+		}
+		defer stream.Close()
+		// Terminate drops the handle's diagnostic matcher. A stream the
+		// caller still holds must keep the redaction it was created with.
+		if err := ctr.Terminate(context.Background()); err != nil {
+			t.Fatalf("Terminate: %v", err)
+		}
+		status, ok := stream.(interface{ TerminalError() error })
+		if !ok {
+			t.Fatalf("stream type %T does not expose terminal status", stream)
+		}
+		assertRedactedCLIError(t, status.TerminalError(), secret)
+	})
+
+	t.Run("terminal read", func(t *testing.T) {
+		ctr := newHandle(t, &stagedTerminalReader{terminalErr: terminal})
+		stream, err := ctr.FollowLogs(context.Background())
+		if err != nil {
+			t.Fatalf("FollowLogs: %v", err)
+		}
+		defer stream.Close()
+		_, readErr := io.ReadAll(stream)
+		assertRedactedCLIError(t, readErr, secret)
+	})
 }
 
 func TestLogsWithOptionsBackendMatrix(t *testing.T) {

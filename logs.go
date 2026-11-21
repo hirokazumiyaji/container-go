@@ -67,11 +67,11 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
-		return nil, err
+		return nil, c.redactError(err)
 	}
 	args, err := c.eng.logsArgsWithOptions(target, opts)
 	if err != nil {
-		return nil, err
+		return nil, c.redactError(err)
 	}
 
 	var (
@@ -108,11 +108,11 @@ func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptio
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
-		return OutputStats{}, err
+		return OutputStats{}, c.redactError(err)
 	}
 	args, err := c.eng.logsArgsWithOptions(target, opts)
 	if err != nil {
-		return OutputStats{}, err
+		return OutputStats{}, c.redactError(err)
 	}
 
 	tracked := newOutputTrackingWriter(output)
@@ -128,9 +128,9 @@ func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptio
 
 func (c *Container) logsError(ctx, qCtx context.Context, err error) error {
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
-		return contextErr
+		return c.redactError(contextErr)
 	}
-	return preserveError(wrapNotFoundFor(c.eng, c.classify(ctx, err)), err)
+	return c.redactError(preserveError(wrapNotFoundFor(c.eng, c.classify(ctx, err)), err))
 }
 
 // FollowLogs streams the container's log output until Close is called
@@ -154,11 +154,11 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 func (c *Container) followLogs(ctx context.Context, resumeSince time.Time) (io.ReadCloser, error) {
 	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
-		return nil, err
+		return nil, c.redactError(err)
 	}
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {
-		return nil, fmt.Errorf("logs: %w: runner does not support streaming", cli.ErrStreamSetup)
+		return nil, c.redactError(fmt.Errorf("logs: %w: runner does not support streaming", cli.ErrStreamSetup))
 	}
 	args := c.eng.logsFollowArgs(target)
 	if !resumeSince.IsZero() {
@@ -169,15 +169,19 @@ func (c *Container) followLogs(ctx context.Context, resumeSince time.Time) (io.R
 		if stream != nil {
 			_ = stream.Close()
 		}
-		return nil, contextErr
+		return nil, c.redactError(contextErr)
 	}
 	if err != nil {
-		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+		return nil, c.redactError(wrapNotFoundFor(c.eng, c.classify(ctx, err)))
 	}
 	classified := &classifyingStream{
 		ReadCloser: stream,
 		ctx:        ctx,
 		container:  c,
+		// Terminate drops the handle's matcher while the caller may still
+		// hold this stream, so its terminal errors keep the matcher in
+		// effect when the stream started.
+		redactor: c.diagnosticRedactor(),
 	}
 	status, ok := stream.(terminalStreamStatus)
 	if !ok || status.Done() == nil {
@@ -193,6 +197,7 @@ type classifyingStream struct {
 	io.ReadCloser
 	ctx          context.Context
 	container    *Container
+	redactor     *cli.Redactor
 	terminalOnce sync.Once
 	terminalErr  error
 }
@@ -274,12 +279,12 @@ func (s *classifyingStream) wrap(err error) error {
 	}
 	classified := s.container.classify(s.ctx, err)
 	if classified == nil || errors.Is(classified, err) || errors.Is(err, classified) {
-		return wrapNotFoundFor(s.container.eng, classified)
+		return cli.WithRedactor(wrapNotFoundFor(s.container.eng, classified), s.redactor)
 	}
 	// A backend probe can classify a terminal CLI failure as an
 	// infrastructure problem. Keep both causes so Read/ForLog callers can
 	// still recover CLIError and ErrContainerNotFound with errors.Is/As.
-	return wrapNotFoundFor(s.container.eng, errors.Join(classified, err))
+	return cli.WithRedactor(wrapNotFoundFor(s.container.eng, errors.Join(classified, err)), s.redactor)
 }
 
 // FollowLogsTo streams the container's log output directly into output until
@@ -304,7 +309,7 @@ func (c *Container) followLogsTo(ctx context.Context, output io.Writer, resumeSi
 	_, copyErr := io.Copy(tracked, stream)
 	copyErr = preserveOutputDeliveryError(copyErr, tracked)
 	if contextErr := commandContextError(ctx, copyErr); contextErr != nil {
-		return contextErr
+		return c.redactError(contextErr)
 	}
-	return copyErr
+	return c.redactError(copyErr)
 }

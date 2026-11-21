@@ -27,7 +27,7 @@ func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 		return "", err
 	}
 	appRoot := filepath.Join(base, "containergo")
-	if err := ensureWindowsPrivateCopyStagingDir(appRoot, true); err != nil {
+	if err := ensureWindowsPrivateDir(appRoot, true); err != nil {
 		// Shared CI images can already have LocalAppData\containergo
 		// owned by another logon SID. Create a unique private parent
 		// rather than writing into that directory.
@@ -36,22 +36,22 @@ func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 			return "", fmt.Errorf("copy staging: create private staging parent: %w", err)
 		}
 		appRoot = filepath.Join(base, "containergo-"+hex.EncodeToString(random[:]))
-		if retryErr := ensureWindowsPrivateCopyStagingDir(appRoot, true); retryErr != nil {
+		if retryErr := ensureWindowsPrivateDir(appRoot, true); retryErr != nil {
 			return "", fmt.Errorf("copy staging: create private staging parent: %w", retryErr)
 		}
 	}
 	root := filepath.Join(appRoot, "copy-staging")
-	if err := ensureWindowsPrivateCopyStagingDir(root, true); err != nil {
+	if err := ensureWindowsPrivateDir(root, true); err != nil {
 		return "", fmt.Errorf("copy staging: create private staging root: %w", err)
 	}
 	return root, nil
 }
 
-func ensureWindowsPrivateCopyStagingDir(path string, create bool) error {
-	return configureWindowsPrivateCopyStagingDir(path, create, false)
+func ensureWindowsPrivateDir(path string, create bool) error {
+	return configureWindowsPrivateDir(path, create, false)
 }
 
-func configureWindowsPrivateCopyStagingDir(path string, create, created bool) error {
+func configureWindowsPrivateDir(path string, create, created bool) error {
 	if create {
 		securityAttributes, err := currentUserSecurityAttributes()
 		if err != nil {
@@ -102,7 +102,7 @@ func configureWindowsPrivateCopyStagingDir(path string, create, created bool) er
 		return err
 	}
 	file := os.NewFile(uintptr(handle), path)
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	reparse, err := windowsCopyHandleIsReparse(file)
 	if err != nil {
@@ -166,7 +166,7 @@ func verifyCurrentUserOwner(file *os.File) error {
 		return err
 	}
 	if !windows.EqualSid(owner, user.User.Sid) {
-		return fmt.Errorf("staging directory is owned by a foreign SID")
+		return fmt.Errorf("object is owned by a foreign SID")
 	}
 	return nil
 }
@@ -220,7 +220,7 @@ func currentUserOnlyACL() (*windows.ACL, error) {
 	}}, nil)
 }
 
-func allowedStagingSIDs() ([]*windows.SID, error) {
+func allowedPrivateSIDs() ([]*windows.SID, error) {
 	token := windows.GetCurrentProcessToken()
 	user, err := token.GetTokenUser()
 	if err != nil {
@@ -236,7 +236,7 @@ func allowedStagingSIDs() ([]*windows.SID, error) {
 	return sids, nil
 }
 
-func sidAllowedForStaging(sid *windows.SID, allowed []*windows.SID) bool {
+func sidAllowedForPrivate(sid *windows.SID, allowed []*windows.SID) bool {
 	for _, candidate := range allowed {
 		if windows.EqualSid(sid, candidate) {
 			return true
@@ -259,7 +259,7 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 		return err
 	}
 	if control&windows.SE_DACL_PROTECTED == 0 {
-		return fmt.Errorf("staging DACL is inheritable")
+		return fmt.Errorf("DACL is inheritable")
 	}
 	// DACL() reports (acl, defaulted, err). An explicit SetSecurityInfo
 	// DACL is not defaulted; the old !present check treated that as empty.
@@ -272,9 +272,9 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 		aceCount = int(dacl.AceCount)
 	}
 	if dacl == nil || aceCount < 1 {
-		return fmt.Errorf("staging DACL has %d ACEs, want a current-logon ACE", aceCount)
+		return fmt.Errorf("DACL has %d ACEs, want a current-logon ACE", aceCount)
 	}
-	allowed, err := allowedStagingSIDs()
+	allowed, err := allowedPrivateSIDs()
 	if err != nil {
 		return err
 	}
@@ -284,11 +284,11 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 			return err
 		}
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
-			return fmt.Errorf("staging DACL ACE type is %d, want allow", ace.Header.AceType)
+			return fmt.Errorf("DACL ACE type is %d, want allow", ace.Header.AceType)
 		}
 		aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-		if !sidAllowedForStaging(aceSID, allowed) {
-			return fmt.Errorf("staging DACL contains a non-current-user ACE")
+		if !sidAllowedForPrivate(aceSID, allowed) {
+			return fmt.Errorf("DACL contains a non-current-user ACE")
 		}
 	}
 	return nil
@@ -339,7 +339,7 @@ func createCopyStagingDir(root string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err := configureWindowsPrivateCopyStagingDir(path, false, true); err != nil {
+		if err := configureWindowsPrivateDir(path, false, true); err != nil {
 			_ = os.RemoveAll(path)
 			return "", err
 		}

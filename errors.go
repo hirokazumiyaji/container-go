@@ -260,10 +260,12 @@ var ErrImageIdentityMismatch = errors.New("backend reported a different image id
 // into the mutable-tag compatibility fallback.
 var ErrImageIdentityNotLocal = errors.New("immutable image identity is not available locally under the selected pull policy")
 
-// ErrEnvFileUnsupported reports that the current platform cannot provide
-// the per-user private temporary storage required for environment files.
-// On Windows, Run and Exec return this error when a non-empty WithEnv or
-// WithExecEnv option would require such a file.
+// ErrEnvFileUnsupported is retained for API compatibility. Every supported
+// platform can now store the secret environment file required by WithEnv and
+// WithExecEnv, so the library no longer returns it.
+//
+// Deprecated: secure environment files are supported on every platform this
+// package targets, and this error is never returned.
 var ErrEnvFileUnsupported = errors.New("secure environment files are not supported on this platform")
 
 // ErrContainerNotFound reports that the container does not exist.

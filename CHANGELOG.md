@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `WithClientQueryTimeout` for Client construction, Run queries, container
   control operations, and prune defaults, and `WithPruneQueryTimeout` for an
   individual prune's listing and candidate budgets.
+- Support `WithEnv` and `WithExecEnv` on Windows: the env file lives under
+  `%LocalAppData%\containergo-env-v1` and is created with a protected DACL
+  limited to the current logon, with `LockFileEx`-based crash cleanup.
 
 ### Fixed
 
@@ -57,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Classify redacted CLI errors using their original command and target identities.
   Wait, prune, and terminate now recognize confirmed container absence, and
   returned diagnostics stay redacted.
+- `Run` and `Exec` no longer return `ErrEnvFileUnsupported` on Windows for a
+  non-empty environment map; `ErrEnvFileUnsupported` remains exported for
+  compatibility. The external watchdog reaper is still unavailable on Windows.
 
 - **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
   an exit code. `ExitCode` also rejects containers that have not stopped. Callers

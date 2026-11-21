@@ -23,8 +23,8 @@ Go 1.26 以降が必要です。`v0.3.0` モジュールにも Go 1.26 以降が
 
 - Windows には watchdog リーパーがありません。リーパーは `/bin/sh` を必要とします。
   Windows でも明示的な `Terminate`、`Cleanup`、`TerminateContainer`、`Prune`、および rollback 経路は利用できます。
-  秘密情報を含む環境ファイルが必要な操作は Windows では
-  `ErrEnvFileUnsupported` で失敗し、Docker の copy-out には Go 1.26 以降が必要です。
+  `WithEnv` と `WithExecEnv` は Windows では現在のログオンだけに許可した DACL で
+  環境ファイルを書き、Docker の copy-out には Go 1.26 以降が必要です。
 - network の作成とライフサイクル管理はスコープ外です。`WithNetwork` は既存の
   network へ接続します。volume の作成とライフサイクル管理もスコープ外で、
   `WithMounts` は bind、名前付き volume、tmpfs の mount を受け付けます。
@@ -1101,10 +1101,19 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   marker が不正な場合、置き換えられた場合、許可されない子がある場合は
   fail closed します。利用者が内容を確認して手動で削除してください。
   cleanup 失敗は API から返し、関数から返る前に deferred retry します。
-- Windows の Go `chmod` はユーザー単位の秘密性を保証しません。
-  空でない環境変数指定を含む `Run`/`Exec` は `ErrEnvFileUnsupported` で
-  fail closed します。
-  それ以外の Windows 機能は利用できます。
+- Windows では `%LocalAppData%\containergo-env-v1` 配下に、現在のログオン
+  (および Administrators と LOCAL SYSTEM。copy staging と同じ許可リスト)
+  だけに許可した保護 DACL で env ファイルを保存します。
+  ルート、各ディレクトリ、各ファイルを使用前と削除前に再検証し、パス構成要素に
+  reparse point があれば fail closed とします。
+  `%LocalAppData%` の祖先に reparse point がある場合も拒否するため、
+  junction でプロファイルを移している環境では `Run`/`Exec` は
+  リンク越しに書き込まず fail closed になります。
+  cleanup は env ファイル、marker、lock ファイルの順に削除し、最初の失敗で止まるため、
+  一時的な sharing violation が起きても marker と writer lock が残ります。
+  再試行を諦めた時点(再試行不可の失敗、または有界の再試行予算の使い切り)で
+  writer lock を解放するため、次回の scan が安全に回収できます。
+  POSIX advisory lock の代わりに `LockFileEx` で作成とクラッシュ後の回収を直列化します。
 - 環境変数キーは、空でない有効な UTF-8 であり、`=`、Unicode 空白、制御
   文字、先頭の `#`、先頭 BOM を含むできません。
   値は有効な UTF-8 であり、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029

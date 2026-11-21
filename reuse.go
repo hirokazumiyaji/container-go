@@ -1396,43 +1396,13 @@ func checkReuseBindingReachable(eng engine, b boundPort) error {
 }
 
 func matchingExposedBinding(bound []boundPort, spec portSpec, eng engine) (boundPort, bool) {
-	var loopback boundPort
-	foundLoopback := false
-	remote := eng != nil && eng.isRemote()
-	for _, b := range bound {
-		if b.containerPort != spec.Port || b.proto != spec.Proto || b.hostPort <= 0 {
-			continue
-		}
-		if remote && ipIsLoopback(b.hostAddr) {
-			loopback, foundLoopback = b, true
-			continue
-		}
-		return b, true
-	}
-	return loopback, foundLoopback
+	binding, ok := domain.MatchingExposedBinding(domainPortBindings(bound), spec, eng.isRemote())
+	return boundPortFromDomain(binding), ok
 }
 
 func matchingPublishedBinding(bound []boundPort, p publishSpec, eng engine) (boundPort, bool) {
-	var loopback boundPort
-	foundLoopback := false
-	remote := eng != nil && eng.isRemote()
-	for _, b := range bound {
-		if b.containerPort != p.ContainerPort || b.proto != p.Proto || b.hostPort <= 0 {
-			continue
-		}
-		if p.HostPort != 0 && b.hostPort != p.HostPort {
-			continue
-		}
-		if p.HostIP() != "" && canonicalIP(b.hostAddr) != p.HostIP() {
-			continue
-		}
-		if remote && ipIsLoopback(b.hostAddr) {
-			loopback, foundLoopback = b, true
-			continue
-		}
-		return b, true
-	}
-	return loopback, foundLoopback
+	binding, ok := domain.MatchingPublishedBinding(domainPortBindings(bound), p, eng.isRemote())
+	return boundPortFromDomain(binding), ok
 }
 
 // imagesCompatible reports whether a requested image reference matches

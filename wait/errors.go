@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // ErrInvalidConfiguration classifies invalid static configuration passed
@@ -15,7 +16,7 @@ var ErrInvalidConfiguration = errors.New("invalid wait strategy configuration")
 // ErrPortNotExposed identifies a wait target that does not declare the
 // requested port. The container package aliases this value for callers
 // that use container.ErrPortNotExposed.
-var ErrPortNotExposed = errors.New("port is not declared or has no usable host binding")
+var ErrPortNotExposed = domain.ErrPortNotExposed
 
 // ErrContainerNotFound identifies a wait target whose container no
 // longer exists. The container package aliases this value for callers

@@ -1318,10 +1318,6 @@ func ipIs4(addr string) bool {
 	return domain.IPIs4(addr)
 }
 
-func ipIsLoopback(addr string) bool {
-	return domain.IPIsLoopback(addr)
-}
-
 func ipIsUnspecified(addr string) bool {
 	return domain.IPIsUnspecified(addr)
 }

@@ -7,7 +7,10 @@
 // system start`), and Docker on Linux, Windows, and macOS (`docker`,
 // selected with CONTAINERGO_BACKEND=docker). On Windows, secret environment
 // files for WithEnv and WithExecEnv are stored under a current-logon-only
-// DACL, but the external watchdog reaper is unavailable. A bind mount
+// DACL, and the watchdog reaper runs natively without /bin/sh to reclaim
+// Docker containers by immutable ID, including the ID an inspect reports for
+// a name-addressed create. A build that cannot re-execute itself has no
+// Windows reaper. A bind mount
 // against a remote Docker daemon is rejected with ErrUnsupportedCapability
 // because the daemon resolves the source path on its own host. See README.md
 // for backend selection, environment validation, and endpoint differences.

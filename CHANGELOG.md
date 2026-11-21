@@ -144,6 +144,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecStrategy.WithResponseMatcher` / `WithOutputContains` (backed by the
   optional `wait.ExecOutputTarget`) and `HTTPStrategy.WithStatusCode` /
   `WithBody`.
+- Add a Go-native watchdog reaper that re-executes the library executable with
+  an internal marker instead of starting `/bin/sh`, reads the same stdin event
+  stream, and reaps pending entries after EOF. It decodes inspect output with
+  `internal/strictjson` and the existing Apple/Docker inspect models, so no
+  `sed` or `awk` is involved. Unix opts in with `CONTAINERGO_REAPER_NATIVE=1`
+  while the `/bin/sh` script remains the default; Windows has no shell and uses
+  the native loop whenever self-execution is available. Self-execution is
+  skipped for `c-shared` and `c-archive` build modes and for setuid/setgid
+  Unix binaries, where Unix falls back to the script and Windows has no
+  reaper. `plugin` and `shared` builds are unsupported because their runtime
+  may report the host's build information; do not use the native flag there.
 
 ### Fixed
 
@@ -336,6 +347,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target resolution), matching the existing `engine_*_target.go` and
   `engine_*_identity.go` split. This is an internal move with no public API
   change.
+- The Windows watchdog reaper is no longer a no-op: `Run`, `WithReuse`, and
+  cleanup register containers with the native loop, which reaps immutable
+  Docker IDs after the parent pipe closes and reclaims a name-addressed Docker
+  create through the immutable ID its inspect reports. The reaper child runs
+  in its own hidden console process group, so a console Ctrl+C no longer kills
+  it together with the parent. A build that cannot self-execute has no
+  Windows reaper; use `Prune` for those leftovers and remote daemons.
 
 
 ## [0.3.0] - 2026-10-26

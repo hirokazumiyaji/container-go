@@ -788,7 +788,7 @@ func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, 
 // imageIdentityIsVerified rejects a digest-shaped identity that has no
 // repository provenance and no verified backend image ID.
 func imageIdentityIsVerified(identity imageIdentity) bool {
-	if identity.mutableAlias || !identity.pinned || !imageRE.MatchString(identity.reference) {
+	if !identity.pinned || !imageRE.MatchString(identity.reference) {
 		return false
 	}
 	if imageID, ok := canonicalDockerImageID(identity.id); ok {
@@ -820,7 +820,6 @@ func (c *config) canUseMutableFallback(image string) bool {
 func mutableImageReference(image string, identity imageIdentity) imageIdentity {
 	identity.reference = image
 	identity.pinned = false
-	identity.mutableAlias = false
 	identity.appleSynthetic = false
 	identity.notLocal = false
 	identity.notLocalReason = ""

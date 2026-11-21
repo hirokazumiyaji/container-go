@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/internal/inspect"
 	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 )
@@ -444,7 +445,7 @@ func dockerLiveOwned(r *cli.ExecRunner, name, token string) (string, bool, error
 	if info.labels[appleCapabilityLabel] != token {
 		return "", false, nil
 	}
-	if !dockerIDRE.MatchString(info.uid) {
+	if !domain.IsImmutableContainerID(info.uid) {
 		return "", false, fmt.Errorf("Docker inspect returned invalid immutable container ID %q", info.uid)
 	}
 	return info.uid, true, nil

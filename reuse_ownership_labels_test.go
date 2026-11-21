@@ -339,3 +339,45 @@ func TestCleanupFailedCreateNotFoundRemainsIdempotent(t *testing.T) {
 		t.Fatalf("deleteCalls = %d, want 0 for a missing container", r.deleteCalls)
 	}
 }
+
+// A Docker container with no container-go ownership marker is a foreign
+// leftover, not a corrupted reuse generation. It is skipped rather than
+// reported as an ownership error; once either marker appears, a partial
+// claim still fails closed.
+func TestDeleteStoppedReuseResultRequiresConsistentOwnershipMarkers(t *testing.T) {
+	tests := []struct {
+		name    string
+		labels  map[string]string
+		wantErr bool
+	}{
+		{
+			name:   "no markers is foreign",
+			labels: map[string]string{},
+		},
+		{
+			name:    "reuse marker without managed marker",
+			labels:  map[string]string{reuseLabel: "true"},
+			wantErr: true,
+		},
+		{
+			name:    "managed and reuse markers without generation",
+			labels:  map[string]string{managedLabel: "true", reuseLabel: "true"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config{runner: newTestRunner(), eng: dockerEngine{}, name: "foreign"}
+			deleted, err := deleteStoppedReuseResult(context.Background(), cfg, &engineInfo{
+				state:  StateStopped,
+				labels: tt.labels,
+			})
+			if deleted {
+				t.Fatal("deleteStoppedReuseResult deleted a container it does not own")
+			}
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Fatalf("deleteStoppedReuseResult error = %v, want error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}

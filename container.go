@@ -741,7 +741,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		inspectContainer := c
 		if cfg.eng.name() == "docker" {
 			uid := c.immutableID()
-			if !dockerIDRE.MatchString(uid) {
+			if !domain.IsImmutableContainerID(uid) {
 				return fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, uid)
 			}
 			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout, sync: &lockPack{uid: uid}}
@@ -773,33 +773,52 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
 	}
-	if info == nil || info.labels[managedLabel] != "true" {
-		return fmt.Errorf("verify created container %s: managed ownership label is missing", c.id)
+	if info == nil {
+		return fmt.Errorf("verify created container %s: inspect returned no container", c.id)
 	}
-	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return fmt.Errorf("verify created container %s: session ownership label does not match", c.id)
-	}
-	if info.labels[creationLabel] != c.creation {
-		return fmt.Errorf("verify created container %s: creation generation does not match", c.id)
-	}
-	if cfg.reuse && info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("verify created container %s: reuse ownership label is missing", c.id)
-	}
-	if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
-		return fmt.Errorf("verify created container %s: reuse group label does not match", c.id)
+	expected := domain.OwnershipExpected{
+		RequireManaged: true,
+		Session:        sessionID(),
+		Creation:       c.creation,
+		RequireReuse:   cfg.reuse,
+		ReuseGroup:     cfg.reuseGroup,
 	}
 	if cfg.eng.name() == "docker" {
-		if info.uid != c.immutableID() {
-			return fmt.Errorf("verify created container %s: immutable ID does not match", c.id)
-		}
-	} else if info.uid != "" {
-		return fmt.Errorf("verify created container %s: unexpected immutable ID", c.id)
+		expected.UID = c.immutableID()
+		expected.RequireImmutableID = true
+	} else {
+		expected.RequireNoImmutableID = true
+	}
+	if failure := domain.VerifyOwnership(expected, ownershipObserved(info)); failure != domain.OwnershipFailureNone {
+		return fmt.Errorf("verify created container %s: %s", c.id, createdOwnershipFailure(failure, cfg.eng.name() == "docker"))
 	}
 	c.pack().mu.Lock()
 	c.pack().info = info
 	c.pack().mu.Unlock()
 	c.setImmutableID(info.uid)
 	return nil
+}
+
+// createdOwnershipFailure keeps the post-create diagnostics specific to the
+// operation while the matching rule stays in domain.VerifyOwnership.
+func createdOwnershipFailure(failure domain.OwnershipFailure, docker bool) string {
+	switch failure {
+	case domain.OwnershipFailureSession:
+		return "session ownership label does not match"
+	case domain.OwnershipFailureCreation:
+		return "creation generation does not match"
+	case domain.OwnershipFailureReuse:
+		return "reuse ownership label is missing"
+	case domain.OwnershipFailureReuseGroup:
+		return "reuse group label does not match"
+	case domain.OwnershipFailureIdentity:
+		if docker {
+			return "immutable ID does not match"
+		}
+		return "unexpected immutable ID"
+	default:
+		return "managed ownership label is missing"
+	}
 }
 
 // rollback removes a container Run created but cannot return. A failed removal
@@ -883,41 +902,25 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		}
 		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
 	}
-	if info.labels[managedLabel] != "true" {
+	expected := domain.OwnershipExpected{
+		RequireManaged: true,
+		Session:        sessionID(),
+		Creation:       cfg.creation,
+		RequireReuse:   cfg.reuse,
+		ReuseGroup:     cfg.reuseGroup,
+	}
+	if failure := domain.VerifyOwnership(expected, ownershipObserved(info)); failure != domain.OwnershipFailureNone {
+		// The object is not the generation this create published. It may
+		// belong to a peer, so leave it untouched.
 		unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
 		return nil
 	}
-	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
-		return nil
-	}
-	if cfg.reuse {
-		if info.labels[reuseLabel] != "true" {
-			unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
-			return nil
-		}
-		if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
-			unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
-			return nil
-		}
-		actual, ok := info.labels[creationLabel]
-		if !ok || !validCreationID(actual) || actual != cfg.creation {
-			unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
-			return nil
-		}
+	if cfg.reuse && info.state != StateStopped && info.state != StateCreated {
 		// A running or transitional reuse generation may already have been
 		// adopted by another caller. Only a freshly stopped/created
 		// generation is eligible for automatic failed-create cleanup.
-		if info.state != StateStopped && info.state != StateCreated {
-			protectReuseReaper(cfg)
-			return fmt.Errorf("cleanup container %s: %s reuse generation may already be adopted; refusing automatic deletion", cfg.name, info.state)
-		}
-	} else {
-		actual, ok := info.labels[creationLabel]
-		if !ok || !validCreationID(actual) || actual != cfg.creation {
-			unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
-			return nil
-		}
+		protectReuseReaper(cfg)
+		return fmt.Errorf("cleanup container %s: %s reuse generation may already be adopted; refusing automatic deletion", cfg.name, info.state)
 	}
 	target, err := verifiedDeleteTarget(cfg.eng, info, cfg.name)
 	if err != nil {
@@ -2297,12 +2300,20 @@ func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) erro
 	}
 	if c.creation != "" {
 		actual := identity.labels[creationLabel]
-		if actual != "" && actual != c.creation {
-			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-		}
-		// Once a name-only handle has observed its generation, losing
-		// the label is also evidence of a replacement.
-		if actual == "" && uid == "" && c.pack().info != nil && c.pack().info.labels[creationLabel] != "" {
+		if actual != "" {
+			// The shared rule also rejects a label that matches the handle's
+			// generation but is not a well-formed generation ID. Handle
+			// generations are always validated (newCreationID, or a reuse
+			// label that checkReuseIdentity accepted), so this can only reject
+			// a corrupted inspect response. It is an intentional tightening,
+			// not a semantic change for valid backends.
+			expected := domain.OwnershipExpected{Creation: c.creation, RequireCreation: true}
+			if failure := domain.VerifyOwnership(expected, ownershipObserved(identity)); failure != domain.OwnershipFailureNone {
+				return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+			}
+		} else if uid == "" && c.pack().info != nil && c.pack().info.labels[creationLabel] != "" {
+			// Once a name-only handle has observed its generation, losing
+			// the label is also evidence of a replacement.
 			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 		}
 	}

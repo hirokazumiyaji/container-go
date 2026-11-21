@@ -152,7 +152,7 @@ func TestAppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 	input := "redis:7-alpine@" + platformPinningRoot
 	r := &platformPinningRunner{inspectJSON: freshAppleImageJSON(platformPinningRoot, platformPinningVariant)}
 	identity, exists := (appleEngine{}).parseImageIdentity(platformPinningAppleImageJSON(nil), input, "")
-	if !exists || !identity.pinned || identity.mutableAlias {
+	if !exists || !identity.pinned {
 		t.Fatalf("parsed name@digest identity = %+v, exists = %v, want pinned identity", identity, exists)
 	}
 	ctr, err := Run(context.Background(), input,
@@ -176,7 +176,7 @@ func TestAppleNameDigestStaysPinnedWithMutableOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !ctr.image.pinned || ctr.image.mutableAlias || ctr.image.digest != platformPinningRoot {
+	if !ctr.image.pinned || ctr.image.digest != platformPinningRoot {
 		t.Fatalf("identity = %+v, want name@digest to remain pinned", ctr.image)
 	}
 	if got, _, _ := r.state(); got != input {

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 func creationInspectJSON(name, creation string) string {
@@ -92,7 +94,7 @@ func TestRunAddsCreationLabel(t *testing.T) {
 	if ctr.creation == "" {
 		t.Fatal("creation empty")
 	}
-	if !creationRE.MatchString(ctr.creation) {
+	if !domain.IsCreationID(ctr.creation) {
 		t.Fatalf("creation = %q, want hex", ctr.creation)
 	}
 	joined := strings.Join(f.callWith("run"), " ")

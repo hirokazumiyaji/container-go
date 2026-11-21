@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 const fuzzInspectTarget = "myctr"
@@ -107,7 +109,7 @@ func checkParseInspectInvariants(t *testing.T, eng engine, data []byte) {
 	if strings.TrimPrefix(first.name, "/") != fuzzInspectTarget {
 		t.Errorf("%s parseInspect accepted a match named %q, want %q", eng.name(), first.name, fuzzInspectTarget)
 	}
-	if eng.name() == "docker" && !dockerIDRE.MatchString(first.uid) {
+	if eng.name() == "docker" && !domain.IsImmutableContainerID(first.uid) {
 		t.Errorf("docker parseInspect accepted a match with invalid ID %q", first.uid)
 	}
 }

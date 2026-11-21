@@ -73,10 +73,10 @@ func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
-// checkConfig applies the parts of Apple Container's CLI contract that are
-// independent of the current service state. The Apple CLI performs these
-// checks only after it has already resolved the image, so doing them here
-// avoids surprising pulls and makes the backend limits visible to callers.
+// checkConfig resolves environment-provided defaults, applies the pure Apple
+// option contract, and normalizes the resulting selector. Apple's CLI contract
+// is state-independent, so the imperative part is limited to reading the
+// process default platform instead of probing the backend.
 func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 	// resolveEffectivePlatform falls back to CONTAINER_DEFAULT_PLATFORM, so
 	// keep the origin to report an environment-variable failure as such.
@@ -87,6 +87,23 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 		}
 		return appleValidationError(defaultPlatformEnv, os.Getenv(defaultPlatformEnv), "%v", err)
 	}
+	if err := (appleEngine{}).validateConfig(cfg); err != nil {
+		return err
+	}
+	if cfg.platform != "" {
+		cfg.platform = canonicalizeApplePlatformSelector(cfg.platform)
+	}
+	return nil
+}
+
+// validateConfig applies the parts of Apple Container's CLI contract that are
+// independent of the current service state. The Apple CLI performs these
+// checks only after it has already resolved the image, so doing them here
+// avoids surprising pulls and makes the backend limits visible to callers.
+//
+// It is the pure core of checkConfig: it reads only cfg, runs no subprocess,
+// and never mutates cfg.
+func (appleEngine) validateConfig(cfg *config) error {
 	if wait.RequiresHealthcheck(cfg.waitStrategy) {
 		return appleCapabilityError(ErrUnsupportedCapability, "WithWaitStrategy", "wait strategy", "ForHealthcheck",
 			"Apple Container has no HEALTHCHECK; wait.ForHealthcheck requires the Docker backend")
@@ -122,7 +139,6 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 			}
 			return appleValidationError(defaultPlatformEnv, cfg.platform, "%v", err)
 		}
-		cfg.platform = canonicalizeApplePlatformSelector(cfg.platform)
 	}
 
 	if cfg.name != "" && !appleContainerNameRE.MatchString(cfg.name) {

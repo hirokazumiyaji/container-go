@@ -721,18 +721,32 @@ func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo
 	if info == nil {
 		return false, fmt.Errorf("reuse %s: missing inspected container", cfg.name)
 	}
-	labels := info.labels
-	dockerLegacy := cfg.eng.name() == "docker" && labels[managedLabel] == "" && labels[reuseLabel] == ""
-	if labels[reuseLabel] != "true" && !dockerLegacy {
+	// A container carrying neither ownership marker is not a reuse
+	// generation, so it is left untouched; pre-library Docker containers
+	// can otherwise look like a stopped reuse result. Once either marker
+	// is present the object claims ownership of this namespace, and a
+	// partial claim fails closed instead of being silently skipped. This
+	// helper is reached only after checkReuseOwnedIdentity or a create this
+	// library owns, so skipping a markerless container changes no production
+	// deletion path.
+	if info.labels[managedLabel] != "true" && info.labels[reuseLabel] != "true" {
 		return false, nil
 	}
-	if labels[reuseLabel] == "true" && labels[managedLabel] != "true" {
+	expected := domain.OwnershipExpected{
+		RequireManaged:  true,
+		RequireReuse:    true,
+		RequireCreation: true,
+	}
+	switch domain.VerifyOwnership(expected, ownershipObserved(info)) {
+	case domain.OwnershipFailureNone:
+	case domain.OwnershipFailureManaged:
 		return false, fmt.Errorf("reuse %s: managed ownership label is missing", cfg.name)
-	}
-	creation := labels[creationLabel]
-	if !validCreationID(creation) {
+	case domain.OwnershipFailureCreation:
 		return false, fmt.Errorf("reuse %s: creation ownership label is missing or invalid", cfg.name)
+	default:
+		return false, nil
 	}
+	creation := info.labels[creationLabel]
 	if info.state != StateStopped {
 		return false, nil
 	}
@@ -793,14 +807,7 @@ func sameStoppedReuseGeneration(before, after *engineInfo) bool {
 	if before == nil || after == nil {
 		return false
 	}
-	if before.labels[managedLabel] != after.labels[managedLabel] ||
-		before.labels[reuseLabel] != after.labels[reuseLabel] ||
-		before.labels[reuseGroupLabel] != after.labels[reuseGroupLabel] ||
-		before.labels[sessionLabel] != after.labels[sessionLabel] ||
-		before.labels[creationLabel] != after.labels[creationLabel] {
-		return false
-	}
-	return after.state == StateStopped
+	return after.state == StateStopped && domain.SameOwnershipLabels(before.labels, after.labels)
 }
 
 func rollbackReuse(ctx context.Context, ctr *Container, cfg *config) (bool, error) {
@@ -1007,23 +1014,33 @@ func checkReuseIdentity(info *engineInfo, cfg *config) error {
 	if info == nil {
 		return fmt.Errorf("reuse %s: inspect returned no container identity", cfg.name)
 	}
-	if info.labels[managedLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
-	}
-	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse: existing container was not created with WithReuse")
-	}
-	if !validCreationID(info.labels[creationLabel]) {
-		return identityError(fmt.Sprintf("reuse %s: existing container has no valid creation generation", cfg.name))
+	expected := domain.OwnershipExpected{
+		RequireManaged:  true,
+		RequireReuse:    true,
+		RequireCreation: true,
 	}
 	if requiresImmutableID(cfg.eng) {
-		if !validImmutableID(cfg.eng, info.uid) {
+		expected.RequireImmutableID = true
+	} else {
+		expected.RequireNoImmutableID = true
+	}
+	switch domain.VerifyOwnership(expected, ownershipObserved(info)) {
+	case domain.OwnershipFailureNone:
+		return nil
+	case domain.OwnershipFailureManaged:
+		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
+	case domain.OwnershipFailureReuse:
+		return fmt.Errorf("reuse: existing container was not created with WithReuse")
+	case domain.OwnershipFailureCreation:
+		return identityError(fmt.Sprintf("reuse %s: existing container has no valid creation generation", cfg.name))
+	case domain.OwnershipFailureIdentity:
+		if requiresImmutableID(cfg.eng) {
 			return identityError(fmt.Sprintf("reuse %s: existing container has no valid immutable ID", cfg.name))
 		}
-	} else if info.uid != "" {
 		return identityError(fmt.Sprintf("reuse %s: name-addressed container unexpectedly has an immutable ID", cfg.name))
+	default:
+		return identityError(fmt.Sprintf("reuse %s: existing container identity is invalid", cfg.name))
 	}
-	return nil
 }
 
 // checkReuseOwnedIdentity reports whether a stopped container may be

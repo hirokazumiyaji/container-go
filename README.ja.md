@@ -21,8 +21,13 @@ Go 1.26 以降が必要です。`v0.3.0` モジュールにも Go 1.26 以降が
 
 現在のチェックアウトには、次の意図的な制約があります。
 
-- Windows には watchdog リーパーがありません。リーパーは `/bin/sh` を必要とします。
-  Windows でも明示的な `Terminate`、`Cleanup`、`TerminateContainer`、`Prune`、および rollback 経路は利用できます。
+- Windows では Go ネイティブの watchdog リーパーを使います。`/bin/sh` が
+  ないため、ライブラリ自身の実行ファイルを再実行して、親の pipe が閉じた後に
+  Docker の immutable ID を回収し、name-addressed な Docker create は inspect が
+  返す immutable ID で回収します。reaper 子プロセスは専用の非表示コンソール
+  プロセスグループで動くため、コンソールの Ctrl+C では親と一緒に終了しません。
+  remote daemon や self-exec できない build では、明示的な `Terminate`、
+  `Cleanup`、`TerminateContainer`、`Prune`、および rollback 経路に依存します。
   `WithEnv` と `WithExecEnv` は Windows では現在のログオンだけに許可した DACL で
   環境ファイルを書き、Docker の copy-out には Go 1.26 以降が必要です。
 - network の作成とライフサイクル管理はスコープ外です。`WithNetwork` は既存の
@@ -82,16 +87,17 @@ func TestRedis(t *testing.T) {
 |---|---|---|
 | macOS | Apple Container | macOS 26+、Apple Silicon、[Apple Container](https://github.com/apple/container) CLI 1.2.2 または 1.3.0、`container system start` 実行済み |
 | Linux | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要 |
-| Windows | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要（watchdog リーパーなし。`TestMain` で `Prune` を実行。クリーンアップの契約を参照） |
+| Windows | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要（Docker コンテナはネイティブ watchdog リーパーで回収。name-addressed create も inspect の immutable ID 経由で回収。remote daemon は `TestMain` で `Prune` を実行。クリーンアップの契約を参照） |
 
 macOS で Docker（Docker Desktop など）を使う場合は
 `CONTAINERGO_BACKEND=docker` を、Apple Container を明示する場合は
 `CONTAINERGO_BACKEND=apple` を設定します。
 
-Windows では watchdog リーパーが使えず、remote daemon はローカルの
-テスト環境より長く残ります。リーパーによる残骸の回収を期待せず、
-クリーンアップの契約に従って `TestMain` の前後で `Prune` を実行して
-ください。
+Windows の watchdog リーパーは Docker コンテナを immutable ID で回収し、
+name-addressed create も inspect が返す immutable ID で回収します。remote
+daemon はローカルのテスト環境より長く残り、self-exec できない build では
+reaper 自体がありません。リーパーによる残骸の回収を期待せず、クリーンアップの
+契約に従って `TestMain` の前後で `Prune` を実行してください。
 
 本ライブラリはバックエンドの CLI（`container` / `docker`）を子プロセスとして
 呼び出します。cgo もデーモン API クライアントも使いません。
@@ -890,19 +896,40 @@ CLI がヘルパーをデタッチする設計の場合は、子孫の終了を�
    トランザクション的な保証ではなく、登録 error や各 entry の delete error は
    `Run` へ返されません。
 
-reaper は外部 `/bin/sh` child で、Windows では利用できません。
-実 CLI コンテナを非 reuse 経路で登録した場合に遅延起動します。
+reaper は実 CLI コンテナを非 reuse 経路で登録した場合に遅延起動します。
+Unix は既定で固定の `/bin/sh` スクリプトを起動し、
+`CONTAINERGO_REAPER_NATIVE=1` を設定するとライブラリ自身の実行ファイルを
+内部マーカー付きで再実行して同じループを Go で動かします。Windows は
+`/bin/sh` がないため、self-exec が可能な場合はネイティブループを使います。
+ネイティブループは inspect 出力を `sed` や `awk` ではなく、ライブラリの
+strict JSON パーサと inspect パーサで解析します。
+
+self-exec には main package の実行ファイルが必要なため、ネイティブループは
+`-buildmode=c-shared` と `c-archive`（独自の Go runtime を持つ）では無効化され、
+Unix では setuid/setgid バイナリでも無効化されます。Unix はその場合
+`/bin/sh` に fallback し、Windows は host process を再実行せず reaper なしに
+なります。`-buildmode=plugin` と `shared` は未サポートです。runtime が host
+実行ファイルの build info を返す可能性があり buildmode を確実に検出できない
+ため、これらの build では `CONTAINERGO_REAPER_NATIVE` を有効にしないでください。
+また再実行はその時点の executable path を起動するため、実行中に
+バイナリを置き換えると respawn 後の reaper は新しい版になります。Windows
+では実行中の reaper が executable image を終了まで開いたままにするため、
+reap が spawn 元の process より一時的に長生きすることがあります。テストで
+起動した場合は test binary の終了前に reap の完了を待ってください。
 作成するコンテナは backend create の開始前に名前と creation generation で
 pre-register されます。create が成功すると、ライブラリは managed / session /
 creation label を検証してから Docker の完全な 64 桁 hex immutable ID を追加の
 reaper entry として保持します。名前で address する entry（Apple は常に、
-Docker は `run` が ID を返すまで）は、通常の generation-checked 削除と同じ
-名前単位 `flock` の下で inspect・削除されます。Docker ID entry は name lookup
-なしで ID により削除されます。backend が解析可能な ID を返さない場合は、
-name と generation の経路が削除対象として残ります。
+Docker は `run` が ID を返すまで）は、lock を持つ場合は通常の
+generation-checked 削除と同じ名前単位 `flock` の下で inspect・削除されます。
+Docker の generation 削除は inspect が返す immutable ID に束縛されるため、
+lock のない name-addressed Docker entry（Windows の場合）もその ID で安全に
+回収されます。Apple の name 削除は常に lock を必要とします。Docker ID entry は
+name lookup なしで ID により削除されます。backend が解析可能な ID を返さない
+場合は、name と generation の経路が削除対象として残ります。
 
 reaper の spawn failure は retry 上限後に一度だけ log へ残ります。
-delete failure は shell が無視します。reaper の動作を cleanup の成功確認に
+delete failure は reaper が無視します。reaper の動作を cleanup の成功確認に
 使わないでください。
 
 現在の reaper は inspect output を構造化フィルタへ流し、raw JSON を disk へ
@@ -994,10 +1021,12 @@ filter します。`container.WithPruneDryRun()` は ownership、state、age、l
 
 ### Windows と remote daemon の cleanup
 
-リーパーはローカルの `/bin/sh` 子プロセスです。Windows では利用できず、
-CI の job cancel や `go test -timeout` でローカルの process tree や
-runner VM が破棄された後にも動作できません。remote Docker daemon 上の
-コンテナもローカル環境より長く残ります。リーパーが動作する場合でも
+リーパーはローカルの子プロセスです（Unix の既定は `/bin/sh`、ネイティブ
+ループではライブラリ自身の実行ファイル）。CI の job cancel や
+`go test -timeout` でローカルの process tree や runner VM が破棄された後には
+動作できません。remote Docker daemon 上のコンテナもローカル環境より長く
+残ります。Windows は Docker コンテナを immutable ID で回収しますが、
+self-exec できない build では reaper がありません。リーパーが動作する場合でも
 登録と削除は best-effort であり、cleanup の成功確認には使えません。
 
 そのような環境では、suite の前後に `TestMain` から停止済みの managed
@@ -1156,9 +1185,10 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
 
 ## セキュリティ上の注意
 
-- すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
-  シェルスクリプト(リーパー)は固定文字列で、コンテナ ID は検証済みの
-  stdin データとしてのみ渡します。name-addressed entry には共有の `nameRE`
+- すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。Unix の
+  リーパーの `/bin/sh` スクリプトは固定文字列で、コンテナ ID は検証済みの
+  stdin データとしてのみ渡します。ネイティブリーパーは同じストリームを
+  シェルなしで解析します。name-addressed entry には共有の `nameRE`
   トークン規則を、Docker の full 64-hex immutable ID は別に受け付けます。
   Apple のより厳密な 2〜63 文字の名前チェックはコンテナ作成前に適用します。
 - Unix では環境変数を、正規化済みの `os.UserCacheDir()` 配下の、所有者と
@@ -1213,10 +1243,10 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
 
 ### 旧バージョンの reaper staging ファイル
 
-現在の watchdog は inspect 出力を構造化フィルタへ流して処理し、raw 出力を
-ディスクへ書きません。旧バージョンは名前空間もない `mktemp` ファイルを使って
-いたため、inspect 中に reaper が kill されると、コンテナの環境変数を含む
-ファイルが残る可能性があります。旧バージョンのファイル名は本ライブラリの
+現在の watchdog は inspect 出力を構造化フィルタへ流すか、ネイティブループで
+メモリ上で解析して処理し、raw 出力をディスクへ書きません。旧バージョンは
+名前空間もない `mktemp` ファイルを使っていたため、inspect 中に reaper が
+kill されると、コンテナの環境変数を含むファイルが残る可能性があります。旧バージョンのファイル名は本ライブラリの
 ものと安全に特定できません。調査・削除する場合は、先にすべての container-go と
 watchdog プロセスを停止し、実効 `TMPDIR`(`/tmp` と決めつけません)でメタデータ
 だけを列挙し、そのユーザーと該当時間帯の通常ファイルに範囲を絞ります。ファイル

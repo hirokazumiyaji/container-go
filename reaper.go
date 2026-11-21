@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -488,7 +487,6 @@ var (
 	errReaperSpawnFailed   = errors.New("reaper: giving up after repeated spawn failures")
 )
 
-
 type reaperEntry struct {
 	id       string
 	creation string
@@ -528,6 +526,10 @@ type reaper struct {
 	retryAt      time.Time
 	retryLevel   int
 
+	// native selects the Go reaper loop instead of the /bin/sh script.
+	// Unix opts in with a feature flag; Windows is always native.
+	native bool
+
 	// These are test seams. Production values are bounded defaults.
 	env             []string
 	timeoutSeconds  int
@@ -545,11 +547,20 @@ func newReaperWithEnv(binary, subcommand string, deleteFlags []string, env []str
 		env:             append([]string(nil), env...),
 		timeoutSeconds:  defaultReaperTimeoutSeconds,
 		pendingAttempts: defaultReaperPendingAttempts,
+		native:          nativeReaperEnabled(),
 	}
 }
 
 func newReaper(binary, subcommand string, deleteFlags ...string) *reaper {
 	return newReaperWithEnv(binary, subcommand, deleteFlags, nil)
+}
+
+// newNativeReaper forces the native loop regardless of the feature flag, so
+// tests can exercise the self-execution path on any platform.
+func newNativeReaper(binary, subcommand string, deleteFlags ...string) *reaper {
+	r := newReaper(binary, subcommand, deleteFlags...)
+	r.native = true
+	return r
 }
 
 func validateReaperEntry(entry reaperEntry) error {
@@ -1095,11 +1106,26 @@ func (r *reaper) spawnLocked() error {
 		if attempts <= 0 {
 			attempts = 1
 		}
-		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, creationLabel, strconv.Itoa(timeout), strconv.Itoa(attempts)}
-		args = append(args, r.deleteFlags...)
-		cmd = exec.Command("/bin/sh", args...)
-		if len(r.env) > 0 {
-			cmd.Env = cli.MergeEnv(os.Environ(), r.env)
+		if r.native {
+			exe, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("reaper: locate executable: %w", err)
+			}
+			args := []string{reaperInternalCommand, r.binary, r.subcommand, creationLabel, strconv.Itoa(timeout), strconv.Itoa(attempts)}
+			args = append(args, r.deleteFlags...)
+			cmd = exec.Command(exe, args...)
+			env := append(append([]string(nil), r.env...), reaperInternalEnv+"=1")
+			cmd.Env = cli.MergeEnv(os.Environ(), env)
+		} else {
+			if !shellReaperAvailable() {
+				return errors.New("reaper: native reaper is unavailable in this build and the platform has no /bin/sh")
+			}
+			args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, creationLabel, strconv.Itoa(timeout), strconv.Itoa(attempts)}
+			args = append(args, r.deleteFlags...)
+			cmd = exec.Command("/bin/sh", args...)
+			if len(r.env) > 0 {
+				cmd.Env = cli.MergeEnv(os.Environ(), r.env)
+			}
 		}
 	}
 	if cmd == nil {
@@ -1146,14 +1172,17 @@ func (r *reaper) stopCurrentProcess() {
 	if cmd == nil {
 		return
 	}
-	if stdin != nil {
-		_ = stdin.Close()
-	}
+	// Stop the child before closing its stdin. Closing first hands the
+	// child an EOF, and a still-running child would start reaping entries
+	// this call is replacing. Only closeStdin is an intentional EOF.
 	if !channelClosed(exited) {
 		killReaperProcess(cmd)
 	}
 	if exited != nil {
 		<-exited
+	}
+	if stdin != nil {
+		_ = stdin.Close()
 	}
 }
 
@@ -1202,7 +1231,23 @@ var (
 	globalReapers   = map[string]*reaper{}
 )
 
+// reaperUnavailable reports a host with neither the native loop nor a
+// /bin/sh fallback. A Windows build without self-execution support (for
+// example -buildmode=c-shared) is the only such host; registration there
+// stays a silent no-op instead of logging a failed spawn for every Run.
+func reaperUnavailable() bool {
+	return reaperUnavailableFor(nativeReaperEnabled(), shellReaperAvailable())
+}
+
+func reaperUnavailableFor(native, shell bool) bool {
+	return !native && !shell
+}
+
+// getGlobalReaperTarget returns nil when this host has no usable reaper.
 func getGlobalReaperTarget(key, binary, subcommand string, deleteFlags []string, env []string) *reaper {
+	if reaperUnavailable() {
+		return nil
+	}
 	if key == "" {
 		key = binary
 	}
@@ -1217,10 +1262,10 @@ func getGlobalReaperTarget(key, binary, subcommand string, deleteFlags []string,
 }
 
 func registerWithGlobalReaperTarget(key, binary, subcommand string, deleteFlags []string, env []string, id, creation string) error {
-	if runtime.GOOS == "windows" {
+	r := getGlobalReaperTarget(key, binary, subcommand, deleteFlags, env)
+	if r == nil {
 		return nil
 	}
-	r := getGlobalReaperTarget(key, binary, subcommand, deleteFlags, env)
 	if err := r.register(id, creation); err != nil {
 		log.Printf("container-go: reaper registration failed (key=%q, binary=%q): %v", key, binary, err)
 		return err
@@ -1235,10 +1280,10 @@ func registerWithGlobalReaper(binary, subcommand string, deleteFlags []string, i
 }
 
 func preRegisterWithGlobalReaperTarget(key, binary, subcommand string, deleteFlags []string, env []string, id, creation string) error {
-	if runtime.GOOS == "windows" {
+	r := getGlobalReaperTarget(key, binary, subcommand, deleteFlags, env)
+	if r == nil {
 		return nil
 	}
-	r := getGlobalReaperTarget(key, binary, subcommand, deleteFlags, env)
 	if err := r.registerPending(id, creation); err != nil {
 		log.Printf("container-go: reaper pre-registration failed (key=%q, binary=%q): %v", key, binary, err)
 		return err
@@ -1247,9 +1292,6 @@ func preRegisterWithGlobalReaperTarget(key, binary, subcommand string, deleteFla
 }
 
 func completePreRegistrationWithGlobalReaperKey(key, id, creation string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[key]
 	globalReapersMu.Unlock()
@@ -1264,9 +1306,6 @@ func completePreRegistrationWithGlobalReaperKey(key, id, creation string) error 
 }
 
 func markSharedWithGlobalReaperKey(key, id, creation string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[key]
 	globalReapersMu.Unlock()
@@ -1281,9 +1320,6 @@ func markSharedWithGlobalReaperKey(key, id, creation string) error {
 }
 
 func unregisterWithGlobalReaperKey(key, id, creation string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[key]
 	globalReapersMu.Unlock()

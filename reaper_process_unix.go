@@ -17,6 +17,8 @@ func configureReaperProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+func shellReaperAvailable() bool { return true }
+
 // killReaperProcess terminates the shell and every process in its group.
 // configureReaperProcess makes the shell a group leader, and the reaper
 // script deliberately does not enable job control, so helpers and backend

@@ -329,6 +329,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged; the resolver's default host stays pinned to the handle's
   creation-time target, and `Endpoint` / `MappedPort` apply the handle's
   diagnostic redactor consistently to resolver failures.
+- Split `engine_apple.go` and `engine_docker.go` by responsibility into
+  `engine_*_args.go` (argv builders), `engine_*_parse.go` (inspect, image,
+  list, and reuse-group JSON parsing), `engine_*_errors.go` (stderr
+  classification), and `engine_*_runtime.go` (probe, version, copy-out, and
+  target resolution), matching the existing `engine_*_target.go` and
+  `engine_*_identity.go` split. This is an internal move with no public API
+  change.
 
 
 ## [0.3.0] - 2026-10-26

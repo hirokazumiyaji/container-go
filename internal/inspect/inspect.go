@@ -88,19 +88,37 @@ type Platform struct {
 }
 
 func (p *Platform) UnmarshalJSON(data []byte) error {
-	type plain Platform
-	var decoded plain
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
+	// Decode each known field into a RawMessage so presence is observable in
+	// the same pass that validates the value types. A second full decode into
+	// a map only to test key presence would repeat the work encoding/json has
+	// already done.
+	var fields struct {
+		OS           json.RawMessage `json:"os"`
+		Architecture json.RawMessage `json:"architecture"`
+		Variant      json.RawMessage `json:"variant"`
 	}
-	*p = Platform(decoded)
-	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
-	_, p.OSPresent = fields["os"]
-	_, p.ArchPresent = fields["architecture"]
-	_, p.VariantPresent = fields["variant"]
+	*p = Platform{}
+	if fields.OS != nil {
+		p.OSPresent = true
+		if err := json.Unmarshal(fields.OS, &p.OS); err != nil {
+			return err
+		}
+	}
+	if fields.Architecture != nil {
+		p.ArchPresent = true
+		if err := json.Unmarshal(fields.Architecture, &p.Architecture); err != nil {
+			return err
+		}
+	}
+	if fields.Variant != nil {
+		p.VariantPresent = true
+		if err := json.Unmarshal(fields.Variant, &p.Variant); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

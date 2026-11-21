@@ -15,6 +15,13 @@ import (
 	"time"
 )
 
+// envDirGCInterval bounds how often the write path scans the cache root for
+// abandoned directories while holding the root lock. A staging directory is
+// independent of that scan, so reclaiming on every WithEnv/WithExecEnv call
+// only lengthened the critical section. Scans triggered by Run's explicit
+// security preflight stay unconditional.
+const envDirGCInterval = 30 * time.Second
+
 var (
 	// Unix cleanup retries are cheap unlink attempts; Windows has its own
 	// backoff because a sharing violation needs time to clear.
@@ -39,6 +46,11 @@ var (
 	// cleanupEnvMu prevents two cleanup callers for the same process from
 	// racing the ownership transition between active and pending state.
 	cleanupEnvMu sync.Mutex
+
+	// envDirGC tracks the last successful reclaim scan per cache root so the
+	// write path does not repeat a readdir/Lstat sweep under the root lock.
+	envDirGCMu   sync.Mutex
+	envDirGCLast = map[string]time.Time{}
 
 	// pendingEnvCleanupRetries prevents a failed deferred cleanup from
 	// starting an unbounded number of background retry loops for one
@@ -212,7 +224,7 @@ func writeEnvFileAtWithRootContextRunner(ctx context.Context, base string, env m
 	operationCtx := ctx
 	err = runRoot(ctx, base, func(rootCtx context.Context, root string) error {
 		operationCtx = rootCtx
-		if err := cleanupEnvDirsContext(rootCtx, root); err != nil {
+		if err := cleanupEnvDirsIfDueContext(rootCtx, root); err != nil {
 			return err
 		}
 		var err error
@@ -1314,7 +1326,11 @@ func cleanupStaleEnvFilesAtContext(ctx context.Context, base string) error {
 	}
 	pending := snapshotPendingEnvCleanupsLocked()
 	scanErr := withEnvFileRootContextWithCallback(ctx, base, func(rootCtx context.Context, root string) error {
-		return cleanupEnvDirsContext(rootCtx, root)
+		if err := cleanupEnvDirsContext(rootCtx, root); err != nil {
+			return err
+		}
+		markEnvDirGC(root, time.Now())
+		return nil
 	})
 	cleanupEnvMu.Unlock()
 	// Pending entries are deliberately drained after releasing the root
@@ -1905,6 +1921,36 @@ func trustedEnvPathComponent(info os.FileInfo) bool {
 	// without the sticky bit are not trusted.
 	return mode.Perm()&0o002 != 0 &&
 		(mode&os.ModeSticky != 0 || mode&0o1000 != 0)
+}
+
+// cleanupEnvDirsIfDueContext reclaims abandoned directories at most once per
+// envDirGCInterval for root. A failed scan is not recorded, so an entry the
+// scan found keeps failing writes until it is removed. An entry created after
+// a successful scan is detected by the next due scan or by Run's unconditional
+// preflight.
+func cleanupEnvDirsIfDueContext(ctx context.Context, root string) error {
+	now := time.Now()
+	if !envDirGCDue(root, now) {
+		return nil
+	}
+	if err := cleanupEnvDirsContext(ctx, root); err != nil {
+		return err
+	}
+	markEnvDirGC(root, now)
+	return nil
+}
+
+func envDirGCDue(root string, now time.Time) bool {
+	envDirGCMu.Lock()
+	defer envDirGCMu.Unlock()
+	last, ok := envDirGCLast[root]
+	return !ok || now.Sub(last) >= envDirGCInterval
+}
+
+func markEnvDirGC(root string, now time.Time) {
+	envDirGCMu.Lock()
+	envDirGCLast[root] = now
+	envDirGCMu.Unlock()
 }
 
 func cleanupEnvDirsContext(ctx context.Context, root string) error {

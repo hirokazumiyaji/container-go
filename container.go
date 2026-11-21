@@ -239,6 +239,7 @@ type Container struct {
 	// operations cannot reuse another target's metadata.
 	dockerMeta              *dockerMetadataCache
 	diagnosticRedactorValue *cli.Redactor
+	diagnosticBaseRedactor  *diagnosticRedactorCache
 	secretsMu               sync.RWMutex
 	targetHost              string
 }

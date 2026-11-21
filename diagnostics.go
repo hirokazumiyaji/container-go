@@ -103,10 +103,23 @@ func composeDiagnosticMatchers(matchers ...*cli.Redactor) *cli.Redactor {
 	return cli.ComposeRedactors(matchers...)
 }
 
+// diagnosticRedactorCache retains the composed matcher for a handle while its
+// long-lived diagnostic matcher is unchanged. The handle identity and declared
+// bindings do not change after construction, so rebuilding and re-hashing them
+// for every returned error is unnecessary.
+type diagnosticRedactorCache struct {
+	base     *cli.Redactor
+	redactor *cli.Redactor
+}
+
 func (c *Container) diagnosticRedactor(extra ...string) *cli.Redactor {
 	c.secretsMu.RLock()
 	base := c.diagnosticRedactorValue
+	cached := c.diagnosticBaseRedactor
 	c.secretsMu.RUnlock()
+	if len(extra) == 0 && cached != nil && cached.base == base {
+		return cached.redactor
+	}
 
 	var matchers []*cli.Redactor
 	if base != nil {
@@ -126,7 +139,18 @@ func (c *Container) diagnosticRedactor(extra ...string) *cli.Redactor {
 	if len(values) > 0 {
 		matchers = append(matchers, cli.NewHashedContextRedactor(values...))
 	}
-	return composeDiagnosticMatchers(matchers...)
+	redactor := composeDiagnosticMatchers(matchers...)
+	if len(extra) == 0 {
+		c.secretsMu.Lock()
+		// clearDiagnosticSecrets may have run while this matcher was built.
+		// Only cache it while the long-lived matcher it contains is still the
+		// handle's current one, so a cleared secret is not retained.
+		if c.diagnosticRedactorValue == base {
+			c.diagnosticBaseRedactor = &diagnosticRedactorCache{base: base, redactor: redactor}
+		}
+		c.secretsMu.Unlock()
+	}
+	return redactor
 }
 
 func (c *Container) publicError(err error, extra ...string) error {
@@ -150,6 +174,7 @@ func (c *Container) clearDiagnosticSecrets() {
 	// The matcher is immutable and may be shared with an in-flight error.
 	// Dropping the handle reference is sufficient; do not mutate it here.
 	c.diagnosticRedactorValue = nil
+	c.diagnosticBaseRedactor = nil
 	c.secretsMu.Unlock()
 }
 

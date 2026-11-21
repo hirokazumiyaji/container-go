@@ -40,7 +40,11 @@ type dockerMetadataEntry struct {
 type dockerMetadataCache struct {
 	mu      sync.Mutex
 	entries map[string]dockerMetadataEntry
-	flights flightGroup[string]
+	// nextExpiry is the earliest expiry among entries, or the zero time when
+	// no entry is known to expire. It lets store skip a full sweep until an
+	// entry can actually be stale.
+	nextExpiry time.Time
+	flights    flightGroup[string]
 
 	// now and ttl are injectable so expiry is testable without sleeping.
 	now func() time.Time
@@ -121,18 +125,56 @@ func (c *dockerMetadataCache) store(key, value string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.currentTime()
+	if !c.nextExpiry.IsZero() && !now.Before(c.nextExpiry) {
+		c.purgeExpiredLocked(now)
+	}
+	if _, exists := c.entries[key]; !exists && c.limit > 0 && len(c.entries) >= c.limit {
+		c.evictEarliestExpiryLocked()
+	}
+	expiry := now.Add(c.ttl)
+	c.entries[key] = dockerMetadataEntry{value: value, expiry: expiry}
+	if c.nextExpiry.IsZero() || expiry.Before(c.nextExpiry) {
+		c.nextExpiry = expiry
+	}
+}
+
+// purgeExpiredLocked drops entries whose expiry has passed and restores the
+// earliest-expiry hint. It runs only when the hint says at least one entry may
+// be stale.
+func (c *dockerMetadataCache) purgeExpiredLocked(now time.Time) {
 	for existing, entry := range c.entries {
 		if !now.Before(entry.expiry) {
 			delete(c.entries, existing)
 		}
 	}
-	if c.limit > 0 && len(c.entries) >= c.limit {
-		for existing := range c.entries {
-			delete(c.entries, existing)
-			break
+	c.recomputeNextExpiryLocked()
+}
+
+// evictEarliestExpiryLocked keeps a just-stored hot answer from being evicted
+// at capacity: with one TTL per cache, the earliest expiry is the oldest
+// insertion, which is the least likely answer a caller needs next.
+func (c *dockerMetadataCache) evictEarliestExpiryLocked() {
+	var oldestKey string
+	var oldestExpiry time.Time
+	for existing, entry := range c.entries {
+		if oldestKey == "" || entry.expiry.Before(oldestExpiry) {
+			oldestKey, oldestExpiry = existing, entry.expiry
 		}
 	}
-	c.entries[key] = dockerMetadataEntry{value: value, expiry: now.Add(c.ttl)}
+	if oldestKey == "" {
+		return
+	}
+	delete(c.entries, oldestKey)
+	c.recomputeNextExpiryLocked()
+}
+
+func (c *dockerMetadataCache) recomputeNextExpiryLocked() {
+	c.nextExpiry = time.Time{}
+	for _, entry := range c.entries {
+		if c.nextExpiry.IsZero() || entry.expiry.Before(c.nextExpiry) {
+			c.nextExpiry = entry.expiry
+		}
+	}
 }
 
 // dockerDefaultNetworkKey identifies one daemon default-network answer: the

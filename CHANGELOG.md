@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux without pidfd), only the direct reaper process is terminated, so helper
   processes in its group may survive.
 
+### Performance
+
+- Reclaim abandoned environment-file directories at most once per 30 seconds per
+  cache root instead of on every `WithEnv`/`WithExecEnv` write, keeping the
+  root-lock critical section to the staging directory. A failed scan is not
+  recorded, so an entry the scan found keeps failing writes until it is
+  removed; a new entry is detected by the next due scan or Run preflight.
+- Stage copied files through a pooled 32 KiB buffer off the kernel zero-copy
+  path, and use bounded `copy_file_range` chunks on Linux and FreeBSD so large
+  copies no longer fall back to a userspace read/write loop or allocate a fresh
+  buffer per file.
+- Decode inspect platform objects in one pass, and skip the null-field map decode
+  for inspect entries whose bytes contain no JSON null.
+- Reuse the composed diagnostic redactor for a handle when no per-call values are
+  supplied, and avoid rebuilding unchanged assignment, JWT, and sanitized text.
+- Track the earliest expiry in the image-presence and Docker metadata caches so
+  inserts no longer sweep the whole map while no entry can be stale.
+
 ### Added
 
 - `ErrCleanupFailed` classifies a `*CleanupError`, including when the cleanup
@@ -142,6 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `errors.As`. `errors.Is` classification is unchanged. A writer error behind
   `ErrOutputDelivery` stays reachable through `errors.As`, as documented, from
   `ExecTo`, `LogsTo`, `FollowLogsTo`, and `AttachedError`.
+- Docker metadata and image-presence caches evict the earliest-expiring entry at
+  capacity instead of an arbitrary one, so a just-stored hot answer survives.
 - Reuse requires matching creation fingerprints and reuse groups, including when
   fingerprinted options are omitted. Recreate existing reuse containers before
   attaching with this version; environment values retain their attach semantics.

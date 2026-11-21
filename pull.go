@@ -597,13 +597,20 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 // inspect must therefore report the same root identity and, when known, the
 // selected platform variant. Any mismatch is returned before the new
 // container is exposed to the caller; Run/reuse then roll it back.
-func verifyStrictCreatedImage(ctx context.Context, c *Container, expected imageIdentity) error {
+//
+// inspected is an inspect that already verified the created generation.
+// When nil, this function performs the inspect itself.
+func verifyStrictCreatedImage(ctx context.Context, c *Container, expected imageIdentity, inspected *engineInfo) error {
 	if !c.eng.capabilities().strictImageIdentity || !expected.pinned {
 		return nil
 	}
-	info, err := c.inspectFresh(ctx)
-	if err != nil {
-		return fmt.Errorf("verify created image: %w", err)
+	info := inspected
+	if info == nil {
+		var err error
+		info, err = c.inspectFresh(ctx)
+		if err != nil {
+			return fmt.Errorf("verify created image: %w", err)
+		}
 	}
 	actual := imageFromInfo(info)
 	if !actual.pinned || !imageRootsCompatible(expected, actual) {

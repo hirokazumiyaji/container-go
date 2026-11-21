@@ -35,7 +35,7 @@ func TestCreatedOwnershipRetriesPerQueryDeadline(t *testing.T) {
 	cfg.reusePollInterval = time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
+	if _, err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 2 {
@@ -290,7 +290,7 @@ func TestInspectRetryLoopsPreserveOuterDeadline(t *testing.T) {
 			case "refresh":
 				_, err = reuseInfoForCaller(ctx, cfg, ctr, imageIdentity{reference: "redis:7-alpine"}, "redis:7-alpine")
 			case "ownership":
-				err = verifyCreatedOwnership(ctx, ctr, cfg)
+				_, err = verifyCreatedOwnership(ctx, ctr, cfg)
 			}
 			if !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("got %v, want outer deadline", err)

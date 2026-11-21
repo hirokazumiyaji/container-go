@@ -529,8 +529,10 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	// an additional deletion target. Both operations are best effort: a
 	// reaper problem must not turn a successful backend create into a
 	// failed Run call.
+	var createdInfo *engineInfo
 	if target, ok := runReaperTarget(cfg); ok {
-		if err := verifyCreatedOwnership(ctx, c, cfg); err != nil {
+		info, err := verifyCreatedOwnership(ctx, c, cfg)
+		if err != nil {
 			// An uncertain inspect is not proof that the generation is
 			// absent. Leave the pending record in place; cleanup only
 			// unregisters it after a confirmed foreign/absent/delete
@@ -541,6 +543,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			}
 			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
+		createdInfo = info
 		// completePending updates the in-memory state before any pipe
 		// write. Never register a second active record as a fallback:
 		// that could turn a failed state transition into a duplicate
@@ -550,7 +553,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			_ = registerWithGlobalReaperTarget(target.reaperKey, target.binary, target.subcommand, target.deleteFlags, target.env, uid, "")
 		}
 	}
-	if err := verifyStrictCreatedImage(ctx, c, resolvedImage); err != nil {
+	if err := verifyStrictCreatedImage(ctx, c, resolvedImage, createdInfo); err != nil {
 		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 	}
 	// Start the attached stream before the env-cleanup early return. Log
@@ -718,10 +721,11 @@ func waitForReusePoll(ctx context.Context, interval ...time.Duration) error {
 // verifyCreatedOwnership validates the labels and backend identity before
 // an external reaper is allowed to retain a newly created container. A
 // successful `run` command alone is not proof that the library's ownership
-// labels were attached.
-func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) error {
+// labels were attached. The returned inspect describes the verified
+// generation so callers can reuse it instead of spawning another inspect.
+func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) (*engineInfo, error) {
 	if c == nil || cfg == nil || !validCreationID(c.creation) {
-		return fmt.Errorf("verify created container: invalid creation generation")
+		return nil, fmt.Errorf("verify created container: invalid creation generation")
 	}
 	verifyCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
@@ -734,7 +738,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if caps.immutableID {
 			uid := c.immutableID()
 			if !domain.IsImmutableContainerID(uid) {
-				return fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, uid)
+				return nil, fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, uid)
 			}
 			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout, sync: &lockPack{uid: uid}}
 		}
@@ -742,7 +746,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if caps.nameAddressed {
 			unlock, err = lockName(verifyCtx, c.id)
 			if err != nil {
-				return fmt.Errorf("verify created container %s: lock name: %w", c.id, err)
+				return nil, fmt.Errorf("verify created container %s: lock name: %w", c.id, err)
 			}
 		}
 		if caps.nameAddressed {
@@ -758,15 +762,15 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		}
 		if !isNotFoundFor(cfg.eng, err) {
 			if err := inspectRetryError(verifyCtx, err); err != nil {
-				return fmt.Errorf("verify created container %s: %w", c.id, err)
+				return nil, fmt.Errorf("verify created container %s: %w", c.id, err)
 			}
 		}
 		if err := waitForReusePoll(verifyCtx, cfg.effectiveReusePollInterval()); err != nil {
-			return fmt.Errorf("verify created container %s: %w", c.id, err)
+			return nil, fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
 	}
 	if info == nil {
-		return fmt.Errorf("verify created container %s: inspect returned no container", c.id)
+		return nil, fmt.Errorf("verify created container %s: inspect returned no container", c.id)
 	}
 	expected := domain.OwnershipExpected{
 		RequireManaged: true,
@@ -782,13 +786,15 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		expected.RequireNoImmutableID = true
 	}
 	if failure := domain.VerifyOwnership(expected, ownershipObserved(info)); failure != domain.OwnershipFailureNone {
-		return fmt.Errorf("verify created container %s: %s", c.id, createdOwnershipFailure(failure, caps.immutableID))
+		return nil, fmt.Errorf("verify created container %s: %s", c.id, createdOwnershipFailure(failure, caps.immutableID))
 	}
 	c.pack().mu.Lock()
 	c.pack().info = info
 	c.pack().mu.Unlock()
 	c.setImmutableID(info.uid)
-	return nil
+	// Return a copy: pack().info is owned under mu, and reuse callers attach
+	// daemon network metadata to the returned snapshot.
+	return cloneEngineInfo(info), nil
 }
 
 // createdOwnershipFailure keeps the post-create diagnostics specific to the
@@ -1273,7 +1279,21 @@ func reportedExitCode(info *engineInfo) (int, error) {
 	return info.exitCode, nil
 }
 
-const waitExitPollInterval = 100 * time.Millisecond
+// Wait polls an inspect-backed state read. The interval starts small so a
+// quick exit is noticed promptly, then backs off to a cap: a long batch
+// container should cost a bounded number of CLI subprocesses.
+var (
+	waitExitPollInterval    = 100 * time.Millisecond
+	waitExitPollMaxInterval = time.Second
+)
+
+func nextWaitExitPollInterval(current time.Duration) time.Duration {
+	next := current * 2
+	if next > waitExitPollMaxInterval {
+		return waitExitPollMaxInterval
+	}
+	return next
+}
 
 // Wait blocks until the container reaches StateStopped and returns its exit code.
 // If the container is already stopped, it returns immediately. A missing backend
@@ -1283,6 +1303,7 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	interval := waitExitPollInterval
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -1309,7 +1330,8 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 		} else if info.state == StateStopped {
 			return reportedExitCode(info)
 		}
-		timer.Reset(waitExitPollInterval)
+		timer.Reset(interval)
+		interval = nextWaitExitPollInterval(interval)
 	}
 }
 
@@ -2207,7 +2229,7 @@ func (c *Container) cachedDynamic() *engineInfo {
 	p := c.pack()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !usableDynamicSnapshot(p.dynamic) {
+	if !c.usableDynamicSnapshot(p.dynamic) {
 		return nil
 	}
 	if !p.currentTime().Before(p.dynamicAt.Add(dynamicInspectTTL)) {
@@ -2305,11 +2327,14 @@ func (c *Container) clearDynamic() {
 	p.dynamicGen++
 }
 
-// usableDynamicSnapshot reports whether a cached inspect has network or
-// port payload worth returning. Callers that still cannot resolve (empty
-// IP, missing host binding) clear the snapshot so the next read re-inspects
-// immediately instead of waiting out the TTL.
-func usableDynamicSnapshot(info *engineInfo) bool {
+// usableDynamicSnapshot reports whether a cached inspect can answer an
+// endpoint read. It accepts address or host-binding payload, and also a
+// Running snapshot that needs neither: Docker host networking reports no
+// address, and a port-less container resolves to the target host. Callers
+// that still cannot resolve (empty IP, missing host binding) clear the
+// snapshot so the next read re-inspects immediately instead of waiting out
+// the TTL.
+func (c *Container) usableDynamicSnapshot(info *engineInfo) bool {
 	if info == nil {
 		return false
 	}
@@ -2321,7 +2346,17 @@ func usableDynamicSnapshot(info *engineInfo) bool {
 			return true
 		}
 	}
-	return false
+	// Docker host networking reports neither a container IP nor any host
+	// binding, and a container with no configured ports needs neither to
+	// answer Host. Cache that running observation instead of re-inspecting
+	// on every read.
+	if info.state != StateRunning {
+		return false
+	}
+	if info.networkMode == dockerNetworkHost {
+		return true
+	}
+	return len(c.published) == 0 && len(c.exposed) == 0
 }
 
 func cloneEngineInfo(info *engineInfo) *engineInfo {
@@ -2500,12 +2535,13 @@ func (c *Container) inspectTargetLocked() string {
 }
 
 // identitySnapshot reads the handle's backend identity and creation
-// generation while holding the same lock that protects their publication.
+// generation. Both are immutable once the handle is constructed or the UID
+// has been promoted, so this does not take the inspect lock; the context
+// still reports an already-finished caller immediately.
 func (c *Container) identitySnapshot(ctx context.Context) (uid, creation string, err error) {
-	if err := c.pack().inspectMu.Lock(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return "", "", err
 	}
-	defer c.pack().inspectMu.Unlock()
 	return c.immutableID(), c.creation, nil
 }
 
@@ -2513,14 +2549,15 @@ func (c *Container) identitySnapshot(ctx context.Context) (uid, creation string,
 // and log operations. In particular, a Docker handle with an empty or
 // malformed UID fails before a CLI call instead of falling back to its
 // name. Apple handles likewise require a valid generation before using a
-// name-addressed operation. Lock acquisition is context-aware so a copy
-// cannot wait behind another call's inspect or default-network lookup after
-// its caller has been canceled.
+// name-addressed operation. It reads only immutable handle state, so it
+// never waits behind an in-flight inspect or default-network lookup; the
+// caller's context still bounds the operation itself.
 func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error) {
-	if err := c.pack().inspectMu.Lock(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	defer c.pack().inspectMu.Unlock()
+	// The UID is only promoted, never rewritten, and is published under
+	// uidMu. creation, id, and engine are fixed when the handle is built.
 	uid := c.immutableID()
 	creation := c.creation
 	if requiresImmutableID(c.eng) {
@@ -2540,7 +2577,10 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error)
 	if c.id == "" {
 		return "", identityError("container has no logical name")
 	}
-	return c.inspectTargetLocked(), nil
+	if uid != "" {
+		return uid, nil
+	}
+	return c.id, nil
 }
 
 func configNeedsDefaultNetwork(cfg *config) bool {

@@ -11,32 +11,32 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func prepareCopyStagingRoot() (string, error) {
+func prepareCopyStagingRoot() (string, func() error, error) {
 	return prepareCopyStagingRootForSource(nil)
 }
 
-func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
+func prepareCopyStagingRootForSource(source *openedCopySource) (string, func() error, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
-		return "", fmt.Errorf("copy staging: locate per-user cache: %w", err)
+		return "", nil, fmt.Errorf("copy staging: locate per-user cache: %w", err)
 	}
 	base, err = filepath.Abs(base)
 	if err != nil {
-		return "", fmt.Errorf("copy staging: resolve per-user cache: %w", err)
+		return "", nil, fmt.Errorf("copy staging: resolve per-user cache: %w", err)
 	}
 	if err := ensureCopyStagingBase(base, source); err != nil {
-		return "", fmt.Errorf("copy staging: ensure per-user cache: %w", err)
+		return "", nil, fmt.Errorf("copy staging: ensure per-user cache: %w", err)
 	}
 
 	appRoot := filepath.Join(base, "containergo")
 	if err := ensurePrivateCopyStagingDir(appRoot); err != nil {
-		return "", fmt.Errorf("copy staging: create private staging parent: %w", err)
+		return "", nil, fmt.Errorf("copy staging: create private staging parent: %w", err)
 	}
 	root := filepath.Join(appRoot, "copy-staging")
 	if err := ensurePrivateCopyStagingDir(root); err != nil {
-		return "", fmt.Errorf("copy staging: create private staging root: %w", err)
+		return "", nil, fmt.Errorf("copy staging: create private staging root: %w", err)
 	}
-	return root, nil
+	return root, noCopyStagingRootCleanup, nil
 }
 
 func ensureCopyStagingBase(path string, source *openedCopySource) error {

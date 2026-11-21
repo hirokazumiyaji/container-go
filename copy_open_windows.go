@@ -28,11 +28,51 @@ func checkCopyFileOpenCapability() error {
 
 // openCopyFile opens the reparse point itself and uses overlapped I/O
 // so a named-pipe target cannot turn the read into an unbounded wait.
+// FILE_FLAG_OPEN_REPARSE_POINT reports the link itself instead of its
+// target, so the handle must be rejected before any caller reads it.
 func openCopyFile(name string) (*os.File, error) {
 	if err := checkCopyFileOpenCapability(); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(name, os.O_RDONLY|windowsCopyFileOpenFlags, 0)
+	file, err := os.OpenFile(name, os.O_RDONLY|windowsCopyFileOpenFlags, 0)
+	if err != nil {
+		return nil, err
+	}
+	reparse, err := windowsCopyHandleIsReparse(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if reparse {
+		_ = file.Close()
+		return nil, fmt.Errorf("opened a reparse point: %w", ErrCopyFileNotRegular)
+	}
+	return file, nil
+}
+
+// lstatCopyFile reads metadata and the file ID from one no-follow handle.
+// os.Lstat defers the ID until os.SameFile reopens the path, which would
+// compare the opened handle with whatever the path names at that later time.
+func lstatCopyFile(name string) (os.FileInfo, error) {
+	pathPtr, err := windows.UTF16PtrFromString(windowsExtendedPath(name))
+	if err != nil {
+		return nil, &os.PathError{Op: "lstat", Path: name, Err: err}
+	}
+	handle, err := windows.CreateFile(
+		pathPtr,
+		windows.FILE_READ_ATTRIBUTES,
+		copySourceShareMode,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
+	if err != nil {
+		return nil, &os.PathError{Op: "lstat", Path: name, Err: err}
+	}
+	file := os.NewFile(uintptr(handle), name)
+	defer func() { _ = file.Close() }()
+	return file.Stat()
 }
 
 const copySourceShareMode = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE

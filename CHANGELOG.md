@@ -127,6 +127,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-empty environment map; `ErrEnvFileUnsupported` remains exported for
   compatibility. The external watchdog reaper is still unavailable on Windows.
 
+- Publish backend behaviour through an engine capability contract instead of
+  asserting `dockerEngine` or comparing backend names in the shared lifecycle,
+  reuse, pull, prune, diagnostics, and wait layers. Target scope, image
+  identity, and network compatibility are now engine-declared policy; the
+  identity error messages now name the backend through `eng.name()` instead of
+  hard-coding Docker or Apple, so string-matched diagnostics can change; the
+  duplicated CLI argv builders, pull/prune runner selection, and probe
+  unavailability classification are shared.
+
 - **Breaking:** `Container.ExitCode` and `Wait` no longer assume success when the backend omits
   an exit code. `ExitCode` also rejects containers that have not stopped. Callers
   relying on `0, nil` must handle these errors; snapshot users must check

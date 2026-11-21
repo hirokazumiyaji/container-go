@@ -12,7 +12,7 @@ import (
 
 func TestCheckReuseOwnedRequiresAllOwnershipLabels(t *testing.T) {
 	const validCreation = "0123456789abcdef"
-	cfg := &config{name: "myctr"}
+	cfg := &config{name: "myctr", eng: appleEngine{}}
 	cases := []struct {
 		name    string
 		labels  map[string]string

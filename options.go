@@ -169,10 +169,10 @@ func (c *config) validate() error {
 // is known. Values are never echoed: a DOCKER_HOST may carry credentials.
 func (c *config) validateDockerTarget() error {
 	if c.clientPinned && (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
-		return validationErrorf(c.dockerTargetOption(), nil, "cannot override Docker target options on Client.Run")
+		return validationErrorf(c.daemonTargetOption(), nil, "cannot override Docker target options on Client.Run")
 	}
-	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.name() != "docker" {
-		return validationErrorf(c.dockerTargetOption(), nil, "Docker target options require Docker backend")
+	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && !c.eng.capabilities().daemonTarget {
+		return validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
 	if c.reuseAttachTimeout > 0 && !c.reuse {
 		return validationErrorf("WithReuseAttachTimeout", c.reuseAttachTimeout, "WithReuseAttachTimeout requires WithReuse")
@@ -218,9 +218,9 @@ func (c *config) effectiveProbeTimeout() time.Duration {
 	return 0
 }
 
-// dockerTargetOption names the option that set a target override so a
+// daemonTargetOption names the option that set a target override so a
 // validation error points at the option the caller must change.
-func (c *config) dockerTargetOption() string {
+func (c *config) daemonTargetOption() string {
 	switch {
 	case c.dockerContext != nil:
 		return "WithDockerContext"

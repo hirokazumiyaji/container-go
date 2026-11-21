@@ -1314,7 +1314,10 @@ must not trigger implicitly.
 The following is the core layout, not an exhaustive file listing. The
 root package contains the public API and backend-neutral lifecycle
 code. Backend implementations own argv assembly and inspect
-normalization.
+normalization. Shared lifecycle code asks `engine.capabilities()` and
+the engine's target-scope, image-identity, and network-compatibility
+methods for backend policy instead of asserting a concrete backend type
+or comparing backend names.
 
 ```
 container-go/
@@ -1332,8 +1335,11 @@ container-go/
 ├── errors.go         // public error values
 ├── backend.go        // backend selection
 ├── engine.go         // backend interface and normalized info
+├── engine_capabilities.go // backend capability and target-scope contract
 ├── engine_apple.go   // Apple Container argv/inspect adapter
 ├── engine_docker.go  // Docker argv/inspect adapter
+├── engine_*_target.go   // backend target scope and diagnostics policy
+├── engine_*_identity.go // backend image identity and network-compat policy
 ├── namelock.go       // cooperating-process name lock
 ├── flight.go         // in-process single-flight helper
 ├── internal/cli/     // CLI runner, streaming, and error classification

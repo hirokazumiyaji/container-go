@@ -61,14 +61,14 @@ func TestSameContainerIdentityRejectsMissingExpectedIdentity(t *testing.T) {
 			eng:      dockerEngine{},
 			expected: identityInfo(identityTestCreation, ""),
 			fresh:    identityInfo(identityTestCreation, identityTestUID),
-			want:     "Docker inspect ID is missing or invalid",
+			want:     "docker inspect ID is missing or invalid",
 		},
 		{
 			name:     "malformed expected Docker ID",
 			eng:      dockerEngine{},
 			expected: identityInfo(identityTestCreation, "not-an-immutable-id"),
 			fresh:    identityInfo(identityTestCreation, identityTestUID),
-			want:     "Docker inspect ID is missing or invalid",
+			want:     "docker inspect ID is missing or invalid",
 		},
 		{
 			name:     "name-addressed expected ID",

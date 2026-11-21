@@ -258,9 +258,6 @@ type engine interface {
 	// image is not in the local store.
 	imageMissing(err error) bool
 	imageMissingForTarget(err error, target string) bool
-	// parseImageExists interprets image inspect output, considering the
-	// requested platform variant when set.
-	parseImageExists(data []byte, platform string) bool
 	// platformCompatible compares a requested platform selector with the
 	// platform this backend reports from container inspect.
 	platformCompatible(selector, actual string) bool
@@ -274,6 +271,139 @@ type engine interface {
 	targetID() string
 	// isRemote reports whether the target daemon lives on another machine.
 	isRemote() bool
+
+	// capabilities declares the backend behaviour shared policy branches on.
+	// Shared code consults these flags instead of asserting a concrete engine
+	// type or comparing name().
+	capabilities() engineCapabilities
+
+	// pinnedTargetEnv returns the child environment that pins this backend's
+	// target, or nil when the backend has no externally addressable target.
+	pinnedTargetEnv() []string
+	// configureTarget applies explicit client target overrides.
+	configureTarget(target engineTargetOverride) engine
+	// freezeTargetEnvironment snapshots ambient target settings so a Client
+	// keeps addressing the same target after the process environment changes.
+	freezeTargetEnvironment() engine
+	// resolveTargetEngine resolves the backend target this operation will
+	// address. Backends without implicit target resolution return themselves.
+	resolveTargetEngine(ctx context.Context, runner cli.Runner) (engine, error)
+	// preparePruneTarget resolves the target a prune will address, tolerating
+	// an implicit target the runner's own CLI can still resolve.
+	preparePruneTarget(ctx context.Context, runner cli.Runner, timeout time.Duration) (engine, error)
+	// targetHost, targetContext, and targetConfigDir report configured target
+	// components for validation and diagnostics.
+	targetHost() string
+	targetContext() string
+	targetConfigDir() string
+	// diagnosticTargetValues returns target components that must be redacted
+	// from diagnostics.
+	diagnosticTargetValues() []string
+	// diagnosticBoundaryValues returns target components that may straddle a
+	// bounded streaming window.
+	diagnosticBoundaryValues() []string
+	// runnerDiagnosticValues returns target components contributed by a
+	// runner's own environment.
+	runnerDiagnosticValues(runner cli.Runner) (values, boundary []string)
+
+	// parseImageIdentity extracts the verified image identity from image
+	// inspect output.
+	parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool)
+	// imageIdentityComplete reports whether a parsed identity carries every
+	// metadata field this backend requires for a pinned reference.
+	imageIdentityComplete(identity imageIdentity, platform string) bool
+	// verifyPinnedImageIdentity rejects a re-inspected pinned identity the
+	// backend cannot prove complete and platform-correct.
+	verifyPinnedImageIdentity(pinned, checked imageIdentity, platform string) error
+	// reconcileImageIdentity merges the authoritative re-inspected identity
+	// back into the caller's pinned spelling.
+	reconcileImageIdentity(pinned, checked imageIdentity) imageIdentity
+	// imageReferencesCompatible compares a requested reference with the
+	// reference inspect reported.
+	imageReferencesCompatible(requested, actual string) bool
+	// defaultRunPlatform reports the platform the backend selects when the
+	// caller chose none, or "" when the backend leaves the default implicit.
+	defaultRunPlatform() string
+	// parsePruneCandidates returns list-time prune metadata keyed by the
+	// identifiers parseStoppedManaged returned.
+	parsePruneCandidates(data []byte) (map[string]pruneCandidate, error)
+	// checkReuseNetworkCompat rejects an existing container whose network
+	// configuration cannot satisfy the requested reuse options.
+	checkReuseNetworkCompat(info *engineInfo, cfg *config) error
+}
+
+// startArgsFor builds the shared start argv. Both backends start by name or
+// verified ID with the same subcommand.
+func startArgsFor(id string) []string { return []string{"start", id} }
+
+// killArgsFor builds the shared kill argv. The signal flag is identical for
+// both backends.
+func killArgsFor(id, signal string) []string {
+	if signal != "" {
+		return []string{"kill", "--signal", signal, id}
+	}
+	return []string{"kill", id}
+}
+
+// copyToArgsFor builds the shared copy-in argv.
+func copyToArgsFor(id, hostPath, containerPath string) []string {
+	return []string{"cp", hostPath, id + ":" + containerPath}
+}
+
+// copyFromArgsFor builds the shared copy-out argv.
+func copyFromArgsFor(id, containerPath, hostPath string) []string {
+	return []string{"cp", id + ":" + containerPath, hostPath}
+}
+
+// execArgsFor builds the shared exec argv.
+func execArgsFor(id string, cfg *execConfig, envFile string, cmd []string) []string {
+	args := []string{"exec"}
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
+	}
+	if cfg.user != "" {
+		args = append(args, "--user", cfg.user)
+	}
+	if cfg.workdir != "" {
+		args = append(args, "--workdir", cfg.workdir)
+	}
+	args = append(args, id)
+	return append(args, cmd...)
+}
+
+// logsFollowArgsFor builds the shared log-follow argv.
+func logsFollowArgsFor(id string) []string {
+	return []string{"logs", "--follow", id}
+}
+
+// pullImageArgsFor builds a pull argv for backends whose pull subcommand
+// differs.
+func pullImageArgsFor(subcommand []string, image, platform string) []string {
+	args := append([]string(nil), subcommand...)
+	if platform != "" {
+		args = append(args, "--platform", platform)
+	}
+	return append(args, image)
+}
+
+// imageInspectArgsFor builds an image-inspect argv. platformAware backends
+// accept --platform; the others inspect the reference alone.
+func imageInspectArgsFor(image, platform string, platformAware bool) []string {
+	args := []string{"image", "inspect"}
+	if platformAware && platform != "" {
+		args = append(args, "--platform", platform)
+	}
+	return append(args, image)
+}
+
+// materializeRunPlatform records the platform the backend will select when
+// the caller chose none. A backend whose default stays implicit reports an
+// empty platform and the selector is left unset.
+func materializeRunPlatform(cfg *config) {
+	if cfg.platform != "" {
+		return
+	}
+	cfg.platform = cfg.eng.defaultRunPlatform()
 }
 
 func stopArgsFor(id string, timeout *time.Duration, maxSeconds int64) ([]string, error) {
@@ -366,7 +496,7 @@ func imageIdentitiesCompatible(a, b imageIdentity) bool {
 		return aHasID && bHasID && strings.EqualFold(aID, bID)
 	}
 
-	if !applePlatformMetadataCompatible(a.platform, b.platform) {
+	if !platformMetadataCompatible(a.platform, b.platform) {
 		return false
 	}
 	if a.variantDigest != "" && !validImageDigest(a.variantDigest) {
@@ -428,7 +558,7 @@ func requestedImageIdentitiesCompatible(requested, actual imageIdentity) bool {
 	return imageIdentitiesCompatible(requested, actualForComparison)
 }
 
-func applePlatformMetadataCompatible(a, b string) bool {
+func platformMetadataCompatible(a, b string) bool {
 	if a == "" && b == "" {
 		return true
 	}

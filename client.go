@@ -56,17 +56,25 @@ func (c *clientConfig) diagnosticValues() []string {
 // environment to the option values, mirroring config.diagnosticValues for
 // Client.Run. Environment values did not pass option validation, so skip any
 // value the bounded streaming window cannot redact.
-func (c *clientConfig) targetDiagnosticValues(de dockerEngine, runner cli.Runner) []string {
+func (c *clientConfig) targetDiagnosticValues(eng engine, runner cli.Runner) []string {
 	values := c.diagnosticValues()
-	for _, value := range []string{de.effectiveHost(), de.effectiveContext(), de.effectiveConfigDir()} {
+	for _, value := range []string{eng.targetHost(), eng.targetContext(), eng.targetConfigDir()} {
 		if value != "" {
 			values = append(values, value)
 		}
+	}
+	if !eng.capabilities().daemonTarget {
+		return uniqueStrings(values)
 	}
 	// A caller-supplied runner can set the target in its own environment,
 	// which the engine does not see until resolveTarget runs. Register those
 	// values too: a failed resolution quotes them before a resolved engine
 	// exists.
+	//
+	// This deliberately differs from engine.runnerDiagnosticValues, which the
+	// prune redactor uses: a Client construction error may quote the literal
+	// "default" context before resolution, so keep it here, while prune drops
+	// that common word to avoid redacting unrelated diagnostics.
 	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"} {
 		if value, ok := runnerEnvLookup(runner, key); ok && value != "" {
 			values = append(values, value)
@@ -75,9 +83,9 @@ func (c *clientConfig) targetDiagnosticValues(de dockerEngine, runner cli.Runner
 	return uniqueStrings(values)
 }
 
-// dockerTargetOption names the option that set a Docker target override so a
+// daemonTargetOption names the option that set a Docker target override so a
 // validation error points at the option the caller must change.
-func (c *clientConfig) dockerTargetOption() string {
+func (c *clientConfig) daemonTargetOption() string {
 	switch {
 	case c.dockerContext != nil:
 		return "WithClientDockerContext"
@@ -228,37 +236,17 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 		return nil, safePublicError(err)
 	}
 
-	if _, ok := eng.(dockerEngine); ok {
-		var de dockerEngine
-		de.explicitTarget = true
-		if cfg.dockerHost != nil {
-			de.host = *cfg.dockerHost
-			de.explicitHost = true
-		} else {
-			de.host = os.Getenv("DOCKER_HOST")
-		}
-		if cfg.dockerContext != nil {
-			de.context = *cfg.dockerContext
-			de.explicitContext = true
-		} else {
-			de.context = os.Getenv("DOCKER_CONTEXT")
-		}
-		if cfg.dockerConfigDir != nil {
-			de.configDir = *cfg.dockerConfigDir
-			de.explicitConfigDir = true
-		} else {
-			de.configDir = os.Getenv("DOCKER_CONFIG")
-		}
-		if cfg.platform != nil {
-			de.defaultPlatform = *cfg.platform
-			de.explicitDefaultPlatform = true
-		} else {
-			de.defaultPlatform = os.Getenv("DOCKER_DEFAULT_PLATFORM")
-		}
-		eng = de
-	} else if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil || cfg.platform != nil {
-		return nil, validationErrorf(cfg.dockerTargetOption(), nil, "Docker target options require Docker backend")
+	dockerOptionsSet := cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil || cfg.platform != nil
+	if dockerOptionsSet && !eng.capabilities().daemonTarget {
+		return nil, validationErrorf(cfg.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
+	eng = configuredTarget(eng, engineTargetOverride{
+		host:      cfg.dockerHost,
+		context:   cfg.dockerContext,
+		configDir: cfg.dockerConfigDir,
+		platform:  cfg.platform,
+	})
+	eng = frozenTarget(eng)
 
 	binary := cfg.binary
 	if binary == "" {
@@ -267,11 +255,7 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 
 	runner := cfg.runner
 	if runner == nil {
-		var env []string
-		if de, ok := eng.(dockerEngine); ok {
-			env = de.pinnedTargetEnv()
-		}
-		runner = &cli.ExecRunner{Binary: binary, Env: env}
+		runner = &cli.ExecRunner{Binary: binary, Env: eng.pinnedTargetEnv()}
 	} else if er, ok := runner.(*cli.ExecRunner); ok {
 		cloned := &cli.ExecRunner{
 			Binary: er.Binary,
@@ -280,45 +264,40 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 		if cloned.Binary == "" {
 			cloned.Binary = binary
 		}
-		if de, ok := eng.(dockerEngine); ok {
-			if targetEnv := de.pinnedTargetEnv(); len(targetEnv) > 0 {
-				cloned.Env = pinRunnerEnv(cloned.Env, targetEnv)
-			}
+		if targetEnv := eng.pinnedTargetEnv(); len(targetEnv) > 0 {
+			cloned.Env = pinRunnerEnv(cloned.Env, targetEnv)
 		}
 		runner = cloned
 	}
 
-	if de, ok := eng.(dockerEngine); ok {
-		queryCtx := ctx
-		queryCancel := func() {}
-		if cfg.queryTimeout > 0 {
-			queryCtx, queryCancel = context.WithTimeout(ctx, cfg.queryTimeout)
+	queryCtx := ctx
+	queryCancel := func() {}
+	if cfg.queryTimeout > 0 {
+		queryCtx, queryCancel = context.WithTimeout(ctx, cfg.queryTimeout)
+	}
+	resolved, err := resolvedTarget(queryCtx, eng, runner)
+	queryErr := queryCtx.Err()
+	queryCancel()
+	if err != nil {
+		// Caller cancellation and explicitly configured query budgets are
+		// terminal; implicit target discovery remains best-effort by default.
+		if ctx.Err() != nil || cfg.queryTimeout > 0 && queryErr != nil {
+			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng, runner)...)
 		}
-		resolved, err := de.resolveTarget(queryCtx, runner)
-		queryErr := queryCtx.Err()
-		queryCancel()
-		if err != nil {
-			// Caller cancellation and explicitly configured query budgets are
-			// terminal; implicit target discovery remains best-effort by default.
-			if ctx.Err() != nil || cfg.queryTimeout > 0 && queryErr != nil {
-				return nil, safePublicError(err, cfg.targetDiagnosticValues(de, runner)...)
-			}
-			if de.effectiveContext() != "" || de.effectiveHost() != "" {
-				return nil, safePublicError(err, cfg.targetDiagnosticValues(de, runner)...)
-			}
-			var configErr *ConfigError
-			if errors.As(err, &configErr) {
-				return nil, safePublicError(err, cfg.targetDiagnosticValues(de, runner)...)
-			}
-		} else {
-			eng = resolved
-			if er, ok := runner.(*cli.ExecRunner); ok {
-				if targetEnv := resolved.pinnedTargetEnv(); len(targetEnv) > 0 {
-					cloned := &cli.ExecRunner{
-						Binary: er.Binary,
-						Env:    pinRunnerEnv(er.Env, targetEnv),
-					}
-					runner = cloned
+		if eng.targetContext() != "" || eng.targetHost() != "" {
+			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng, runner)...)
+		}
+		var configErr *ConfigError
+		if errors.As(err, &configErr) {
+			return nil, safePublicError(err, cfg.targetDiagnosticValues(eng, runner)...)
+		}
+	} else {
+		eng = resolved
+		if er, ok := runner.(*cli.ExecRunner); ok {
+			if targetEnv := resolved.pinnedTargetEnv(); len(targetEnv) > 0 {
+				runner = &cli.ExecRunner{
+					Binary: er.Binary,
+					Env:    pinRunnerEnv(er.Env, targetEnv),
 				}
 			}
 		}
@@ -371,9 +350,9 @@ func (c *Client) Pull(ctx context.Context, image string, opts ...PullOption) err
 		return err
 	}
 	if cfg.dockerHost != nil || cfg.dockerContext != nil {
-		return validationErrorf(cfg.dockerTargetOption(), nil, "cannot override Docker target options on Client.Pull")
+		return validationErrorf(cfg.daemonTargetOption(), nil, "cannot override Docker target options on Client.Pull")
 	}
-	opCfg := cfg.operationConfig(c.pullRunner(cfg), c.eng)
+	opCfg := cfg.operationConfig(c.operationRunner(cfg.runner, cfg.binary), c.eng)
 	if err := pullWithConfig(ctx, opCfg, image); err != nil {
 		return opCfg.publicError(err)
 	}
@@ -388,7 +367,7 @@ func (c *Client) Prune(ctx context.Context, opts ...PruneOption) ([]string, erro
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.pruneRunner(cfg)), c.eng, cfg)
+	return pruneWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.operationRunner(cfg.runner, cfg.binary)), c.eng, cfg)
 }
 
 // PruneReuseGroup force-removes every container tagged with the given reuse group
@@ -402,39 +381,24 @@ func (c *Client) PruneReuseGroup(ctx context.Context, group string, opts ...Prun
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneReuseGroupWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.pruneRunner(cfg)), c.eng, group, cfg)
+	return pruneReuseGroupWithConfig(ctx, pinRunnerTargetEnv(c.eng, c.operationRunner(cfg.runner, cfg.binary)), c.eng, group, cfg)
 }
 
-// pullRunner selects the runner for a Client.Pull. A runner supplied through
-// PullOption wins; otherwise the Client's pinned runner is cloned so a binary
-// option cannot mutate it. cloneRunner only copies *cli.ExecRunner, so a custom
-// pinned runner that implements SetBinary is mutated by WithPullBinary; pass a
-// per-call runner instead when isolation is required.
-func (c *Client) pullRunner(cfg pullConfig) Runner {
-	if cfg.runner == nil && cfg.binary == "" {
+// operationRunner selects the runner for one Client operation. A runner
+// supplied through the operation options wins; otherwise the Client's pinned
+// runner is cloned so a binary option cannot mutate it. cloneRunner only
+// copies *cli.ExecRunner, so a custom pinned runner that implements SetBinary
+// is mutated by an operation-level binary option; pass a per-call runner
+// instead when isolation is required.
+func (c *Client) operationRunner(runner Runner, binary string) Runner {
+	if runner == nil && binary == "" {
 		return c.runner
 	}
-	base := cfg.runner
+	base := runner
 	if base == nil {
 		base = cloneRunner(c.runner)
 	}
-	return effectiveRunner(base, cfg.binary, c.eng)
-}
-
-// pruneRunner selects the runner for a Client prune. A runner supplied through
-// PruneOption wins; otherwise the Client's pinned runner is cloned so a binary
-// option cannot mutate it. cloneRunner only copies *cli.ExecRunner, so a custom
-// pinned runner that implements SetBinary is mutated by WithPruneBinary; pass a
-// per-call runner instead when isolation is required.
-func (c *Client) pruneRunner(cfg pruneConfig) Runner {
-	if cfg.runner == nil && cfg.binary == "" {
-		return c.runner
-	}
-	base := cfg.runner
-	if base == nil {
-		base = cloneRunner(c.runner)
-	}
-	return effectiveRunner(base, cfg.binary, c.eng)
+	return effectiveRunner(base, binary, c.eng)
 }
 
 // Backend returns the backend engine name ("docker" or "apple").

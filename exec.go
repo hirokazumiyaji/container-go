@@ -541,7 +541,7 @@ func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
 			err:   fmt.Errorf("exec verification: inspect returned no state"),
 		}
 	}
-	if c.dockerGenerationMatches(info) {
+	if c.immutableIDGenerationMatches(info) {
 		c.setImmutableUID(info.uid)
 	}
 	return execInspection{state: info.state}

@@ -210,7 +210,7 @@ func (t waitTarget) Health(ctx context.Context) (wait.Health, error) {
 	if t.c == nil || t.c.eng == nil {
 		return wait.HealthNone, nil
 	}
-	if t.c.eng.name() != "docker" {
+	if !t.c.eng.capabilities().healthcheck {
 		return wait.HealthNone, fmt.Errorf("%w: %w", ErrUnsupportedCapability, &wait.ConfigError{
 			Strategy: "ForHealthcheck",
 			Field:    "backend",

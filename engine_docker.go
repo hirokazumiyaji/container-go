@@ -229,8 +229,6 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
-func (dockerEngine) requiresImmutableID() bool { return true }
-
 // imageStoreID partitions presence-cache entries by the env-visible
 // Docker client settings that change which store or platform variant a
 // Run without WithPlatform would observe: DOCKER_HOST, DOCKER_CONTEXT,
@@ -675,54 +673,7 @@ func (dockerEngine) probe() cli.Probe {
 }
 
 func dockerProbeUnavailable(err error) bool {
-	if isContextError(err) {
-		return false
-	}
-	branches := backendCLIErrorBranches(err, "docker")
-	var versionBranches []cliErrorBranch
-	for _, branch := range branches {
-		if branch.ctx.operation == "version" {
-			versionBranches = append(versionBranches, branch)
-		}
-	}
-	if len(versionBranches) == 0 {
-		return false
-	}
-	// Configuration/TLS diagnostics on the version branch or on non-CLI
-	// joined probe text (withProbeOutput stderr) veto liveness. Other
-	// operations' CLI branches must not suppress a real version failure.
-	for _, branch := range versionBranches {
-		if cli.IsProbeConfigurationError(branch.cause) {
-			return false
-		}
-	}
-	nonCLI := cli.CollectNonCLIErrorBranches(err)
-	for _, extra := range nonCLI {
-		if cli.IsProbeConfigurationError(extra) {
-			return false
-		}
-	}
-	for _, branch := range versionBranches {
-		stderr, stdout := branchLines(branch, true)
-		for _, line := range stderr {
-			if dockerProbeLivenessText(line) {
-				return true
-			}
-		}
-		for _, line := range stdout {
-			if dockerProbeLivenessText(line) {
-				return true
-			}
-		}
-	}
-	// Desktop/npipe fixtures often arrive as joined non-CLI stderr text
-	// from withProbeOutput rather than CLIError.Stderr.
-	for _, extra := range nonCLI {
-		if dockerProbeLivenessText(extra.Error()) {
-			return true
-		}
-	}
-	return false
+	return probeUnavailable(err, "docker", "version", dockerProbeLivenessText)
 }
 
 func dockerProbeLivenessText(line string) bool {
@@ -1614,7 +1565,7 @@ func dockerState(s string) State {
 }
 
 func (dockerEngine) startArgs(id string) []string {
-	return []string{"start", id}
+	return startArgsFor(id)
 }
 
 func (dockerEngine) restartArgs(id string, timeout *time.Duration) ([]string, error) {
@@ -1629,10 +1580,7 @@ func (dockerEngine) restartArgs(id string, timeout *time.Duration) ([]string, er
 }
 
 func (dockerEngine) killArgs(id string, signal string) []string {
-	if signal != "" {
-		return []string{"kill", "--signal", signal, id}
-	}
-	return []string{"kill", id}
+	return killArgsFor(id, signal)
 }
 
 func (dockerEngine) pauseArgs(id string) ([]string, error) {
@@ -1652,11 +1600,11 @@ func (dockerEngine) deleteArgs(id string) []string {
 }
 
 func (dockerEngine) copyToArgs(id, hostPath, containerPath string) []string {
-	return []string{"cp", hostPath, id + ":" + containerPath}
+	return copyToArgsFor(id, hostPath, containerPath)
 }
 
 func (dockerEngine) copyFromArgs(id, containerPath, hostPath string) []string {
-	return []string{"cp", id + ":" + containerPath, hostPath}
+	return copyFromArgsFor(id, containerPath, hostPath)
 }
 
 func (dockerEngine) checkCopyFileFromContainer() error { return nil }
@@ -1783,22 +1731,11 @@ func (dockerEngine) reaperSubcommand() string { return "rm" }
 func (dockerEngine) reaperDeleteFlags() []string { return []string{dockerDeleteVolumesFlag} }
 
 func (dockerEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {
-	args := []string{"exec"}
-	if envFile != "" {
-		args = append(args, "--env-file", envFile)
-	}
-	if cfg.user != "" {
-		args = append(args, "--user", cfg.user)
-	}
-	if cfg.workdir != "" {
-		args = append(args, "--workdir", cfg.workdir)
-	}
-	args = append(args, id)
-	return append(args, cmd...)
+	return execArgsFor(id, cfg, envFile, cmd)
 }
 
 func (dockerEngine) logsFollowArgs(id string) []string {
-	return []string{"logs", "--follow", id}
+	return logsFollowArgsFor(id)
 }
 
 // logsFollowResumeArgs starts the replacement stream at since. Docker keeps
@@ -1860,17 +1797,11 @@ func parseDockerPruneIDs(data []byte) ([]string, error) {
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
-	if platform != "" {
-		return []string{"image", "inspect", "--platform", platform, image}
-	}
-	return []string{"image", "inspect", image}
+	return imageInspectArgsFor(image, platform, true)
 }
 
 func (dockerEngine) pullImageArgs(image, platform string) []string {
-	if platform != "" {
-		return []string{"pull", "--platform", platform, image}
-	}
-	return []string{"pull", image}
+	return pullImageArgsFor([]string{"pull"}, image, platform)
 }
 
 // imageMissing matches only Docker's image-inspect response. Pull errors
@@ -1941,13 +1872,6 @@ func dockerImageMissingStderr(branch cliErrorBranch) bool {
 		}
 	}
 	return false
-}
-
-func (dockerEngine) imageIdentityNeedsLocalCheck() bool { return false }
-
-func (dockerEngine) parseImageExists(data []byte, platform string) bool {
-	_, exists := (dockerEngine{}).parseImageIdentity(data, "", platform)
-	return exists
 }
 
 // parseImageIdentity prefers a registry digest because it remains tied

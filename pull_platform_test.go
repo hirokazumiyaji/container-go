@@ -256,22 +256,25 @@ func TestDockerKeepsGenericVariantPlatforms(t *testing.T) {
 	}
 }
 
-func TestAppleParseImageExistsPlatform(t *testing.T) {
+func TestAppleParseImageIdentityPlatform(t *testing.T) {
 	data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm64"}}]}]`, testImageIdentityOld, testImageIdentityNew))
-	if !(appleEngine{}).parseImageExists(data, "linux/arm64") {
-		t.Error("want match for linux/arm64")
-	}
-	if (appleEngine{}).parseImageExists(data, "linux/amd64") {
-		t.Error("want mismatch for linux/amd64")
-	}
-	if !(appleEngine{}).parseImageExists(data, "linux") {
-		t.Error("an OS-only selector must accept any Linux architecture")
-	}
-	if (appleEngine{}).parseImageExists(data, "darwin") {
-		t.Error("want mismatch for a different OS")
-	}
-	if !(appleEngine{}).parseImageExists(data, "") {
-		t.Error("empty platform must mean present")
+	for _, tc := range []struct {
+		platform  string
+		wantLocal bool
+	}{
+		{platform: "linux/arm64", wantLocal: true},
+		{platform: "linux/amd64", wantLocal: false},
+		{platform: "linux", wantLocal: true},
+		{platform: "darwin", wantLocal: false},
+		{platform: "", wantLocal: true},
+	} {
+		identity, exists := (appleEngine{}).parseImageIdentity(data, "", tc.platform)
+		if !exists {
+			t.Fatalf("platform %q: parser must report existence for a non-empty inspect", tc.platform)
+		}
+		if gotLocal := !identity.notLocal; gotLocal != tc.wantLocal {
+			t.Errorf("platform %q local = %v, want %v (notLocal=%v)", tc.platform, gotLocal, tc.wantLocal, identity.notLocal)
+		}
 	}
 }
 
@@ -294,21 +297,30 @@ func TestApplePlatformVariantMatchingNormalizesAliases(t *testing.T) {
 				variant = fmt.Sprintf(`,"variant":%q`, parts[2])
 			}
 			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q%s}}]}]`, testImageIdentityOld, testImageIdentityNew, parts[0], parts[1], variant))
-			if !(appleEngine{}).parseImageExists(data, tc.requested) {
+			identity, exists := (appleEngine{}).parseImageIdentity(data, "", tc.requested)
+			if !exists {
+				t.Fatalf("platform %q: parser must report existence", tc.requested)
+			}
+			if identity.notLocal {
 				t.Fatalf("platform %q did not match inspected %q", tc.requested, tc.actual)
 			}
 		})
 	}
 }
 
-func TestAppleParseImageExistsVariantMismatch(t *testing.T) {
+func TestAppleParseImageIdentityVariantMismatch(t *testing.T) {
 	// Variant-less image must not satisfy a variant-pinned request.
 	data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm"}}]}]`, testImageIdentityOld, testImageIdentityNew))
-	if (appleEngine{}).parseImageExists(data, "linux/arm/v7") {
+	identity, exists := (appleEngine{}).parseImageIdentity(data, "", "linux/arm/v7")
+	if !exists {
+		t.Fatal("variant-less arm inspect must report existence")
+	}
+	if !identity.notLocal {
 		t.Error("variant-less arm must not match linux/arm/v7")
 	}
 	dataV7 := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm","variant":"v7"}}]}]`, testImageIdentityOld, testImageIdentityNew))
-	if !(appleEngine{}).parseImageExists(dataV7, "linux/arm/v7") {
+	identity, exists = (appleEngine{}).parseImageIdentity(dataV7, "", "linux/arm/v7")
+	if !exists || identity.notLocal {
 		t.Error("v7 must match linux/arm/v7")
 	}
 }
@@ -330,8 +342,12 @@ func TestAppleBareArmelSelectorDefaultsToV6(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			parts := strings.Split(tc.actual, "/")
 			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q,"variant":%q}}]}]`, testImageIdentityOld, testImageIdentityNew, parts[0], parts[1], parts[2]))
-			if got := (appleEngine{}).parseImageExists(data, tc.selector); got != tc.wantMatch {
-				t.Errorf("parseImageExists(%q) against %q = %v, want %v", tc.selector, tc.actual, got, tc.wantMatch)
+			identity, exists := (appleEngine{}).parseImageIdentity(data, "", tc.selector)
+			if !exists {
+				t.Fatalf("parseImageIdentity(%q) against %q reported no existence", tc.selector, tc.actual)
+			}
+			if got := !identity.notLocal; got != tc.wantMatch {
+				t.Errorf("parseImageIdentity(%q) against %q match = %v, want %v", tc.selector, tc.actual, got, tc.wantMatch)
 			}
 		})
 	}

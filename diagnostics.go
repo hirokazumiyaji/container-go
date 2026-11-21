@@ -47,17 +47,8 @@ func (c *config) diagnosticValues() []string {
 	// Environment-sourced values did not pass option validation, so skip
 	// any value the bounded streaming window cannot redact instead of
 	// making every stream on this handle fail.
-	if de, ok := c.eng.(dockerEngine); ok {
-		targetValues := []string{de.effectiveHost(), de.effectiveConfigDir()}
-		if context := de.effectiveContext(); context != "default" {
-			targetValues = append(targetValues, context)
-		}
-		if de.resolvedTarget != nil {
-			if de.resolvedTarget.isRemote {
-				targetValues = append(targetValues, de.resolvedTarget.rawHost)
-			}
-		}
-		for _, value := range targetValues {
+	if c.eng != nil {
+		for _, value := range c.eng.diagnosticTargetValues() {
 			if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
 				values = append(values, value)
 			}
@@ -207,17 +198,10 @@ func uniqueStrings(values []string) []string {
 }
 
 func (c *config) diagnosticBoundaryValues() []string {
-	de, ok := c.eng.(dockerEngine)
-	if !ok {
+	if c.eng == nil {
 		return nil
 	}
-	var values []string
-	if endpoint, err := parseDockerEndpoint(de.effectiveHost()); err == nil && endpoint.isRemote {
-		values = append(values, dockerEndpointBoundaryValues(endpoint)...)
-	}
-	if de.resolvedTarget != nil && de.resolvedTarget.isRemote {
-		values = append(values, dockerEndpointBoundaryValues(*de.resolvedTarget)...)
-	}
+	values := c.eng.diagnosticBoundaryValues()
 	if c.dockerHost != nil {
 		if endpoint, err := parseDockerEndpoint(*c.dockerHost); err == nil && endpoint.isRemote {
 			values = append(values, dockerEndpointBoundaryValues(endpoint)...)

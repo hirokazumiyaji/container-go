@@ -190,17 +190,17 @@ func (r *imageInspectMissingThenPresentRunner) Run(ctx context.Context, args ...
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestParseImageExists(t *testing.T) {
-	if (dockerEngine{}).parseImageExists([]byte(`[]`), "") {
+func TestParseImageIdentityExistence(t *testing.T) {
+	if _, exists := (dockerEngine{}).parseImageIdentity([]byte(`[]`), "", ""); exists {
 		t.Error("docker: empty array means absent")
 	}
-	if !(dockerEngine{}).parseImageExists([]byte(`[{"Id":"sha256:x"}]`), "") {
+	if _, exists := (dockerEngine{}).parseImageIdentity([]byte(`[{"Id":"sha256:x"}]`), "", ""); !exists {
 		t.Error("docker: non-empty array means present")
 	}
-	if (appleEngine{}).parseImageExists([]byte(`[]`), "") {
+	if _, exists := (appleEngine{}).parseImageIdentity([]byte(`[]`), "", ""); exists {
 		t.Error("apple: empty array means absent")
 	}
-	if !(appleEngine{}).parseImageExists([]byte(testImageInspectJSON), "") {
+	if _, exists := (appleEngine{}).parseImageIdentity([]byte(testImageInspectJSON), "", ""); !exists {
 		t.Error("apple: non-empty array means present")
 	}
 }

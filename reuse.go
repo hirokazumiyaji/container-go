@@ -264,14 +264,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
-	if cfg.eng.name() == "apple" && resolvedImage.pinned {
+	if cfg.eng.capabilities().strictImageIdentity && resolvedImage.pinned {
 		// A pinned reuse run requires an existing container to be
 		// running the requested root digest. Docker enforces this via
 		// inspect; Apple uses the same post-bootstrap probe on fresh
-		// reuse adoption that verifyAppleCreatedImage closes for create.
+		// reuse adoption that verifyStrictCreatedImage closes for create.
 		probe := namedContainer(cfg, cfg.name)
 		probe.image = resolvedImage
-		if err := verifyAppleCreatedImage(ctx, probe, resolvedImage); err != nil {
+		if err := verifyStrictCreatedImage(ctx, probe, resolvedImage); err != nil {
 			return nil, err
 		}
 	}
@@ -518,7 +518,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	// even when the caller's context carries a tighter attach deadline.
 	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), cfg.effectiveRunTimeout())
 	defer cancel()
-	materializeAppleRunPlatform(cfg)
+	materializeRunPlatform(cfg)
 	// Keep the secret file out of the image-pull and attach/retry windows;
 	// it exists only for the run command that consumes it. A failed first
 	// removal is returned and retried by the deferred cleanup.
@@ -589,7 +589,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 
 	uid := cfg.eng.parseRunID(stdout)
 	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
-		identityErr := identityError("Docker run returned no valid immutable container ID")
+		identityErr := identityError(fmt.Sprintf("%s run returned no valid immutable container ID", cfg.eng.name()))
 		if cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr); cleanupErr != nil {
 			return nil, joinEnvFileCleanupError(withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 		}
@@ -667,7 +667,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	if err := checkReuseCompatIdentity(createdInfo, resolvedImage, image, cfg); err != nil {
 		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
 	}
-	if err := verifyAppleCreatedImage(context.WithoutCancel(ctx), ctr, resolvedImage); err != nil {
+	if err := verifyStrictCreatedImage(context.WithoutCancel(ctx), ctr, resolvedImage); err != nil {
 		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
 	}
 	if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {
@@ -752,7 +752,7 @@ func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo
 	if info.state != StateStopped {
 		return false, nil
 	}
-	if cfg.eng.name() == "docker" && !validImmutableID(cfg.eng, info.uid) {
+	if cfg.eng.capabilities().immutableID && !validImmutableID(cfg.eng, info.uid) {
 		return false, fmt.Errorf("reuse %s: stopped container has no verified immutable ID", cfg.name)
 	}
 
@@ -787,7 +787,7 @@ func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo
 		protectReuseReaper(cfg)
 		return false, nil
 	}
-	if cfg.eng.name() == "docker" {
+	if cfg.eng.capabilities().immutableID {
 		if !validImmutableID(cfg.eng, fresh.uid) || fresh.uid != info.uid {
 			unregisterContainerReaper(cfg, cfg.name, creation, info.uid)
 			return false, nil
@@ -795,7 +795,7 @@ func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo
 		target = info.uid
 	} else if fresh.uid != "" {
 		unregisterContainerReaper(cfg, cfg.name, creation, "")
-		return false, fmt.Errorf("reuse %s: Apple inspect returned an unexpected immutable ID", cfg.name)
+		return false, fmt.Errorf("reuse %s: %s inspect returned an unexpected immutable ID", cfg.name, cfg.eng.name())
 	}
 	_, _, err = cfg.runner.Run(guardCtx, cfg.eng.deleteArgs(target)...)
 	if err != nil && !isNotFoundFor(cfg.eng, err) {
@@ -1063,11 +1063,7 @@ func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original
 		}
 		return nil
 	}
-	compatible := imagesCompatible(original, info.image)
-	if cfg.eng != nil && cfg.eng.name() == "apple" {
-		compatible = appleImageReferencesCompatible(original, info.image)
-	}
-	if !compatible {
+	if !cfg.eng.imageReferencesCompatible(original, info.image) {
 		return fmt.Errorf("%w: reuse %s: image %q does not match existing %q", ErrReuseMismatch, cfg.name, original, info.image)
 	}
 	return nil
@@ -1092,22 +1088,8 @@ func checkReuseConfigCompat(info *engineInfo, cfg *config) error {
 	if err := checkReuseCreationConfig(info, cfg); err != nil {
 		return err
 	}
-	if cfg.eng != nil && cfg.eng.name() == "docker" {
-		requested := cfg.network
-		if !cfg.networkExplicit {
-			requested = ""
-		}
-		if err := dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork); err != nil {
-			return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
-		}
-		if err := dockerReuseNetworkAliasesError(cfg, info); err != nil {
-			return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
-		}
-		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {
-			if err := dockerNetworkEndpointError(info.networkMode); err != nil {
-				return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
-			}
-		}
+	if err := cfg.eng.checkReuseNetworkCompat(info, cfg); err != nil {
+		return err
 	}
 	if cfg.platform != "" {
 		if info.platform == "" || platformSelectorUnverifiable(cfg.platform, info.platform) {
@@ -1360,7 +1342,7 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 }
 
 func checkReuseBindingReachable(eng engine, b boundPort) error {
-	if eng.name() != "docker" {
+	if eng.directIP() {
 		return nil
 	}
 	_, err := dockerBindingConnectHost(b, eng)

@@ -118,7 +118,7 @@ func copyStagingTestRoot(t *testing.T) string {
 		// which ignores environment overrides.
 		t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	}
-	root, err := prepareCopyStagingRoot()
+	root, _, err := prepareCopyStagingRoot()
 	if err != nil {
 		t.Fatalf("prepareCopyStagingRoot: %v", err)
 	}
@@ -355,6 +355,135 @@ func TestCopyFileFromContainerReadsAndCleansUp(t *testing.T) {
 	}
 	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
 		t.Errorf("temp copy %q still exists after Close", tmpPath)
+	}
+}
+
+func TestCopyFileFromContainerRejectsFileReplacedBetweenInspectAndOpen(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	root := copyStagingTestRoot(t)
+	before := copyStagingEntryCount(t, root)
+	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "inspected"}
+	ctr := runCopyDockerTestContainer(t, f)
+
+	// Rename a different regular file over the inspected path before the
+	// real no-follow open. On Windows this catches an identity that is
+	// resolved from the path after the swap rather than at inspection.
+	rc, err := ctr.copyFileFromContainer(context.Background(), "/out/file", copyOutHooks{
+		openFile: func(dst string) (*os.File, error) {
+			replacement := filepath.Join(filepath.Dir(dst), "replacement")
+			if err := os.WriteFile(replacement, []byte("replacement"), 0o600); err != nil {
+				return nil, err
+			}
+			if err := os.Rename(replacement, dst); err != nil {
+				return nil, err
+			}
+			return openCopyFile(dst)
+		},
+	})
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("replaced file returned a reader")
+	}
+	if !errors.Is(err, errCopyFileFromContainerChanged) {
+		t.Fatalf("error = %v, want errCopyFileFromContainerChanged", err)
+	}
+	if !errors.Is(err, ErrCopyFileNotRegular) {
+		t.Fatalf("error = %v, want ErrCopyFileNotRegular", err)
+	}
+	if after := copyStagingEntryCount(t, root); after != before {
+		t.Errorf("staging entries = %d, want %d after identity mismatch", after, before)
+	}
+}
+
+func TestCopyFileFromContainerBoundsReadsAfterFileGrowth(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	root := copyStagingTestRoot(t)
+	before := copyStagingEntryCount(t, root)
+	var dst string
+	f := &cpRunner{
+		fakeRunner: newTestRunner(),
+		materialize: func(path string) error {
+			dst = path
+			return os.WriteFile(path, []byte("initial"), 0o600)
+		},
+	}
+	ctr := runCopyDockerTestContainer(t, f)
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/out/file")
+	if err != nil {
+		t.Fatalf("CopyFileFromContainer: %v", err)
+	}
+	if dst == "" {
+		_ = rc.Close()
+		t.Fatal("copy destination was not recorded")
+	}
+	if err := os.Truncate(dst, MaxCopyFileFromContainerSize+1); err != nil {
+		_ = rc.Close()
+		t.Fatal(err)
+	}
+	n, readErr := io.Copy(io.Discard, rc)
+	if !errors.Is(readErr, ErrCopyFileFromContainerTooLarge) {
+		_ = rc.Close()
+		t.Fatalf("read error = %v after %d bytes, want ErrCopyFileFromContainerTooLarge", readErr, n)
+	}
+	if n != MaxCopyFileFromContainerSize {
+		t.Errorf("read %d bytes, want %d before the limit error", n, MaxCopyFileFromContainerSize)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Dir(dst)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("staging directory remains after reader close: %v", err)
+	}
+	if after := copyStagingEntryCount(t, root); after != before {
+		t.Errorf("staging entries = %d, want %d after reader close", after, before)
+	}
+}
+
+func TestTempFileReaderRejectsGrowthBeyondLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "payload")
+	if err := os.WriteFile(path, []byte("12345"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := newTempFileReader(file, func() error { return nil }, "/out/file", 4)
+	data, err := io.ReadAll(reader)
+	if !errors.Is(err, ErrCopyFileFromContainerTooLarge) {
+		t.Fatalf("read error = %v, want ErrCopyFileFromContainerTooLarge", err)
+	}
+	if !strings.Contains(err.Error(), `"/out/file"`) {
+		t.Errorf("read error = %v, want the container path", err)
+	}
+	if string(data) != "1234" {
+		t.Errorf("read = %q, want the first 4 bytes", data)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTempFileReaderReadsAtLimitToEOF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "payload")
+	if err := os.WriteFile(path, []byte("1234"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := newTempFileReader(file, func() error { return nil }, "/out/file", 4)
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(data) != "1234" {
+		t.Errorf("read = %q, want all 4 bytes", data)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

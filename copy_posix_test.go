@@ -96,7 +96,7 @@ func TestCopyToContainerRejectsDevice(t *testing.T) {
 }
 
 func TestCopyStagingRootAndDirectoryAreCurrentUserOnly(t *testing.T) {
-	root, err := prepareCopyStagingRoot()
+	root, _, err := prepareCopyStagingRoot()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,8 +160,8 @@ func TestCopyStagingDoesNotFallBackToMutableConfiguredDirectories(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer opened.file.Close()
-	if dir, err := newCopyStagingDir(opened); err == nil {
-		_ = os.RemoveAll(dir)
+	if dir, cleanup, err := newCopyStagingDir(opened); err == nil {
+		_ = cleanup()
 		t.Fatalf("newCopyStagingDir used an untrusted configured directory: %q", dir)
 	}
 }
@@ -203,11 +203,11 @@ func TestSnapshotCopyDirectoryIgnoresPostOpenReplacementForStagingAncestry(t *te
 		}
 	}
 
-	staging, err := newCopyStagingDir(opened)
+	_, cleanup, err := newCopyStagingDir(opened)
 	if err != nil {
 		t.Fatalf("newCopyStagingDir followed post-open replacement: %v", err)
 	}
-	if err := cleanupCopyStagingDir(staging); err != nil {
+	if err := cleanup(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -239,7 +239,8 @@ func TestCopyStagingRejectsCacheInsideOpenedSourceBeforeCreate(t *testing.T) {
 	}
 	defer opened.file.Close()
 
-	if _, err := newCopyStagingDir(opened); err == nil {
+	if _, cleanup, err := newCopyStagingDir(opened); err == nil {
+		_ = cleanup()
 		t.Fatal("cache inside opened source was accepted")
 	}
 	if _, err := os.Lstat(cache); !errors.Is(err, os.ErrNotExist) {
@@ -268,7 +269,7 @@ func TestCopyStagingCreatesMissingUserCacheBasePrivately(t *testing.T) {
 	if _, err := os.Lstat(cache); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cache precondition failed: %v", err)
 	}
-	if _, err := prepareCopyStagingRoot(); err != nil {
+	if _, _, err := prepareCopyStagingRoot(); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(cache)

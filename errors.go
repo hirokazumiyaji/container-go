@@ -364,8 +364,9 @@ var ErrCopySourceMetadataTooLarge = errors.New("copy source metadata exceeds lim
 var ErrCopySourceChanged = errors.New("copy source changed while staging")
 
 // ErrCopyFileNotRegular reports that a file copied out of a container
-// was not a regular file. Callers should not consume paths that resolve
-// to directories, links, or other special files.
+// was not a regular file, or that the copied path was replaced after it was
+// inspected. Callers should not consume paths that resolve to directories,
+// links, or other special files.
 var ErrCopyFileNotRegular = errors.New("copied container path is not a regular file")
 
 // ErrCopyFileFromContainerTooLarge reports that a regular file copied out of

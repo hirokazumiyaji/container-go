@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"unsafe"
@@ -14,37 +15,69 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func prepareCopyStagingRoot() (string, error) {
+func prepareCopyStagingRoot() (string, func() error, error) {
 	return prepareCopyStagingRootForSource(nil)
 }
 
-func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
+func prepareCopyStagingRootForSource(source *openedCopySource) (string, func() error, error) {
 	base, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
 	if err != nil {
-		return "", fmt.Errorf("copy staging: locate per-user LocalAppData: %w", err)
+		return "", nil, fmt.Errorf("copy staging: locate per-user LocalAppData: %w", err)
 	}
+	return prepareWindowsCopyStagingRootForSource(base, source)
+}
+
+// prepareWindowsCopyStagingRootForSource prepares a staging root under base.
+// When the shared LocalAppData\containergo directory cannot be used, the
+// returned cleanup removes the one-off parent with the operation's staging
+// tree instead of leaving it behind.
+func prepareWindowsCopyStagingRootForSource(base string, source *openedCopySource) (string, func() error, error) {
 	if err := ensureCopyStagingOutsideSource(base, source); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	appRoot := filepath.Join(base, "containergo")
+	rootCleanup := noCopyStagingRootCleanup
 	if err := ensureWindowsPrivateDir(appRoot, true); err != nil {
 		// Shared CI images can already have LocalAppData\containergo
 		// owned by another logon SID. Create a unique private parent
 		// rather than writing into that directory.
 		var random [8]byte
 		if _, randErr := rand.Read(random[:]); randErr != nil {
-			return "", fmt.Errorf("copy staging: create private staging parent: %w", err)
+			return "", nil, fmt.Errorf("copy staging: create private staging parent: %w", err)
 		}
 		appRoot = filepath.Join(base, "containergo-"+hex.EncodeToString(random[:]))
 		if retryErr := ensureWindowsPrivateDir(appRoot, true); retryErr != nil {
-			return "", fmt.Errorf("copy staging: create private staging parent: %w", retryErr)
+			return "", nil, errors.Join(
+				fmt.Errorf("copy staging: create private staging parent: %w", retryErr),
+				removeUnverifiedCopyStagingParent(appRoot),
+			)
+		}
+		rootCleanup = func() error {
+			if removeErr := os.RemoveAll(appRoot); removeErr != nil {
+				return fmt.Errorf("copy staging: remove private staging parent %q: %w", appRoot, removeErr)
+			}
+			return nil
 		}
 	}
 	root := filepath.Join(appRoot, "copy-staging")
 	if err := ensureWindowsPrivateDir(root, true); err != nil {
-		return "", fmt.Errorf("copy staging: create private staging root: %w", err)
+		return "", nil, errors.Join(
+			fmt.Errorf("copy staging: create private staging root: %w", err),
+			rootCleanup(),
+		)
 	}
-	return root, nil
+	return root, rootCleanup, nil
+}
+
+// removeUnverifiedCopyStagingParent removes a one-off parent whose creation
+// succeeded but whose ownership or DACL could not be verified. os.Remove
+// deletes a file or an empty directory; a non-empty planted directory stays
+// intact.
+func removeUnverifiedCopyStagingParent(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("copy staging: remove unverified staging parent %q: %w", path, err)
+	}
+	return nil
 }
 
 func ensureWindowsPrivateDir(path string, create bool) error {
@@ -274,10 +307,16 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 	if dacl == nil || aceCount < 1 {
 		return fmt.Errorf("DACL has %d ACEs, want a current-logon ACE", aceCount)
 	}
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return err
+	}
+	currentUser := user.User.Sid
 	allowed, err := allowedPrivateSIDs()
 	if err != nil {
 		return err
 	}
+	grantsCurrentUser := false
 	for i := 0; i < aceCount; i++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, uint32(i), &ace); err != nil {
@@ -290,6 +329,12 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 		if !sidAllowedForPrivate(aceSID, allowed) {
 			return fmt.Errorf("DACL contains a non-current-user ACE")
 		}
+		if windows.EqualSid(aceSID, currentUser) && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 && ace.Mask != 0 {
+			grantsCurrentUser = true
+		}
+	}
+	if !grantsCurrentUser {
+		return fmt.Errorf("DACL has no current-user allow ACE")
 	}
 	return nil
 }

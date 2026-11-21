@@ -48,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported on stderr. Where stop observation is unavailable (BSD, Solaris, or
   Linux without pidfd), only the direct reaper process is terminated, so helper
   processes in its group may survive.
+- `CopyFileFromContainer` verifies that the opened file is the one it
+  inspected and reports a replacement as `ErrCopyFileNotRegular`. On Windows
+  the file ID is read from the inspecting no-follow handle rather than resolved
+  from the path later. Reparse points are rejected before a Windows handle is
+  returned, and reads are bounded at `MaxCopyFileFromContainerSize` so a file
+  that grows after inspection cannot escape the limit. The returned reader now
+  provides only `Read` and `Close`; it no longer exposes `*os.File` methods
+  such as `Seek` or `ReadAt` through type assertions.
+- Windows copy staging requires an allow ACE for the current user in the
+  staging DACL; Administrators or SYSTEM entries alone no longer pass.
+- Remove a one-off fallback staging parent together with the operation's
+  private staging directory instead of leaking it on every copy, and remove it
+  when its ownership or DACL cannot be verified.
 
 ### Performance
 
@@ -153,6 +166,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `redis:7@sha256:...`) keep both parts during normalization instead of reading
   the digest as a tag. References naming the same digest are compatible even
   when one omits a redundant tag.
+- Align the `copy_open_unix.go` build constraints with `copy_open_posix.go` so
+  every host that builds the POSIX copy helpers also defines `openCopyFile`.
+  DragonFly BSD and illumos now build; AIX and Solaris still fail elsewhere
+  because `env_lock_unix.go` uses `syscall.Flock`.
 
 ### Changed
 

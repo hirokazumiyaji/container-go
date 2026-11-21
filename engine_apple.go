@@ -835,7 +835,7 @@ func appleImageOperationalFailure(stderr string) bool {
 // ImageDescription shape. When a platform is selected, the variant is
 // validated separately while the root descriptor remains the run and
 // reuse identity.
-func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool) {
+func (appleEngine) parseImageIdentity(data []byte, image, platform string) imageLookupResult {
 	var records []appleImageInspectRecord
 	if err := json.Unmarshal(data, &records); err != nil {
 		// A successful CLI invocation with malformed JSON is not proof
@@ -843,10 +843,10 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 		// result so PullMissing cannot turn a parser failure into a fetch,
 		// and mark it unreadable so imageExists does not report the image
 		// as present.
-		return imageIdentity{unreadable: true}, true
+		return unreadableImage()
 	}
 	if len(records) == 0 {
-		return imageIdentity{}, false
+		return absentImage()
 	}
 	record := records[0]
 	if platform == "" && (record.Configuration.Platform.OS != "" || record.Configuration.Platform.Architecture != "" || record.Configuration.Platform.Variant != "") {
@@ -856,7 +856,7 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 		}
 		parsed, ok := parseApplePlatformSelector(candidate)
 		if !ok {
-			return imageIdentity{}, true
+			return availableImage(imageIdentity{})
 		}
 		platform = formatApplePlatform(parsed)
 	}
@@ -868,39 +868,31 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 				// An old ID-only record proves that some local content
 				// exists, but it cannot prove that the host variant is
 				// addressable by a digest reference.
-				return imageIdentity{
-					notLocal:       true,
-					notLocalReason: "Apple image inspect has no platform variant metadata",
-					platform:       platform,
-				}, true
+				return notLocalImage(imageIdentity{platform: platform}, "Apple image inspect has no platform variant metadata")
 			}
 			// Without a usable root descriptor or a local ID, the record
 			// is identity-unavailable rather than evidence that a requested
 			// platform is absent from the local store.
-			return imageIdentity{}, true
+			return availableImage(imageIdentity{})
 		}
 		var variantOK bool
 		variantDigest, variantOK = applePlatformVariantDigest(record, platform)
 		if !variantOK {
-			return imageIdentity{
-				notLocal:       true,
-				notLocalReason: "Apple image inspect has no complete matching platform variant",
-				platform:       platform,
-			}, true
+			return notLocalImage(imageIdentity{platform: platform}, "Apple image inspect has no complete matching platform variant")
 		}
 		if !rootOK {
 			// A selected variant is not a substitute for the root
 			// index identity used by run and reuse.
-			return imageIdentity{}, true
+			return availableImage(imageIdentity{})
 		}
 	}
 	if !rootOK && appleDescriptorPresent(record) {
 		// A malformed descriptor is not equivalent to an older
 		// descriptor-less response. Do not fall back to an ID when the
 		// backend supplied an unusable descriptor field.
-		return imageIdentity{}, true
+		return availableImage(imageIdentity{})
 	}
-	return finishAppleImageIdentity(image, record, rootDigest, platform, variantDigest), true
+	return finishAppleImageIdentity(image, record, rootDigest, platform, variantDigest)
 }
 
 // appleRootDescriptorDigest returns the index/root descriptor digest,
@@ -959,7 +951,7 @@ func applePlatformVariantDigest(record appleImageInspectRecord, platform string)
 	return selected, selected != ""
 }
 
-func finishAppleImageIdentity(requested string, record appleImageInspectRecord, digest, platform, variantDigest string) imageIdentity {
+func finishAppleImageIdentity(requested string, record appleImageInspectRecord, digest, platform, variantDigest string) imageLookupResult {
 	reference := record.Configuration.Name
 	if reference == "" {
 		reference = record.Configuration.Reference
@@ -980,13 +972,13 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 	// gives us a repository base for the normalized run reference.
 	if isImageID(requested) || isBareImageID(requested) {
 		if imageReferenceBase(reference) == "" || !validImageDigest(digest) {
-			return imageIdentity{}
+			return availableImage(imageIdentity{})
 		}
 		if !appleImageIDMatchesDescriptor(requested, record.ID, digest) {
-			return imageIdentity{mismatch: true}
+			return mismatchedImage()
 		}
 	} else if requested != "" && reference != "" && !appleImageReferencesCompatible(requested, reference) {
-		return imageIdentity{mismatch: true}
+		return mismatchedImage()
 	}
 
 	if validImageDigest(digest) {
@@ -1008,12 +1000,12 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 				identity.appleSynthetic = false
 			}
 		}
-		return identity
+		return availableImage(identity)
 	}
 	if isImageID(record.ID) {
 		// Apple must not treat a Docker-style ID field as an immutable
 		// run target without a descriptor proving what that ID names.
-		return imageIdentity{}
+		return availableImage(imageIdentity{})
 	}
 	if len(record.ID) == 64 && domain.IsHex(record.ID) {
 		// Older Apple image-inspect responses exposed the local content ID
@@ -1025,9 +1017,9 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		identity.platform = platform
 		identity.variantDigest = variantDigest
 		identity.repository = imageRepository(identity.reference)
-		return identity
+		return availableImage(identity)
 	}
-	return imageIdentity{}
+	return availableImage(imageIdentity{})
 }
 
 // appleSyntheticIndex identifies Apple's explicitly annotated local index

@@ -204,13 +204,15 @@ func TestAppleOrdinaryOneVariantIndexWorksForPullNever(t *testing.T) {
 
 func TestAppleSyntheticRequiresReliableSignal(t *testing.T) {
 	host := freshHostPlatform()
-	ordinary, exists := (appleEngine{}).parseImageIdentity(ordinaryScopedIndexJSON(host), "registry.example/team/demo:stable", host)
-	if !exists || ordinary.appleSynthetic {
-		t.Fatalf("ordinary one-variant identity = %+v, exists=%v, want non-synthetic", ordinary, exists)
+	ordinaryLookup := (appleEngine{}).parseImageIdentity(ordinaryScopedIndexJSON(host), "registry.example/team/demo:stable", host)
+	ordinary := ordinaryLookup.identity
+	if !ordinaryLookup.found() || ordinary.appleSynthetic {
+		t.Fatalf("ordinary one-variant identity = %+v, found=%v, want non-synthetic", ordinary, ordinaryLookup.found())
 	}
-	synthetic, exists := (appleEngine{}).parseImageIdentity(reconcileImageJSON(host, finalVariant, true), "registry.example/team/demo:stable", host)
-	if !exists || !synthetic.appleSynthetic {
-		t.Fatalf("annotated synthetic identity = %+v, exists=%v, want synthetic", synthetic, exists)
+	syntheticLookup := (appleEngine{}).parseImageIdentity(reconcileImageJSON(host, finalVariant, true), "registry.example/team/demo:stable", host)
+	synthetic := syntheticLookup.identity
+	if !syntheticLookup.found() || !synthetic.appleSynthetic {
+		t.Fatalf("annotated synthetic identity = %+v, found=%v, want synthetic", synthetic, syntheticLookup.found())
 	}
 }
 
@@ -232,8 +234,8 @@ func TestAppleOrdinaryOneVariantPullNeverRejectsMissingRootWithoutLabelingSynthe
 }
 
 func TestReconcileFixtureHasSyntheticAnnotation(t *testing.T) {
-	identity, exists := (appleEngine{}).parseImageIdentity(finalFixture(t), "team/demo:stable", "")
-	if !exists || !identity.appleSynthetic {
-		t.Fatalf("single-manifest fixture identity = %+v, exists=%v, want annotated synthetic index", identity, exists)
+	lookup := (appleEngine{}).parseImageIdentity(finalFixture(t), "team/demo:stable", "")
+	if !lookup.found() || !lookup.identity.appleSynthetic {
+		t.Fatalf("single-manifest fixture identity = %+v, found=%v, want annotated synthetic index", lookup.identity, lookup.found())
 	}
 }

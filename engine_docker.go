@@ -1854,7 +1854,7 @@ func dockerImageMissingStderr(branch cliErrorBranch) bool {
 // accepts both the canonical sha256:... ID and Docker's 64-hex spelling
 // only after the inspected Id matches exactly. Both forms prevent a
 // later tag reassignment from changing run's target.
-func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdentity, bool) {
+func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookupResult {
 	var images []dockerImageInspect
 	if err := json.Unmarshal(data, &images); err != nil {
 		// A successful CLI invocation with malformed JSON is not proof
@@ -1862,16 +1862,16 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 		// PullMissing cannot turn a parser failure into a fetch, and mark
 		// it unreadable so imageExists does not report the image as
 		// present.
-		return imageIdentity{unreadable: true}, true
+		return unreadableImage()
 	}
 	if len(images) == 0 {
-		return imageIdentity{}, false
+		return absentImage()
 	}
 	requestedID, requestedIsID := canonicalDockerImageID(image)
 	if image != "" && isBareImageReference(image) && !requestedIsID {
 		// A malformed or unprefixed digest/ID-shaped value is not a
 		// Docker image-ID request that inspect can verify.
-		return imageIdentity{}, true
+		return availableImage(imageIdentity{})
 	}
 	explicitPinned := requestedIsID || (image != "" && validImageDigest(imageDigest(image)))
 	sawExplicitConflict := false
@@ -1886,7 +1886,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 			if inspectedIDOK && strings.EqualFold(inspectedID, requestedID) {
 				identity := imageReferenceWithDigest(requestedID, "", "", inspectedID)
 				identity.rootDigest = ""
-				return identity, true
+				return availableImage(identity)
 			}
 			if inspectedIDOK {
 				sawDifferentID = true
@@ -1921,7 +1921,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 			}
 			identity := imageReferenceWithDigest(image, repoDigest, digest, identityID)
 			identity.repository = imageRepository(repoDigest)
-			return identity, true
+			return availableImage(identity)
 		}
 		if inspectedIDOK {
 			// A tag can be a local alias whose RepoDigests came from a
@@ -1932,7 +1932,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 			if !explicitPinned {
 				identity := imageReferenceWithDigest(image, "", "", inspectedID)
 				identity.repository = imageRepository(image)
-				return identity, true
+				return availableImage(identity)
 			}
 			if fallbackID == "" {
 				fallbackID = inspectedID
@@ -1943,15 +1943,15 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 	}
 	if explicitPinned {
 		if sawExplicitConflict || sawDifferentID {
-			return imageIdentity{mismatch: true}, true
+			return mismatchedImage()
 		}
 		if fallbackID != "" {
 			identity := imageReferenceWithDigest(image, "", "", fallbackID)
 			identity.repository = imageRepository(image)
-			return identity, true
+			return availableImage(identity)
 		}
 	}
-	return imageIdentity{}, true
+	return availableImage(imageIdentity{})
 }
 
 func (dockerEngine) platformCompatible(selector, actual string) bool {

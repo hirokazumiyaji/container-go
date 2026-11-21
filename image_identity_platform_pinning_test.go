@@ -151,9 +151,9 @@ func callHasPlatform(call []string, platform string) bool {
 func TestAppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 	input := "redis:7-alpine@" + platformPinningRoot
 	r := &platformPinningRunner{inspectJSON: freshAppleImageJSON(platformPinningRoot, platformPinningVariant)}
-	identity, exists := (appleEngine{}).parseImageIdentity(platformPinningAppleImageJSON(nil), input, "")
-	if !exists || !identity.pinned {
-		t.Fatalf("parsed name@digest identity = %+v, exists = %v, want pinned identity", identity, exists)
+	lookup := (appleEngine{}).parseImageIdentity(platformPinningAppleImageJSON(nil), input, "")
+	if !lookup.found() || !lookup.identity.pinned {
+		t.Fatalf("parsed name@digest identity = %+v, found = %v, want pinned identity", lookup.identity, lookup.found())
 	}
 	ctr, err := Run(context.Background(), input,
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
@@ -472,18 +472,18 @@ func (r *dockerIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte,
 
 func TestAppleMalformedDescriptorDoesNotFallbackToID(t *testing.T) {
 	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":"not-a-digest"}}}]`, platformPinningID))
-	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists || identity.pinned {
-		t.Fatalf("identity = %+v, exists = %v, want fail-closed malformed descriptor", identity, exists)
+	lookup := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	if !lookup.found() || lookup.identity.pinned {
+		t.Fatalf("lookup = %+v, found = %v, want fail-closed malformed descriptor", lookup, lookup.found())
 	}
 }
 
 func TestDockerUnprefixedInspectIDCanonicalizes(t *testing.T) {
 	raw := strings.Repeat("a", 64)
-	identity, exists := (dockerEngine{}).parseImageIdentity(
+	lookup := (dockerEngine{}).parseImageIdentity(
 		[]byte(`[{"Id":"`+raw+`"}]`), "redis:7-alpine", "")
-	if !exists || !identity.pinned || identity.reference != "sha256:"+raw {
-		t.Fatalf("identity = %+v exists = %v, want canonical local ID", identity, exists)
+	if !lookup.found() || !lookup.identity.pinned || lookup.identity.reference != "sha256:"+raw {
+		t.Fatalf("lookup = %+v found = %v, want canonical local ID", lookup, lookup.found())
 	}
 	actual := imageFromInfo(&engineInfo{imageID: raw})
 	if !actual.pinned || actual.reference != "sha256:"+raw {
@@ -495,15 +495,15 @@ func TestDockerUnprefixedImageIDCanonicalizesOnlyAfterExactMatch(t *testing.T) {
 	canonical := "sha256:" + platformPinningID
 	input := platformPinningID
 	matching := []byte(fmt.Sprintf(`[{"Id":%q}]`, canonical))
-	identity, exists := (dockerEngine{}).parseImageIdentity(matching, input, "")
-	if !exists || !identity.pinned || identity.reference != canonical {
-		t.Fatalf("identity = %+v, exists = %v, want canonical %q", identity, exists, canonical)
+	lookup := (dockerEngine{}).parseImageIdentity(matching, input, "")
+	if !lookup.found() || !lookup.identity.pinned || lookup.identity.reference != canonical {
+		t.Fatalf("lookup = %+v, found = %v, want canonical %q", lookup, lookup.found(), canonical)
 	}
 
 	mismatched := []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`)
-	identity, exists = (dockerEngine{}).parseImageIdentity(mismatched, input, "")
-	if !exists || identity.pinned {
-		t.Fatalf("identity = %+v, exists = %v, want fail-closed ID mismatch", identity, exists)
+	lookup = (dockerEngine{}).parseImageIdentity(mismatched, input, "")
+	if !lookup.found() || lookup.identity.pinned {
+		t.Fatalf("lookup = %+v, found = %v, want fail-closed ID mismatch", lookup, lookup.found())
 	}
 }
 

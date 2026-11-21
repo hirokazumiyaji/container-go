@@ -106,10 +106,11 @@ func (r *appleAddressRunner) state() (runImage string, inspectTargets, pullTarge
 }
 
 func TestAppleFixtureUsesImageResourceDescriptor(t *testing.T) {
-	identity, exists := (appleEngine{}).parseImageIdentity(appleImageFixture(t), "docker.io/library/redis:7-alpine", "")
-	if !exists {
+	lookup := (appleEngine{}).parseImageIdentity(appleImageFixture(t), "docker.io/library/redis:7-alpine", "")
+	if !lookup.found() {
 		t.Fatal("realistic Apple image fixture was reported absent")
 	}
+	identity := lookup.identity
 	if !identity.pinned || identity.id != "" {
 		t.Fatalf("identity = %+v, want descriptor-backed identity without Docker ID", identity)
 	}
@@ -117,9 +118,10 @@ func TestAppleFixtureUsesImageResourceDescriptor(t *testing.T) {
 		t.Fatalf("digest = %q, want fixture descriptor", identity.digest)
 	}
 
-	variant, exists := (appleEngine{}).parseImageIdentity(appleImageFixture(t), "docker.io/library/redis:7-alpine", "linux/arm64/v8")
-	if !exists || variant.digest != "sha256:1111111111111111111111111111111111111111111111111111111111111111" {
-		t.Fatalf("variant identity = %+v, exists = %v, want root descriptor", variant, exists)
+	variantLookup := (appleEngine{}).parseImageIdentity(appleImageFixture(t), "docker.io/library/redis:7-alpine", "linux/arm64/v8")
+	variant := variantLookup.identity
+	if !variantLookup.found() || variant.digest != "sha256:1111111111111111111111111111111111111111111111111111111111111111" {
+		t.Fatalf("variant identity = %+v, found = %v, want root descriptor", variant, variantLookup.found())
 	}
 	if variant.variantDigest != "sha256:2222222222222222222222222222222222222222222222222222222222222222" || variant.platform != "linux/arm64/v8" {
 		t.Fatalf("variant metadata = %+v, want selected platform digest", variant)
@@ -327,21 +329,25 @@ func TestAppleIdentitylessAddressInspectIsUnavailableNotNotLocal(t *testing.T) {
 func TestApplePrefixedIDIsNotAnImmutableRunReference(t *testing.T) {
 	prefixed := "sha256:" + appleImageID
 	data := []byte(fmt.Sprintf(`[{"id":%q,"reference":%q,"descriptor":{"digest":%q}}]`, prefixed, prefixed, prefixed))
-	identity, exists := (appleEngine{}).parseImageIdentity(data, prefixed, "")
-	if !exists {
+	lookup := (appleEngine{}).parseImageIdentity(data, prefixed, "")
+	if !lookup.found() {
 		t.Fatal("inspect should report that the image record exists")
 	}
-	if identity.pinned {
-		t.Fatalf("Apple accepted Docker-style image ID as immutable: %+v", identity)
+	if lookup.identity.pinned {
+		t.Fatalf("Apple accepted Docker-style image ID as immutable: %+v", lookup.identity)
 	}
 }
 
 func TestAppleUnprefixedIDRequiresMatchingDescriptor(t *testing.T) {
 	digest := "sha256:" + appleImageID
 	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":%q}},"variants":[]}]`, appleImageID, digest))
-	identity, exists := (appleEngine{}).parseImageIdentity(data, appleImageID, "")
-	if !exists || !identity.pinned || identity.id != "" {
-		t.Fatalf("identity = %+v, exists = %v, want descriptor-verified normalized ID", identity, exists)
+	lookup := (appleEngine{}).parseImageIdentity(data, appleImageID, "")
+	if !lookup.found() {
+		t.Fatal("image record was reported absent")
+	}
+	identity := lookup.identity
+	if !identity.pinned || identity.id != "" {
+		t.Fatalf("identity = %+v, want descriptor-verified normalized ID", identity)
 	}
 	if identity.reference != "redis:7-alpine@"+digest {
 		t.Fatalf("reference = %q, want repository digest reference", identity.reference)
@@ -351,27 +357,27 @@ func TestAppleUnprefixedIDRequiresMatchingDescriptor(t *testing.T) {
 func TestApplePrefixedIDWithoutDescriptorFailsClosed(t *testing.T) {
 	prefixed := "sha256:" + appleImageID
 	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine"},"variants":[]}]`, prefixed))
-	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists {
+	lookup := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	if !lookup.found() {
 		t.Fatal("inspect should report that the image record exists")
 	}
-	if identity.pinned {
-		t.Fatalf("Apple treated an unverified prefixed ID as immutable: %+v", identity)
+	if lookup.identity.pinned {
+		t.Fatalf("Apple treated an unverified prefixed ID as immutable: %+v", lookup.identity)
 	}
 }
 
 func TestDockerImageIDRequiresMatchingVerifiedID(t *testing.T) {
 	requested := "sha256:" + appleImageID
 	data := []byte(fmt.Sprintf(`[{"Id":"sha256:%064x","RepoDigests":["docker.io/library/redis@sha256:%064x"]}]`, 4, 5))
-	identity, exists := (dockerEngine{}).parseImageIdentity(data, requested, "")
-	if !exists || identity.pinned {
-		t.Fatalf("identity = %+v, exists = %v, want unverified ID mismatch", identity, exists)
+	lookup := (dockerEngine{}).parseImageIdentity(data, requested, "")
+	if !lookup.found() || lookup.identity.pinned {
+		t.Fatalf("lookup = %+v, found = %v, want unverified ID mismatch", lookup, lookup.found())
 	}
 
 	matching := []byte(fmt.Sprintf(`[{"Id":%q}]`, requested))
-	identity, exists = (dockerEngine{}).parseImageIdentity(matching, requested, "")
-	if !exists || !identity.pinned || identity.id != requested {
-		t.Fatalf("identity = %+v, exists = %v, want verified Docker ID", identity, exists)
+	lookup = (dockerEngine{}).parseImageIdentity(matching, requested, "")
+	if !lookup.found() || !lookup.identity.pinned || lookup.identity.id != requested {
+		t.Fatalf("lookup = %+v, found = %v, want verified Docker ID", lookup, lookup.found())
 	}
 }
 

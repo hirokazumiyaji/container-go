@@ -290,6 +290,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend CLI process; normalization and daemon probes stay in the shell.
 - Remove the never-set `imageIdentity.mutableAlias` field and validate creation
   and immutable container IDs through `internal/domain`.
+- Split image lookups into a normal `imageIdentity` value and an
+  `imageLookupResult` carrying one availability state and an optional reason.
+  Image resolution, reuse, and post-create verification now branch on that
+  result instead of the former `notLocal`/`notLocalReason`/`unreadable`/
+  `mismatch` flag combinations; behavior and the public API are unchanged.
 - **Breaking:** `wait.State` is now the same type as `container.State`. A type
   switch that lists both types, an `any`-keyed map that distinguishes them, and
   `%T`/`reflect` output now see one type; `wait.StateTarget` implementations and

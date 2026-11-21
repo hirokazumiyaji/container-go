@@ -319,54 +319,56 @@ func (r *idOnlyRunner) Run(_ context.Context, args ...string) ([]byte, []byte, e
 
 func TestDockerImageIdentityUsesRepoDigestWithoutTag(t *testing.T) {
 	data := []byte(`[{"Id":"` + testImageIdentityOld + `","RepoDigests":["docker.io/library/redis@` + testImageIdentityNew + `"]}]`)
-	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists {
+	lookup := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	if !lookup.found() {
 		t.Fatal("image was reported absent")
 	}
 	want := "redis:7-alpine@" + testImageIdentityNew
-	if identity.reference != want || identity.digest != testImageIdentityNew || !identity.pinned {
+	if identity := lookup.identity; identity.reference != want || identity.digest != testImageIdentityNew || !identity.pinned {
 		t.Fatalf("identity = %+v, want reference %q", identity, want)
 	}
 }
 
 func TestDockerImageIdentityFallsBackToIDForForeignRepoDigest(t *testing.T) {
 	data := []byte(`[{"Id":"` + testImageIdentityOld + `","RepoDigests":["evil.example/library/redis@` + testImageIdentityNew + `"]}]`)
-	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists || identity.mismatch || !identity.pinned || identity.id != testImageIdentityOld {
-		t.Fatalf("identity = %+v, exists = %v, want immutable local ID fallback", identity, exists)
+	lookup := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	identity := lookup.identity
+	if !lookup.found() || lookup.availability != imageAvailable || !identity.pinned || identity.id != testImageIdentityOld {
+		t.Fatalf("identity = %+v, found = %v, want immutable local ID fallback", identity, lookup.found())
 	}
 }
 
 func TestAppleImageIdentityUsesDescriptorDigest(t *testing.T) {
 	data := []byte(`[{"id":"` + testImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + testImageIdentityNew + `"}},"variants":[]}]`)
-	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists {
+	lookup := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	if !lookup.found() {
 		t.Fatal("image was reported absent")
 	}
 	want := "redis:7-alpine@" + testImageIdentityNew
-	if identity.reference != want || identity.digest != testImageIdentityNew || !identity.pinned {
+	if identity := lookup.identity; identity.reference != want || identity.digest != testImageIdentityNew || !identity.pinned {
 		t.Fatalf("identity = %+v, want reference %q", identity, want)
 	}
 }
 
 func TestAppleImageIdentityUsesIDAsDigestReference(t *testing.T) {
 	data := []byte(`[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","configuration":{"name":"redis:7-alpine"},"variants":[]}]`)
-	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists {
+	lookup := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	if !lookup.found() {
 		t.Fatal("image was reported absent")
 	}
 	want := "redis:7-alpine@sha256:" + strings.Repeat("a", 64)
-	if identity.reference != want || identity.digest != "sha256:"+strings.Repeat("a", 64) {
+	if identity := lookup.identity; identity.reference != want || identity.digest != "sha256:"+strings.Repeat("a", 64) {
 		t.Fatalf("identity = %+v, want digest reference %q", identity, want)
 	}
 }
 
 func TestAppleImageIdentityUsesRootForSelectedPlatformVariant(t *testing.T) {
 	data := []byte(`[{"id":"` + testImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + testImageIdentityOld + `"}},"variants":[{"digest":"` + testImageIdentityNew + `","platform":{"os":"linux","architecture":"arm64"}}]}]`)
-	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "linux/arm64")
-	if !exists {
+	lookup := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "linux/arm64")
+	if !lookup.found() {
 		t.Fatal("selected platform was reported absent")
 	}
+	identity := lookup.identity
 	if identity.digest != testImageIdentityOld || identity.reference != "redis:7-alpine@"+testImageIdentityOld {
 		t.Fatalf("identity = %+v, want root descriptor identity", identity)
 	}
@@ -376,13 +378,13 @@ func TestAppleImageIdentityUsesRootForSelectedPlatformVariant(t *testing.T) {
 }
 
 func TestImageIdentityMismatchCannotUseMutableFallback(t *testing.T) {
-	identity, exists := (appleEngine{}).parseImageIdentity(
+	lookup := (appleEngine{}).parseImageIdentity(
 		[]byte(`[{"id":"`+testImageIdentityOld+`","configuration":{"name":"nginx:alpine","descriptor":{"digest":"`+testImageIdentityNew+`"}}}]`),
 		"redis:7-alpine", "")
-	if !exists || !identity.mismatch {
-		t.Fatalf("identity = %+v, exists = %v, want mismatch", identity, exists)
+	if !lookup.found() || lookup.availability != imageMismatch {
+		t.Fatalf("lookup = %+v, found = %v, want mismatch", lookup, lookup.found())
 	}
-	if _, err := (&config{eng: appleEngine{}, allowMutableImageTag: true}).pinImage("redis:7-alpine", identity); !errors.Is(err, ErrImageIdentityMismatch) {
+	if _, err := (&config{eng: appleEngine{}, allowMutableImageTag: true}).pinImage("redis:7-alpine", lookup); !errors.Is(err, ErrImageIdentityMismatch) {
 		t.Fatalf("pinImage error = %v, want ErrImageIdentityMismatch", err)
 	}
 }

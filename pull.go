@@ -401,7 +401,7 @@ func isImageQueryDeadline(err error) bool {
 	return errors.As(err, &queryErr)
 }
 
-func (c *config) inspectImage(ctx context.Context, image, platform string) (imageIdentity, bool, error) {
+func (c *config) inspectImage(ctx context.Context, image, platform string) (imageLookupResult, error) {
 	return inspectImage(ctx, c.runner, c.eng, image, platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 }
 
@@ -454,22 +454,22 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 			resolved, leader, err := imageResolutionFlights.doWithLeader(ctx, key, func() (imageIdentity, error) {
 				execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), c.effectiveRunTimeout())
 				defer cancel()
-				identity, exists, err := c.inspectImage(execCtx, image, platform)
+				lookup, err := c.inspectImage(execCtx, image, platform)
 				if err != nil {
 					return imageIdentity{}, err
 				}
-				if exists {
+				if lookup.found() {
 					// A record without a complete requested variant is not
 					// proof that PullMissing already has the requested
 					// platform. Pull explicitly when that policy permits;
 					// PullNever still returns the typed not-local error below.
-					if identity.notLocal && c.pullPolicy == PullMissing {
+					if lookup.availability == imageNotLocal && c.pullPolicy == PullMissing {
 						if err := c.pullImage(execCtx, image, platform); err != nil {
 							return imageIdentity{}, err
 						}
 						return c.resolveImage(execCtx, image, platform)
 					}
-					return c.resolveInspectedImage(execCtx, image, platform, identity)
+					return c.resolveInspectedImage(execCtx, image, platform, lookup)
 				}
 				if err := c.pullImage(execCtx, image, platform); err != nil {
 					return imageIdentity{}, err
@@ -496,21 +496,21 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 // explicitly opt into the old mutable-tag behavior, but the default is
 // fail closed when the backend cannot identify the inspected image.
 func (c *config) resolveImage(ctx context.Context, image, platform string) (imageIdentity, error) {
-	identity, exists, err := c.inspectImage(ctx, image, platform)
+	lookup, err := c.inspectImage(ctx, image, platform)
 	if err != nil {
 		return imageIdentity{}, err
 	}
-	if !exists {
+	if !lookup.found() {
 		if platform != "" {
 			return imageIdentity{}, fmt.Errorf("%w: %s for platform %s", ErrImageNotFound, image, platform)
 		}
 		return imageIdentity{}, fmt.Errorf("%w: %s", ErrImageNotFound, image)
 	}
-	return c.resolveInspectedImage(ctx, image, platform, identity)
+	return c.resolveInspectedImage(ctx, image, platform, lookup)
 }
 
-func (c *config) resolveInspectedImage(ctx context.Context, image, platform string, identity imageIdentity) (imageIdentity, error) {
-	pinned, err := c.pinImage(image, identity)
+func (c *config) resolveInspectedImage(ctx context.Context, image, platform string, lookup imageLookupResult) (imageIdentity, error) {
+	pinned, err := c.pinImage(image, lookup)
 	if err != nil {
 		return imageIdentity{}, err
 	}
@@ -527,7 +527,7 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 	// silently becoming a registry lookup during create. Even when the
 	// caller's reference already contains a digest, an identity-less
 	// inspect must not be treated as proof of the descriptor identity.
-	checked, pinnedExists, err := c.inspectImage(ctx, pinned.reference, platform)
+	checked, err := c.inspectImage(ctx, pinned.reference, platform)
 	if err != nil {
 		// A transport, permission, or cancellation failure is an
 		// operational error, not evidence that identity is unavailable.
@@ -535,7 +535,7 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 		// mutable tag on this path.
 		return imageIdentity{}, fmt.Errorf("inspect locally addressable image %s: %w", pinned.reference, err)
 	}
-	if !pinnedExists && c.pullPolicy != PullNever {
+	if !checked.found() && c.pullPolicy != PullNever {
 		// Apple creates a local synthetic index around a single manifest.
 		// Pulling that generated root by name@digest asks the registry for
 		// an object it cannot name. Try the exact root only when it is
@@ -555,47 +555,43 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 			// cancellation) must be returned unchanged and must not be
 			// hidden by a mutable fallback.
 			if c.canUseMutableFallback(image) && imageAddressMissing(c.eng, pullErr) {
-				return mutableImageReference(image, identity), nil
+				return mutableImageReference(image, lookup.identity), nil
 			}
 			if imageAddressMissing(c.eng, pullErr) {
 				return imageIdentity{}, fmt.Errorf("%w: %s could not be made locally addressable: %w", ErrImageIdentityNotLocal, pinned.reference, pullErr)
 			}
 			return imageIdentity{}, fmt.Errorf("pull locally addressable image %s: %w", pinned.reference, pullErr)
 		}
-		checked, pinnedExists, err = c.inspectImage(ctx, pinned.reference, platform)
+		checked, err = c.inspectImage(ctx, pinned.reference, platform)
 		if err != nil {
 			return imageIdentity{}, fmt.Errorf("verify locally addressable image %s: %w", pinned.reference, err)
 		}
 	}
-	if !pinnedExists {
+	if !checked.found() {
 		if c.canUseMutableFallback(image) {
 			return mutableImageReference(image, pinned), nil
 		}
 		return imageIdentity{}, fmt.Errorf("%w: %s cannot run %s without fetching it", ErrImageIdentityNotLocal, c.eng.name(), pinned.reference)
 	}
-	if checked.notLocal {
-		reason := checked.notLocalReason
-		if reason == "" {
-			reason = "the requested platform variant is not locally addressable"
-		}
-		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s (%s)", ErrImageIdentityNotLocal, pinned.reference, reason)
+	if checked.availability == imageNotLocal {
+		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s (%s)", ErrImageIdentityNotLocal, pinned.reference, checked.notLocalReason())
 	}
-	if checked.mismatch {
+	if checked.availability == imageMismatch {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s resolves to another image", ErrImageIdentityMismatch, pinned.reference)
 	}
-	if !checked.pinned {
+	if !checked.identity.pinned {
 		if c.canUseMutableFallback(image) {
-			return mutableImageReference(image, checked), nil
+			return mutableImageReference(image, checked.identity), nil
 		}
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not report an immutable identity", ErrImageIdentityUnavailable, pinned.reference)
 	}
-	if err := c.eng.verifyPinnedImageIdentity(pinned, checked, platform); err != nil {
+	if err := c.eng.verifyPinnedImageIdentity(pinned, checked.identity, platform); err != nil {
 		return imageIdentity{}, err
 	}
-	if !requestedImageIdentitiesCompatible(pinned, checked) {
+	if !requestedImageIdentitiesCompatible(pinned, checked.identity) {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s changed before run", ErrImageIdentityMismatch, pinned.reference)
 	}
-	return c.eng.reconcileImageIdentity(pinned, checked), nil
+	return c.eng.reconcileImageIdentity(pinned, checked.identity), nil
 }
 
 // verifyStrictCreatedImage closes the final addressability window for a
@@ -635,14 +631,14 @@ func verifyStrictCreatedImage(ctx context.Context, c *Container, expected imageI
 			if imageReference == "" {
 				imageReference = expected.reference
 			}
-			checked, exists, inspectErr := inspectImage(ctx, c.runner, c.eng, imageReference, actual.platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
+			checked, inspectErr := inspectImage(ctx, c.runner, c.eng, imageReference, actual.platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 			if inspectErr != nil {
 				return fmt.Errorf("verify created image variant: %w", inspectErr)
 			}
-			if !exists || !checked.pinned || !imageRootsCompatible(expected, checked) {
+			if !checked.found() || !checked.identity.pinned || !imageRootsCompatible(expected, checked.identity) {
 				return fmt.Errorf("%w: container did not retain the requested image variant", ErrImageIdentityMismatch)
 			}
-			variantDigest = checked.variantDigest
+			variantDigest = checked.identity.variantDigest
 		}
 		if !validImageDigest(variantDigest) || !strings.EqualFold(expected.variantDigest, variantDigest) {
 			return fmt.Errorf("%w: container created from a different image variant", ErrImageIdentityMismatch)
@@ -705,20 +701,20 @@ func imageMissingError(eng engine, err error) bool {
 	return eng.imageMissing(err)
 }
 
-func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, error) {
-	if identity.mismatch {
+func (c *config) pinImage(image string, lookup imageLookupResult) (imageIdentity, error) {
+	if lookup.availability == imageMismatch {
 		return imageIdentity{}, fmt.Errorf("%w: %s", ErrImageIdentityMismatch, image)
 	}
-	if identity.notLocal {
+	identity := lookup.identity
+	if lookup.availability == imageNotLocal {
 		if !identity.pinned && c.canUseMutableFallback(image) {
 			return mutableImageReference(image, identity), nil
 		}
-		reason := identity.notLocalReason
-		if reason == "" {
-			reason = "the requested platform variant is not locally addressable"
-		}
-		return imageIdentity{}, fmt.Errorf("%w: %s (%s)", ErrImageIdentityNotLocal, image, reason)
+		return imageIdentity{}, fmt.Errorf("%w: %s (%s)", ErrImageIdentityNotLocal, image, lookup.notLocalReason())
 	}
+	// An unreadable result carries no identity, so it falls through the
+	// unpinned path and fails closed unless the explicit compatibility
+	// fallback applies.
 	requestedDigest := imageDigest(image)
 	if identity.pinned {
 		if !imageIdentityIsVerified(identity) {
@@ -787,8 +783,6 @@ func mutableImageReference(image string, identity imageIdentity) imageIdentity {
 	identity.reference = image
 	identity.pinned = false
 	identity.appleSynthetic = false
-	identity.notLocal = false
-	identity.notLocalReason = ""
 	return identity
 }
 
@@ -800,7 +794,7 @@ type opTimeouts struct {
 	probe time.Duration
 }
 
-func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform string, timeouts opTimeouts) (imageIdentity, bool, error) {
+func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform string, timeouts opTimeouts) (imageLookupResult, error) {
 	qTimeout := timeouts.query
 	if qTimeout <= 0 {
 		qTimeout = queryTimeout
@@ -813,23 +807,32 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 		if ctx.Err() == nil && errors.Is(qCtx.Err(), context.DeadlineExceeded) && !cli.IsProbeConfigurationError(contextErr) {
 			contextErr = imageQueryDeadlineError{contextErr}
 		}
-		return imageIdentity{}, false, contextErr
+		return imageLookupResult{}, contextErr
 	}
 	if err != nil {
 		if eng.imageMissingForTarget(err, image) || imageMissingError(eng, err) {
-			return imageIdentity{}, false, nil
+			return absentImage(), nil
 		}
-		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, cli.CommandOperation(args), image)
+		return imageLookupResult{}, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, cli.CommandOperation(args), image)
 	}
-	identity, exists := eng.parseImageIdentity(stdout, image, platform)
-	return identity, exists, nil
+	return eng.parseImageIdentity(stdout, image, platform), nil
 }
 
 // imageExists reports whether the image (and requested platform
 // variant, when set) is in the backend's store.
 func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform string) (bool, error) {
-	identity, exists, err := inspectImage(ctx, r, eng, image, platform, opTimeouts{})
-	return exists && !identity.notLocal && !identity.unreadable, err
+	lookup, err := inspectImage(ctx, r, eng, image, platform, opTimeouts{})
+	if err != nil {
+		return false, err
+	}
+	// A known-different identity still proves the reference resolved in the
+	// local store. Unreadable output and a not-local variant do not.
+	switch lookup.availability {
+	case imageAvailable, imageMismatch:
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 // pullImage fetches the image (and requested platform variant, when

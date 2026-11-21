@@ -464,6 +464,12 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			}
 			platform = formatApplePlatform(parsed)
 		}
+		cpus := 0.0
+		cpusReported := false
+		if configured := c.Configuration.Resources.CPUS; configured != nil {
+			cpus = *configured
+			cpusReported = true
+		}
 		info := &engineInfo{
 			state:              appleState(c.Status.State),
 			name:               c.ID,
@@ -472,8 +478,8 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			imageDigest:        imageDigest,
 			imageVariantDigest: c.Configuration.Image.VariantDigest,
 			runOptions: engineRunOptions{
-				cpus:         float64(c.Configuration.Resources.CPUS),
-				cpusReported: c.Configuration.Resources.CPUS != 0,
+				cpus:         cpus,
+				cpusReported: cpusReported,
 				capAdd:       c.Configuration.CapAdd,
 				capDrop:      c.Configuration.CapDrop,
 			},
@@ -834,8 +840,10 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 	if err := json.Unmarshal(data, &records); err != nil {
 		// A successful CLI invocation with malformed JSON is not proof
 		// that the image is absent. Treat it as an identity-unavailable
-		// result so PullMissing cannot turn a parser failure into a fetch.
-		return imageIdentity{}, true
+		// result so PullMissing cannot turn a parser failure into a fetch,
+		// and mark it unreadable so imageExists does not report the image
+		// as present.
+		return imageIdentity{unreadable: true}, true
 	}
 	if len(records) == 0 {
 		return imageIdentity{}, false

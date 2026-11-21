@@ -1,6 +1,12 @@
 package container
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
+)
 
 func TestDockerPlatformCompatible(t *testing.T) {
 	tests := []struct {
@@ -65,6 +71,70 @@ func TestApplePlatformSelectorIsArchitectureAware(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := (appleEngine{}).platformCompatible(tc.selector, tc.actual); got != tc.want {
 				t.Fatalf("platformCompatible(%q, %q) = %v, want %v", tc.selector, tc.actual, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPlatformSelectorUnverifiableOnlyForUnreadableMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		selector string
+		actual   string
+		want     bool
+	}{
+		{name: "matching platform", selector: "linux/arm64", actual: "linux/arm64"},
+		{name: "different architecture", selector: "linux/arm64", actual: "linux/amd64"},
+		{name: "different OS", selector: "windows/amd64", actual: "linux/amd64"},
+		{name: "unreported architecture", selector: "linux/arm64", actual: "linux"},
+		{name: "malformed actual", selector: "linux/arm64", actual: "linux/arm64/v8/extra", want: true},
+		{name: "malformed selector", selector: "linux//arm64", actual: "linux/arm64", want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := platformSelectorUnverifiable(tc.selector, tc.actual); got != tc.want {
+				t.Fatalf("platformSelectorUnverifiable(%q, %q) = %v, want %v", tc.selector, tc.actual, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReusePlatformDiagnosisDistinguishesMismatch(t *testing.T) {
+	tests := []struct {
+		name       string
+		platform   string
+		wantReason string
+	}{
+		{name: "matching platform", platform: "linux/amd64"},
+		{name: "verified mismatch", platform: "linux/arm64", wantReason: "does not match existing"},
+		{name: "unreported platform", wantReason: "could not be verified"},
+		{name: "malformed platform", platform: "linux/arm64/v8/extra", wantReason: "could not be verified"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := newConfig()
+			cfg.eng = appleEngine{}
+			cfg.name = "myctr"
+			if err := WithPlatform("linux/amd64")(cfg); err != nil {
+				t.Fatal(err)
+			}
+			info := &engineInfo{
+				platform:     tc.platform,
+				platformMeta: platformMetadataFromString(tc.platform),
+				labels:       map[string]string{domain.LabelReuseConfig: cfg.reuseConfigHash()},
+			}
+			err := checkReuseConfigCompat(info, cfg)
+			if tc.wantReason == "" {
+				if err != nil {
+					t.Fatalf("compatible platform rejected: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrReuseMismatch) {
+				t.Fatalf("error = %v, want ErrReuseMismatch", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantReason) {
+				t.Fatalf("error = %v, want %q", err, tc.wantReason)
 			}
 		})
 	}

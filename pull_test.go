@@ -205,6 +205,28 @@ func TestParseImageIdentityExistence(t *testing.T) {
 	}
 }
 
+// Malformed image inspect output is not proof that the image is absent, so
+// identity resolution must not fetch; it is also not proof of presence, so the
+// identity is marked unreadable and imageExists reports false.
+func TestParseImageIdentityMarksUnreadableOutput(t *testing.T) {
+	for _, eng := range []engine{appleEngine{}, dockerEngine{}} {
+		t.Run(eng.name(), func(t *testing.T) {
+			for _, data := range []string{
+				`{not json`,
+				`{"Id":"sha256:x"}`,
+			} {
+				identity, exists := eng.parseImageIdentity([]byte(data), "", "")
+				if !exists {
+					t.Errorf("parseImageIdentity(%q) reported absence; unreadable output must not trigger a pull", data)
+				}
+				if !identity.unreadable {
+					t.Errorf("parseImageIdentity(%q) did not mark the identity unreadable", data)
+				}
+			}
+		})
+	}
+}
+
 const testImageInspectJSON = `[
   {
     "reference": "docker.io/library/redis:7-alpine",

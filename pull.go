@@ -815,7 +815,7 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 // variant, when set) is in the backend's store.
 func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform string) (bool, error) {
 	identity, exists, err := inspectImage(ctx, r, eng, image, platform, opTimeouts{})
-	return exists && !identity.notLocal, err
+	return exists && !identity.notLocal && !identity.unreadable, err
 }
 
 // pullImage fetches the image (and requested platform variant, when

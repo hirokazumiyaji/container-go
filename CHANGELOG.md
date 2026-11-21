@@ -102,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Report a verified reuse platform mismatch as a mismatch instead of an
+  unverifiable platform, treat an explicitly reported zero CPU or shm limit as
+  reported rather than missing, and stop treating malformed image inspect JSON as
+  proof that the image is present locally.
 - Bound name lock files to a fixed set of hash buckets. Creating containers with
   new names no longer leaves one `.lock` inode per name behind, so a test suite
   that generates random names stops leaking lock files.

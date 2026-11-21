@@ -203,9 +203,11 @@ bounded reader は `Truncated() bool` を提供し、保持したデータを返
 terminal read error が `ErrOutputTruncated` になります。backend の
 infrastructure、cancellation、launch、missing-container エラー時も
 partial reader と truncation state を返します。`FollowLogs` は長期
-ストリームなので自動 byte 上限はありません。`wait.ForExec` は各 poll の
-出力を `io.Discard` へ送り、失敗診断のログは固定長 1MiB の末尾リングに
-保持します。internal `CLIError` は失敗した invocation ごとに分類用の
+ストリームなので自動 byte 上限はありません。`wait.ForExec` は
+出力 matcher を指定しない限り各 poll の出力を `io.Discard` へ送ります。
+matcher を指定した場合、container adapter は matcher 用に最大 64KiB だけ
+保持します。失敗診断のログは固定長 1MiB の末尾リングに保持します。
+internal `CLIError` は失敗した invocation ごとに分類用の
 末尾 stderr ウィンドウを有界に保持し、`Error` はそのウィンドウを
 秘匿化してから末尾最大 64KiB を描画します。これは `Run` の全量出力や
 caller-owned sink の上限ではありません。
@@ -407,10 +409,17 @@ func ReleasedWaitStrategies() {
 ビルダーは新しい戦略を返し、レシーバを変更しません。既存の値を再設定する場合は戻り値を代入してください（`s = s.WithHeader("X-Tenant", tenant)`）。
 
 現在の開発チェックアウトは、Docker の `HEALTHCHECK` 状態を待つ
-`wait.ForHealthcheck()` と、上限付きでレスポンスボディを判定する
-`HTTPStrategy.WithResponseMatcher` も追加しています。
-ヘルスチェック戦略は Docker 専用であり、Apple バックエンドはコンテナを
-作成する前にこの戦略を拒否します。
+`wait.ForHealthcheck()`、任意のコールバックで readiness を判定する
+`wait.ForFunc`、`database/sql` の probe を行う `wait.ForSQL` も追加して
+います。`ForSQL` は driver を同梱せず、呼び出し側が driver を import して
+登録し、その名前を渡します。未登録の driver はコンテナ作成前の検証で拒否され、
+各 SQL probe の試行には deadline があり、応答しない handshake は再試行されます。`HTTPStrategy` には単一のステータスコードを
+受理する `WithStatusCode` と、リクエストボディを送る `WithBody` を、
+`ExecStrategy` にはコマンド出力を判定する `WithResponseMatcher` /
+`WithOutputContains` を追加しています。出力 matcher は任意の
+`wait.ExecOutputTarget` を実装する target を必要とし、container adapter は
+最大 64KiB のコマンド出力を保持します。ヘルスチェック戦略は Docker 専用で
+あり、Apple バックエンドはコンテナを作成する前にこの戦略を拒否します。
 
 コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
 created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF は再-open します。終了コードを伴うログストリームエラーは返却します。
@@ -424,6 +433,8 @@ created、restarting、unknown と一時的な inspect エラーはタイムア�
 組み込み戦略は `StateTarget` を自動利用し、互換性のため `Running` にフォールバックします。
 Docker のヘルスチェック待機では、任意の `wait.HealthTarget` インターフェースも使います。
 `ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返します。
+`ForExec` の出力 matcher は任意の `wait.ExecOutputTarget` インターフェースを
+同様に使い、実装しないターゲットには `*wait.ConfigError` を返します。
 
 Docker では、公開ポートへの TCP 接続が成功してもコンテナ内のプロセスが
 listen しているとは限りません。`docker-proxy` や Docker Desktop の port
@@ -471,7 +482,9 @@ nil の `Container.Stop` timeout は backend CLI の既定の grace period を�
 package docexample
 
 import (
+    "context"
     "crypto/tls"
+    "fmt"
     "net/http"
     "time"
 
@@ -483,10 +496,21 @@ func DevelopmentWaitOptions() {
         WithHeaders(map[string]string{"X-Test": "yes"}).
         WithHeader("X-Other", "yes").
         WithBasicAuth("user", "pass").
+        WithStatusCode(http.StatusNoContent).
+        WithBody([]byte(`{"probe":true}`)).
         WithTLSConfig(&tls.Config{}).
         WithHTTPClient(&http.Client{}).
         WithStartupTimeout(time.Second).
         WithPollInterval(time.Millisecond)
+    _ = wait.ForExec([]string{"pg_isready"}).
+        WithOutputContains("accepting connections")
+    _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
+    _ = wait.ForSQL("5432/tcp", "postgres", func(host string, port int) string {
+        return fmt.Sprintf(
+            "host=%s port=%d user=postgres password=postgres sslmode=disable",
+            host, port,
+        )
+    })
     _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
     _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
 }

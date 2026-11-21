@@ -139,6 +139,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FileFromContent` normalizes a nil content slice, so an empty in-memory file
   is no longer mistaken for an unset source. Add `BindMount`, `VolumeMount`,
   and `TmpfsMount` smart constructors for `Mount`.
+- Add `wait.ForFunc` for callback-based readiness probes and `wait.ForSQL` for
+  `database/sql` probes that need no driver dependency. Add
+  `ExecStrategy.WithResponseMatcher` / `WithOutputContains` (backed by the
+  optional `wait.ExecOutputTarget`) and `HTTPStrategy.WithStatusCode` /
+  `WithBody`.
 
 ### Fixed
 

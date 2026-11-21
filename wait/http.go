@@ -1,6 +1,7 @@
 package wait
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,8 +33,12 @@ type HTTPStrategy struct {
 	portSet         bool
 	method          string
 	statusMatcher   func(int) bool
+	statusCode      int
+	statusCodeSet   bool
 	responseMatcher func(io.Reader) bool
 	headers         map[string]string
+	body            []byte
+	bodySet         bool
 	username        string
 	password        string
 	basicAuth       bool
@@ -73,10 +79,34 @@ func (s *HTTPStrategy) WithMethod(method string) *HTTPStrategy {
 	return cloned
 }
 
-// WithStatusCodeMatcher replaces the default 2xx acceptance check.
+// WithStatusCodeMatcher replaces the default 2xx acceptance check. It also
+// clears a fixed status code set by WithStatusCode.
 func (s *HTTPStrategy) WithStatusCodeMatcher(matcher func(status int) bool) *HTTPStrategy {
 	cloned := s.clone()
 	cloned.statusMatcher = matcher
+	cloned.statusCode, cloned.statusCodeSet = 0, false
+	return cloned
+}
+
+// WithStatusCode accepts only the given HTTP status code instead of the
+// default 2xx range. It replaces both the default and a matcher configured by
+// WithStatusCodeMatcher. Codes outside 100-599 are rejected with a
+// *ConfigError before probing.
+func (s *HTTPStrategy) WithStatusCode(code int) *HTTPStrategy {
+	cloned := s.clone()
+	cloned.statusCode, cloned.statusCodeSet = code, true
+	cloned.statusMatcher = nil
+	return cloned
+}
+
+// WithBody sends body with every readiness request. The body is cloned, so a
+// later caller mutation cannot diverge the transmitted payload from the value
+// registered for diagnostic redaction. Set a Content-Type with WithHeader when
+// the endpoint requires one. A body too large to protect in streamed
+// diagnostics is rejected as a *ConfigError.
+func (s *HTTPStrategy) WithBody(body []byte) *HTTPStrategy {
+	cloned := s.clone()
+	cloned.body, cloned.bodySet = bytes.Clone(body), true
 	return cloned
 }
 
@@ -161,6 +191,9 @@ func (s *HTTPStrategy) WithPollInterval(d time.Duration) *HTTPStrategy {
 // in the URL; other query values are boundary values.
 func (s *HTTPStrategy) DiagnosticValues() []string {
 	var values []string
+	if s.bodySet {
+		values = append(values, string(s.body))
+	}
 	if s.username != "" {
 		values = append(values, s.username)
 	}
@@ -236,6 +269,12 @@ func (s *HTTPStrategy) validate() error {
 			return err
 		}
 	}
+	if s.bodySet && (len(s.body) > cli.MaxStreamOverlap || !cli.StreamValueFits(string(s.body))) {
+		return invalidConfigf("ForHTTP", "body", "", "is too large to redact safely from streamed diagnostics")
+	}
+	if s.statusCodeSet && (s.statusCode < 100 || s.statusCode > 599) {
+		return invalidConfigf("ForHTTP", "status code", strconv.Itoa(s.statusCode), "must be between 100 and 599")
+	}
 	if s.method == "" {
 		return invalidConfigf("ForHTTP", "method", "", "must not be empty")
 	}
@@ -275,7 +314,12 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 
 	matcher := s.statusMatcher
 	if matcher == nil {
-		matcher = func(status int) bool { return status >= 200 && status < 300 }
+		if s.statusCodeSet {
+			status := s.statusCode
+			matcher = func(candidate int) bool { return candidate == status }
+		} else {
+			matcher = func(status int) bool { return status >= 200 && status < 300 }
+		}
 	}
 	client := s.httpClient
 	if client == nil {
@@ -296,7 +340,11 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 		if err != nil {
 			return fatalCheckError{err: invalidConfigf("ForHTTP", "request", "", "%v", err)}
 		}
-		req, err := http.NewRequestWithContext(ctx, s.method, probeURL, nil)
+		var requestBody io.Reader
+		if s.bodySet {
+			requestBody = bytes.NewReader(s.body)
+		}
+		req, err := http.NewRequestWithContext(ctx, s.method, probeURL, requestBody)
 		if err != nil {
 			return fatalCheckError{err: invalidConfigf("ForHTTP", "request", "", "%v", err)}
 		}

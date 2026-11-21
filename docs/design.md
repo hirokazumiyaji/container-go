@@ -488,8 +488,11 @@ writer error alongside any CLI terminal error, and bounded snapshot
 APIs return a partial reader on infrastructure, cancellation, launch,
 and missing-container failures.
 
-The wait adapter never materializes `ForExec` output: it sends both
-streams to `io.Discard` through `ExecTo`. Failure diagnostics keep the
+The wait adapter does not buffer `ForExec` output by default: it sends
+both streams to `io.Discard` through `ExecTo`. When a strategy configures
+an output matcher, the adapter exposes `ExecCommandOutput` through the
+optional `wait.ExecOutputTarget` interface and caps the retained prefix
+at 64KiB through `WithExecMaxBytes`. Failure diagnostics keep the
 trailing 1 MiB of the backend's bounded log tail and redact it before it
 is attached. The CLI runner exposes direct streaming through `RunTo`; runners implementing only the historical `Run` interface are
 adapted for compatibility, but such adapters cannot provide a hard
@@ -703,10 +706,12 @@ provides:
   the first published TCP port when no exposed TCP port is declared.
 - `wait.ForHTTP(path)`: send an HTTP request to the resolved endpoint
   until its status matches (2xx by default; change it with
-  `WithStatusCodeMatcher`). `WithPort` and `WithMethod` select the
-  target. The current development checkout also adds `WithHeaders`,
-  `WithHeader`, `WithBasicAuth`, `WithTLS`, `WithTLSConfig`, and
-  `WithHTTPClient`; these setters are not in `v0.2.0`.
+  `WithStatusCodeMatcher` or a single accepted code with
+  `WithStatusCode`). `WithPort` and `WithMethod` select the target, and
+  `WithBody` sends a request payload with every poll. The current
+  development checkout also adds `WithHeaders`, `WithHeader`,
+  `WithBasicAuth`, `WithTLS`, `WithTLSConfig`, and `WithHTTPClient`;
+  these setters are not in `v0.2.0`.
   `WithResponseMatcher(func(io.Reader) bool)` checks up to 64KiB of an
   accepted response body, and a false verdict is retried.
 - `wait.ForHealthcheck()`: wait until Docker reports the image's
@@ -717,6 +722,37 @@ provides:
 - `wait.ForExec(cmd)`: run a command through the backend CLI until it
   exits with an accepted code (0 by default). Each attempt has a timeout
   derived from the poll interval (1–5s); `WithExecTimeout` overrides it.
+  `WithResponseMatcher(func([]byte) bool)` and `WithOutputContains` also
+  require the command output to match, after the exit code is accepted.
+  They use the optional `wait.ExecOutputTarget` interface; a target
+  without it fails immediately with a `*wait.ConfigError`, and the
+  container adapter retains at most 64KiB of output. Without a matcher
+  the output is discarded as before.
+- `wait.ForFunc(fn)`: call `fn(ctx, target)` once per poll and accept nil.
+  Non-nil errors retry and the latest one is reported on timeout; an
+  error wrapping `context.Canceled` or one classified as permanent (for
+  example `ErrInvalidConfiguration`) ends the wait immediately;
+  per-attempt deadline errors are retried. `WithExitCheck(false)`
+  disables the stopped container guard for callbacks that intentionally
+  wait for container exit, but only for the ForFunc poll: `ForAll` and
+  `ForAny` run their own lifecycle monitor and final check against the
+  real target, so a composite still fails when the container exits. A
+  callback that observes container exit must be used outside a
+  composite.
+- `wait.ForSQL(port, driver, dsn)`: poll `database/sql` with
+  `db.PingContext` (or a `WithQuery` readiness statement) against the
+  resolved host and port. Each attempt runs under a 3s deadline, so a
+  stalled handshake is retried instead of consuming the startup budget.
+  The package imports no driver; the caller registers one and passes its
+  name, and an unregistered driver is rejected by `Validate` (and so by
+  `WithWaitStrategy` before container work) as well as at the start of
+  the wait. `dsn(host, port)` builds the connection string per attempt;
+  host has no IPv6 brackets, so URL-style DSNs should use
+  `net.JoinHostPort`. The strategy keeps no per-wait state, so one value
+  can be reused for concurrent waits. The DSN and its password-derived
+  forms are registered for redaction of that wait's error only; a log
+  tail attached later by a higher-level helper is outside that
+  redaction.
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`:
   composition. Child strategies keep their own settings. In the current
   development checkout, the exported `AllStrategy` and `AnyStrategy`
@@ -774,9 +810,12 @@ strategies prefer `State` and fall back to `Running`. Port strategies use
 optional `PortListenTarget` checks to confirm the container-side LISTEN
 state; unsupported targets use the host connection alone. Docker healthcheck
 waits use the optional `HealthTarget` interface; `ForHealthcheck` returns a
-`*wait.ConfigError` for targets that do not implement it. `container.Run`
-adapts `*container.Container` to these interfaces. The dependency points
-from `container` to `wait`, never back, avoiding an import cycle.
+`*wait.ConfigError` for targets that do not implement it. `ForExec` output
+matchers use the optional `ExecOutputTarget` interface and return a
+`*wait.ConfigError` when the target does not report command output.
+`container.Run` adapts `*container.Container` to these interfaces. The
+dependency points from `container` to `wait`, never back, avoiding an
+import cycle.
 
 ## Cleanup
 
@@ -1196,7 +1235,9 @@ Tail to `-n` and rejects Since with `ErrUnsupportedCapability`. Neither
 option adds a byte cap; `LogsOptions.MaxBytes`, `WithExecMaxBytes`,
 `ExecTo`, and `LogsTo` provide a prefix cap or a caller-owned sink, and
 bounded captures report truncation through `Truncated` and
-`ErrOutputTruncated`. `ForExec` discards its output. `FollowLogs` is intentionally an unbounded stream;
+`ErrOutputTruncated`. `ForExec` discards its output unless an output
+matcher needs a bounded prefix. `FollowLogs` is intentionally an
+unbounded stream;
 closing its `io.ReadCloser` or cancelling its context terminates the CLI
 process. The wait-failure diagnostic tail is capped at 1MiB.
 

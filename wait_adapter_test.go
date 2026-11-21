@@ -794,3 +794,57 @@ func TestWaitTargetHealthInspectRateStaysAtLifecycleCadence(t *testing.T) {
 		t.Fatalf("inspects = %d over 1.2s, want at most one per lifecycle interval", inspects)
 	}
 }
+
+func TestWaitTargetExecCommandOutput(t *testing.T) {
+	f := &execRunner{fakeRunner: newTestRunner(), execStdout: "PONG\n"}
+	target := newDockerWaitTarget(f)
+
+	code, output, err := target.ExecCommandOutput(context.Background(), []string{"redis-cli", "ping"})
+	if err != nil {
+		t.Fatalf("ExecCommandOutput: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(string(output), "PONG") {
+		t.Errorf("output = %q, want the command output", output)
+	}
+	if f.callWith("exec") == nil {
+		t.Fatal("no exec call recorded")
+	}
+}
+
+func TestWaitTargetExecCommandOutputIsBounded(t *testing.T) {
+	f := &execRunner{fakeRunner: newTestRunner(), execStdout: strings.Repeat("x", waitExecOutputLimit*2)}
+	target := newDockerWaitTarget(f)
+
+	_, output, err := target.ExecCommandOutput(context.Background(), []string{"probe"})
+	if err != nil {
+		t.Fatalf("ExecCommandOutput: %v", err)
+	}
+	if len(output) > waitExecOutputLimit {
+		t.Errorf("output length = %d, want at most %d", len(output), waitExecOutputLimit)
+	}
+}
+
+func TestForExecOutputMatcherWithWaitTarget(t *testing.T) {
+	uid := strings.Repeat("a", 64)
+	runner := waitRunnerFunc(func(_ context.Context, args ...string) ([]byte, []byte, error) {
+		if len(args) > 0 && args[0] == "exec" {
+			return []byte("PONG\n"), nil, nil
+		}
+		return []byte(`[{"Id":"` + uid + `","State":{"Status":"running"}}]`), nil, nil
+	})
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.pack().uid = uid
+	target := waitTarget{c: ctr}
+
+	err := wait.ForExec([]string{"redis-cli", "ping"}).
+		WithOutputContains("PONG").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(5*time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+}

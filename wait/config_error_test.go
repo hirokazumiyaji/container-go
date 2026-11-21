@@ -50,6 +50,37 @@ func TestAllConfigErrorsShareSentinel(t *testing.T) {
 			},
 		},
 		{
+			name:     "ForExec empty output substring",
+			strategy: "ForExec",
+			run: func() error {
+				return ForExec([]string{"probe"}).WithOutputContains("").
+					WaitUntilReady(context.Background(), newFakeTarget())
+			},
+		},
+		{
+			name:     "ForFunc nil function",
+			strategy: "ForFunc",
+			run: func() error {
+				return ForFunc(nil).WaitUntilReady(context.Background(), newFakeTarget())
+			},
+		},
+		{
+			name:     "ForHTTP invalid status code",
+			strategy: "ForHTTP",
+			run: func() error {
+				return ForHTTP("/").WithStatusCode(600).
+					WaitUntilReady(context.Background(), newFakeTarget())
+			},
+		},
+		{
+			name:     "ForSQL empty driver",
+			strategy: "ForSQL",
+			run: func() error {
+				return ForSQL("5432/tcp", "", func(string, int) string { return "" }).
+					WaitUntilReady(context.Background(), newFakeTarget())
+			},
+		},
+		{
 			name:     "ForLog bad regexp",
 			strategy: "ForLog",
 			run: func() error {

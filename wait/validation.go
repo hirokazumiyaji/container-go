@@ -194,6 +194,11 @@ func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error
 			return requireWaitTCPPort(allowed)
 		}
 		return requireWaitPort("ForHTTP", allowed, s.port)
+	case *SQLStrategy:
+		if s.port == "" {
+			return requireWaitTCPPort(allowed)
+		}
+		return requireWaitPort("ForSQL", allowed, s.port)
 	case *AllStrategy:
 		for i, child := range s.strategies {
 			if err := validateStrategyPorts(child, allowed); err != nil {

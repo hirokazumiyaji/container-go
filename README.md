@@ -223,13 +223,14 @@ container cannot make the host allocate an unbounded response:
   return the partial reader and its truncation state.
 - `FollowLogs` is intentionally a long-lived stream and has no
   automatic byte limit. The caller owns its lifetime and backpressure.
-- `wait.ForExec` discards command output for every poll, and wait-failure
-  diagnostics use a fixed 1 MiB trailing log buffer. That diagnostic tail
-  is separate from the public prefix cap. The internal ExecRunner
-  `CLIError` keeps a bounded trailing stderr window per failed invocation
-  for classification; `Error` redacts that window and renders at most the
-  trailing 64 KiB. This diagnostic limit does not bound `Run` output or a
-  caller-owned sink.
+- `wait.ForExec` discards command output for every poll unless an output
+  matcher is configured; the container adapter then retains at most 64 KiB
+  for the matcher. Wait-failure diagnostics use a fixed 1 MiB trailing log
+  buffer. That diagnostic tail is separate from the public prefix cap. The
+  internal ExecRunner `CLIError` keeps a bounded trailing stderr window per
+  failed invocation for classification; `Error` redacts that window and
+  renders at most the trailing 64 KiB. This diagnostic limit does not bound
+  `Run` output or a caller-owned sink.
 
 `Logs`, `Exec` without `WithExecMaxBytes`, and `MaxBytes == 0` retain
 the historical full-output behavior for source compatibility. That
@@ -438,9 +439,18 @@ strategy and leave the receiver unchanged; assign the result when configuring
 an existing value (`s = s.WithHeader("X-Tenant", tenant)`).
 
 The current development checkout also adds `wait.ForHealthcheck()` for
-Docker's `HEALTHCHECK` status and `HTTPStrategy.WithResponseMatcher` for
-bounded response-body checks. The healthcheck strategy is Docker-only; the
-Apple backend rejects it before creating a container.
+Docker's `HEALTHCHECK` status, `wait.ForFunc` for caller-supplied readiness
+callbacks, and `wait.ForSQL` for `database/sql` probes. `ForSQL` registers no
+driver itself; the caller imports and registers one and passes its name, and an
+unregistered driver is rejected by validation before container work. Each SQL
+probe attempt runs under a deadline so a stalled handshake is retried.
+`HTTPStrategy` gains `WithStatusCode` for a single accepted code and
+`WithBody` for request payloads, and `ExecStrategy` gains
+`WithResponseMatcher` / `WithOutputContains` for command output. An output
+matcher needs a target implementing the optional `wait.ExecOutputTarget`
+interface; the container adapter retains at most 64 KiB of command output for
+it. The healthcheck strategy is Docker-only; the Apple backend rejects it
+before creating a container.
 
 Waiting fails fast when the container is stopping, stopped, or paused.
 Created, restarting, unknown, and transient inspect states retry under the
@@ -459,7 +469,9 @@ Implement the optional `wait.StateTarget` interface when the target can
 distinguish transient startup states; built-in strategies use it automatically
 and fall back to `Running` for compatibility. Docker healthcheck waits also
 use the optional `wait.HealthTarget` interface; `ForHealthcheck` returns a
-`*wait.ConfigError` for targets that do not implement it.
+`*wait.ConfigError` for targets that do not implement it. `ForExec` output
+matchers use the optional `wait.ExecOutputTarget` interface the same way and
+fail with a `*wait.ConfigError` when it is missing.
 
 On Docker, a successful TCP connection to a published port does not prove
 that the container process listens: `docker-proxy` or Docker Desktop's port
@@ -506,7 +518,9 @@ The current development checkout adds the following APIs, which are not in
 package docexample
 
 import (
+    "context"
     "crypto/tls"
+    "fmt"
     "net/http"
     "time"
 
@@ -518,10 +532,21 @@ func DevelopmentWaitOptions() {
         WithHeaders(map[string]string{"X-Test": "yes"}).
         WithHeader("X-Other", "yes").
         WithBasicAuth("user", "pass").
+        WithStatusCode(http.StatusNoContent).
+        WithBody([]byte(`{"probe":true}`)).
         WithTLSConfig(&tls.Config{}).
         WithHTTPClient(&http.Client{}).
         WithStartupTimeout(time.Second).
         WithPollInterval(time.Millisecond)
+    _ = wait.ForExec([]string{"pg_isready"}).
+        WithOutputContains("accepting connections")
+    _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
+    _ = wait.ForSQL("5432/tcp", "postgres", func(host string, port int) string {
+        return fmt.Sprintf(
+            "host=%s port=%d user=postgres password=postgres sslmode=disable",
+            host, port,
+        )
+    })
     _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
     _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
 }

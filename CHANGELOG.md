@@ -219,6 +219,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Share the `<UserCacheDir>/containergo` base validation and creation between
+  copy staging and the cross-process name lock. The name lock now rejects a
+  symlinked cache base, a substituted `containergo` directory, and a group- or
+  world-writable non-sticky ancestor that copy staging already refused. Both
+  paths also verify the cache base's immediate parent before creating a missing
+  base, so copy staging no longer creates it below an unsafe parent and the
+  name lock no longer creates a missing parent chain. The default lock
+  directory uses the same private-directory validation and mode repair as the
+  cache root. An explicit `CONTAINERGO_LOCK_DIR` remains a separate path.
 - `Exec`, `ExecTo`, and the `Logs` family now return errors across the
   redaction boundary, which narrows `errors.As`. `*CLIError`,
   `*ValidationError`, `*ExecTerminationError`, and `*exec.Error` resolve to

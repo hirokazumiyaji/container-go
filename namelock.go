@@ -47,9 +47,11 @@ func nameLockPath(name string) (string, error) {
 // directories, where another local user could pre-create a fixed path and
 // permanently deny every locked operation. It is also independent of
 // TMPDIR, so processes that see different temporary directories still
-// coordinate. Processes that do not share a cache directory (for example a
-// different HOME or XDG_CACHE_HOME) must set CONTAINERGO_LOCK_DIR to the
-// same path to share the lock namespace.
+// coordinate. The cache base and the containergo directory are validated by
+// the same helper copy staging uses, so both callers reject a substituted,
+// foreign, or writable path. Processes that do not share a cache directory
+// (for example a different HOME or XDG_CACHE_HOME) must set
+// CONTAINERGO_LOCK_DIR to the same path to share the lock namespace.
 func nameLockDir() (string, error) {
 	if override := os.Getenv("CONTAINERGO_LOCK_DIR"); override != "" {
 		dir, err := filepath.Abs(override)
@@ -61,23 +63,13 @@ func nameLockDir() (string, error) {
 		}
 		return dir, nil
 	}
-	cacheDir, err := os.UserCacheDir()
+	appDir, err := ensureContainergoCacheRoot(nil)
 	if err != nil {
-		return "", lockDirHint(fmt.Errorf("locate per-user lock directory: %w", err))
-	}
-	cacheDir, err = filepath.Abs(cacheDir)
-	if err != nil {
-		return "", lockDirHint(fmt.Errorf("resolve per-user lock directory: %w", err))
-	}
-	if err := ensureLockCacheDir(cacheDir); err != nil {
 		return "", lockDirHint(err)
 	}
-	appDir := filepath.Join(cacheDir, "containergo")
 	lockDir := filepath.Join(appDir, "locks")
-	for _, dir := range []string{appDir, lockDir} {
-		if err := ensurePrivateDir(dir); err != nil {
-			return "", lockDirHint(err)
-		}
+	if err := ensurePrivateCacheDir(lockDir, nil); err != nil {
+		return "", lockDirHint(err)
 	}
 	return lockDir, nil
 }
@@ -86,28 +78,6 @@ func nameLockDir() (string, error) {
 // directory cannot host the private lock directory.
 func lockDirHint(err error) error {
 	return fmt.Errorf("%w; set CONTAINERGO_LOCK_DIR to a private directory to override", err)
-}
-
-// ensureLockCacheDir creates the per-user cache directory if it does not
-// exist and refuses a base that another local user could have substituted,
-// which is the pre-creation attack a fixed path under os.TempDir allowed.
-// The base itself need not be 0700: an existing ~/.cache is commonly 0755,
-// but it must be owned by this user and not group- or world-writable.
-func ensureLockCacheDir(dir string) error {
-	if err := os.MkdirAll(dir, nameLockDirPerm); err != nil {
-		return fmt.Errorf("create lock cache directory %s: %w", dir, err)
-	}
-	info, err := os.Stat(dir)
-	if err != nil {
-		return fmt.Errorf("stat lock cache directory %s: %w", dir, err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("lock cache directory %s is not a directory", dir)
-	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("lock cache directory %s is group- or world-writable", dir)
-	}
-	return checkLockOwner(info, "lock cache directory")
 }
 
 // ensurePrivateDir creates dir if needed and refuses to use a path that

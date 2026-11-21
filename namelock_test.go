@@ -52,10 +52,7 @@ func TestLockNameSerializesHolders(t *testing.T) {
 
 func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
 	// Exercise the default per-user cache path, not the override.
-	t.Setenv("CONTAINERGO_LOCK_DIR", "")
-	cacheRoot := t.TempDir()
-	t.Setenv("HOME", cacheRoot)
-	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	isolateUserCacheBase(t, true)
 	name := "lock-" + newContainerName()
 	first, err := nameLockPath(name)
 	if err != nil {
@@ -296,14 +293,7 @@ func TestNameLockSerializesAcrossProcessesWithDifferentTempDirs(t *testing.T) {
 
 func TestNameLockDirUsesPerUserCache(t *testing.T) {
 	// Force the default path even if the developer's shell sets an override.
-	t.Setenv("CONTAINERGO_LOCK_DIR", "")
-	cacheRoot := t.TempDir()
-	t.Setenv("HOME", cacheRoot)
-	t.Setenv("XDG_CACHE_HOME", cacheRoot)
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
+	cacheDir, _ := isolateUserCacheBase(t, true)
 	dir, err := nameLockDir()
 	if err != nil {
 		t.Fatalf("nameLockDir: %v", err)
@@ -324,14 +314,7 @@ func TestNameLockDirUsesPerUserCache(t *testing.T) {
 }
 
 func TestNameLockDirRejectsWorldWritableCacheBase(t *testing.T) {
-	t.Setenv("CONTAINERGO_LOCK_DIR", "")
-	cacheRoot := t.TempDir()
-	t.Setenv("HOME", cacheRoot)
-	t.Setenv("XDG_CACHE_HOME", cacheRoot)
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
+	cacheDir, _ := isolateUserCacheBase(t, true)
 	if err := os.MkdirAll(cacheDir, nameLockDirPerm); err != nil {
 		t.Fatal(err)
 	}
@@ -344,14 +327,7 @@ func TestNameLockDirRejectsWorldWritableCacheBase(t *testing.T) {
 }
 
 func TestNameLockDirRejectsSubstitutedAppDir(t *testing.T) {
-	t.Setenv("CONTAINERGO_LOCK_DIR", "")
-	cacheRoot := t.TempDir()
-	t.Setenv("HOME", cacheRoot)
-	t.Setenv("XDG_CACHE_HOME", cacheRoot)
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatal(err)
-	}
+	cacheDir, _ := isolateUserCacheBase(t, true)
 	if err := os.MkdirAll(cacheDir, nameLockDirPerm); err != nil {
 		t.Fatal(err)
 	}

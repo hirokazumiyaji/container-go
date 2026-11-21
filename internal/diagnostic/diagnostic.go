@@ -561,8 +561,8 @@ func redactFlags(s string) string {
 
 func redactUnquotedAssignments(s string) string {
 	var b strings.Builder
-	b.Grow(len(s))
 	last := 0
+	replaced := false
 	for i := 0; i < len(s); {
 		if !isNameStart(s, i) || (i > 0 && isNameByte(s[i-1])) {
 			i++
@@ -607,6 +607,10 @@ func redactUnquotedAssignments(s string) string {
 			if isSecretName(name) {
 				valueEnd = extendMultilineSecret(s, valueEnd)
 			}
+			if !replaced {
+				b.Grow(len(s))
+				replaced = true
+			}
 			b.WriteString(s[last:valueStart])
 			b.WriteString(Redacted)
 			last = valueEnd
@@ -618,7 +622,7 @@ func redactUnquotedAssignments(s string) string {
 		// the value rather than consuming it.
 		i = valueStart
 	}
-	if last == 0 {
+	if !replaced {
 		return s
 	}
 	b.WriteString(s[last:])
@@ -674,10 +678,10 @@ func isNameByte(c byte) bool {
 // never partially matched and an arbitrary dotted word is not overmatched.
 func redactJWT(s string) string {
 	var b strings.Builder
-	b.Grow(len(s))
+	last := 0
+	replaced := false
 	for i := 0; i < len(s); {
 		if !isCompactTokenByte(s[i]) {
-			b.WriteByte(s[i])
 			i++
 			continue
 		}
@@ -686,15 +690,26 @@ func redactJWT(s string) string {
 			i++
 		}
 		token := s[start:i]
-		if isCompactJWSOrJWE(token) {
-			b.WriteString(Redacted)
-		} else if cut, ok := compactTokenBeforeTrailingDots(token); ok {
-			b.WriteString(Redacted)
-			b.WriteString(token[cut:])
-		} else {
-			b.WriteString(token)
+		replacement := Redacted
+		if !isCompactJWSOrJWE(token) {
+			cut, ok := compactTokenBeforeTrailingDots(token)
+			if !ok {
+				continue
+			}
+			replacement += token[cut:]
 		}
+		if !replaced {
+			b.Grow(len(s))
+			replaced = true
+		}
+		b.WriteString(s[last:start])
+		b.WriteString(replacement)
+		last = i
 	}
+	if !replaced {
+		return s
+	}
+	b.WriteString(s[last:])
 	return b.String()
 }
 
@@ -904,6 +919,9 @@ func wordByte(b byte) bool {
 // although they are Unicode separators rather than control characters, many
 // log viewers treat them as line breaks.
 func Sanitize(s string) string {
+	if !sanitizeNeeded(s) {
+		return s
+	}
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); {
@@ -946,6 +964,31 @@ func Sanitize(s string) string {
 		i += size
 	}
 	return b.String()
+}
+
+// sanitizeNeeded reports whether Sanitize would rewrite any byte or rune in
+// s. Diagnostics are usually clean, and returning the original string in that
+// case avoids building a copy that only repeats the input.
+func sanitizeNeeded(s string) bool {
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= 0x20 && c < 0x7f {
+			i++
+			continue
+		}
+		if c < 0x20 || c == 0x7f {
+			return true
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return true
+		}
+		if r == '\u2028' || r == '\u2029' || unicode.IsControl(r) || unicode.In(r, unicode.Cf) {
+			return true
+		}
+		i += size
+	}
+	return false
 }
 
 func ansiSequenceLen(s string) int {

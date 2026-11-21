@@ -41,8 +41,13 @@ func Array[T any](data []byte, required []string) ([]T, error) {
 		if IsNull(entry) {
 			return nil, fmt.Errorf("entry %d: expected an object, got null", i)
 		}
-		if field, bad := nullField(entry, required); bad {
-			return nil, fmt.Errorf("entry %d: field %q must not be null", i, field)
+		// nullField decodes the entry into a field map. A required field can
+		// only be null when the entry bytes contain the null literal, so skip
+		// that second decode for the normal case that has none.
+		if bytes.Contains(entry, jsonNullLiteral) {
+			if field, bad := nullField(entry, required); bad {
+				return nil, fmt.Errorf("entry %d: field %q must not be null", i, field)
+			}
 		}
 		var v T
 		if err := json.Unmarshal(entry, &v); err != nil {
@@ -53,9 +58,12 @@ func Array[T any](data []byte, required []string) ([]T, error) {
 	return values, nil
 }
 
+// jsonNullLiteral is the only byte sequence a JSON null value can occupy.
+var jsonNullLiteral = []byte("null")
+
 // IsNull reports whether raw is the JSON null literal.
 func IsNull(raw json.RawMessage) bool {
-	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+	return bytes.Equal(bytes.TrimSpace(raw), jsonNullLiteral)
 }
 
 // nullField reports the first required field present with a JSON null

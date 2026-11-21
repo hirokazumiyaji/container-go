@@ -28,6 +28,10 @@ type imageCacheEntry struct {
 type imageCache struct {
 	mu      sync.Mutex
 	entries map[string]imageCacheEntry // key -> entry
+	// nextExpiry is the earliest expiry among entries, or the zero time when
+	// no entry is known to expire. It lets remember skip its full sweep while
+	// no entry can be stale, even when the map is far below imageCacheLimit.
+	nextExpiry time.Time
 
 	// now is the clock, injectable so the expiry behavior is testable
 	// without sleeping.
@@ -106,24 +110,56 @@ func (c *imageCache) rememberIdentity(eng engine, image, platform string, identi
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var oldestKey string
-	var oldestExpiry time.Time
-	haveOldest := false
-	for k, entry := range c.entries {
-		if !now.Before(entry.expiry) {
-			delete(c.entries, k)
-			continue
-		}
-		if !haveOldest || entry.expiry.Before(oldestExpiry) {
-			oldestKey, oldestExpiry, haveOldest = k, entry.expiry, true
-		}
+	if !c.nextExpiry.IsZero() && !now.Before(c.nextExpiry) {
+		c.purgeExpiredLocked(now)
 	}
 	if _, exists := c.entries[key]; !exists && len(c.entries) >= imageCacheLimit {
-		delete(c.entries, oldestKey)
+		c.evictEarliestExpiryLocked()
 	}
+	expiry := now.Add(c.ttl)
 	c.entries[key] = imageCacheEntry{
-		expiry:   now.Add(c.ttl),
+		expiry:   expiry,
 		identity: identity,
+	}
+	if c.nextExpiry.IsZero() || expiry.Before(c.nextExpiry) {
+		c.nextExpiry = expiry
+	}
+}
+
+// purgeExpiredLocked drops entries whose expiry has passed and restores the
+// earliest-expiry hint. The hint keeps a remember from sweeping the whole map
+// when nothing can be stale, even though expired keys must still be reclaimed
+// before they are looked up again.
+func (c *imageCache) purgeExpiredLocked(now time.Time) {
+	for key, entry := range c.entries {
+		if !now.Before(entry.expiry) {
+			delete(c.entries, key)
+		}
+	}
+	c.recomputeNextExpiryLocked()
+}
+
+func (c *imageCache) evictEarliestExpiryLocked() {
+	var oldestKey string
+	var oldestExpiry time.Time
+	for key, entry := range c.entries {
+		if oldestKey == "" || entry.expiry.Before(oldestExpiry) {
+			oldestKey, oldestExpiry = key, entry.expiry
+		}
+	}
+	if oldestKey == "" {
+		return
+	}
+	delete(c.entries, oldestKey)
+	c.recomputeNextExpiryLocked()
+}
+
+func (c *imageCache) recomputeNextExpiryLocked() {
+	c.nextExpiry = time.Time{}
+	for _, entry := range c.entries {
+		if c.nextExpiry.IsZero() || entry.expiry.Before(c.nextExpiry) {
+			c.nextExpiry = entry.expiry
+		}
 	}
 }
 

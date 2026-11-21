@@ -965,8 +965,12 @@ func sameOpenCopyInfo(before, after os.FileInfo) bool {
 		before.ModTime().Equal(after.ModTime())
 }
 
+// copySnapshotBytes copies at most limit+1 bytes and reports
+// ErrCopySourceTooLarge when the source grew past the caller's budget. The
+// extra byte is what distinguishes an oversized source from one that exactly
+// fills the budget.
 func copySnapshotBytes(ctx context.Context, dst io.Writer, src io.Reader, limit int64) (int64, error) {
-	n, err := io.Copy(dst, io.LimitReader(copyContextReader{ctx: ctx, reader: src}, limit+1))
+	n, err := copySnapshotLimited(ctx, dst, src, limit+1)
 	if err != nil {
 		return n, err
 	}
@@ -974,6 +978,66 @@ func copySnapshotBytes(ctx context.Context, dst io.Writer, src io.Reader, limit 
 		return n, ErrCopySourceTooLarge
 	}
 	return n, nil
+}
+
+// copySnapshotFileBytes keeps the source as an *os.File so ReadFrom can use
+// the kernel's copy_file_range path instead of a userspace read/write loop. It
+// transfers bounded chunks to keep a cancellation observable and to stop a
+// growing file before more than limit+1 bytes reach the staging file.
+func copySnapshotFileBytes(ctx context.Context, dst, src *os.File, max int64) (int64, error) {
+	var written int64
+	for max > 0 {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		chunk := max
+		if chunk > copySnapshotReadFromChunk {
+			chunk = copySnapshotReadFromChunk
+		}
+		n, err := dst.ReadFrom(io.LimitReader(src, chunk))
+		written += n
+		max -= n
+		if err != nil {
+			return written, err
+		}
+		// A regular-file transfer shorter than the requested chunk only ends
+		// at EOF. Stop here instead of asking ReadFrom again, which would run
+		// the generic fallback and allocate a buffer just to confirm EOF.
+		if n < chunk {
+			break
+		}
+	}
+	return written, nil
+}
+
+func copySnapshotLimited(ctx context.Context, dst io.Writer, src io.Reader, max int64) (int64, error) {
+	if fileDst, ok := dst.(*os.File); ok && copyReadFromSupported {
+		if fileSrc, ok := src.(*os.File); ok {
+			return copySnapshotFileBytes(ctx, fileDst, fileSrc, max)
+		}
+	}
+	buffer := copySnapshotBufferPool.Get().(*[]byte)
+	defer copySnapshotBufferPool.Put(buffer)
+	reader := io.LimitReader(copyContextReader{ctx: ctx, reader: src}, max)
+	// Hide ReadFrom so the copy uses the pooled buffer instead of allocating
+	// a fresh one inside the standard library's generic fallback.
+	return io.CopyBuffer(copyWriteOnly{Writer: dst}, reader, *buffer)
+}
+
+const (
+	copySnapshotBufferSize    = 32 * 1024
+	copySnapshotReadFromChunk = 1 << 20
+)
+
+var copySnapshotBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, copySnapshotBufferSize)
+		return &buffer
+	},
+}
+
+type copyWriteOnly struct {
+	io.Writer
 }
 
 type copyContextReader struct {

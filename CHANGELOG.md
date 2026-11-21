@@ -21,14 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   errors returned by `Read` and `TerminalError`. A follower keeps the handle's
   redaction from when it started, so a terminal error read after `Terminate`
   is still redacted.
-- `Exec`, `ExecTo`, and the `Logs` family now return errors across the
-  redaction boundary, which narrows `errors.As`. `*CLIError`,
-  `*ValidationError`, `*ExecTerminationError`, and `*exec.Error` resolve to
-  redacted clones rather than the original values, and other raw causes such as
-  `*json.SyntaxError` from target verification are no longer reachable through
-  `errors.As`. `errors.Is` classification is unchanged. A writer error behind
-  `ErrOutputDelivery` stays reachable through `errors.As`, as documented, from
-  `ExecTo`, `LogsTo`, `FollowLogsTo`, and `AttachedError`.
 - Redact sensitive argv in `internal/cli` stream setup, cancellation, and terminal
   wait diagnostics instead of embedding the raw command line.
 
@@ -66,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Exec`, `ExecTo`, and the `Logs` family now return errors across the
+  redaction boundary, which narrows `errors.As`. `*CLIError`,
+  `*ValidationError`, `*ExecTerminationError`, and `*exec.Error` resolve to
+  redacted clones rather than the original values, and other raw causes such as
+  `*json.SyntaxError` from target verification are no longer reachable through
+  `errors.As`. `errors.Is` classification is unchanged. A writer error behind
+  `ErrOutputDelivery` stays reachable through `errors.As`, as documented, from
+  `ExecTo`, `LogsTo`, `FollowLogsTo`, and `AttachedError`.
 - Reuse requires matching creation fingerprints and reuse groups, including when
   fingerprinted options are omitted. Recreate existing reuse containers before
   attaching with this version; environment values retain their attach semantics.

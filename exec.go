@@ -131,7 +131,8 @@ func withExecTimeout(ctx context.Context, cfg *execConfig) (context.Context, con
 //
 // Output is fully retained unless WithExecMaxBytes is supplied. A bounded
 // reader holds the prefix of the combined output and reports truncation
-// through ErrOutputTruncated and TruncationReporter.
+// through ErrOutputTruncated and TruncationReporter. Error messages redact
+// the command arguments and accepted environment values.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
 	code, output, _, err := c.execute(ctx, cmd, opts, nil, false)
 	return code, output, err

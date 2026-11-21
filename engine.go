@@ -65,6 +65,10 @@ type engineInfo struct {
 	// "unhealthy". It is empty when the image defines no HEALTHCHECK or
 	// the backend does not report one.
 	health string
+	// healthFailingStreak is Docker's count of consecutive failed
+	// health checks reported with health. It is zero when the backend did
+	// not report one.
+	healthFailingStreak int
 	// observedAt is when the backend inspect that produced this info
 	// completed. Health waits accept the snapshot only while it is within
 	// the lifecycle probe interval; older data must be re-inspected.
@@ -106,6 +110,10 @@ type engineInfo struct {
 	// Docker reports for the container's configured network. Docker is the
 	// only backend with network aliases.
 	networkAliases []string
+	// networkAliasMap carries the same aliases keyed by network name for
+	// the public snapshot. The flat list above remains the creation-time
+	// compatibility view for the configured network mode.
+	networkAliasMap map[string][]string
 	// defaultNetwork is the authoritative Docker daemon default identity
 	// (bridge on Linux, nat on Windows). It is daemon metadata rather than
 	// container identity, so it is not cached with the immutable fields.

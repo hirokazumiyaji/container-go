@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -506,6 +507,14 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
 		}
+		networkNames := make([]string, 0, len(c.Status.Networks))
+		for _, network := range c.Status.Networks {
+			if network.Network != "" {
+				networkNames = append(networkNames, network.Network)
+			}
+		}
+		sort.Strings(networkNames)
+		info.networkNames = networkNames
 		info.createdAt = parseInspectTime(c.Configuration.CreationDate)
 		if c.Status.StartedDate != nil {
 			info.startedAt = parseInspectTime(*c.Status.StartedDate)

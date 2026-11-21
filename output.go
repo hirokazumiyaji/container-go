@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -288,6 +289,40 @@ func (w *outputTrackingWriter) Truncated() bool {
 // contract, while avoiding duplicate wrappers when RunTo already joined
 // the same writer error.
 func preserveOutputDeliveryError(err error, tracked *outputTrackingWriter) error {
+	return preserveNamedOutputDeliveryError(err, tracked, "combined output")
+}
+
+// sameWriter reports whether a and b are the same interface value. Writer
+// implementations are often pointers; a non-comparable dynamic value cannot
+// be compared and is treated as distinct.
+func sameWriter(a, b io.Writer) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	if va.Type() != vb.Type() || !va.Type().Comparable() {
+		return false
+	}
+	return a == b
+}
+
+// serializedWriter serializes writes to one destination. APIs that can route
+// stdout and stderr to the same caller writer use it so the caller's Write is
+// never invoked concurrently.
+type serializedWriter struct {
+	mu  sync.Mutex
+	dst io.Writer
+}
+
+func (w *serializedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dst.Write(p)
+}
+
+// preserveNamedOutputDeliveryError is preserveOutputDeliveryError for an API
+// that separates streams, so the diagnostic names the writer that failed.
+func preserveNamedOutputDeliveryError(err error, tracked *outputTrackingWriter, stream string) error {
 	if tracked == nil {
 		return err
 	}
@@ -295,7 +330,7 @@ func preserveOutputDeliveryError(err error, tracked *outputTrackingWriter) error
 	if writerErr == nil || (cli.IsOutputError(err) && errors.Is(err, writerErr)) {
 		return err
 	}
-	deliveryErr := &cli.OutputError{Stream: "combined output", Err: writerErr}
+	deliveryErr := &cli.OutputError{Stream: stream, Err: writerErr}
 	if err == nil {
 		return deliveryErr
 	}

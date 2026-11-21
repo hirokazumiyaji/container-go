@@ -40,6 +40,10 @@ type engineCapabilities struct {
 	// prune list, and deletes candidates by name under the name lock after a
 	// fresh inspect.
 	pruneCandidateMetadata bool
+	// pruneLabelListFilter accepts label filters in the prune list command, so
+	// candidates can be selected daemon-side. A backend without it filters
+	// listed candidates from their inspected labels instead.
+	pruneLabelListFilter bool
 	// strictImageIdentity requires a pinned image reference to be proven
 	// locally addressable with complete platform metadata before a container
 	// may run, and verifies the created container's image afterwards.
@@ -118,11 +122,12 @@ func preparedPruneTarget(ctx context.Context, eng engine, runner cli.Runner, tim
 // capabilities implements the engine contract for Docker.
 func (dockerEngine) capabilities() engineCapabilities {
 	return engineCapabilities{
-		immutableID:              true,
-		daemonTarget:             true,
-		defaultNetwork:           true,
-		copyOutVersionCheck:      true,
-		healthcheck:              true,
+		immutableID:          true,
+		daemonTarget:         true,
+		defaultNetwork:       true,
+		copyOutVersionCheck:  true,
+		healthcheck:          true,
+		pruneLabelListFilter: true,
 	}
 }
 

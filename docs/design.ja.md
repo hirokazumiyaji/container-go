@@ -153,7 +153,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithName(name string)`：コンテナ名を指定する（省略時は `containergo-<ランダムな 16 進数>`）。共有の 1～63 文字 guard を使う。Apple のより厳密な 2～63 文字 rule は Apple バックエンドの preflight が image 解決前に強制する。
 - `WithLabels(labels map[string]string)`：追加ラベルを指定する。ライブラリが管理するラベルは予約済みである。
 - `WithMounts(mounts ...Mount)`：bind、名前付きボリューム、tmpfs のマウントを指定する。bind source は host OS の path 構文を使うため、ローカル Docker daemon では Windows の host path も受け付ける。remote Docker daemon への bind mount は、daemon が source path を自分の host で解決するため `ErrUnsupportedCapability` で拒否する。
-- `WithFiles(files ...File)`：起動後のコンテナへ regular file をコピーする。各 `File` は `HostPath` と `Content` のどちらか一方だけを設定し、`Mode` で非公開ステージング上の Unix permission bits を上書きできる。option 評価時に host directory、symlink、特殊ファイルを拒否する。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
+- `WithFiles(files ...File)`：起動後のコンテナへ通常ファイルとディレクトリをコピーする。各 `File` は `HostPath` と `Content` のどちらか一方だけを設定し、`Mode` で非公開ステージング上の Unix permission bits を上書きできる。option 評価時にはルートがシンボリックリンクまたは特殊ファイルなら拒否し、ディレクトリはコピー実行時にツリーとしてスナップショットされ、内部のシンボリックリンクや特殊ファイルはエラーになる。コピーに失敗すると `Run` をロールバックする。directory root は source の basename を付けず、中身を `ContainerPath` へコピーするため、reuse の attach を繰り返しても nest しない。この `<staged>/.` source form は Docker が定義しており、Apple も同じ form を受け取るが、検証は Apple integration suite が backend 利用可能な host で行う（利用できない場合は skip）。directory root の `Mode` は 0 でなければならない。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
+- `WithPostReadyHook(fn)`：readiness 後、`Run` の返却前に初期化処理を実行する。失敗時は通常 Create を rollback し、作成者の `WithReuse` は generation を破棄する。attach caller もフックを実行するが、作成者との同期はないため、caller 間の初期化は冪等にするか readiness で完了を検出する。
+- `WithTestLogger(t)`：テストの間、コンテナ log を `t.Logf` へ転送する。新規コンテナは履歴を replay し、Docker の reuse attach は時計ずれで直後の log を落とさないよう attach の少し前から resume する。
 - `WithPublishedPort(spec string)`：ホスト側ポートの明示的な公開を指定する。Apple Container は通常コンテナへ直接接続し、Docker は `WithExposedPorts` で宣言したポートを daemon が host port へ自動公開する。特定の host port が必要な場合だけ明示的な binding を使う。
 - `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever`（Docker のみ。Apple は `ErrPullNeverUnsupported`）を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
 - `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。CPU、shm、capability、ulimit、extra host、hostname の option は reuse の互換性 identity に含まれ、既存コンテナと一致しなければならない。capability は requested-subset rule で、要求した `--cap-add`/`--cap-drop` のすべてが存在する必要があり、空の要求は inspect された任意の capability set を受け入れる。それ以外の作成専用 option は attach 時に無視される。
@@ -172,7 +174,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 
 
 バックエンド中立の CLI 面にないオプションは意図的に提供しない。
-公開 API にログ注入用のフックはない。
+公開 API に汎用ログ注入用のフックはない。テスト専用の `WithTestLogger` はある。
 ログを使うには `FollowLogs` でストリームを取得するか、`Logs` と `LogsWithOptions` でスナップショットを取得する。
 
 ### Container ハンドル
@@ -200,13 +202,16 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
+func (c *Container) Shared() *Container
+func (c *Container) Created() bool
+func (c *Container) Reused() bool
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
 `Stop` は duration を受け付ける。非 nil の timeout は非負でなければならず、negative の場合は CLI 呼び出し前に拒否される。両 backend は whole seconds を受け付けるため、正の sub-second timeout は切り上げ、0 は即時終了を要求し、丸めた秒数が backend limit（確認した両 CLI では `math.MaxInt32` 秒）を超える値は拒否される。timeout は操作の query budget にも加算される。
 
-`Exec` は有限時間かつバッファリングされる操作で、終了コードと stdout+stderr を返す（非ゼロ終了は結果であり error ではない）。caller の context に deadline がない場合は 30 秒の既定 deadline を適用する。正の `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadline のみを無効化し、caller の deadline は取り除かない。長寿命のプロセスは通常 `WithCmd` で本体コマンドとして起動し、出力は `FollowLogs` で取得する（Long-open な Exec は避ける）。
+`Exec` は有限時間かつバッファリングされる操作で、終了コードと stdout+stderr を返す（非ゼロ終了は結果であり error ではない）。`WithExecStderr(w)` は stderr を分離し、`Exec` は stdout のみ、`ExecTo` は stderr を `w` へ流す。この場合 `WithExecMaxBytes` は stdout のみを制限し、両 stream に同じ比較可能な writer 値（通常は同じポインタ）を渡した場合は書き込みを直列化する。異なる wrapper や比較不能な動的型は同じ writer として検出されない。caller の context に deadline がない場合は 30 秒の既定 deadline を適用する。正の `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadline のみを無効化し、caller の deadline は取り除かない。長寿命のプロセスは通常 `WithCmd` で本体コマンドとして起動し、出力は `FollowLogs` で取得する（Long-open な Exec は避ける）。
 backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error とともに返す。CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。command の起動中実際に context error が競合した場合だけ、その分類は終了コードに依存しません。Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
 context 取消時は stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ local CLI process group を停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確認できない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送ります。この identity を持たない Unix target は直接の子 handle だけを使います。直接の子を回収した後は古い process group ID に signal を送りません。
 Windows では lifecycle が `OpenProcess` handle を保持し、`TerminateProcess` で直接の子だけを終了します。detach された descendant や親を付け替えられた descendant は保証外です。終了済み child への kill 成功は active process の証拠として扱いません。
@@ -226,8 +231,15 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 各 source entry は、最終要素のリンクを追わずに一度だけ開く。
 ディレクトリ内の child は、既に開いた親ハンドルからの相対 open で取得する。
 そのハンドルを、backend CLI の実行前に現在のユーザー専用の staging root へコピーする。
-`WithFiles` も同じ経路を使うが、option 評価時に通常ファイル以外
-（ディレクトリ、シンボリックリンク、特殊ファイル）を `ValidationError` で拒否する。
+`WithFiles` も同じ経路を使い、通常ファイルとディレクトリを受け付ける。
+option 評価時にはルートがシンボリックリンクまたは特殊ファイルなら
+`ValidationError` で拒否し、ディレクトリ内部のシンボリックリンクや特殊ファイルは
+スナップショット作成時にエラーにする。directory root は `<staged>/.` の source form
+を使い、source の basename ではなく中身を `ContainerPath` へコピーする。
+Docker はこの form を定義しており、Apple も同じ form を受け取るが、検証は
+Apple integration suite が backend 利用可能な host で行う（利用できない場合は skip）。
+`CopyToContainer` は従来どおり backend `cp` の意味論（既存 directory では
+basename の下へ nest し得る）を維持する。
 staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
 ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
 スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
@@ -433,7 +445,10 @@ timer process も回収する。reap 全体にも overall budget があり、そ
 created は残します。`WithPruneOlderThan(d)` は backend が報告する作成時刻が
 now-d より前の candidate だけに絞り、作成時刻が不明な candidate も残します。
 これにより共有 daemon や remote daemon で他の job が最近停止したコンテナを
-保護できます。これは watchdog の代替ではなく、回収のための運用パターンです。
+保護できます。`WithPruneLabel(key, value)` は exact-or-presence の label filter を
+追加し、Docker は `ps`、Apple は client-side で適用したうえで検証した candidate を
+再確認します。`WithPruneDryRun()` は削除対象となる ID を、削除も reaper 状態の変更も
+行わずに返します。これは watchdog の代替ではなく、回収のための運用パターンです。
 
 reaper は実 CLI コンテナを非 reuse 経路で登録したときに遅延起動する。
 作成するコンテナは backend create の開始前に名前と creation generation で
@@ -479,7 +494,7 @@ reuse container は削除・再作成される。この変数をグローバル�
 
 ## Reuse
 
-`WithReuse` は安定した `WithName` に対する `Run` を get-or-create にする。共有は同じ host の process 間で行う。既存コンテナは managed marker、`WithReuse` marker、有効な creation generation、および Docker では有効な immutable UID を持つ必要があり、各呼び出しは自分の wait strategy を再実行する。停止済みコンテナはこれらの ownership check と image check に合格した場合だけ削除・再作成の対象になる。image 互換性は元の mutable tag ではなく解決済み digest / image ID で判定し、Docker では要求した network identity も一致する必要がある。reuse は互換性 check の前と readiness 後、handle を返す直前に再 inspect する。Docker は immutable UID、Apple は creation generation を再確認するため、wait 中の置き換えは adopt せず error になる。port 互換性は backend ごとに異なる。Docker は `WithExposedPorts` の自動公開 binding と明示的な `WithPublishedPort` binding を比較する。Apple は明示的な published binding を比較するが、library の Apple inspect model に `WithExposedPorts` の宣言が残らないため、その宣言は比較できない。Apple の各呼び出しは自分の exposed-port 宣言を共有コンテナ IP へ使う。宣言を分離したい場合は名前を変える。`WithFiles` は attach caller を含むすべての caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずエラーを返す。`PullAlways` は attach 前にも各 caller で実行される。`WithMemory`、user、working directory、entrypoint、cmd、mounts、custom labels は作成時に予約ラベルへ保存した fingerprint と比較し、不一致なら `ErrReuseMismatch` を返す。省略した設定と reuse group も一致する必要があり、fingerprint のない既存コンテナへ attach するには再作成が必要となる。`env` の差は attach 時に無視する。分離が必要なら異なる名前を使う。`CONTAINERGO_KEEP=1` はこの reuse rule を変えない。条件に一致した stopped reuse container は削除・再作成され、`PruneReuseGroup` はその group を削除できる。
+`WithReuse` は安定した `WithName` に対する `Run` を get-or-create にする。共有は同じ host の process 間で行う。既存コンテナは managed marker、`WithReuse` marker、有効な creation generation、および Docker では有効な immutable UID を持つ必要があり、各呼び出しは自分の wait strategy を再実行する。停止済みコンテナはこれらの ownership check と image check に合格した場合だけ削除・再作成の対象になる。image 互換性は元の mutable tag ではなく解決済み digest / image ID で判定し、Docker では要求した network identity も一致する必要がある。reuse は互換性 check の前と readiness 後、handle を返す直前に再 inspect する。Docker は immutable UID、Apple は creation generation を再確認するため、wait 中の置き換えは adopt せず error になる。port 互換性は backend ごとに異なる。Docker は `WithExposedPorts` の自動公開 binding と明示的な `WithPublishedPort` binding を比較する。Apple は明示的な published binding を比較するが、library の Apple inspect model に `WithExposedPorts` の宣言が残らないため、その宣言は比較できない。Apple の各呼び出しは自分の exposed-port 宣言を共有コンテナ IP へ使う。宣言を分離したい場合は名前を変える。`WithFiles` は attach caller を含むすべての caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずエラーを返す。`PullAlways` は attach 前にも各 caller で実行される。`Container.Created()` はその呼び出しが generation を作成したかを返し、`Reused()` はその逆を返す（`Shared()` も引き継ぐ）。`WithPostReadyHook` は全 caller の readiness 後に実行され、作成者の失敗時はその generation を破棄する。attach caller は作成者のフック完了と同期しないため、caller 間の初期化は冪等にするか readiness で検出する。`WithMemory`、user、working directory、entrypoint、cmd、mounts、custom labels は作成時に予約ラベルへ保存した fingerprint と比較し、不一致なら `ErrReuseMismatch` を返す。省略した設定と reuse group も一致する必要があり、fingerprint のない既存コンテナへ attach するには再作成が必要となる。`env` の差は attach 時に無視する。分離が必要なら異なる名前を使う。`CONTAINERGO_KEEP=1` はこの reuse rule を変えない。条件に一致した stopped reuse container は削除・再作成され、`PruneReuseGroup` はその group を削除できる。
 
 Apple では delete 前に fresh inspect を行い、inspect と delete を `<UserCacheDir>/containergo/locks` 内で、コンテナ名を固定数のハッシュバケットへ割り当てた名前単位 `flock` で直列化する。lock file は名前ごとに増えず、world-writable な一時ディレクトリの固定パスにもならない。バケット衝突は無関係な名前を直列化するだけで、排他の保証は弱めない。ただし衝突した reaper は無関係な作成を待つため、lock 待ちの上限に達するとその削除を次回に回すことがある。reaper は同じ lock を使い、現在ユーザー所有の 0600 通常ファイルではない lock file を拒否する。別の `HOME` や `XDG_CACHE_HOME` で解決される cache ディレクトリが異なるプロセスは、同じ lock 名前空間を共有するために `CONTAINERGO_LOCK_DIR` を同じパスへ設定する必要がある。同じ host で本ライブラリの generation-checked `Terminate` と failed-create cleanup、Apple の `Prune` と `PruneReuseGroup`、および名前で address する reaper entry は名前単位 `flock` で保護される。外部ツールによる同じ窓の delete / recreate は保証外である。Docker の handle は `docker run` が出力した、または inspect で検証した完全な不変 `Id` で削除するため、同じ名前の置き換えとは delete target の ID が一致しない。Docker のすべての backend operation はその immutable ID を使い、inspect parser は要求した ID や name に一致しない object を拒否する。これらは別の保護であり、reuse は backend CLI を直接使う信頼できない process に対する一般的な fail-closed 保証ではない。
 
@@ -536,7 +551,7 @@ cleanup は一時的な sharing violation / access denied を有界の指数バ�
 
 **認証情報を扱わない**。レジストリ認証はバックエンド CLI に委ねる。Apple Container では `container registry login`、Docker では `docker login` を使う。ライブラリに認証情報を入力する経路はない。
 
-**ログ注入 API はない**。公開 API にロガーフックはない。`CLIError` は診断用に失敗したコマンドの引数と上限付き stderr を提供するが、環境変数の値は一時 env ファイルにあり argv には現れない。watchdog は起動を繰り返し失敗した場合に標準ログへ一度だけメッセージを出す。
+**汎用ログ注入 API はない**。公開 API に汎用ロガーフックはない。テスト専用の `WithTestLogger` は `t.Logf` へ転送するだけで、backend のコマンドデータを任意の sink へ公開しない。`CLIError` は診断用に失敗したコマンドの引数と上限付き stderr を提供するが、環境変数の値は一時 env ファイルにあり argv には現れない。watchdog は起動を繰り返し失敗した場合に標準ログへ一度だけメッセージを出す。
 
 **旧バージョンの reaper staging ファイル**。
 現在の reaper は inspect 出力を構造化フィールドフィルタへ流して処理し、raw
@@ -616,6 +631,11 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 `InspectInfo.ExitCode()` は backend の値を返し、省略時にはゼロを返す。
 スナップショットからゼロを正常終了と判定する前に、`State()` と `ExitCodeReported()` を確認する。
+同じ snapshot は parse 済み metadata として `Health()`（Docker の healthcheck status と連続失敗回数）、
+`ImageDigest()`、`NetworkMode()`、`Networks()`、`NetworkAliases()` を公開する。
+Docker の `ImageDigest()` は run 時の参照が digest 固定の場合だけ値を持ち、
+Apple は inspect が報告する descriptor digest を返す。Apple は healthcheck、
+network mode、network alias を持たないが、接続 network は報告する。
 
 Apple の任意フィールド `status.exitCode` は、取得済みの CLI 1.2.2 と 1.3.0 の fixture には含まれない。
 稼働中の Apple service で実際の終了コード報告は未検証であり、フィールドがなければ利用不可のエラーを返す。
@@ -765,7 +785,7 @@ v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、�
 - **Apple の名前ベース削除**：non-empty で一致する作成世代チェックと per-name `flock` は、同じ host で本ライブラリの generation-checked `Terminate` / failed-create cleanup、`Prune` / `PruneReuseGroup`、および名前で address する reaper entry を保護する。同じ窓で外部の CLI が delete して再作成した場合には区別できず、外部競合を閉じるには backend の不変 ID または原子的な条件付き削除が必要である。
 - **remote Docker の検出**：remote endpoint は `DOCKER_HOST` および Docker context（`tcp://` および `ssh://` トランスポートをサポート）の両方から解決される。
 - **Reuse の互換性**：両 backend で image を検査する。Docker は published port binding も検査するが、Apple は inspect data に `WithExposedPorts` の宣言を残さないため比較できない。`WithMemory`、user、working directory、entrypoint、cmd、mounts、custom labels は作成時の fingerprint と比較する。`env` の差は attach 時に無視する。分離が必要なら別の名前を使う。
-- **logger injection**：公開 logger hook は存在しない。追加するには新しい API と、公開できるコマンドデータの範囲を決める決定が必要である。
+- **logger injection**：汎用 logger hook は存在しない。テスト専用の `WithTestLogger` は `t.Logf` のみを sink とし、ログ content は既存の `Logs`/`FollowLogs` と同じ範囲である。
 - **remote bind mount**：remote Docker daemon への bind mount は、daemon が source path を自分の host で解決するため拒否している。remote bind mount をサポートするかは未解決である。ローカル Docker daemon では Windows の host path を受け付ける。
 - **UDP readiness**：`ForListeningPort` と `ForExposedPort` は TCP-only で、UDP 宣言は endpoint 設定にだけ使う。UDP probe を追加するかは未解決である。
 - **Stop timeout の精度**：公開 option は duration を受け付けるが、両 backend は whole seconds を取るため正の sub-second 値は切り上げ、backend limit を強制する。sub-second 精度を保持するかは未解決である。

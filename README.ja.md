@@ -193,6 +193,12 @@ prefix ポリシーを `Exec` に適用します。旧 unbounded reader は stdo
 返します。CLI の終端エラーも同時に発生した場合は同じ error chain に
 保持します。分類は `errors.Is(err, container.ErrOutputDelivery)` で確認し、
 元の writer error も chain に残ります。
+`WithExecStderr(w)` は exec した process の stderr を stdout から分離します。
+`Exec` の戻り値 reader は stdout だけになり、`ExecTo` は stdout を output、
+stderr を `w` へ流します。この場合 `WithExecMaxBytes` は stdout だけを制限します。
+stdout と stderr に同じ比較可能な writer 値（通常は同じポインタ）を渡すこともでき、
+その場合は書き込みが直列化されます。異なる wrapper や比較不能な動的型は
+同じ writer として検出されず、直列化されません。
 bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の
 terminal read error が `ErrOutputTruncated` になります。backend の
 infrastructure、cancellation、launch、missing-container エラー時も
@@ -763,6 +769,14 @@ Apple の `status.exitCode` は任意項目で、保存済みの CLI 1.2.2・1.3
 実際に動作した Apple コンテナの終了コードは、サービス未稼働のため検証できていません。
 Docker の `dead` 状態では報告されたプロセス終了コードを返しますが、デーモンによる後処理の成功は示しません。
 
+`InspectInfo` は再 inspect なしで parse 済みの backend metadata を公開します。
+`Health()` は Docker の healthcheck status と連続失敗回数を返し、
+`ImageDigest()` は backend が digest を公開する場合にそれを返します
+（Docker は run 時の参照が digest 固定の場合だけ）。
+`NetworkMode()`、`Networks()`、`NetworkAliases()` は接続 network の情報を返します。
+Apple Container は Networks を報告しますが、healthcheck、network mode、
+network alias は持ちません。
+
 ## Exec のタイムアウトと長時間実行
 
 `Container.Exec` は有限時間・バッファリングされる操作です。caller の
@@ -940,6 +954,15 @@ daemon で掃除するとき、並行して動く job が最近停止したコ�
 引き続き停止済みの managed コンテナだけを選ぶため、実行中のまま残った
 コンテナは停止するまで削除されません。
 
+`container.WithPruneLabel(key, value)` は `Prune` と `PruneReuseGroup` の
+対象を、その label を持つコンテナに限定します。value が空でない場合は完全一致、
+空の場合は key の存在だけを要求します。複数回指定した場合はすべての label を
+要求します。Docker は `ps` の filter として適用し、検証した candidate でも
+再確認します。Apple Container は list した candidate を client-side で
+filter します。`container.WithPruneDryRun()` は ownership、state、age、label の
+同じ検証を行い、実際に削除する ID を削除せずに返します。reaper の状態も
+変更しません。
+
 ### Windows と remote daemon の cleanup
 
 リーパーはローカルの `/bin/sh` 子プロセスです。Windows では利用できず、
@@ -1048,6 +1071,24 @@ func TestReuse(t *testing.T) {
   `env` の差は attach 時に無視するため、重要なら別の名前を使ってください。`WithFiles` は attach caller を含むすべての reuse
   caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずに
   error を返します。`PullAlways` は attach 前にも各 caller で実行されます。
+- `Container.Created()` はその `Run` 呼び出しがコンテナを作成したかを返し、
+  `Container.Reused()` はその逆を返します。`WithReuse` で作成した caller は
+  `Created`、既存 generation へ attach した caller は `Reused` です。
+- `WithPostReadyHook(fn)` は readiness 後、`Run` の返却前に実行されます。
+  フックが失敗すると通常の Create は rollback され、作成者の `WithReuse` は
+  その generation を破棄します。フックは attach caller でも実行されますが、
+  caller 間の同期機構ではありません。初期化は冪等にするか、wait strategy や
+  application の readiness signal で完了を検出してください。
+- `WithFiles` の directory root は、source directory 名ではなく中身を
+  `ContainerPath` にコピーするため、reuse の attach を繰り返しても nest しません。
+  Docker はこの動作を `<staged>/.` source form として定義しています。
+  Apple Container も同じ form を受け取りますが、検証は Apple integration suite が
+  backend 利用可能な host で行い、利用できない場合は skip します。
+  そのため Apple の挙動はその test を実行した host でのみ検証済みです。
+  `WithTestLogger(t)` はコンテナ log を test の間 `t.Logf` へ転送します。
+  新規コンテナは履歴を replay し、Docker の reuse attach は時計ずれで直後の log を
+  落とさないよう attach の少し前から resume します（Apple は `--since` を持たないため
+  履歴を replay します）。
 - 各作成は generation label を持ちます。`Terminate`、stopped 再作成経路、
   watchdog reaper は置き換わった generation の削除を拒否します。Docker の
   handle は `docker run` が出力した（または inspect で検証した）immutable ID で
@@ -1123,9 +1164,9 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   値でも env ファイルには書かないという意図的な互換性変更です。
 - `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
   開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
-  `WithFiles` は通常ファイル専用で、option 評価時にディレクトリ、
-  シンボリックリンク、reparse point、特殊ファイルを backend 呼び出し前に拒否します。
-  コピー経路はシンボリックリンク、reparse point、特殊ファイルを拒否します。
+  `WithFiles` は通常ファイルとディレクトリを受け付けます。
+  option 評価時にはルートがシンボリックリンク、reparse point、特殊ファイルなら拒否し、
+  スナップショット作成時にはディレクトリ内のシンボリックリンク、reparse point、特殊ファイルを拒否します。
   スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
   保持するメタデータは名前、バイト列、Unix パーミッションだけです。
   タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。

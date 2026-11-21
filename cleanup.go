@@ -89,6 +89,8 @@ type pruneConfig struct {
 	runner       Runner
 	binary       string
 	olderThan    time.Duration
+	labels       map[string]string
+	dryRun       bool
 	now          func() time.Time
 }
 
@@ -134,6 +136,44 @@ func WithPruneOlderThan(d time.Duration) PruneOption {
 			return validationErrorf("WithPruneOlderThan", d, "age must be positive")
 		}
 		c.olderThan = d
+		return nil
+	}
+}
+
+// WithPruneLabel limits Prune and PruneReuseGroup to containers carrying the
+// given label. A non-empty value requires an exact match; an empty value
+// requires only that the key is present. Repeated options require every label.
+// Docker applies the filter in its list query; Apple Container filters the
+// listed candidates client-side. The filter is rechecked against the verified
+// candidate before deletion.
+func WithPruneLabel(key, value string) PruneOption {
+	return func(c *pruneConfig) error {
+		if len(key) > 128 || !labelKeyRE.MatchString(key) {
+			return newValidationErrorWithField("WithPruneLabel", "key", key, fmt.Errorf("invalid label key %q", key))
+		}
+		if len(key)+len(value)+1 > 4096 {
+			return newValidationErrorWithField("WithPruneLabel", "value", nil,
+				fmt.Errorf("label %q: key=value exceeds 4096 bytes", key))
+		}
+		if strings.ContainsAny(value, "\x00") {
+			return newValidationErrorWithField("WithPruneLabel", "value", nil,
+				fmt.Errorf("label %q: value must not contain NUL", key))
+		}
+		if c.labels == nil {
+			c.labels = map[string]string{}
+		}
+		c.labels[key] = value
+		return nil
+	}
+}
+
+// WithPruneDryRun makes Prune and PruneReuseGroup verify and report the
+// containers they would remove without deleting any of them. The returned IDs
+// are the candidates that passed the same ownership, state, age, and label
+// checks as a real prune. Reaper registrations are not changed.
+func WithPruneDryRun() PruneOption {
+	return func(c *pruneConfig) error {
+		c.dryRun = true
 		return nil
 	}
 }
@@ -205,9 +245,10 @@ func parsePruneOptions(name string, opts []PruneOption) (pruneConfig, error) {
 }
 
 // Prune removes stopped containers created by this library, from any
-// session. PruneOption values such as WithPruneTimeout and WithPruneOlderThan
-// apply. It returns the IDs it removed. The package-level function uses the
-// process backend and has no Docker target options; use Client.Prune with
+// session. PruneOption values such as WithPruneTimeout, WithPruneOlderThan,
+// WithPruneLabel, and WithPruneDryRun apply. It returns the IDs it removed, or
+// the IDs a dry run would remove. The package-level function uses the process
+// backend and has no Docker target options; use Client.Prune with
 // WithClientDockerHost or WithClientDockerContext to select a target.
 func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	cfg, err := parsePruneOptions("Prune", opts)
@@ -245,6 +286,62 @@ type pruneCandidate struct {
 	creation  string
 	createdAt time.Time
 	state     State
+}
+
+// pruneLabelFilter requires every requested label. A requested empty value
+// matches any value as long as the key exists, mirroring Docker's
+// `--filter label=key` presence form.
+type pruneLabelFilter map[string]string
+
+func newPruneLabelFilter(cfg pruneConfig) pruneLabelFilter {
+	if len(cfg.labels) == 0 {
+		return nil
+	}
+	filter := make(pruneLabelFilter, len(cfg.labels))
+	for key, value := range cfg.labels {
+		filter[key] = value
+	}
+	return filter
+}
+
+func (f pruneLabelFilter) admits(labels map[string]string) bool {
+	for key, value := range f {
+		got, ok := labels[key]
+		if !ok {
+			return false
+		}
+		if value != "" && got != value {
+			return false
+		}
+	}
+	return true
+}
+
+// pruneListArgs adds daemon-side label filters for backends whose list command
+// supports them. Other backends filter listed candidates from inspect metadata.
+func pruneListArgs(eng engine, args []string, labels map[string]string) []string {
+	if !eng.capabilities().pruneLabelListFilter || len(labels) == 0 {
+		return args
+	}
+	filtered := append([]string(nil), args...)
+	for _, key := range sortedKeys(labels) {
+		value := labels[key]
+		filter := "label=" + key
+		if value != "" {
+			filter += "=" + value
+		}
+		filtered = append(filtered, "--filter", filter)
+	}
+	return filtered
+}
+
+// pruneSelection carries the filters and the dry-run policy through the
+// candidate paths. Keeping them together avoids growing the candidate
+// signatures for each new prune option.
+type pruneSelection struct {
+	ages   pruneAgeFilter
+	labels pruneLabelFilter
+	dryRun bool
 }
 
 // pruneAgeFilter limits a prune run to candidates whose backend creation
@@ -299,6 +396,12 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 		cfg.queryTimeout = queryTimeout
 	}
 	ages := newPruneAgeFilter(cfg)
+	selection := pruneSelection{
+		ages:   ages,
+		labels: newPruneLabelFilter(cfg),
+		dryRun: cfg.dryRun,
+	}
+	listArgs = pruneListArgs(eng, listArgs, cfg.labels)
 
 	redactor := pruneDiagnosticRedactor(eng, r, reuseGroup)
 	defer func() { resultErr = cli.WithRedactor(resultErr, redactor) }()
@@ -372,10 +475,10 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 					if !ok {
 						opErr = fmt.Errorf("%s %s: list candidate metadata missing", errKind, job.id)
 					} else {
-						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, ages, cfg.queryTimeout)
+						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup, selection, cfg.queryTimeout)
 					}
 				} else {
-					didRemove, opErr = pruneIDAddressedCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, ages, cfg.queryTimeout)
+					didRemove, opErr = pruneIDAddressedCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup, selection, cfg.queryTimeout)
 				}
 				mu.Lock()
 				attemptedAt[job.index] = true
@@ -418,7 +521,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	return removed, errors.Join(errs...)
 }
 
-func pruneIDAddressedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
+func pruneIDAddressedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string, selection pruneSelection, timeout time.Duration) (bool, error) {
 	if !domain.IsImmutableContainerID(id) {
 		return false, nil
 	}
@@ -445,10 +548,13 @@ func pruneIDAddressedCandidate(ctx context.Context, r cli.Runner, eng engine, id
 		createdAt: fresh.createdAt,
 		state:     fresh.state,
 	}
-	if !pruneCandidateEligible(candidate, reuseGroup) || !ages.admits(candidate.createdAt) {
+	if !pruneCandidateEligible(candidate, reuseGroup) || !selection.labels.admits(candidate.labels) || !selection.ages.admits(candidate.createdAt) {
 		// In particular, ordinary prune never force-deletes a candidate
 		// that became running after the daemon-side list.
 		return false, nil
+	}
+	if selection.dryRun {
+		return true, nil
 	}
 	deleteArgs := pruneDeleteArgs(eng, id, reuseGroup)
 	stdout, _, err := r.Run(ctx, deleteArgs...)
@@ -539,14 +645,14 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 	return domain.SameOwnershipLabels(candidate.labels, fresh.labels)
 }
 
-func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string, ages pruneAgeFilter, timeout time.Duration) (bool, error) {
-	if !eng.capabilities().pruneCandidateMetadata || !pruneCandidateEligible(candidate, reuseGroup) {
+func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string, selection pruneSelection, timeout time.Duration) (bool, error) {
+	if !eng.capabilities().pruneCandidateMetadata || !pruneCandidateEligible(candidate, reuseGroup) || !selection.labels.admits(candidate.labels) {
 		return false, nil
 	}
 	// The list-time timestamp can keep a known-recent candidate from taking
 	// the name lock at all. Unknown list metadata is checked again against
 	// the fresh inspect below.
-	if ages.active && !candidate.createdAt.IsZero() && !ages.admits(candidate.createdAt) {
+	if selection.ages.active && !candidate.createdAt.IsZero() && !selection.ages.admits(candidate.createdAt) {
 		return false, nil
 	}
 	guardCtx, guardCancel := context.WithTimeout(ctx, timeout)
@@ -569,8 +675,12 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if err != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
 	}
-	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) || fresh.uid != "" || !ages.admits(fresh.createdAt) {
+	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) || fresh.uid != "" ||
+		!selection.labels.admits(fresh.labels) || !selection.ages.admits(fresh.createdAt) {
 		return false, nil
+	}
+	if selection.dryRun {
+		return true, nil
 	}
 	deleteArgs := pruneDeleteArgs(eng, candidate.id, reuseGroup)
 	_, _, err = r.Run(guardCtx, deleteArgs...)

@@ -206,6 +206,11 @@ type Container struct {
 	// allowDestructive is set via Shared. Explicit Terminate still removes
 	// them.
 	reused bool
+	// created reports whether the Run call that returned this handle
+	// created the container. It is true for an ordinary Run and for the
+	// WithReuse caller whose flight created the shared generation; an
+	// attach to a generation another caller created reports false.
+	created bool
 	// allowDestructive lifts Stop/Copy refusals on a reused handle
 	// without clearing reused, so Cleanup/TerminateContainer still skip.
 	allowDestructive bool
@@ -511,6 +516,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		published:       cfg.published,
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
+		created:         true,
 		creation:        cfg.creation,
 		image:           resolvedImage,
 		sync:            &lockPack{uid: uid},
@@ -575,6 +581,10 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			}
 			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 		}
+	}
+	startTestLogger(cfg, c)
+	if err := runPostReadyHooks(ctx, c, cfg.postReadyHooks); err != nil {
+		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 	}
 	return c, envCleanupErr
 }
@@ -1033,6 +1043,28 @@ func (c *Container) Image() string {
 	return c.image.reference
 }
 
+// Created reports whether the Run call that returned this handle created the
+// container. It is always true for a plain Run. WithReuse reports true only
+// for the caller whose shared flight created the generation; callers that
+// attached to a generation created earlier or concurrently report false.
+//
+// Created is not a cross-caller synchronization barrier. Another WithReuse
+// caller can attach and return before the creating caller's post-ready hook
+// has finished, so initialization gated on Created must be idempotent or
+// detected through a wait strategy or application-level signal.
+func (c *Container) Created() bool {
+	return c.created
+}
+
+// Reused reports whether this handle attached to a WithReuse generation
+// instead of creating it. It is the inverse of Created and is independent of
+// the shared-handle cleanup behavior: a WithReuse caller whose flight created
+// the generation reports false here even though Cleanup still leaves it in
+// place.
+func (c *Container) Reused() bool {
+	return !c.created
+}
+
 // InspectInfo represents a point-in-time snapshot of container state and metadata.
 type InspectInfo struct {
 	id               string
@@ -1040,6 +1072,9 @@ type InspectInfo struct {
 	uid              string
 	image            string
 	imageID          string
+	imageDigest      string
+	health           string
+	healthStreak     int
 	state            State
 	exitCode         int
 	exitCodeReported bool
@@ -1049,6 +1084,9 @@ type InspectInfo struct {
 	labels           map[string]string
 	ip               string
 	platform         string
+	networkMode      string
+	networks         []string
+	networkAliases   map[string][]string
 	ports            []PortBinding
 }
 
@@ -1087,6 +1125,56 @@ func (i *InspectInfo) StartedAt() time.Time  { return i.startedAt }
 func (i *InspectInfo) FinishedAt() time.Time { return i.finishedAt }
 func (i *InspectInfo) IP() string            { return i.ip }
 func (i *InspectInfo) Platform() string      { return i.platform }
+
+// ImageDigest returns the OCI root/index digest for the container image when
+// the backend exposes one. Docker reports it only when the image reference used
+// for the container is digest-pinned; a tag-based container returns an empty
+// value even though inspect carries the resolved image ID. Apple Container
+// returns the descriptor digest reported by its inspect output. The value is
+// empty when the backend does not expose a digest.
+func (i *InspectInfo) ImageDigest() string { return i.imageDigest }
+
+// Health returns the backend's healthcheck status and its consecutive failed
+// check count. Docker reports "starting", "healthy", or "unhealthy" and the
+// streak; Apple Container has no healthcheck, so both values are empty and
+// zero. An empty status means the image defines no healthcheck or the backend
+// does not report one.
+func (i *InspectInfo) Health() (status string, failingStreak int) {
+	return i.health, i.healthStreak
+}
+
+// NetworkMode returns the backend's reported network mode. Docker reports
+// "bridge", "host", "none", or a user-defined network name. Apple Container
+// has no equivalent mode and returns an empty value.
+func (i *InspectInfo) NetworkMode() string { return i.networkMode }
+
+// Networks returns the names of the networks attached to the container.
+// Docker reports the names from its network settings; Apple Container reports
+// the networks from its inspect status. The result is a copy the caller may
+// modify.
+func (i *InspectInfo) Networks() []string {
+	if i.networks == nil {
+		return nil
+	}
+	clone := make([]string, len(i.networks))
+	copy(clone, i.networks)
+	return clone
+}
+
+// NetworkAliases returns the network-scoped DNS aliases and DNS names Docker
+// reports, keyed by network name. It is nil when the backend reports none or
+// does not support aliases, which is the case for Apple Container. The
+// returned map and its slices are copies the caller may modify.
+func (i *InspectInfo) NetworkAliases() map[string][]string {
+	if i.networkAliases == nil {
+		return nil
+	}
+	clone := make(map[string][]string, len(i.networkAliases))
+	for name, aliases := range i.networkAliases {
+		clone[name] = append([]string(nil), aliases...)
+	}
+	return clone
+}
 
 func (i *InspectInfo) Labels() map[string]string {
 	if i.labels == nil {
@@ -1129,6 +1217,9 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 		uid:              info.uid,
 		image:            info.image,
 		imageID:          info.imageID,
+		imageDigest:      info.imageDigest,
+		health:           info.health,
+		healthStreak:     info.healthFailingStreak,
 		state:            info.state,
 		exitCode:         info.exitCode,
 		exitCodeReported: info.exitCodeReported,
@@ -1138,6 +1229,9 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 		labels:           info.labels,
 		ip:               info.ip,
 		platform:         info.platform,
+		networkMode:      info.networkMode,
+		networks:         info.networkNames,
+		networkAliases:   info.networkAliasMap,
 		ports:            ports,
 	}, nil
 }
@@ -1442,7 +1536,7 @@ func (c *Container) Shared() *Container {
 		queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout,
 		exposed: c.exposed, published: c.published,
 		network: c.network, networkExplicit: c.networkExplicit,
-		reused: c.reused, allowDestructive: true, creation: c.creation,
+		reused: c.reused, created: c.created, allowDestructive: true, creation: c.creation,
 		image: c.image, nameInspect: c.nameInspect,
 		sync: c.sync, dockerMeta: c.dockerMeta,
 		diagnosticRedactorValue: diagnosticRedactor,

@@ -243,13 +243,28 @@ described below are not.
   for a local Docker daemon; a bind mount against a remote Docker daemon is
   rejected with `ErrUnsupportedCapability` because the daemon resolves the
   source path on its own host.
-- `WithFiles(files ...File)`: regular files copied into the running
-  container after start; a copy failure rolls back `Run`. Each `File` sets
-  exactly one of `HostPath` or `Content`; `Mode` optionally overrides the
-  Unix permission bits on the private staged copy. Host directories,
-  symlinks, and special files are rejected at option evaluation. On `WithReuse`, files
-  are copied for every caller, including attach callers; an attach copy
-  failure returns an error without deleting the shared container.
+- `WithFiles(files ...File)`: host files and directories copied into the
+  running container after start; a copy failure rolls back `Run`. Each `File`
+  sets exactly one of `HostPath` or `Content`; `Mode` optionally overrides the
+  Unix permission bits on the private staged copy. A symlink or special file
+  root is rejected at option evaluation; a directory is snapshotted tree-wise
+  when the copy runs and a symlink or special file inside it fails the copy.
+  A directory root copies its contents into `ContainerPath` instead of adding
+  the source basename, so repeated reuse attaches do not nest. Docker defines
+  the `<staged>/.` source form used for this. Apple receives the same form and
+  is covered by the Apple integration suite, which skips when that backend is
+  unavailable; Apple behavior is verified only where that test has run.
+  `Mode` must be zero for a directory root.
+  On `WithReuse`, files are copied for every caller, including attach callers;
+  an attach copy failure returns an error without deleting the shared container.
+- `WithPostReadyHook(fn func(context.Context, *Container) error)`: run setup
+  after readiness and before `Run` returns. An ordinary create is rolled back
+  on failure; a creating `WithReuse` caller discards its generation. Attach
+  callers also run the hook, but are not synchronized with the creator, so
+  cross-caller initialization must be idempotent or detected through readiness.
+- `WithTestLogger(t testing.TB)`: stream the container's logs into `t.Logf`
+  for the test's lifetime. New containers replay available history; Docker
+  reuse attaches resume slightly before attach time to tolerate clock skew.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
   Apple normally uses the container's direct IP, while Docker
   auto-publishes ports declared with `WithExposedPorts` to
@@ -316,9 +331,9 @@ described below are not.
   `linux/amd64` (including Rosetta use on Apple Container).
 
 Options outside the backend-neutral CLI surface are intentionally
-omitted. There is no public logger-injection option. For log consumers,
-`FollowLogs` returns a stream and `Logs`/`LogsWithOptions` return
-snapshots.
+omitted. `WithTestLogger` is the supported test logger; for general log
+consumers, `FollowLogs` returns a stream and `Logs`/`LogsWithOptions`
+return snapshots.
 
 ### Public input validation
 
@@ -338,9 +353,9 @@ unwrap chain. The exported `Message` field remains for source compatibility
 but does not override `Err`. `Run` validates its image before invoking any
 `Option`; `WithFiles` rejects a file that sets both or neither of `HostPath`
 and `Content`, rejects non-permission `Mode` bits, and resolves and checks each
-host path is a regular file before image or container work. A `Content` slice
-is bounded by `MaxCopyToContainerSize` at option evaluation. Docker applies its
-complete local-volume-name grammar in `checkConfig` while Apple keeps its
+host path is a regular file or directory before image or container work. A
+`Content` slice is bounded by `MaxCopyToContainerSize` at option evaluation.
+Docker applies its complete local-volume-name grammar in `checkConfig` while Apple keeps its
 backend-specific name rules. Copy paths are interpreted as POSIX paths with
 the `path` package, and a negative `Container.Stop` timeout is rejected before
 the CLI is called.
@@ -370,6 +385,9 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
+func (c *Container) Shared() *Container
+func (c *Container) Created() bool
+func (c *Container) Reused() bool
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
@@ -383,8 +401,12 @@ timeout is added to the operation's query budget.
 
 `Exec` is a finite, buffered operation. It returns the exit code with
 combined stdout+stderr (a non-zero exit is a result, not an error);
-this is kept for v1 compatibility. When the caller's context has no
-deadline, Exec applies a 30-second default. For a positive
+this is kept for v1 compatibility. `WithExecStderr(w)` separates stderr:
+`Exec` then returns only stdout and `ExecTo` streams stderr to `w`;
+`WithExecMaxBytes` bounds stdout in that mode. If both streams use the same
+comparable writer value (typically the same pointer), writes are serialized;
+distinct wrappers and non-comparable dynamic types are not detected. When the
+caller's context has no deadline, Exec applies a 30-second default. For a positive
 `WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
 the caller's deadline. `WithExecTimeout(0)` only disables the library
 default for a deliberately long-running command; it does not remove a
@@ -539,13 +561,20 @@ available on both backends.
 source entry once without following a final link; directory children are
 opened relative to the already-open parent handle. It copies from those
 handles into a current-user-only staging root before invoking either CLI.
-`WithFiles` uses the same snapshot path but rejects directories, symlinks,
-and special files when the option is applied, before any backend call.
-Separate staging and CLI deadlines prevent filesystem work from consuming the
-CLI budget, while a caller deadline remains authoritative for both. Directory
-snapshots are bounded by file bytes, entry count, depth, and aggregate
-source-path metadata. They intentionally preserve only names, bytes, and
-Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
+`CopyToContainer` keeps the backend `cp` convention: a directory source can
+nest under the basename of an existing `ContainerPath`. `WithFiles` uses the
+same snapshot path and accepts a file or directory; a symlink or special file
+root is rejected when the option is applied, before any backend call, and a
+symlink or special file inside a directory fails the snapshot. A directory
+root passes the `<staged>/.` source form so the contents land in
+`ContainerPath` instead of nesting under the source basename; repeated reuse
+attaches therefore do not stack directories. Docker documents this source
+form; Apple receives the same form and is covered by the Apple integration
+suite, which skips when that backend is unavailable. Separate staging and CLI
+deadlines prevent filesystem work from consuming the CLI budget, while a
+caller deadline remains authoritative for both. Directory snapshots are
+bounded by file bytes, entry count, depth, and aggregate source-path metadata. They intentionally preserve only names, bytes,
+and Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
 extended attributes, alternate data streams, sparse layout, and hardlink
 identity are not preserved.
 
@@ -807,8 +836,11 @@ suite. `Prune` removes stopped managed containers from any session;
 running and created containers remain. `WithPruneOlderThan(d)` restricts
 a sweep to candidates the backend reports as created before now-d and
 leaves candidates whose creation time is unknown, so a shared or remote
-daemon does not lose another job's recent containers. This is recovery,
-not a replacement watchdog.
+daemon does not lose another job's recent containers. `WithPruneLabel`
+adds exact-or-presence label filtering (daemon-side on Docker, client-side
+on Apple) and rechecks the inspected candidate. `WithPruneDryRun` returns
+the candidates a real prune would remove without deleting them or changing
+reaper state. This is recovery, not a replacement watchdog.
 
 The reaper is started lazily for a real CLI container on the non-reuse
 path. Every created container is pre-registered under its name and
@@ -910,6 +942,17 @@ backends. A missing or different fingerprint returns `ErrReuseMismatch`, includi
 all these options are omitted. The reuse group must also match exactly.
 Recreate older containers before attaching.
 Environment differences still attach; use distinct names when they matter.
+
+`Container.Created()` reports whether the call created the generation;
+`Container.Reused()` is its inverse, including through `Shared()`.
+`WithPostReadyHook` runs after readiness for every caller. A hook failure
+discards a generation created by that caller; an attach caller leaves the
+shared container alone. The creator's hook is not a barrier for concurrent or
+later attach callers, which can observe `ErrGenerationReplaced` if the
+creator's hook fails; make cross-caller initialization idempotent or detect
+completion through readiness. `WithTestLogger` follows container logs into
+the test; a Docker reuse attach resumes slightly before attach time to tolerate
+clock skew, while Apple has no `--since` and replays history.
 
 Each creation carries a `creationLabel` (16-hex). Reuse requires the
 managed marker, the `WithReuse` marker, a valid creation generation, and
@@ -1220,6 +1263,13 @@ previously treated `0, nil` as success must handle these errors.
 omitted. Snapshot callers must check `State()` and `ExitCodeReported()` before
 interpreting zero as a successful process exit.
 
+The same snapshot exposes already-parsed backend metadata without another
+CLI call: `Health()` (Docker healthcheck status and failing streak),
+`ImageDigest()`, `NetworkMode()`, `Networks()`, and `NetworkAliases()`.
+Docker reports an image digest only for a digest-pinned run reference; Apple
+reports the inspected descriptor digest. Apple has no healthcheck, network
+mode, or network aliases but does report its attached networks.
+
 Apple's optional `status.exitCode` is absent from the captured CLI 1.2.2 and
 1.3.0 fixtures. Actual process exit reporting has not been verified against a
 running Apple service; absent data returns an unavailable error. Docker `dead`
@@ -1527,7 +1577,8 @@ These are deliberately recorded rather than implied by the current API:
   inspect data. Memory, user, working directory, entrypoint, command,
   mounts, and custom labels are compared through a creation fingerprint.
   Environment differences still attach; use distinct names when they matter.
-- **Logger injection**: no public logger hook exists. Adding one would
+- **Logger injection**: no general logger hook exists. `WithTestLogger` is
+  test-only and forwards container logs to `t.Logf`; a general hook would
   require a separate API and a decision about what command data may be
   exposed.
 - **Remote bind mounts**: a bind mount against a remote Docker daemon is

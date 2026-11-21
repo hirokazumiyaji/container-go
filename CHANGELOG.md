@@ -63,6 +63,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support `WithEnv` and `WithExecEnv` on Windows: the env file lives under
   `%LocalAppData%\containergo-env-v1` and is created with a protected DACL
   limited to the current logon, with `LockFileEx`-based crash cleanup.
+- Expose already-parsed inspect metadata through `InspectInfo.Health`
+  (healthcheck status and failing streak), `InspectInfo.ImageDigest`,
+  `InspectInfo.NetworkMode`, `InspectInfo.Networks`, and
+  `InspectInfo.NetworkAliases`.
+- Add `Container.Created` and `Container.Reused` so a `WithReuse` caller can
+  tell whether its call created the container or attached to an existing one.
+- Add `WithPostReadyHook` for setup that runs after readiness and before `Run`
+  returns; a failed hook rolls back an ordinary create and discards a
+  `WithReuse` generation created by that call. Add `WithTestLogger` for
+  forwarding container logs to a test while it runs.
+- `WithFiles` now accepts a host directory and copies its validated contents
+  into `ContainerPath`, so repeated reuse attaches do not nest a basename
+  level; symlinks and special files inside the tree are still rejected (#344).
+- Add `WithExecStderr` to keep the exec'd process's stderr out of `Exec`'s
+  stdout and deliver it to a separate writer.
+- Add `WithPruneLabel` to limit `Prune` and `PruneReuseGroup` to containers
+  carrying a label, and `WithPruneDryRun` to report candidates without deleting
+  them.
 
 ### Fixed
 

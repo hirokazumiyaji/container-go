@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,7 +72,7 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 	// while forwarding the merged child output.
 	childRead, childWrite, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
+		return nil, fmt.Errorf("%s: %w", commandText(bin, args), err)
 	}
 	pr, pw := io.Pipe()
 	lifecycle := newCommandLifecycle(ctx, cmd)
@@ -116,9 +115,9 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		_ = pw.Close()
 		stream.closeSourceFiles()
 		if PermanentStartError(err) {
-			return nil, fmt.Errorf("%s %s: %w: %w", bin, strings.Join(args, " "), ErrStreamSetup, err)
+			return nil, fmt.Errorf("%s: %w: %w", commandText(bin, args), ErrStreamSetup, err)
 		}
-		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
+		return nil, fmt.Errorf("%s: %w", commandText(bin, args), err)
 	}
 
 	// The child owns the inherited write end. Close the parent's copy
@@ -624,7 +623,7 @@ func (s *processStream) terminalError(waitErr error) error {
 	if hasExit {
 		terminalErr = s.cliError(exitErr)
 	} else {
-		terminalErr = fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), waitErr)
+		terminalErr = fmt.Errorf("%s: %w", commandText(s.binary, s.args), waitErr)
 	}
 	if ctxErr != nil || s.ctx.Err() != nil {
 		// Keep the settled process error matchable (especially *CLIError)
@@ -633,7 +632,7 @@ func (s *processStream) terminalError(waitErr error) error {
 		return errors.Join(terminalErr, s.contextError())
 	}
 	if drainErr != nil {
-		return errors.Join(terminalErr, fmt.Errorf("%s %s: stream drain: %w", s.binary, strings.Join(s.args, " "), drainErr))
+		return errors.Join(terminalErr, fmt.Errorf("%s: stream drain: %w", commandText(s.binary, s.args), drainErr))
 	}
 	return terminalErr
 }
@@ -696,7 +695,7 @@ func (s *processStream) contextError() error {
 	if err == nil {
 		err = context.Canceled
 	}
-	return fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), err)
+	return fmt.Errorf("%s: %w", commandText(s.binary, s.args), err)
 }
 
 func (s *processStream) Close() error {

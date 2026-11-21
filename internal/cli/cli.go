@@ -558,10 +558,16 @@ func commandError(ctx context.Context, bin, identity string, args []string, stdo
 	return err
 }
 
-func commandContextError(bin string, args []string, err error) error {
+// commandText renders a CLI invocation for a diagnostic. The binary and
+// argv are structurally redacted so a sensitive flag value never reaches
+// an error message, matching the rendering used for CLIError.
+func commandText(bin string, args []string) string {
 	redactor := NewRedactor()
-	message := fmt.Sprintf("%s %s", redactor.Text(bin), strings.Join(redactor.Args(args), " "))
-	return fmt.Errorf("%s: %w", message, err)
+	return fmt.Sprintf("%s %s", redactor.Text(bin), strings.Join(redactor.Args(args), " "))
+}
+
+func commandContextError(bin string, args []string, err error) error {
+	return fmt.Errorf("%s: %w", commandText(bin, args), err)
 }
 
 // commandRunError is the historical helper name retained for tests that

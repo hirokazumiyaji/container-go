@@ -37,6 +37,24 @@ func TestPublicErrorRedactionSurvivesErrorsAs(t *testing.T) {
 		}
 	})
 
+	t.Run("ValidationError float value", func(t *testing.T) {
+		for name, value := range map[string]any{"float64": float64(-1.5), "float32": float32(-1.5)} {
+			t.Run(name, func(t *testing.T) {
+				original := &ValidationError{
+					Option: "WithCPUs", Field: "WithCPUs", Value: value,
+					Err: errors.New("cpus must be greater than zero"),
+				}
+				var got *ValidationError
+				if !errors.As(wrap(original), &got) {
+					t.Fatal("errors.As did not find *ValidationError")
+				}
+				if got.Value != value {
+					t.Fatalf("ValidationError.Value = %#v, want the rejected %T", got.Value, value)
+				}
+			})
+		}
+	})
+
 	t.Run("ExecTerminationError", func(t *testing.T) {
 		original := &ExecTerminationError{Err: errors.New(secret)}
 		var got *ExecTerminationError

@@ -290,3 +290,52 @@ func TestClassificationTreePreservesJoinedWrapperType(t *testing.T) {
 		t.Fatal("classification lost joined wrapper timeout veto")
 	}
 }
+
+type callerSinkError struct{ path string }
+
+func (e *callerSinkError) Error() string { return "sink closed: " + e.path }
+
+func TestSafeErrorExposesCallerSinkErrorThroughErrorsAs(t *testing.T) {
+	sink := &callerSinkError{path: "/var/log/app.log"}
+	raw := errors.Join(
+		&CLIError{Binary: "docker", Args: []string{"logs"}, ExitCode: 1, Stderr: "failed"},
+		fmt.Errorf("delivery: %w", &OutputError{Stream: "stdout", Err: sink}),
+	)
+	err := WithRedactor(raw, NewHashedContextRedactor("app"))
+
+	var got *callerSinkError
+	if !errors.As(err, &got) || got != sink {
+		t.Fatalf("errors.As(sink) = %v, want the caller's writer error %v", got, sink)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 1 {
+		t.Fatalf("errors.As(CLIError) = %v, want the redacted terminal clone", cliErr)
+	}
+}
+
+func TestSafeErrorStillHidesNonSinkErrorsFromErrorsAs(t *testing.T) {
+	err := WithRedactor(fmt.Errorf("probe: %w", &callerSinkError{path: "secret"}), NewRedactor())
+
+	var got *callerSinkError
+	if errors.As(err, &got) {
+		t.Fatalf("errors.As exposed a raw error outside a sink failure: %v", got)
+	}
+}
+
+func TestSafeErrorExposesOutputErrorThroughErrorsAs(t *testing.T) {
+	sink := &callerSinkError{path: "/var/log/app.log"}
+	raw := fmt.Errorf("delivery: %w", &OutputError{Stream: "stdout", Err: sink})
+	err := WithRedactor(raw, NewHashedContextRedactor("app"))
+
+	var outputErr *OutputError
+	if !errors.As(err, &outputErr) {
+		t.Fatal("errors.As(OutputError) = false, want the caller's sink wrapper")
+	}
+	if outputErr.Stream != "stdout" {
+		t.Fatalf("Stream = %q, want stdout", outputErr.Stream)
+	}
+	var got *callerSinkError
+	if !errors.As(outputErr, &got) || got != sink {
+		t.Fatalf("errors.As(outputErr) = %v, want the raw caller sink error %v", got, sink)
+	}
+}

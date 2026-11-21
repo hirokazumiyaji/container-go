@@ -70,6 +70,29 @@ func TestRunRejectsInvalidPublicOptionsBeforeBackend(t *testing.T) {
 	}
 }
 
+func TestRejectedCPUsValueSurvivesRedaction(t *testing.T) {
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(f), withEngine(appleEngine{}), WithCPUs(-1.5))
+	if err == nil {
+		t.Fatal("Run accepted a negative CPU quota")
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("error = %T %v, want *ValidationError", err, err)
+	}
+	value, ok := validationErr.Value.(float64)
+	if !ok || value != -1.5 {
+		t.Fatalf("validation value = %#v, want -1.5", validationErr.Value)
+	}
+	if !strings.Contains(err.Error(), "-1.5") {
+		t.Fatalf("error = %q, want the rejected value", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called for an invalid CPU quota: %v", f.calls)
+	}
+}
+
 func TestRunRejectsInvalidImageAsValidationErrorBeforeBackend(t *testing.T) {
 	t.Setenv(backendEnv, "not-a-backend")
 	const image = "-bad"

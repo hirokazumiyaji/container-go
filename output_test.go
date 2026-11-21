@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -688,5 +689,57 @@ func TestBoundedReaderSpansFixedChunks(t *testing.T) {
 	}
 	if buffer.Truncated() {
 		t.Fatal("Truncated() = true for output shorter than limit")
+	}
+}
+
+type typedSinkError struct{ path string }
+
+func (e *typedSinkError) Error() string { return "sink closed: " + e.path }
+
+// TestOutputDeliveryErrorSurvivesRedactionThroughErrorsAs keeps the
+// ErrOutputDelivery contract: the caller's own writer error type remains
+// reachable with errors.As even though these APIs return redacted errors.
+func TestOutputDeliveryErrorSurvivesRedactionThroughErrorsAs(t *testing.T) {
+	cases := map[string]func(*testing.T, io.Writer) error{
+		"ExecTo": func(t *testing.T, w io.Writer) error {
+			ctr := runTestContainer(t, &outputTestRunner{fakeRunner: newTestRunner(), output: "exec output"})
+			_, _, err := ctr.ExecTo(context.Background(), []string{"true"}, w)
+			return err
+		},
+		"LogsTo": func(t *testing.T, w io.Writer) error {
+			ctr := runTestContainer(t, &outputTestRunner{fakeRunner: newTestRunner(), output: "log output"})
+			_, err := ctr.LogsTo(context.Background(), w, LogsOptions{})
+			return err
+		},
+		"FollowLogsTo": func(t *testing.T, w io.Writer) error {
+			ctr := runTestContainer(t, &fakeStreamerRunner{fakeRunner: newTestRunner(), streamData: "log line\n"})
+			return ctr.FollowLogsTo(context.Background(), w)
+		},
+		"AttachedError": func(t *testing.T, w io.Writer) error {
+			ctr := runTestContainer(t, &fakeStreamerRunner{fakeRunner: newTestRunner(), streamData: "log line\n"},
+				WithAttachOutput(w))
+			select {
+			case <-ctr.AttachedDone():
+			case <-time.After(2 * time.Second):
+				t.Fatal("attached stream did not finish")
+			}
+			return ctr.AttachedError()
+		},
+	}
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			sinkErr := &typedSinkError{path: "/var/log/app.log"}
+			err := call(t, &failingOutputWriter{err: sinkErr})
+			if !errors.Is(err, ErrOutputDelivery) {
+				t.Fatalf("error = %v, want ErrOutputDelivery", err)
+			}
+			if !cli.IsOutputError(err) {
+				t.Fatalf("IsOutputError(%v) = false, want true", err)
+			}
+			var got *typedSinkError
+			if !errors.As(err, &got) || got != sinkErr {
+				t.Fatalf("errors.As(sink) = %v, want the caller's writer error: %v", got, err)
+			}
+		})
 	}
 }

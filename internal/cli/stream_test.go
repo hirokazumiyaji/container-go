@@ -722,3 +722,70 @@ func TestStreamClassifiesNonExecutableAbsolutePath(t *testing.T) {
 		t.Fatalf("error = %v, want underlying permission cause", err)
 	}
 }
+
+func TestStreamStartErrorRedactsSensitiveArguments(t *testing.T) {
+	const secret = "stream-start-secret-329"
+	backend := filepath.Join(t.TempDir(), "missing-backend")
+
+	stream, err := (&ExecRunner{Binary: backend}).Stream(
+		context.Background(), "logs", "--follow", "--env", "TOKEN="+secret)
+	if err == nil {
+		_ = stream.Close()
+		t.Fatal("Stream unexpectedly started a missing backend")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error = %q, leaks the sensitive argument", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("error = %q, want a redacted argument", err)
+	}
+}
+
+func TestStreamCancellationErrorRedactsSensitiveArguments(t *testing.T) {
+	const secret = "stream-cancel-secret-329"
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := (&ExecRunner{Binary: writeStub(t, `sleep 30`)}).Stream(
+		ctx, "logs", "--follow", "--env", "TOKEN="+secret)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	cancel()
+	buf := make([]byte, 16)
+	var readErr error
+	for {
+		if _, readErr = stream.Read(buf); readErr != nil {
+			break
+		}
+	}
+	if !errors.Is(readErr, context.Canceled) {
+		t.Fatalf("read error = %v, want context.Canceled", readErr)
+	}
+	if strings.Contains(readErr.Error(), secret) {
+		t.Fatalf("read error = %q, leaks the sensitive argument", readErr)
+	}
+	if !strings.Contains(readErr.Error(), "[REDACTED]") {
+		t.Fatalf("read error = %q, want a redacted argument", readErr)
+	}
+}
+
+func TestStreamTerminalWaitErrorRedactsSensitiveArguments(t *testing.T) {
+	const secret = "stream-terminal-secret-329"
+	stream := &processStream{
+		ctx:    context.Background(),
+		binary: "docker",
+		args:   []string{"logs", "--follow", "--env", "TOKEN=" + secret},
+	}
+
+	err := stream.terminalError(errors.New("wait failed"))
+	if err == nil {
+		t.Fatal("terminalError returned nil for a failed wait")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("terminal error = %q, leaks the sensitive argument", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("terminal error = %q, want a redacted argument", err)
+	}
+}

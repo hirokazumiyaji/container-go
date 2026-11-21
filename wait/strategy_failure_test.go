@@ -783,7 +783,7 @@ func TestCanonicalPortSpecNormalizesNumericText(t *testing.T) {
 	}
 	for input, want := range tests {
 		t.Run(input, func(t *testing.T) {
-			got, err := canonicalPortSpec(input)
+			got, err := canonicalPortSpec("", input)
 			if err != nil {
 				t.Fatalf("canonicalPortSpec(%q): %v", input, err)
 			}

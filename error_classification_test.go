@@ -704,6 +704,54 @@ func TestCommandTargetUsesOperationSpecificArgvSchemas(t *testing.T) {
 			args:      []string{"run", "--name=myctr", "redis:7-alpine"},
 			want:      "myctr",
 		},
+		{
+			name:      "cp to container",
+			operation: "cp",
+			args:      []string{"cp", "/host/source", "myctr:/tmp/destination"},
+			want:      "myctr",
+		},
+		{
+			name:      "cp from container",
+			operation: "cp",
+			args:      []string{"cp", "myctr:/tmp/source", "/host/destination"},
+			want:      "myctr",
+		},
+		{
+			name:      "cp windows host source",
+			operation: "cp",
+			args:      []string{"cp", `C:\tmp\source`, "myctr:/tmp/destination"},
+			want:      "myctr",
+		},
+		{
+			name:      "rm options first",
+			operation: "rm",
+			args:      []string{"rm", "--force", "--volumes", "myctr"},
+			want:      "myctr",
+		},
+		{
+			name:      "rm option after target",
+			operation: "rm",
+			args:      []string{"rm", "myctr", "--force"},
+			want:      "myctr",
+		},
+		{
+			name:      "apple delete",
+			operation: "delete",
+			args:      []string{"delete", "--force", "myctr"},
+			want:      "myctr",
+		},
+		{
+			name:      "inspect type option",
+			operation: "inspect",
+			args:      []string{"inspect", "--type=container", "myctr"},
+			want:      "myctr",
+		},
+		{
+			name:      "image pull option value",
+			operation: "image pull",
+			args:      []string{"image", "pull", "--platform=linux/amd64", "redis:7-alpine"},
+			want:      "redis:7-alpine",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -577,8 +578,19 @@ func TestPullAlwaysStillPullsAndRecords(t *testing.T) {
 // from silently disabling the cache.
 func TestWithImagePresenceCacheRejectsNegativeTTL(t *testing.T) {
 	cfg := newConfig()
-	if err := WithImagePresenceCache(-time.Second)(cfg); err == nil {
+	err := WithImagePresenceCache(-time.Second)(cfg)
+	if err == nil {
 		t.Fatal("want an error for a negative ttl")
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("err = %T, want *ValidationError", err)
+	}
+	if validationErr.Option != "WithImagePresenceCache" {
+		t.Errorf("Option = %q, want WithImagePresenceCache", validationErr.Option)
+	}
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("err = %v, want ErrInvalidOption", err)
 	}
 	if cfg.imageCache != nil {
 		t.Error("a rejected ttl installed a cache")

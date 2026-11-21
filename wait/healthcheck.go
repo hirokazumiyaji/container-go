@@ -35,7 +35,7 @@ func (s *HealthcheckStrategy) WithPollInterval(d time.Duration) *HealthcheckStra
 }
 
 func (s *HealthcheckStrategy) validate() error {
-	return s.options.validate()
+	return s.options.validate("ForHealthcheck")
 }
 
 func (s *HealthcheckStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {

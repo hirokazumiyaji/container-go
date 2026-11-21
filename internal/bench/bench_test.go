@@ -571,3 +571,63 @@ func TestTableRendersAllColumns(t *testing.T) {
 		}
 	}
 }
+
+// A zero-duration sample is a real measurement, not an unset marker. Before
+// this, the first zero sample let a later positive value become Min.
+func TestSummarizeKeepsZeroMinimum(t *testing.T) {
+	results := []Result{
+		{Backend: "docker", Library: LibraryContainerGo, Image: "redis", Scenario: "run/warm", DurationNS: 0},
+		{Backend: "docker", Library: LibraryContainerGo, Image: "redis", Scenario: "run/warm", DurationNS: int64(5 * time.Millisecond)},
+		{Backend: "docker", Library: LibraryContainerGo, Image: "redis", Scenario: "run/warm", DurationNS: int64(3 * time.Millisecond)},
+	}
+	summaries := Summarize(results)
+	if len(summaries) != 1 {
+		t.Fatalf("summaries = %d, want 1", len(summaries))
+	}
+	summary := summaries[0]
+	if summary.Min != 0 {
+		t.Errorf("Min = %v, want 0", summary.Min)
+	}
+	if summary.Max != 5*time.Millisecond {
+		t.Errorf("Max = %v, want 5ms", summary.Max)
+	}
+	if summary.Median != 3*time.Millisecond {
+		t.Errorf("Median = %v, want 3ms", summary.Median)
+	}
+}
+
+// A document covering both backends must accept both version sets. The old
+// independent conditions required both sets and then rejected each one.
+func TestValidateVersionMetadataAllowsMixedBackendResults(t *testing.T) {
+	env := testEnv(testCommit)
+	env.ReaperSessionID = ""
+	env.CLIs[AppleClientVersionKey] = "1.3.0"
+	env.CLIs[AppleServiceVersionKey] = "1.3.0"
+	results := []Result{
+		{Backend: "docker", Library: LibraryContainerGo},
+		{Backend: "apple", Library: LibraryContainerGo},
+	}
+	if err := validateVersionMetadata(env, results); err != nil {
+		t.Fatalf("mixed-backend metadata was rejected: %v", err)
+	}
+}
+
+func TestValidateVersionMetadataRejectsOtherBackendForSingleBackendResults(t *testing.T) {
+	t.Run("docker only", func(t *testing.T) {
+		env := testEnv(testCommit)
+		env.ReaperSessionID = ""
+		env.CLIs[AppleClientVersionKey] = "1.3.0"
+		results := []Result{{Backend: "docker", Library: LibraryContainerGo}}
+		if err := validateVersionMetadata(env, results); err == nil || !strings.Contains(err.Error(), "Docker-only") {
+			t.Fatalf("validateVersionMetadata error = %v, want Docker-only rejection", err)
+		}
+	})
+	t.Run("apple only", func(t *testing.T) {
+		env := testEnv(testCommit)
+		env.ReaperSessionID = ""
+		results := []Result{{Backend: "apple", Library: LibraryContainerGo}}
+		if err := validateVersionMetadata(env, results); err == nil || !strings.Contains(err.Error(), "Apple-only") {
+			t.Fatalf("validateVersionMetadata error = %v, want Apple-only rejection", err)
+		}
+	})
+}

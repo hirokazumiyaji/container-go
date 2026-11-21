@@ -34,11 +34,11 @@ var ErrLogStreamSetup = cli.ErrStreamSetup
 // It can be inspected with errors.As and classified with errors.Is using
 // ErrInvalidConfiguration.
 //
-// It covers every static configuration error this package can report: a port
-// specification that is not TCP or is out of range (ForListeningPort,
-// ForHTTP), an empty exec command (ForExec), and an uncompilable log
-// pattern (ForLog). Each fails immediately rather than being retried until
-// the startup timeout.
+// It covers every static configuration error this package can report:
+// startup and poll durations, port specifications, HTTP methods, paths, and
+// header values, exec commands, log patterns and occurrence counts, and nil
+// strategies. Each fails immediately rather than being retried until the
+// startup timeout.
 type ConfigError struct {
 	Strategy string
 	Field    string
@@ -47,7 +47,20 @@ type ConfigError struct {
 }
 
 func (e *ConfigError) Error() string {
-	return fmt.Sprintf("wait.%s: invalid %s %q: %s", e.Strategy, e.Field, e.Value, e.Reason)
+	if e == nil {
+		return "<nil>"
+	}
+	scope := "wait configuration"
+	if e.Strategy != "" {
+		scope = "wait." + e.Strategy
+	}
+	if e.Field == "" {
+		return scope + ": " + e.Reason
+	}
+	if e.Value == "" {
+		return fmt.Sprintf("%s: invalid %s: %s", scope, e.Field, e.Reason)
+	}
+	return fmt.Sprintf("%s: invalid %s %q: %s", scope, e.Field, e.Value, e.Reason)
 }
 
 func (e *ConfigError) Unwrap() error { return ErrInvalidConfiguration }

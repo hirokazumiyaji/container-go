@@ -6,6 +6,11 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+// ErrCleanupFailed identifies a *CleanupError: the container left behind by a
+// failed operation could not be removed. Callers can use errors.Is on a
+// returned error to detect the whole class without knowing the container.
+var ErrCleanupFailed = errors.New("container cleanup failed")
+
 // CleanupError reports that an operation failed and the container it created
 // could not be removed. It joins the cleanup failure onto the operation's
 // error, so a caller can tell "the command failed and the container is gone"
@@ -24,10 +29,27 @@ type CleanupError struct {
 }
 
 func (e *CleanupError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Err == nil {
+		return "container " + e.Container + " left behind: " + ErrCleanupFailed.Error()
+	}
 	return "container " + e.Container + " left behind: " + e.Err.Error()
 }
 
-func (e *CleanupError) Unwrap() error { return e.Err }
+// Is classifies every CleanupError as ErrCleanupFailed while Unwrap keeps its
+// historical single-error result for callers that inspect the chain directly.
+func (e *CleanupError) Is(target error) bool {
+	return e != nil && target == ErrCleanupFailed
+}
+
+func (e *CleanupError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 func (e *CleanupError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**CleanupError)

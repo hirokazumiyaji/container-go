@@ -188,14 +188,17 @@ func validateVersionMetadata(env Env, results []Result) error {
 			usesTestcontainers = true
 		}
 	}
-	if usesDocker {
+	// Reject the other backend's metadata only when the result set really is
+	// single-backend. A document covering both backends requires both
+	// version sets, so rejecting either would make it impossible to record.
+	if usesDocker && !usesApple {
 		for _, name := range []string{AppleClientVersionKey, AppleServiceVersionKey} {
 			if _, ok := env.CLIs[name]; ok {
 				return fmt.Errorf("env.clis[%q] is not valid for a Docker-only result set", name)
 			}
 		}
 	}
-	if usesApple {
+	if usesApple && !usesDocker {
 		for _, name := range []string{DockerClientVersionKey, DockerServerVersionKey} {
 			if _, ok := env.CLIs[name]; ok {
 				return fmt.Errorf("env.clis[%q] is not valid for an Apple-only result set", name)

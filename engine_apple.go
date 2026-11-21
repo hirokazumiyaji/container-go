@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -77,59 +78,80 @@ func (appleEngine) directIP() bool { return true }
 // checks only after it has already resolved the image, so doing them here
 // avoids surprising pulls and makes the backend limits visible to callers.
 func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
+	// resolveEffectivePlatform falls back to CONTAINER_DEFAULT_PLATFORM, so
+	// keep the origin to report an environment-variable failure as such.
+	explicitPlatform := cfg.platform != ""
 	if err := resolveEffectivePlatform(cfg); err != nil {
-		return err
+		if explicitPlatform {
+			return appleValidationError("WithPlatform", cfg.platform, "%v", err)
+		}
+		return appleValidationError(defaultPlatformEnv, os.Getenv(defaultPlatformEnv), "%v", err)
 	}
 	if wait.RequiresHealthcheck(cfg.waitStrategy) {
-		return fmt.Errorf("%w: Apple Container has no HEALTHCHECK; wait.ForHealthcheck requires the Docker backend", ErrUnsupportedCapability)
+		return appleCapabilityError(ErrUnsupportedCapability, "WithWaitStrategy", "wait strategy", "ForHealthcheck",
+			"Apple Container has no HEALTHCHECK; wait.ForHealthcheck requires the Docker backend")
 	}
 	if len(cfg.networkAliases) > 0 {
-		return fmt.Errorf("%w: apple backend does not support network aliases", ErrUnsupportedCapability)
+		return appleCapabilityError(ErrUnsupportedCapability, "WithNetworkAliases", "network aliases", len(cfg.networkAliases),
+			"apple backend does not support network aliases")
 	}
 	if cfg.pullPolicy == PullNever {
-		return fmt.Errorf("%w: Apple Container's run command always resolves images; use PullMissing or PullAlways", ErrPullNeverUnsupported)
+		return appleCapabilityError(ErrPullNeverUnsupported, "WithPullPolicy", "pull policy", cfg.pullPolicy,
+			"Apple Container's run command always resolves images; use PullMissing or PullAlways")
 	}
 	if cfg.privileged {
-		return fmt.Errorf("%w: apple backend does not support WithPrivileged", ErrUnsupportedCapability)
+		return appleCapabilityError(ErrUnsupportedCapability, "WithPrivileged", "privileged", true,
+			"apple backend does not support WithPrivileged")
 	}
 	if len(cfg.extraHosts) > 0 {
-		return fmt.Errorf("%w: apple backend does not support WithExtraHost", ErrUnsupportedCapability)
+		return appleCapabilityError(ErrUnsupportedCapability, "WithExtraHost", "extra hosts", len(cfg.extraHosts),
+			"apple backend does not support WithExtraHost")
 	}
 	if cfg.hostname != "" {
-		return fmt.Errorf("%w: apple backend does not support WithHostname", ErrUnsupportedCapability)
+		return appleCapabilityError(ErrUnsupportedCapability, "WithHostname", "hostname", cfg.hostname,
+			"apple backend does not support WithHostname")
 	}
 	if cfg.cpus > 0 && cfg.cpus != math.Trunc(cfg.cpus) {
-		return fmt.Errorf("%w: apple backend requires a whole-number CPU count, got %s", ErrUnsupportedCapability, formatCPUs(cfg.cpus))
+		return appleCapabilityError(ErrUnsupportedCapability, "WithCPUs", "cpus", cfg.cpus,
+			"apple backend requires a whole-number CPU count, got %s", formatCPUs(cfg.cpus))
 	}
 	if cfg.platform != "" {
 		if err := validateApplePlatform(cfg.platform); err != nil {
-			return err
+			if explicitPlatform {
+				return appleValidationError("WithPlatform", cfg.platform, "%v", err)
+			}
+			return appleValidationError(defaultPlatformEnv, cfg.platform, "%v", err)
 		}
 		cfg.platform = canonicalizeApplePlatformSelector(cfg.platform)
 	}
 
 	if cfg.name != "" && !appleContainerNameRE.MatchString(cfg.name) {
-		return fmt.Errorf("invalid Apple container name %q: must be 2-63 characters and match %s", cfg.name, appleContainerNameRE)
+		return appleValidationError("WithName", cfg.name,
+			"invalid Apple container name %q: must be 2-63 characters and match %s", cfg.name, appleContainerNameRE)
 	}
 	if cfg.network != "" {
 		// Apple accepts comma-separated network properties, but this
 		// public option intentionally represents a name only. Rejecting
 		// the separator here avoids passing an option string as a name.
 		if strings.Contains(cfg.network, ",") {
-			return fmt.Errorf("invalid Apple network name %q: comma-separated network properties are not supported", cfg.network)
+			return appleValidationError("WithNetwork", cfg.network,
+				"invalid Apple network name %q: comma-separated network properties are not supported", cfg.network)
 		}
 		if !appleNetworkNameRE.MatchString(cfg.network) {
-			return fmt.Errorf("invalid Apple network name %q: must match %s", cfg.network, appleNetworkNameRE)
+			return appleValidationError("WithNetwork", cfg.network,
+				"invalid Apple network name %q: must match %s", cfg.network, appleNetworkNameRE)
 		}
 	}
 
 	if len(cfg.published) > applePublishedPortLimit {
-		return fmt.Errorf("apple backend supports at most %d published-port descriptors, got %d", applePublishedPortLimit, len(cfg.published))
+		return appleValidationError("WithPublishedPort", len(cfg.published),
+			"apple backend supports at most %d published-port descriptors, got %d", applePublishedPortLimit, len(cfg.published))
 	}
 	seenPublished := make(map[string]struct{}, len(cfg.published))
 	for _, p := range cfg.published {
 		if p.hostPort <= 1 || p.containerPort <= 1 {
-			return fmt.Errorf("apple backend requires published ports to be 2-65535, got %q", p.raw)
+			return appleValidationError("WithPublishedPort", p.raw,
+				"apple backend requires published ports to be 2-65535, got %q", p.raw)
 		}
 		// Match Apple Container's PublishPort.hasOverlaps key:
 		// "\(hostPort)/\(proto)" without hostAddress. Distinct bind
@@ -137,17 +159,35 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 		// upstream, so include them here before the CLI is called.
 		key := fmt.Sprintf("%d/%s", p.hostPort, p.proto)
 		if _, exists := seenPublished[key]; exists {
-			return fmt.Errorf("apple backend published-port descriptors overlap at %q", p.raw)
+			return appleValidationError("WithPublishedPort", p.raw,
+				"apple backend published-port descriptors overlap at %q", p.raw)
 		}
 		seenPublished[key] = struct{}{}
 	}
 
 	if cfg.memory != "" {
 		if _, err := appleMemoryBytes(cfg.memory); err != nil {
-			return err
+			return appleValidationError("WithMemory", cfg.memory, "%v", err)
 		}
 	}
 	return nil
+}
+
+// appleValidationError reports an Apple-specific option value the backend
+// rejects. It returns a *ValidationError whose cause also matches
+// ErrInvalidConfig, so callers classifying a backend configuration failure
+// can use either contract.
+func appleValidationError(option string, value any, format string, args ...any) error {
+	return newValidationError(option, value, fmt.Errorf("%w: %s", ErrInvalidConfig, fmt.Sprintf(format, args...)))
+}
+
+// appleCapabilityError reports an Apple option the backend cannot honor. The
+// capability sentinel stays first so errors.Is keeps working, and the option
+// is exposed as a *ValidationError without classifying a capability gap as
+// ErrInvalidConfig.
+func appleCapabilityError(sentinel error, option, field string, value any, format string, args ...any) error {
+	validationErr := newValidationErrorWithField(option, field, value, fmt.Errorf(format, args...))
+	return fmt.Errorf("%w: %w", sentinel, validationErr)
 }
 
 // appleMemoryBytes parses the integer/unit form accepted by WithMemory and
@@ -1378,83 +1418,27 @@ func appleTypedNotFoundLine(line, target, command string) bool {
 	return ok && appleContainerNotFoundMessage(line, message, target, command)
 }
 
-// appleTypedNotFoundMessage unwraps only the typed wrapper grammar. The
-// cause value is treated as a quoted string at each level, then escapes are
-// decoded before the next wrapper is examined. This handles both escaped
-// forms emitted by the CLI and the older unescaped nested spelling without
-// searching arbitrary stderr for the words "not found".
+// appleTypedNotFoundMessage walks the shared ContainerizationError parser and
+// returns the message of the first notFound node reachable through
+// internalError wrappers. Wording is lowercased to preserve the classifier's
+// historical case-insensitive matching.
 func appleTypedNotFoundMessage(line string) (string, bool) {
-	current := strings.ToLower(strings.TrimSpace(line))
-	if strings.HasPrefix(current, "error:") {
-		current = strings.TrimSpace(strings.TrimPrefix(current, "error:"))
+	root, ok := parseAppleContainerizationError(line)
+	if !ok {
+		return "", false
 	}
-	for range 16 {
-		current = strings.TrimSpace(current)
-		current = strings.TrimSpace(strings.Trim(current, "()"))
-		switch {
-		case strings.HasPrefix(current, "notfound:"):
-			message := decodeAppleQuotedValue(strings.TrimSpace(strings.TrimPrefix(current, "notfound:")))
+	for node := &root; node != nil; node = node.cause {
+		switch node.code {
+		case "notfound":
+			message := strings.ToLower(strings.TrimSpace(node.message))
 			return message, message != ""
-		case strings.HasPrefix(current, "internalerror:"), strings.HasPrefix(current, "cause:"):
-			index := strings.Index(current, "cause:")
-			if index < 0 {
-				return "", false
-			}
-			current = decodeAppleQuotedValue(strings.TrimSpace(current[index+len("cause:"):]))
-			if current == "" {
-				return "", false
-			}
+		case "internalerror":
+			continue
 		default:
 			return "", false
 		}
 	}
 	return "", false
-}
-
-// decodeAppleQuotedValue removes one outer quoted value and decodes the
-// escaping used when Swift's diagnostic description is rendered. The
-// fallback is intentionally permissive for the CLI's older unescaped nested
-// form, but it still requires the value to be bounded by a quote.
-func decodeAppleQuotedValue(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') {
-		quote := value[0]
-		value = value[1:]
-		if value[len(value)-1] == quote {
-			value = value[:len(value)-1]
-		}
-	}
-	var b strings.Builder
-	b.Grow(len(value))
-	escaped := false
-	for _, r := range value {
-		if !escaped {
-			if r == '\\' {
-				escaped = true
-				continue
-			}
-			b.WriteRune(r)
-			continue
-		}
-		switch r {
-		case 'n':
-			b.WriteByte('\n')
-		case 'r':
-			b.WriteByte('\r')
-		case 't':
-			b.WriteByte('\t')
-		case '"', '\\':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('\\')
-			b.WriteRune(r)
-		}
-		escaped = false
-	}
-	if escaped {
-		b.WriteByte('\\')
-	}
-	return strings.TrimSpace(b.String())
 }
 
 func appleContainerNotFoundMessage(line, message, target, command string) bool {

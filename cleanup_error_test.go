@@ -414,3 +414,48 @@ func writeTempFile(t *testing.T) string {
 	}
 	return path
 }
+
+// A cleanup failure without a recorded cause is still a valid value to render
+// and classify. Before this, Error dereferenced the nil Err and panicked.
+func TestCleanupErrorWithoutCause(t *testing.T) {
+	err := &CleanupError{Container: "myctr"}
+	if got := err.Error(); !strings.Contains(got, "myctr") || !strings.Contains(got, ErrCleanupFailed.Error()) {
+		t.Fatalf("Error() = %q, want container and cleanup-failure wording", got)
+	}
+	if !errors.Is(err, ErrCleanupFailed) {
+		t.Fatalf("errors.Is(ErrCleanupFailed) = false for %v", err)
+	}
+	var got *CleanupError
+	if !errors.As(err, &got) || got != err {
+		t.Fatalf("errors.As(CleanupError) = %#v, want the original value", got)
+	}
+}
+
+// ErrCleanupFailed classifies every CleanupError while the underlying removal
+// failure and the operation error stay reachable.
+func TestCleanupErrorMatchesSentinelAndCause(t *testing.T) {
+	cleanupErr := errors.New("delete failed")
+	cleanup := &CleanupError{Container: "myctr", Err: cleanupErr}
+	err := errors.Join(errors.New("operation failed"), cleanup)
+	if !errors.Is(err, ErrCleanupFailed) {
+		t.Fatalf("errors.Is(ErrCleanupFailed) = false for %v", err)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("errors.Is(cleanup cause) = false for %v", err)
+	}
+	// Is classifies the sentinel without changing the historical Unwrap
+	// result that callers inspecting the chain directly may rely on.
+	if got := errors.Unwrap(cleanup); got != cleanupErr {
+		t.Fatalf("errors.Unwrap(cleanup) = %v, want the cleanup cause", got)
+	}
+}
+
+func TestNilCleanupError(t *testing.T) {
+	var err *CleanupError
+	if got := err.Error(); got != "<nil>" {
+		t.Fatalf("nil CleanupError.Error() = %q, want <nil>", got)
+	}
+	if errors.Unwrap(err) != nil {
+		t.Fatalf("nil CleanupError.Unwrap() = %v, want nil", errors.Unwrap(err))
+	}
+}

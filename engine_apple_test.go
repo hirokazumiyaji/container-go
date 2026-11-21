@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 func appleCapabilityConfig(t *testing.T, opts ...Option) *config {
@@ -340,4 +342,146 @@ func TestAppleLogsFollowResumeKeepsOrdinaryFollow(t *testing.T) {
 	if got := e.logsFollowResumeArgs("myctr", since); !slices.Equal(got, []string{"logs", "--follow", "myctr"}) {
 		t.Errorf("logsFollowResumeArgs = %v", got)
 	}
+}
+
+// Apple checkConfig failures expose structured contracts: invalid values are
+// *ValidationError and match ErrInvalidConfig, while unsupported capabilities
+// keep their sentinel and match ErrInvalidOption but not ErrInvalidConfig.
+// Docker reports the equivalent capability errors as bare sentinels, so this
+// classification is intentionally Apple-specific.
+func TestAppleCheckConfigErrorsAreStructured(t *testing.T) {
+	t.Run("validation errors", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			option string
+			opts   []Option
+			mutate func(*config)
+		}{
+			{name: "container name", option: "WithName", opts: []Option{WithName("a")}},
+			{name: "network name", option: "WithNetwork", opts: []Option{WithNetwork("INVALID")}},
+			// WithNetwork and WithMemory reject these values while applying
+			// the option, so set the config field directly to exercise the
+			// backend-specific check.
+			{name: "network properties", option: "WithNetwork", mutate: func(cfg *config) { cfg.network = "default,mac=02:42:ac:11:00:02" }},
+			{name: "published port", option: "WithPublishedPort", opts: []Option{WithPublishedPort("1:80")}},
+			{name: "memory", option: "WithMemory", mutate: func(cfg *config) { cfg.memory = "1K" }},
+			{name: "platform", option: "WithPlatform", opts: []Option{WithPlatform("windows/amd64")}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cfg := appleCapabilityConfig(t, tt.opts...)
+				if tt.mutate != nil {
+					tt.mutate(cfg)
+				}
+				err := (appleEngine{}).checkConfig(context.Background(), cfg)
+				if err == nil {
+					t.Fatal("want a validation error")
+				}
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Errorf("errors.Is(ErrInvalidConfig) = false for %v", err)
+				}
+				var validationErr *ValidationError
+				if !errors.As(err, &validationErr) {
+					t.Fatalf("err = %T, want *ValidationError", err)
+				}
+				if validationErr.Option != tt.option {
+					t.Errorf("Option = %q, want %q", validationErr.Option, tt.option)
+				}
+				if !errors.Is(err, ErrInvalidOption) {
+					t.Errorf("errors.Is(ErrInvalidOption) = false for %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("unsupported capability errors", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			option   string
+			sentinel error
+			opts     []Option
+		}{
+			{name: "healthcheck", option: "WithWaitStrategy", sentinel: ErrUnsupportedCapability, opts: []Option{WithWaitStrategy(wait.ForHealthcheck())}},
+			{name: "network aliases", option: "WithNetworkAliases", sentinel: ErrUnsupportedCapability, opts: []Option{WithNetworkAliases("alias")}},
+			{name: "privileged", option: "WithPrivileged", sentinel: ErrUnsupportedCapability, opts: []Option{WithPrivileged()}},
+			{name: "extra host", option: "WithExtraHost", sentinel: ErrUnsupportedCapability, opts: []Option{WithExtraHost("db", "127.0.0.1")}},
+			{name: "hostname", option: "WithHostname", sentinel: ErrUnsupportedCapability, opts: []Option{WithHostname("db")}},
+			{name: "pull never", option: "WithPullPolicy", sentinel: ErrPullNeverUnsupported, opts: []Option{WithPullPolicy(PullNever)}},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				cfg := appleCapabilityConfig(t, tt.opts...)
+				err := (appleEngine{}).checkConfig(context.Background(), cfg)
+				if err == nil {
+					t.Fatal("want a configuration error")
+				}
+				if !errors.Is(err, tt.sentinel) {
+					t.Errorf("errors.Is(%v) = false for %v", tt.sentinel, err)
+				}
+				// A capability gap is not an invalid option combination;
+				// callers branching on ErrInvalidConfig must keep reaching
+				// the capability sentinel instead.
+				if errors.Is(err, ErrInvalidConfig) {
+					t.Errorf("unsupported capability matched ErrInvalidConfig: %v", err)
+				}
+				if strings.Contains(err.Error(), "\n") {
+					t.Errorf("capability error spans multiple lines: %q", err)
+				}
+				var validationErr *ValidationError
+				if !errors.As(err, &validationErr) {
+					t.Fatalf("err = %T, want *ValidationError", err)
+				}
+				if validationErr.Option != tt.option {
+					t.Errorf("Option = %q, want %q", validationErr.Option, tt.option)
+				}
+				// The Apple capability gap is reported as *ValidationError,
+				// so it also matches ErrInvalidOption. Docker's equivalent
+				// capability errors do not; CHANGELOG documents the
+				// intentional asymmetry.
+				if !errors.Is(err, ErrInvalidOption) {
+					t.Errorf("errors.Is(ErrInvalidOption) = false for %v", err)
+				}
+			})
+		}
+	})
+}
+
+// A platform rejected before it is materialized must name where it came from:
+// an explicit WithPlatform value or CONTAINER_DEFAULT_PLATFORM.
+func TestAppleCheckConfigPlatformErrorSource(t *testing.T) {
+	t.Run("explicit WithPlatform", func(t *testing.T) {
+		cfg := appleCapabilityConfig(t, WithPlatform("windows/amd64"))
+		err := (appleEngine{}).checkConfig(context.Background(), cfg)
+		var validationErr *ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("err = %T, want *ValidationError", err)
+		}
+		if validationErr.Option != "WithPlatform" || validationErr.Value != "windows/amd64" {
+			t.Fatalf("ValidationError = %+v, want WithPlatform and the rejected value", validationErr)
+		}
+	})
+
+	t.Run("malformed environment default", func(t *testing.T) {
+		t.Setenv(defaultPlatformEnv, "not a platform")
+		err := (appleEngine{}).checkConfig(context.Background(), appleCapabilityConfig(t))
+		var validationErr *ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("err = %T, want *ValidationError", err)
+		}
+		if validationErr.Option != defaultPlatformEnv || validationErr.Value != "not a platform" {
+			t.Fatalf("ValidationError = %+v, want the environment variable as the source", validationErr)
+		}
+	})
+
+	t.Run("unsupported environment platform", func(t *testing.T) {
+		t.Setenv(defaultPlatformEnv, "windows/amd64")
+		err := (appleEngine{}).checkConfig(context.Background(), appleCapabilityConfig(t))
+		var validationErr *ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("err = %T, want *ValidationError", err)
+		}
+		if validationErr.Option != defaultPlatformEnv || validationErr.Value != "windows/amd64" {
+			t.Fatalf("ValidationError = %+v, want the environment variable as the source", validationErr)
+		}
+	})
 }

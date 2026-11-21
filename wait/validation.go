@@ -12,16 +12,23 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/portspec"
 )
 
-func invalidConfigf(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", ErrInvalidConfiguration, fmt.Sprintf(format, args...))
+// invalidConfigf reports a static configuration error as a *ConfigError so
+// every validation failure in this package shares one public error type.
+func invalidConfigf(strategy, field, value, format string, args ...any) error {
+	return &ConfigError{
+		Strategy: strategy,
+		Field:    field,
+		Value:    value,
+		Reason:   fmt.Sprintf(format, args...),
+	}
 }
 
-func (o options) validate() error {
+func (o options) validate(strategy string) error {
 	if o.startupTimeout < 0 {
-		return invalidConfigf("startup timeout must not be negative")
+		return invalidConfigf(strategy, "startup timeout", o.startupTimeout.String(), "must not be negative")
 	}
 	if o.pollInterval < 0 {
-		return invalidConfigf("poll interval must not be negative")
+		return invalidConfigf(strategy, "poll interval", o.pollInterval.String(), "must not be negative")
 	}
 	return nil
 }
@@ -71,16 +78,16 @@ func isTerminalStreamError(err error) bool {
 	return errors.As(err, &cliErr)
 }
 
-func validateHTTPHeader(key, value string) error {
+func validateHTTPHeader(strategy, key, value string) error {
 	if !validHeaderFieldName(key) {
-		return invalidConfigf("invalid HTTP header name %q", key)
+		return invalidConfigf(strategy, "header name", key, "must be a valid HTTP header field name")
 	}
 	for i := 0; i < len(value); i++ {
 		if value[i] == '\t' {
 			continue
 		}
 		if value[i] < 0x20 || value[i] == 0x7f {
-			return invalidConfigf("invalid HTTP header value for %q", key)
+			return invalidConfigf(strategy, "header value for "+key, "", "must not contain control characters")
 		}
 	}
 	return nil
@@ -123,7 +130,7 @@ func ValidateWithPorts(strategy Strategy, ports []string) error {
 	}
 	allowed := make(map[string]struct{}, len(ports))
 	for _, port := range ports {
-		canonical, err := canonicalPortSpec(port)
+		canonical, err := canonicalPortSpec("", port)
 		if err != nil {
 			return err
 		}
@@ -134,7 +141,7 @@ func ValidateWithPorts(strategy Strategy, ports []string) error {
 
 func validateStrategy(strategy Strategy) error {
 	if isNilStrategy(strategy) {
-		return invalidConfigf("strategy must not be nil")
+		return invalidConfigf("", "strategy", "", "must not be nil")
 	}
 	validator, ok := strategy.(strategyValidator)
 	if !ok {
@@ -165,13 +172,13 @@ func validateStrategies(strategies []Strategy) error {
 	return nil
 }
 
-func canonicalPortSpec(port string) (string, error) {
+func canonicalPortSpec(strategy, port string) (string, error) {
 	if port == "" {
-		return "", invalidConfigf("port must not be empty")
+		return "", invalidConfigf(strategy, "port specification", port, "port must not be empty")
 	}
 	spec, err := portspec.Parse(port)
 	if err != nil {
-		return "", invalidConfigf("%s", err)
+		return "", invalidConfigf(strategy, "port specification", port, "%s", err)
 	}
 	return strconv.Itoa(spec.Port) + "/" + spec.Protocol, nil
 }
@@ -180,14 +187,14 @@ func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error
 	switch s := strategy.(type) {
 	case *HostPortStrategy:
 		if s.portSet {
-			return requireWaitPort(allowed, s.port)
+			return requireWaitPort("ForListeningPort", allowed, s.port)
 		}
 		return requireWaitTCPPort(allowed)
 	case *HTTPStrategy:
 		if !s.portSet {
 			return requireWaitTCPPort(allowed)
 		}
-		return requireWaitPort(allowed, s.port)
+		return requireWaitPort("ForHTTP", allowed, s.port)
 	case *AllStrategy:
 		for i, child := range s.strategies {
 			if err := validateStrategyPorts(child, allowed); err != nil {
@@ -204,8 +211,8 @@ func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error
 	return nil
 }
 
-func requireWaitPort(allowed map[string]struct{}, port string) error {
-	canonical, err := canonicalPortSpec(port)
+func requireWaitPort(strategy string, allowed map[string]struct{}, port string) error {
+	canonical, err := canonicalPortSpec(strategy, port)
 	if err != nil {
 		return err
 	}

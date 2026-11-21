@@ -99,7 +99,7 @@ func (s *HostPortStrategy) WithHostOnly() *HostPortStrategy {
 func (s *HostPortStrategy) DiagnosticValues() []string { return []string{s.port} }
 
 func (s *HostPortStrategy) validate() error {
-	if err := s.options.validate(); err != nil {
+	if err := s.options.validate("ForListeningPort"); err != nil {
 		return err
 	}
 	if s.portSet {

@@ -924,14 +924,22 @@ and compatibility checks, so a replacement during the wait is not adopted.
 reuse container can still be deleted and recreated, and
 `PruneReuseGroup` can still remove the group.
 
-For Apple, inspect plus delete runs under a per-name `flock` in a persistent,
-user-scoped lock directory, with the container name hashed into the filename.
-That protects the ordinary
+For Apple, inspect plus delete runs under a per-name `flock` in a persistent
+lock directory at `<UserCacheDir>/containergo/locks`. The container name selects
+one of a fixed set of hash buckets, so the lock directory cannot accumulate one
+inode per name and is not a fixed path in a world-writable temporary directory.
+A bucket collision only serializes unrelated names; it does not weaken the
+exclusion, but a reaper that hits a collision waits behind the unrelated
+creation and its bounded lock wait can leave that deletion for a later pass. That protects the ordinary
 generation-checked `Terminate` and failed-create cleanup paths from
 cooperating library processes on the same host, and the same per-name lock
 covers Apple `Prune` and `PruneReuseGroup` candidate deletion. The reaper
-uses the same lock for name-addressed entries. An external `container
-delete` plus re-create in the same window remains outside the guarantee.
+uses the same lock and rejects a lock file that is not a regular file owned by
+the current user with mode 0600. Processes that resolve a different cache
+directory (for example a different `HOME` or `XDG_CACHE_HOME`) must set
+`CONTAINERGO_LOCK_DIR` to the same path to share the lock namespace. An
+external `container delete` plus re-create in the same window remains outside
+the guarantee.
 A Docker handle deletes by the immutable `Id` printed by `docker run` or
 verified by inspect, so a same-name replacement does not share the
 deletion target. Every Docker backend operation on the handle uses that

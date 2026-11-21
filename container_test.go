@@ -37,6 +37,20 @@ func TestMain(m *testing.M) {
 	os.Unsetenv("CONTAINERGO_BACKEND")
 	os.Unsetenv(defaultPlatformEnv)
 	os.Unsetenv("CONTAINERGO_KEEP")
+	// Keep the name lock out of the developer's cache directory so unit
+	// tests cannot depend on (or disturb) the host's cache permissions. A
+	// test that isolates its own lock directory passes the override on to
+	// its helper processes, so do not replace a value that is already set.
+	// The directory is left for the OS to clean up: a reaper drains its
+	// entries after this process exits, and it needs the directory then.
+	if os.Getenv("CONTAINERGO_LOCK_DIR") == "" {
+		lockDir, err := os.MkdirTemp("", "container-go-test-locks-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Setenv("CONTAINERGO_LOCK_DIR", lockDir)
+	}
 	os.Exit(m.Run())
 }
 

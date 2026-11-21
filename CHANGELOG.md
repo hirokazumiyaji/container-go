@@ -14,6 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `O_NONBLOCK` so a FIFO swapped in at the path cannot block the open. File
   ownership is checked against the effective UID, matching the kernel's owner
   for setuid processes.
+- Move the cross-process name lock from a fixed `/tmp/container-go-<uid>` path
+  into the per-user cache directory, and require a private directory that this
+  user owns. Another local user can no longer pre-create the lock directory to
+  deny every locked operation. Cooperating processes that resolve a different
+  cache directory (for example a different `HOME` or `XDG_CACHE_HOME`) must set
+  `CONTAINERGO_LOCK_DIR` to the same path. A cache base that is group- or
+  world-writable, or that cannot be created, now fails the locked operation with
+  a hint to set `CONTAINERGO_LOCK_DIR`; processes running an older release use
+  the previous `/tmp` lock and therefore do not share the namespace during an
+  upgrade.
+- Validate the reaper lock file with the same owner, mode, and regular-file
+  checks as `lockName`, and open it with `O_NONBLOCK`. A substituted FIFO or
+  non-private file is rejected instead of blocking a delete.
 - Redact structural secrets in CLI diagnostics before trimming them. `CLIError`
   keeps a bounded trailing stderr window so a password prefix or private-key PEM
   header outside the rendered 64 KiB tail still reaches the redaction rules, and
@@ -41,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Bound name lock files to a fixed set of hash buckets. Creating containers with
+  new names no longer leaves one `.lock` inode per name behind, so a test suite
+  that generates random names stops leaking lock files.
 - Reject carriage returns, NUL bytes, and invalid UTF-8 in working directories,
   entrypoints, and command arguments with a `*ValidationError` before backend work,
   and fail wait probes immediately instead of retrying an invalid argument.

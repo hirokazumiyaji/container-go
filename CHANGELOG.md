@@ -170,6 +170,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every host that builds the POSIX copy helpers also defines `openCopyFile`.
   DragonFly BSD and illumos now build; AIX and Solaris still fail elsewhere
   because `env_lock_unix.go` uses `syscall.Flock`.
+- Reuse a running dynamic inspect snapshot for Docker `--network=host` and
+  port-less containers. Host networking reports no container IP or host
+  binding, so the 1-second cache previously never hit and every `Host`,
+  `Endpoint`, `MappedPort`, or `ContainerIP` read spawned another `inspect`
+  subprocess.
 
 ### Changed
 
@@ -234,6 +239,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switch that lists both types, an `any`-keyed map that distinguishes them, and
   `%T`/`reflect` output now see one type; `wait.StateTarget` implementations and
   explicit conversions still compile.
+- Reuse the verified post-create inspect for Apple image-identity checks and
+  reuse compatibility instead of spawning duplicate serial `inspect`
+  subprocesses during `Run` and `WithReuse`.
+- Resolve lifecycle, copy, exec, and log operation targets from immutable
+  handle state without taking the inspect lock, so they no longer wait behind
+  an in-flight inspect.
+- Back off `Container.Wait` lifecycle polling from 100 ms to a 1 s cap to
+  bound the CLI subprocesses spawned while a long-running container exits.
 
 
 ## [0.3.0] - 2026-10-26

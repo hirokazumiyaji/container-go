@@ -269,9 +269,11 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		// running the requested root digest. Docker enforces this via
 		// inspect; Apple uses the same post-bootstrap probe on fresh
 		// reuse adoption that verifyStrictCreatedImage closes for create.
+		// The caller's compatibility inspect already described this
+		// generation, so reuse it instead of spawning another inspect.
 		probe := namedContainer(cfg, cfg.name)
 		probe.image = resolvedImage
-		if err := verifyStrictCreatedImage(ctx, probe, resolvedImage); err != nil {
+		if err := verifyStrictCreatedImage(ctx, probe, resolvedImage, info); err != nil {
 			return nil, err
 		}
 	}
@@ -625,8 +627,10 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		dockerMeta:      cfg.dockerMeta,
 	}
 	ctr.applyConfigDiagnostics(cfg)
+	var createdInfo *engineInfo
 	if target, ok := runReaperTarget(cfg); ok {
-		if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
+		info, err := verifyCreatedOwnership(ctx, ctr, cfg)
+		if err != nil {
 			protectReuseReaper(cfg)
 			cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
 			if cleanupErr != nil {
@@ -634,6 +638,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 			}
 			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
+		createdInfo = info
 		_ = markSharedWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 		unregisterReuseFromGlobalReaper(cfg)
 	}
@@ -657,20 +662,23 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		// ownership and the flight layer carries this as a warning.
 		return ctr, &reuseCleanupWarning{err: envCleanupErr}
 	}
-	inspectCtx, inspectCancel := context.WithTimeout(ctx, cfg.effectiveReuseAttachTimeout())
-	defer inspectCancel()
-	var createdInfo *engineInfo
-	for {
-		var err error
-		createdInfo, err = ctr.inspectDynamicFresh(inspectCtx)
-		if err == nil {
-			break
-		}
-		if err := inspectRetryError(inspectCtx, err); err != nil {
-			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
-		}
-		if err := waitForReusePoll(inspectCtx, cfg.effectiveReusePollInterval()); err != nil {
-			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
+	if createdInfo == nil {
+		// Without an external reaper there was no ownership inspect to
+		// reuse, so obtain the post-create generation now.
+		inspectCtx, inspectCancel := context.WithTimeout(ctx, cfg.effectiveReuseAttachTimeout())
+		defer inspectCancel()
+		for {
+			var err error
+			createdInfo, err = ctr.inspectDynamicFresh(inspectCtx)
+			if err == nil {
+				break
+			}
+			if err := inspectRetryError(inspectCtx, err); err != nil {
+				return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
+			}
+			if err := waitForReusePoll(inspectCtx, cfg.effectiveReusePollInterval()); err != nil {
+				return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
+			}
 		}
 	}
 	if err := attachDefaultNetworkForConfig(ctx, cfg, createdInfo); err != nil {
@@ -680,7 +688,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	if err := checkReuseCompatIdentity(createdInfo, resolvedImage, image, cfg); err != nil {
 		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
 	}
-	if err := verifyStrictCreatedImage(context.WithoutCancel(ctx), ctr, resolvedImage); err != nil {
+	if err := verifyStrictCreatedImage(context.WithoutCancel(ctx), ctr, resolvedImage, createdInfo); err != nil {
 		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
 	}
 	if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {

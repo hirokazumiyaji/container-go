@@ -74,7 +74,7 @@ func TestCreatedOwnershipRetryKeepsOperationBudget(t *testing.T) {
 	cfg.reusePollInterval = 40 * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
+	if _, err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 2 {

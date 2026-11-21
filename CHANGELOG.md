@@ -308,6 +308,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strategy. Migrate `s.WithHeader("X-Tenant", tenant)` to
   `s = s.WithHeader("X-Tenant", tenant)` (the same applies to every builder,
   including `WithStartupTimeout` and `WithPollInterval`).
+- Extract the reuse state machine and compatibility decision into the pure
+  `internal/domain.DecideReuse` and `DecideReuseCompat` functions. `reuse.go`
+  gathers inspect, ownership, image-identity, network, and port facts first,
+  then only executes the selected create, attach, wait, recreate, or failure
+  step. The decision table is unit-tested without a container backend; reuse
+  behavior and the public API are unchanged.
 
 
 ## [0.3.0] - 2026-10-26

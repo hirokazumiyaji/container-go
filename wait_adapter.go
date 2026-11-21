@@ -39,6 +39,7 @@ var (
 	_ wait.StateTarget      = waitTarget{}
 	_ wait.PortListenTarget = waitTarget{}
 	_ wait.HealthTarget     = waitTarget{}
+	_ wait.ExecOutputTarget = waitTarget{}
 )
 
 // selectedPort resolves an empty port request the same way for Endpoint and
@@ -346,6 +347,19 @@ func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) 
 	// polling attempt.
 	code, _, err := t.c.ExecTo(ctx, cmd, io.Discard)
 	return code, waitTargetError(err)
+}
+
+// waitExecOutputLimit bounds the command output a wait matcher can inspect.
+// Readiness markers are short, so a command that prints unboundedly must not
+// turn a poll into a memory cost.
+const waitExecOutputLimit = 64 * 1024
+
+// ExecCommandOutput returns the command's combined stdout and stderr, capped
+// at waitExecOutputLimit bytes, for output-matching readiness probes.
+func (t waitTarget) ExecCommandOutput(ctx context.Context, cmd []string) (int, []byte, error) {
+	var output bytes.Buffer
+	code, _, err := t.c.ExecTo(ctx, cmd, &output, WithExecMaxBytes(waitExecOutputLimit))
+	return code, output.Bytes(), waitTargetError(err)
 }
 
 func waitTargetError(err error) error {

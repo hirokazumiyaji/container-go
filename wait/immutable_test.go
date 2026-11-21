@@ -1,6 +1,7 @@
 package wait
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sync"
@@ -221,6 +222,125 @@ func TestStrategyBuildersConcurrent(t *testing.T) {
 	if httpBase.startupTimeout != 0 || execBase.startupTimeout != 0 || logBase.occurrences != 1 ||
 		portBase.startupTimeout != 0 || healthBase.pollInterval != 0 ||
 		allBase.startupTimeout != 0 || anyBase.startupTimeout != 0 {
+		t.Error("a base strategy was mutated by concurrent builders")
+	}
+}
+
+// New builders added for issue #343 follow the same copy-on-write contract as
+// the original strategies.
+func TestNewStrategyBuildersDoNotMutateReceiver(t *testing.T) {
+	t.Run("Func", func(t *testing.T) {
+		base := ForFunc(func(context.Context, Target) error { return nil })
+		derived := base.WithStartupTimeout(time.Second).
+			WithPollInterval(time.Millisecond).
+			WithExitCheck(false)
+
+		if base.startupTimeout != 0 || base.pollInterval != 0 || !base.exitCheck {
+			t.Errorf("base strategy was mutated: %+v", base)
+		}
+		if derived.startupTimeout != time.Second || derived.pollInterval != time.Millisecond || derived.exitCheck {
+			t.Errorf("derived strategy = %+v", derived)
+		}
+		if derived.fn == nil {
+			t.Error("derived strategy lost the callback")
+		}
+	})
+
+	t.Run("SQL", func(t *testing.T) {
+		base := ForSQL("5432/tcp", fakeSQLDriverName, func(string, int) string { return "dsn" })
+		derived := base.WithStartupTimeout(time.Second).
+			WithPollInterval(time.Millisecond).
+			WithQuery("SELECT 1")
+
+		if base.startupTimeout != 0 || base.pollInterval != 0 ||
+			base.query != "" || base.querySet {
+			t.Errorf("base strategy was mutated: %+v", base)
+		}
+		if derived.startupTimeout != time.Second || derived.pollInterval != time.Millisecond ||
+			derived.query != "SELECT 1" || !derived.querySet {
+			t.Errorf("derived strategy = %+v", derived)
+		}
+	})
+
+	t.Run("Exec output", func(t *testing.T) {
+		base := ForExec([]string{"probe"})
+		contains := base.WithOutputContains("PONG")
+		matcher := base.WithResponseMatcher(func([]byte) bool { return true })
+
+		if base.outputMatcher != nil || base.outputContains != "" || base.outputContainsSet {
+			t.Errorf("base strategy was mutated: %+v", base)
+		}
+		if contains.outputMatcher == nil || contains.outputContains != "PONG" || !contains.outputContainsSet {
+			t.Errorf("WithOutputContains derived strategy = %+v", contains)
+		}
+		if matcher.outputMatcher == nil || matcher.outputContains != "" || matcher.outputContainsSet {
+			t.Errorf("WithResponseMatcher derived strategy = %+v", matcher)
+		}
+	})
+
+	t.Run("HTTP status and body", func(t *testing.T) {
+		body := []byte(`{"probe":true}`)
+		base := ForHTTP("/health")
+		derived := base.WithStatusCode(http.StatusNoContent).WithBody(body)
+		matcher := derived.WithStatusCodeMatcher(func(int) bool { return true })
+
+		if base.statusCodeSet || base.statusCode != 0 || base.bodySet || len(base.body) != 0 {
+			t.Errorf("base strategy was mutated: %+v", base)
+		}
+		if !derived.statusCodeSet || derived.statusCode != http.StatusNoContent ||
+			!derived.bodySet || string(derived.body) != string(body) {
+			t.Errorf("derived strategy = %+v", derived)
+		}
+		if !derived.statusCodeSet || derived.statusMatcher != nil {
+			t.Errorf("derived strategy was mutated by WithStatusCodeMatcher: %+v", derived)
+		}
+		if matcher.statusCodeSet || matcher.statusMatcher == nil {
+			t.Errorf("WithStatusCodeMatcher derived strategy = %+v", matcher)
+		}
+
+		body[0] = 'X'
+		if string(derived.body) != `{"probe":true}` {
+			t.Error("WithBody aliases the caller's slice")
+		}
+	})
+}
+
+func TestNewStrategyBuildersConcurrent(t *testing.T) {
+	funcBase := ForFunc(func(context.Context, Target) error { return nil })
+	sqlBase := ForSQL("5432/tcp", fakeSQLDriverName, func(string, int) string { return "dsn" })
+	execBase := ForExec([]string{"probe"})
+	httpBase := ForHTTP("/health")
+
+	const workers = 32
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tenant := fmt.Sprintf("tenant-%d", i)
+			timeout := time.Duration(i+1) * time.Millisecond
+
+			if got := funcBase.WithStartupTimeout(timeout).WithExitCheck(false); got.startupTimeout != timeout || got.exitCheck {
+				t.Errorf("Func derived strategy = %+v", got)
+			}
+			if got := sqlBase.WithQuery(tenant).WithPollInterval(timeout); got.query != tenant || got.pollInterval != timeout {
+				t.Errorf("SQL derived strategy = %+v", got)
+			}
+			if got := execBase.WithOutputContains(tenant); got.outputContains != tenant || !got.outputContainsSet {
+				t.Errorf("Exec derived strategy = %+v", got)
+			}
+			if got := httpBase.WithStatusCode(200 + i).WithBody([]byte(tenant)); got.statusCode != 200+i ||
+				!got.bodySet || string(got.body) != tenant {
+				t.Errorf("HTTP derived strategy = %+v", got)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if !funcBase.exitCheck || funcBase.startupTimeout != 0 ||
+		sqlBase.query != "" || sqlBase.querySet || sqlBase.pollInterval != 0 ||
+		execBase.outputMatcher != nil || execBase.outputContainsSet ||
+		httpBase.statusCodeSet || httpBase.bodySet {
 		t.Error("a base strategy was mutated by concurrent builders")
 	}
 }

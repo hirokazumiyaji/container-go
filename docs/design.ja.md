@@ -260,7 +260,7 @@ CLI の出力には、全量を保持する互換モードと、caller の sink 
 
 正の制限値は stdout と stderr の合計に適用する。保持上限に達した後も CLI 子プロセスは排水され続けるため、pipe が詰まって停止しない。bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の terminal read error として `ErrOutputTruncated` を返す。`OutputStats` は破棄されたデータを含む観測バイト数と truncation を表す。`FollowLogs` は長期ストリームであり、byte 上限を意図的に設けない。sink の書き込みエラーは成功結果に変換せず、`RunTo`、`ExecTo`、`LogsTo` は CLI の終端エラーを保持する。bounded snapshot API は infrastructure、cancellation、launch、missing-container エラー時も partial reader と truncation state を返す。
 
-wait adapter は `ForExec` の出力を `ExecTo` で `io.Discard` へ送り、失敗診断のログだけを backend の bounded tail の末尾 1MiB として redact して保持する。CLI runner は `RunTo` で直接 streaming を提供する。旧 `Run` しか実装しない runner は互換 adapter を使うが、`Run` が戻る前に大きな slice を作るため peak memory の上限は保証できない。大きな出力の integration test は bounded forwarding と draining を確認するだけで、peak host memory を測定するものではない。RSS の測定には外部 sampler が必要である。
+wait adapter は既定では `ForExec` の出力を `ExecTo` で `io.Discard` へ送り、失敗診断のログだけを backend の bounded tail の末尾 1MiB として redact して保持する。出力 matcher が設定された場合は任意の `wait.ExecOutputTarget` として `ExecCommandOutput` を提供し、`WithExecMaxBytes` で保持する先頭を 64KiB に制限する。CLI runner は `RunTo` で直接 streaming を提供する。旧 `Run` しか実装しない runner は互換 adapter を使うが、`Run` が戻る前に大きな slice を作るため peak memory の上限は保証できない。大きな出力の integration test は bounded forwarding と draining を確認するだけで、peak host memory を測定するものではない。RSS の測定には外部 sampler が必要である。
 
 `LogsOptions` に `Tail` と `Since` に加えて `MaxBytes` を追加した。Go の構造体にはフィールドを追加しても旧 unkeyed literal を維持する仕組みがないため、この pre-1.0 リリースでは source break を明示的に受け入れる。呼び出しは keyed `LogsOptions` literal へ移行する。微妙に異なる二重の options 表現を維持するより、この選択の方が明確である。internal CLI diagnostic はさらに別で、各失敗 invocation の `CLIError` には分類用の末尾 stderr ウィンドウを有界に保持し、描画時に秘匿化したうえで末尾最大 64KiB を出力する。`Run` の全量出力と caller-owned `RunTo` sink の動作は変えない。
 
@@ -356,9 +356,11 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForLog(pattern)`：`FollowLogs` のストリームを読み、部分文字列（`AsRegexp` による正規表現も可）が現れるまで待つ。照合は行単位で行い、`WithOccurrence(n)` で出現回数を指定できる。ストリーム方式なので poll 方式ではない。
 - `wait.ForListeningPort(port)`：解決したエンドポイントへの TCP 接続と、対応する target ではコンテナ側の LISTEN 状態を確認する。`WithHostOnly` でコンテナ側の確認を省略できる。
 - `wait.ForExposedPort()`：最初の exposed TCP port を使い、TCP の exposed 宣言がなければ最初の published TCP port を選ぶ。
-- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定する。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。受理したレスポンスボディは `WithResponseMatcher` で最大 64KiB まで判定でき、false なら再試行する。
+- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` または単一コードの `WithStatusCode` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定し、`WithBody` で各 poll のリクエストボディを送る。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。受理したレスポンスボディは `WithResponseMatcher` で最大 64KiB まで判定でき、false なら再試行する。
 - `wait.ForHealthcheck()`：Docker の `HEALTHCHECK` が healthy になるまで待つ。`starting` の間は poll を続け、`unhealthy` は終端エラーになる。`HEALTHCHECK` を持たないイメージは `*wait.ConfigError` で即座に失敗し、Apple バックエンドはコンテナ作成前にこの戦略を拒否する。
-- `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。各試行の timeout は poll interval から 1〜5 秒の範囲で導出し、`WithExecTimeout` で上書きできる。
+- `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。各試行の timeout は poll interval から 1〜5 秒の範囲で導出し、`WithExecTimeout` で上書きできる。`WithResponseMatcher(func([]byte) bool)` と `WithOutputContains` を指定すると、終了コードの受理後にコマンド出力も判定する。これらは任意の `wait.ExecOutputTarget` インターフェースを使い、実装しない target には `*wait.ConfigError` を即座に返す。container adapter は最大 64KiB の出力を保持する。matcher を指定しない場合、出力は従来どおり破棄される。
+- `wait.ForFunc(fn)`：poll ごとに `fn(ctx, target)` を呼び、nil で準備完了とする。非 nil エラーは再試行し、timeout 時には最後のエラーを報告する。`context.Canceled` を包むエラーや、`ErrInvalidConfiguration` など恒久エラーとして分類されるエラーは即座に待機を終える。試行ごとの deadline エラーは再試行する。コンテナの終了そのものをコールバックで観測したい場合は `WithExitCheck(false)` で stopped コンテナのガードを無効化できるが、これは ForFunc 自身の poll に限られる。`ForAll` / `ForAny` は実 target に対して独自の lifecycle monitor と最終チェックを実行するため、合成戦略の中ではコンテナ終了時に失敗する。終了を観測する ForFunc は合成せず単独で使うこと。
+- `wait.ForSQL(port, driver, dsn)`：解決した host と port に対して `database/sql` の `db.PingContext`（または `WithQuery` の readiness 文）を poll する。各試行には 3 秒の deadline を渡すため、応答しない handshake は startup budget を消費せず再試行される。パッケージは driver を import せず、呼び出し側が driver を登録して名前を渡す。未登録の driver は `Validate`（したがってコンテナ作成前の `WithWaitStrategy`）と待機開始時の両方で `*wait.ConfigError` になる。`dsn(host, port)` が試行ごとに接続文字列を作り、host に IPv6 の角括弧は付かないため URL 形式では `net.JoinHostPort` を使う。戦略は待機ごとの状態を持たないので、同じ値を並行 wait で再利用できる。DSN とパスワード由来の派生値は、その wait のエラーの redaction にだけ登録され、後から上位ヘルパーが付ける log tail は対象外である。
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。合成 timeout が 0 または負の場合は合成全体を無制限とし、各子の timeout を適用する。
 
 すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を持つ。`ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間である。コンテナが stopping、stopped、paused の状態のいずれかになると、残りのタイムアウトを待たずに失敗する。created、restarting、unknown と一時的な inspect エラーは再試行し、一時的なログストリームの open と EOF は再-open する。終了コードを伴うログストリームエラーは返却する。成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理される。`ForLog` はワンショットジョブではなく長時間稼働するサービス向けである。`ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計する。再利用でない `Run` の待機が失敗した場合はコンテナをロールバックし、上限付き log の取得が成功した場合だけ 1MiB 上限の末尾をエラーに付ける。再利用の待機失敗では共有コンテナを残す。
@@ -391,6 +393,8 @@ type Strategy interface {
 port strategy は任意の `PortListenTarget` を使ってコンテナ側の LISTEN 状態を確認し、未対応の target では host 側の接続だけで判定する。
 Docker のヘルスチェック待機では、任意の `HealthTarget` インターフェースも実装する。
 `ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返す。
+`ForExec` の出力 matcher は任意の `ExecOutputTarget` インターフェースを使い、
+コマンド出力を返さないターゲットには `*wait.ConfigError` を返す。
 `container.Run` が `*container.Container` をこれらのインターフェースへ適合させる。
 依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避ける。
 
@@ -613,7 +617,7 @@ Unix では停止状態を確認したあと CLI の process group へベスト�
 Windows では保持した process handle で直接の CLI 子だけを終了し、descendant は終了しません。
 その他の対応 OS でも直接の子だけを対象とします。
 ForLog が診断用に保持するログは 1MiB を上限とする。
-`LogsOptions.MaxBytes`、`WithExecMaxBytes`、`ExecTo`、`LogsTo` は byte 上限（先頭 prefix のみ保持）または呼び出し元所有の sink を提供し、bounded capture は `Truncated` と `ErrOutputTruncated` で truncation を通知する。`ForExec` は `ExecTo` で出力を `io.Discard` へ送り、buffer しない。
+`LogsOptions.MaxBytes`、`WithExecMaxBytes`、`ExecTo`、`LogsTo` は byte 上限（先頭 prefix のみ保持）または呼び出し元所有の sink を提供し、bounded capture は `Truncated` と `ErrOutputTruncated` で truncation を通知する。`ForExec` は matcher を指定しない限り `ExecTo` で出力を `io.Discard` へ送り、buffer しない。出力 matcher を指定した場合は最大 64KiB の先頭だけを保持する。
 
 ストリームのエラーは 2 つの段階に分かれる。
 `Stream` と公開 API の `FollowLogs` は起動エラーを返す。

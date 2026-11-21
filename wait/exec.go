@@ -1,6 +1,7 @@
 package wait
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,13 +24,27 @@ const (
 	maxExecAttemptTimeout    = 5 * time.Second
 )
 
+// ExecOutputTarget is an optional extension to Target for targets that can
+// return a command's combined output. ForExec requires it only when an output
+// matcher is configured, so targets that discard output keep working without
+// changes. Implementations may bound the retained output; a matcher sees only
+// the bytes the target reports, so a marker beyond that bound can never be
+// observed. The container adapter retains at most 64 KiB.
+type ExecOutputTarget interface {
+	ExecCommandOutput(ctx context.Context, cmd []string) (code int, output []byte, err error)
+}
+
 // ExecStrategy waits until a command run inside the container exits
-// with an accepted code (0 by default).
+// with an accepted code (0 by default) and, when configured, produces
+// acceptable output.
 type ExecStrategy struct {
 	options
-	cmd         []string
-	exitMatcher func(int) bool
-	execTimeout time.Duration
+	cmd               []string
+	exitMatcher       func(int) bool
+	outputMatcher     func([]byte) bool
+	outputContains    string
+	outputContainsSet bool
+	execTimeout       time.Duration
 }
 
 // ForExec waits for cmd to succeed inside the container.
@@ -53,6 +68,29 @@ func (s *ExecStrategy) clone() *ExecStrategy {
 func (s *ExecStrategy) WithExitCodeMatcher(matcher func(code int) bool) *ExecStrategy {
 	cloned := s.clone()
 	cloned.exitMatcher = matcher
+	return cloned
+}
+
+// WithResponseMatcher accepts a poll only when matcher reports true for the
+// command's output. The matcher runs only after the exit-code matcher accepts,
+// so a rejected exit code stays the reported cause. ForExec needs an
+// ExecOutputTarget for this; a target without it fails immediately with a
+// *ConfigError. Without an output matcher, output is discarded as before.
+func (s *ExecStrategy) WithResponseMatcher(matcher func(output []byte) bool) *ExecStrategy {
+	cloned := s.clone()
+	cloned.outputMatcher = matcher
+	cloned.outputContains, cloned.outputContainsSet = "", false
+	return cloned
+}
+
+// WithOutputContains accepts a poll only when the command's output contains
+// substr. It is shorthand for WithResponseMatcher over bytes.Contains. An
+// empty substr is rejected as a *ConfigError because it would accept any
+// output.
+func (s *ExecStrategy) WithOutputContains(substr string) *ExecStrategy {
+	cloned := s.clone()
+	cloned.outputContains, cloned.outputContainsSet = substr, true
+	cloned.outputMatcher = func(output []byte) bool { return bytes.Contains(output, []byte(substr)) }
 	return cloned
 }
 
@@ -130,6 +168,13 @@ func (s *ExecStrategy) validate() error {
 			Reason:   "executable must not be empty",
 		}
 	}
+	if s.outputContainsSet && s.outputContains == "" {
+		return &ConfigError{
+			Strategy: "ForExec",
+			Field:    "output substring",
+			Reason:   "output substring must not be empty",
+		}
+	}
 	return nil
 }
 
@@ -142,6 +187,19 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 	if matcher == nil {
 		matcher = func(code int) bool { return code == 0 }
 	}
+	var outputTarget ExecOutputTarget
+	if s.outputMatcher != nil {
+		var ok bool
+		outputTarget, ok = target.(ExecOutputTarget)
+		if !ok {
+			return &ConfigError{
+				Strategy: "ForExec",
+				Field:    "target",
+				Value:    fmt.Sprintf("%T", target),
+				Reason:   "target does not report exec output; cannot apply an output matcher",
+			}
+		}
+	}
 	pollOptions := s.options
 	if pollOptions.pollInterval == 0 {
 		pollOptions.pollInterval = defaultExecPollInterval
@@ -149,7 +207,14 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 	attemptTimeout := s.attemptTimeout()
 	return poll(ctx, pollOptions, target, fmt.Sprintf("wait for exec %v", s.cmd), func(ctx context.Context) error {
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		code, err := target.ExecCommand(attemptCtx, s.cmd)
+		var code int
+		var output []byte
+		var err error
+		if outputTarget != nil {
+			code, output, err = outputTarget.ExecCommandOutput(attemptCtx, s.cmd)
+		} else {
+			code, err = target.ExecCommand(attemptCtx, s.cmd)
+		}
 		attemptErr := attemptCtx.Err()
 		cancel()
 		if attemptErr != nil {
@@ -180,6 +245,9 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 		}
 		if !matcher(code) {
 			return fmt.Errorf("exit code %d not accepted", code)
+		}
+		if s.outputMatcher != nil && !s.outputMatcher(output) {
+			return fmt.Errorf("exit code %d accepted but command output rejected", code)
 		}
 		return nil
 	})

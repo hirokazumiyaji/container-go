@@ -3,8 +3,11 @@
 package container
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // configureReaperProcess gives each reaper shell its own process group.
@@ -21,15 +24,29 @@ func configureReaperProcess(cmd *exec.Cmd) {
 // it before its PID can be reused; this function must not hold or signal
 // numeric descendant PIDs.
 func killReaperProcess(cmd *exec.Cmd) {
+	killReaperProcessWithObserver(cmd, cli.ObserveProcessStopped)
+}
+
+// killReaperProcessWithObserver is the test seam for the stopped-state
+// barrier. SIGSTOP is asynchronous: a group signal sent before the leader
+// has actually stopped can let an in-flight backend command fork a
+// descendant that the numeric PGID teardown then misses. The group signal
+// is therefore issued only after the stop has been observed, and the
+// direct handle is the fail-closed fallback when it cannot be.
+func killReaperProcessWithObserver(cmd *exec.Cmd, observe func(*os.Process) (bool, error)) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	// Stop the leader first. A stopped process cannot exit, so its PID (and
 	// therefore the PGID, which Setpgid made equal to it) cannot be recycled
-	// between this check and the group signal. Signal uses the retained
+	// between the observation and the group signal. Signal uses the retained
 	// *os.Process, so an already-reaped command reports ErrProcessDone and
 	// the numeric group is never touched.
 	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		_ = cmd.Process.Kill()
+		return
+	}
+	if stopped, err := observe(cmd.Process); err != nil || !stopped {
 		_ = cmd.Process.Kill()
 		return
 	}

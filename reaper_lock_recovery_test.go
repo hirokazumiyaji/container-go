@@ -55,7 +55,7 @@ func TestReaperSpawnRecoveryIsBoundedAndReplaysEntries(t *testing.T) {
 		if failSpawn {
 			return nil, errors.New("synthetic reaper spawn failure")
 		}
-		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), "1", "1"}
+		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, creationLabel, "1", "1"}
 		args = append(args, r.deleteFlags...)
 		return exec.Command("/bin/sh", args...), nil
 	}

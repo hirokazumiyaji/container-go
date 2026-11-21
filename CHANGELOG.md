@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is still redacted.
 - Redact sensitive argv in `internal/cli` stream setup, cancellation, and terminal
   wait diagnostics instead of embedding the raw command line.
+- Bound the watchdog reaper's `flock` acquisition with a 30-second timeout and
+  confirm the reaper shell has stopped before signaling its process group, so a
+  wedged lock holder cannot stall later cleanup and an in-flight backend child
+  cannot race the group teardown (#332). An entry skipped by a lock timeout is
+  reported on stderr. Where stop observation is unavailable (BSD, Solaris, or
+  Linux without pidfd), only the direct reaper process is terminated, so helper
+  processes in its group may survive.
 
 ### Added
 
@@ -67,6 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and fail wait probes immediately instead of retrying an invalid argument.
 - Preserve `float64` and `float32` validation values through redaction so a
   rejected `WithCPUs` value remains inspectable on `ValidationError.Value`.
+- Drop a watchdog reaper entry before writing its removal event so a failed pipe
+  write cannot replay a container that was already deleted (#332).
+- Project reaper inspect output by JSON object depth and string boundaries, so
+  compact one-line output and nested `Id` fields cannot hide or misattribute the
+  delete target (#332).
 - Preserve non-CLI configuration and ambiguous-object vetoes at any wrapper depth
   when classifying CLI absence errors.
 - Retry inspection-query deadlines while the enclosing verification or reuse

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -159,8 +160,12 @@ func TestReaperSIGKILLDoesNotStageInspectSecrets(t *testing.T) {
 	t.Setenv("REAPER_TEST_DONE", done)
 	script := "#!/bin/sh\n" +
 		"if [ \"$1\" = inspect ]; then\n" +
-		"  echo '  \"environment\": [\"PASSWORD=" + secret + "\"]'\n" +
-		"  echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'\n" +
+		"  echo '['\n" +
+		"  echo '  {'\n" +
+		"  echo '    \"environment\": [\"PASSWORD=" + secret + "\"],'\n" +
+		"  echo '    \"" + creationLabel + "\": \"0123456789abcdef\"'\n" +
+		"  echo '  }'\n" +
+		"  echo ']'\n" +
 		"  : > \"$REAPER_TEST_STARTED\"\n" +
 		"  while [ ! -e \"$REAPER_TEST_RELEASE\" ]; do sleep 1; done\n" +
 		"  : > \"$REAPER_TEST_DONE\"\n" +
@@ -210,17 +215,28 @@ func TestReaperSIGKILLDoesNotStageInspectSecrets(t *testing.T) {
 	}
 }
 
-func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
+func TestReaperScriptHasTimeoutAndStructuralJSONMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, `sleep "$seconds"`) || !strings.Contains(reaperScript, "kill -9") {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
 	}
-	// The creation label must be read as a structural JSON field, anchored
-	// at line start on the quoted key, and compared for exact equality.
-	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
-		t.Error("reaper script must anchor the creation label match on the quoted key")
+	// Inspect output is projected by object depth and string boundaries. A
+	// line-anchored sed expression only matched indented multi-line JSON, so
+	// compact output hid the generation and a nested "Id" could be chosen.
+	if strings.Contains(reaperScript, "sed -n") {
+		t.Error("reaper script must not depend on line-anchored sed JSON parsing")
+	}
+	if !strings.Contains(reaperScript, `awk -v want_key="$key"`) ||
+		!strings.Contains(reaperScript, `project(last_key, depth, text)`) {
+		t.Error("reaper script must project inspect JSON structurally")
 	}
 	if !strings.Contains(reaperScript, `[ "$got" = "$entry_creation" ] || return 0`) {
 		t.Error("reaper script must compare the extracted generation exactly")
+	}
+	// One wedged lock holder must not stall every entry behind it, so lock
+	// acquisition needs the same bounded timeout as the lockf fallback.
+	if !strings.Contains(reaperScript, `lock_timeout=30`) ||
+		!strings.Contains(reaperScript, `"$flock_bin" -x -w "$lock_timeout"`) {
+		t.Error("reaper script must bound flock acquisition with a timeout")
 	}
 	if strings.Contains(reaperScript, "mktemp") {
 		t.Error("reaper must not stage raw inspect output")
@@ -238,12 +254,6 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	reapAt := strings.Index(reaperScript, `run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &`)
 	if budgetAt < 0 || reapAt < 0 || budgetAt >= reapAt {
 		t.Error("reaper script must arm the overall budget before concurrent reap work")
-	}
-}
-
-func TestBreQuoteEscapesLabelKey(t *testing.T) {
-	if got := breQuote("com.github.x-y"); got != `com\.github\.x-y` {
-		t.Errorf("breQuote = %q", got)
 	}
 }
 
@@ -385,8 +395,18 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
 		"if [ \"$1\" = \"inspect\" ]; then\n" +
-		"  echo '    \"Id\": \"" + uid + "\",'\n" +
-		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"  cat <<'JSON'\n" +
+		"[\n" +
+		"  {\n" +
+		"    \"Id\": \"" + uid + "\",\n" +
+		"    \"Config\": {\n" +
+		"      \"Labels\": {\n" +
+		"        \"" + creationLabel + "\": \"" + creation + "\"\n" +
+		"      }\n" +
+		"    }\n" +
+		"  }\n" +
+		"]\n" +
+		"JSON\n" +
 		"fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -533,6 +553,48 @@ func TestReaperUnregisterRemovesCompletedEntryFromEOF(t *testing.T) {
 	data, _ := os.ReadFile(logPath)
 	if strings.Contains(string(data), "delete --force completed") {
 		t.Fatalf("reaper deleted completed entry: %q", data)
+	}
+}
+
+// failingReaperStdin stands in for a reaper pipe whose reader is gone.
+type failingReaperStdin struct {
+	writes int
+}
+
+func (w *failingReaperStdin) Write([]byte) (int, error) {
+	w.writes++
+	return 0, io.ErrClosedPipe
+}
+
+func (*failingReaperStdin) Close() error { return nil }
+
+// TestReaperUnregisterRemovesEntryWhenRemovalWriteFails is the regression
+// for replaying an unregistered entry: the delete is already confirmed, so
+// the entry must leave the replay set before the removal write. A broken
+// pipe then respawns with only the remaining targets instead of resurrecting
+// a container the caller already deleted.
+func TestReaperUnregisterRemovesEntryWhenRemovalWriteFails(t *testing.T) {
+	r := newReaper("unused", "delete")
+	r.entries = []reaperEntry{{id: "removed"}, {id: "retained"}}
+	stdin := &failingReaperStdin{}
+	r.stdin = stdin
+	r.exited = make(chan struct{}) // open, so unregister takes the write path
+	r.spawnCommand = func() (*exec.Cmd, error) {
+		return nil, errors.New("synthetic respawn failure")
+	}
+
+	err := r.unregister("removed", "")
+	if !errors.Is(err, errReaperSpawnFailed) {
+		t.Fatalf("unregister error = %v, want repeated spawn failure", err)
+	}
+	if stdin.writes != 1 {
+		t.Fatalf("removal writes = %d, want 1", stdin.writes)
+	}
+	r.mu.Lock()
+	entries := append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 1 || entries[0].id != "retained" {
+		t.Fatalf("retained entries = %+v, want only the untouched entry", entries)
 	}
 }
 

@@ -55,6 +55,9 @@ case "$timeout" in ''|*[!0-9]*) timeout=30;; esac
 case "$pending_attempts" in ''|*[!0-9]*) pending_attempts=30;; esac
 [ "$timeout" -gt 0 ] 2>/dev/null || timeout=30
 [ "$pending_attempts" -gt 0 ] 2>/dev/null || pending_attempts=1
+# Bound lock acquisition like the lockf fallback always did: a lock held by
+# a wedged process must not stall every entry behind it forever.
+lock_timeout=30
 tab=$(printf '\t')
 # Overall reap budget and bounded concurrency. Both apply only after
 # EOF (the awk END below), so a long-lived parent does not spend them.
@@ -146,10 +149,93 @@ inspect_projection() {
     run_with_timeout 10 "$bin" inspect "$inspect_id" 2>/dev/null
     inspect_rc=$?
     printf '\n__containergo_inspect_rc__%s\n' "$inspect_rc"
-  } | sed -n \
-    -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/creation=\1/p" \
-    -e 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/id=\1/p' \
-    -e 's/^__containergo_inspect_rc__\([0-9][0-9]*\)$/rc=\1/p'
+  } | awk -v want_key="$key" '
+    # Project only the fields the delete gate needs. A character-level scan
+    # tracks object depth and string boundaries, so compact one-line JSON
+    # works and a nested "Id" or a value that merely contains a key cannot
+    # be mistaken for a top-level field.
+    function project(seen_key, seen_depth, seen_value) {
+      if (seen_depth == 2 && seen_key == "Id" && length(seen_value) == 64 && seen_value !~ /[^0-9a-f]/) {
+        printf "id=%s\n", seen_value
+      }
+      if (seen_key == want_key && length(seen_value) == 16 && seen_value !~ /[^0-9a-f]/) {
+        printf "creation=%s\n", seen_value
+      }
+    }
+    BEGIN {
+      marker = "__containergo_inspect_rc__"
+      marker_len = length(marker)
+      depth = 0
+      in_string = 0
+      escaped = 0
+      saw_colon = 0
+      is_value = 0
+      text = ""
+      last_key = ""
+    }
+    {
+      if (!in_string && depth == 0 && $0 ~ /^__containergo_inspect_rc__[0-9]+$/) {
+        printf "rc=%s\n", substr($0, marker_len + 1)
+        next
+      }
+      line = $0
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (in_string) {
+          if (escaped) {
+            text = text c
+            escaped = 0
+            continue
+          }
+          if (c == "\\") {
+            escaped = 1
+            continue
+          }
+          if (c == "\"") {
+            in_string = 0
+            if (is_value) {
+              project(last_key, depth, text)
+              is_value = 0
+            } else {
+              last_key = text
+            }
+            saw_colon = 0
+            continue
+          }
+          text = text c
+          continue
+        }
+        if (c == "\"") {
+          in_string = 1
+          text = ""
+          is_value = saw_colon
+          continue
+        }
+        if (c == ":") {
+          saw_colon = 1
+          continue
+        }
+        if (c == ",") {
+          saw_colon = 0
+          continue
+        }
+        if (c == "{" || c == "[") {
+          depth++
+          saw_colon = 0
+          continue
+        }
+        if (c == "}" || c == "]") {
+          if (depth > 0) depth--
+          saw_colon = 0
+          continue
+        }
+        if (c != " " && c != "\t") {
+          saw_colon = 0
+        }
+      }
+    }
+  '
 }
 
 process_entry() {
@@ -235,9 +321,11 @@ reap_entry() {
     if [ -n "$flock_bin" ]; then
       REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
       REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
-        "$flock_bin" -x "$entry_lock" sh -c "$entry_script" reaper-entry \
-        "$entry_id" "$entry_creation" "$pending" "$@"
-      return $?
+        "$flock_bin" -x -w "$lock_timeout" "$entry_lock" sh -c "$entry_script" reaper-entry \
+        "$entry_id" "$entry_creation" "$pending" "$@" || {
+          echo "container-go: reaper lock timed out; skipping one entry" >&2
+        }
+      return 0
     fi
     lockf_bin=$(command -v lockf 2>/dev/null) || lockf_bin=
     case "$lockf_bin" in
@@ -247,9 +335,11 @@ reap_entry() {
     if [ -n "$lockf_bin" ]; then
       REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
       REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
-        "$lockf_bin" -k -t 30 "$entry_lock" sh -c "$entry_script" reaper-entry \
-        "$entry_id" "$entry_creation" "$pending" "$@"
-      return $?
+        "$lockf_bin" -k -t "$lock_timeout" "$entry_lock" sh -c "$entry_script" reaper-entry \
+        "$entry_id" "$entry_creation" "$pending" "$@" || {
+          echo "container-go: reaper lock timed out; skipping one entry" >&2
+        }
+      return 0
     else
       return 0
     fi
@@ -398,18 +488,6 @@ var (
 	errReaperSpawnFailed   = errors.New("reaper: giving up after repeated spawn failures")
 )
 
-// breQuote escapes a literal for use inside the reaper's sed basic
-// regular expression, so the label key's dots match only dots.
-func breQuote(s string) string {
-	var b strings.Builder
-	for _, c := range s {
-		if strings.ContainsRune(`\.*[]^$/`, c) {
-			b.WriteByte('\\')
-		}
-		b.WriteRune(c)
-	}
-	return b.String()
-}
 
 type reaperEntry struct {
 	id       string
@@ -763,16 +841,15 @@ func (r *reaper) unregister(id, creation string) error {
 	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
 	r.mu.Unlock()
 
+	// The caller has decided this entry must not be reaped, whether the
+	// container was deleted, reused, or never created. Drop it from the
+	// replay set before notifying the child so a failed pipe write cannot
+	// resurrect the entry.
+	r.removeEntryLocked(entry)
 	if closed {
-		r.removeEntryLocked(entry)
 		return nil
 	}
-	// If the child is already gone, the confirmed delete cannot be
-	// undone by a later replay; remove the durable intent immediately.
-	// A live child, however, keeps the record until it accepts the
-	// removal event so an uncertain pipe failure cannot lose cleanup.
 	if stdin == nil || channelClosed(exited) {
-		r.removeEntryLocked(entry)
 		if r.entriesEmpty() {
 			// With no retained targets there is no fail-closed state to
 			// preserve; a later registration may start a fresh bounded
@@ -782,12 +859,8 @@ func (r *reaper) unregister(id, creation string) error {
 		}
 		return nil
 	}
-	// Keep the entry in memory until the removal event is accepted by
-	// the child. If the pipe write fails, replay the retained entry
-	// instead of silently losing a pending cleanup guarantee.
 	if failures < maxReaperSpawnFailures {
 		if err := writeReaperRemoval(stdin, entry); err == nil {
-			r.removeEntryLocked(entry)
 			r.clearSpawnFailure()
 			if r.entriesEmpty() {
 				r.stopCurrentProcess()
@@ -1022,7 +1095,7 @@ func (r *reaper) spawnLocked() error {
 		if attempts <= 0 {
 			attempts = 1
 		}
-		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout), strconv.Itoa(attempts)}
+		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, creationLabel, strconv.Itoa(timeout), strconv.Itoa(attempts)}
 		args = append(args, r.deleteFlags...)
 		cmd = exec.Command("/bin/sh", args...)
 		if len(r.env) > 0 {

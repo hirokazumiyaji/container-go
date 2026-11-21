@@ -16,7 +16,7 @@ func TestAppleValidateConfigIsPure(t *testing.T) {
 	cfg.runner = runner
 	before := *cfg
 
-	if err := (appleEngine{}).validateConfig(cfg); err != nil {
+	if err := (appleEngine{}).validateConfig(cfg, cfg.platform != ""); err != nil {
 		t.Fatalf("validateConfig: %v", err)
 	}
 	if got := runner.count(); got != 0 {
@@ -47,7 +47,7 @@ func TestAppleValidateConfigRejectsWithoutBackendIO(t *testing.T) {
 	cfg := appleCapabilityConfig(t, WithName("a"))
 	cfg.runner = runner
 
-	err := (appleEngine{}).validateConfig(cfg)
+	err := (appleEngine{}).validateConfig(cfg, cfg.platform != "")
 	if err == nil || !strings.Contains(err.Error(), "2-63") {
 		t.Fatalf("validateConfig error = %v, want Apple name contract", err)
 	}

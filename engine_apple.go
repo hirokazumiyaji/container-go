@@ -87,7 +87,7 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 		}
 		return appleValidationError(defaultPlatformEnv, os.Getenv(defaultPlatformEnv), "%v", err)
 	}
-	if err := (appleEngine{}).validateConfig(cfg); err != nil {
+	if err := (appleEngine{}).validateConfig(cfg, explicitPlatform); err != nil {
 		return err
 	}
 	if cfg.platform != "" {
@@ -103,7 +103,7 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 //
 // It is the pure core of checkConfig: it reads only cfg, runs no subprocess,
 // and never mutates cfg.
-func (appleEngine) validateConfig(cfg *config) error {
+func (appleEngine) validateConfig(cfg *config, explicitPlatform bool) error {
 	if wait.RequiresHealthcheck(cfg.waitStrategy) {
 		return appleCapabilityError(ErrUnsupportedCapability, "WithWaitStrategy", "wait strategy", "ForHealthcheck",
 			"Apple Container has no HEALTHCHECK; wait.ForHealthcheck requires the Docker backend")

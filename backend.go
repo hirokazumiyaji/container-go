@@ -74,20 +74,23 @@ func effectiveRunner(configured Runner, binary string, eng engine) Runner {
 // applyEngineRunnerEnv points the default runner at the selected engine's
 // target environment. A backend without an addressable target pins nothing.
 func applyEngineRunnerEnv(cfg *config) {
-	cfg.runner = pinRunnerTargetEnv(cfg.eng, cfg.runner)
+	cfg.runner = pinRunnerTargetEnv(cfg.eng.target(), cfg.runner)
 }
 
-// pinRunnerTargetEnv returns an ExecRunner anchored to eng's target
-// environment. Prune has no --host/--context flag, so without this a
-// caller-supplied ExecRunner would use whatever the ambient environment
-// points at. Other runner types are returned unchanged because their
-// environment is opaque.
-func pinRunnerTargetEnv(eng engine, r Runner) Runner {
+// pinRunnerTargetEnv returns an ExecRunner anchored to target's environment.
+// Prune has no --host/--context flag, so without this a caller-supplied
+// ExecRunner would use whatever the ambient environment points at. A nil
+// target pins nothing; other runner types are returned unchanged because
+// their environment is opaque.
+func pinRunnerTargetEnv(target engineTarget, r Runner) Runner {
+	if target == nil {
+		return r
+	}
 	er, ok := r.(*cli.ExecRunner)
 	if !ok {
 		return r
 	}
-	targetEnv := eng.pinnedTargetEnv()
+	targetEnv := target.pinnedTargetEnv()
 	if len(targetEnv) == 0 {
 		return r
 	}
@@ -96,8 +99,17 @@ func pinRunnerTargetEnv(eng engine, r Runner) Runner {
 	return &pinned
 }
 
+// targetPinnedEnv returns the child environment that pins eng's target, or nil
+// when the backend has no target scope.
+func targetPinnedEnv(eng engine) []string {
+	if target := eng.target(); target != nil {
+		return target.pinnedTargetEnv()
+	}
+	return nil
+}
+
 func defaultRunnerFor(eng engine) cli.Runner {
-	return &cli.ExecRunner{Binary: eng.binary(), Env: eng.pinnedTargetEnv()}
+	return &cli.ExecRunner{Binary: eng.binary(), Env: targetPinnedEnv(eng)}
 }
 
 func detectEngineFor(goos, value string) (engine, error) {

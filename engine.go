@@ -171,6 +171,42 @@ type boundPort struct {
 	hostPort      int
 }
 
+// engineTarget is the daemon target scope a backend may own: the child
+// environment that pins its CLI, explicit and ambient target configuration,
+// implicit target resolution, and the values diagnostics must redact. Apple
+// Container has one local service and no externally addressable target, so it
+// returns nil from engine.target() and shared code branches on that instead of
+// calling no-op implementations.
+type engineTarget interface {
+	// pinnedTargetEnv returns the child environment that pins this target.
+	pinnedTargetEnv() []string
+	// configureTarget applies explicit client target overrides.
+	configureTarget(target engineTargetOverride) engine
+	// freezeTargetEnvironment snapshots ambient target settings so a Client
+	// keeps addressing the same target after the process environment changes.
+	freezeTargetEnvironment() engine
+	// resolveTargetEngine resolves the backend target this operation will
+	// address.
+	resolveTargetEngine(ctx context.Context, runner cli.Runner) (engine, error)
+	// preparePruneTarget resolves the target a prune will address, tolerating
+	// an implicit target the runner's own CLI can still resolve.
+	preparePruneTarget(ctx context.Context, runner cli.Runner, timeout time.Duration) (engine, error)
+	// targetHost, targetContext, and targetConfigDir report configured target
+	// components for validation and diagnostics.
+	targetHost() string
+	targetContext() string
+	targetConfigDir() string
+	// diagnosticTargetValues returns target components that must be redacted
+	// from diagnostics.
+	diagnosticTargetValues() []string
+	// diagnosticBoundaryValues returns target components that may straddle a
+	// bounded streaming window.
+	diagnosticBoundaryValues() []string
+	// runnerDiagnosticValues returns target components contributed by a
+	// runner's own environment.
+	runnerDiagnosticValues(runner cli.Runner) (values, boundary []string)
+}
+
 // engine encapsulates what differs between container backends: how CLI
 // argv vectors are built and how inspect output is read. Process
 // execution, waiting, validation, and cleanup are shared.
@@ -290,34 +326,12 @@ type engine interface {
 	// type or comparing name().
 	capabilities() engineCapabilities
 
-	// pinnedTargetEnv returns the child environment that pins this backend's
-	// target, or nil when the backend has no externally addressable target.
-	pinnedTargetEnv() []string
-	// configureTarget applies explicit client target overrides.
-	configureTarget(target engineTargetOverride) engine
-	// freezeTargetEnvironment snapshots ambient target settings so a Client
-	// keeps addressing the same target after the process environment changes.
-	freezeTargetEnvironment() engine
-	// resolveTargetEngine resolves the backend target this operation will
-	// address. Backends without implicit target resolution return themselves.
-	resolveTargetEngine(ctx context.Context, runner cli.Runner) (engine, error)
-	// preparePruneTarget resolves the target a prune will address, tolerating
-	// an implicit target the runner's own CLI can still resolve.
-	preparePruneTarget(ctx context.Context, runner cli.Runner, timeout time.Duration) (engine, error)
-	// targetHost, targetContext, and targetConfigDir report configured target
-	// components for validation and diagnostics.
-	targetHost() string
-	targetContext() string
-	targetConfigDir() string
-	// diagnosticTargetValues returns target components that must be redacted
-	// from diagnostics.
-	diagnosticTargetValues() []string
-	// diagnosticBoundaryValues returns target components that may straddle a
-	// bounded streaming window.
-	diagnosticBoundaryValues() []string
-	// runnerDiagnosticValues returns target components contributed by a
-	// runner's own environment.
-	runnerDiagnosticValues(runner cli.Runner) (values, boundary []string)
+	// target returns the backend's daemon target scope, or nil when the
+	// backend has no externally addressable target. A wrapper that embeds a
+	// backend and changes target behavior must override target() itself:
+	// shared code calls the scope this method returns, so an override of an
+	// individual scope method on the wrapper is not consulted.
+	target() engineTarget
 
 	// parseImageIdentity extracts the verified image identity from image
 	// inspect output.

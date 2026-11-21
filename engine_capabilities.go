@@ -27,9 +27,6 @@ type engineCapabilities struct {
 	// prune, and delete serialize cooperating processes with the per-name
 	// lock.
 	nameAddressed bool
-	// daemonTarget supports external daemon target overrides and implicit
-	// target resolution.
-	daemonTarget bool
 	// defaultNetwork resolves the daemon's concrete default network for the
 	// special "default" network mode.
 	defaultNetwork bool
@@ -78,52 +75,55 @@ func targetOverrideString(value string) *string {
 }
 
 // configuredTarget applies explicit target settings. Only a backend that owns
-// a daemon target replaces its engine, so a name-addressed engine (or a test
+// a daemon target replaces its engine, so a backend without one (or a test
 // wrapper embedding one) is returned untouched. No settings means no call at
 // all, which also preserves a wrapper that embeds a targeted backend.
 //
 // A wrapper that embeds a targeted backend and overrides its target behavior
-// loses those overrides when settings are applied: the promoted method returns
-// the embedded value. Configure such a wrapper through the embedded engine
-// before wrapping it.
+// loses those overrides when settings are applied: the promoted target()
+// returns the embedded value. Configure such a wrapper through the embedded
+// engine before wrapping it.
 func configuredTarget(eng engine, target engineTargetOverride) engine {
-	if !eng.capabilities().daemonTarget || target.empty() {
+	targetScope := eng.target()
+	if targetScope == nil || target.empty() {
 		return eng
 	}
-	return eng.configureTarget(target)
+	return targetScope.configureTarget(target)
 }
 
 // frozenTarget snapshots ambient target settings for a Client. A backend
 // without an addressable target is returned untouched.
 func frozenTarget(eng engine) engine {
-	if !eng.capabilities().daemonTarget {
+	target := eng.target()
+	if target == nil {
 		return eng
 	}
-	return eng.freezeTargetEnvironment()
+	return target.freezeTargetEnvironment()
 }
 
 // resolvedTarget resolves the daemon target one operation addresses.
 func resolvedTarget(ctx context.Context, eng engine, runner cli.Runner) (engine, error) {
-	if !eng.capabilities().daemonTarget {
+	target := eng.target()
+	if target == nil {
 		return eng, nil
 	}
-	return eng.resolveTargetEngine(ctx, runner)
+	return target.resolveTargetEngine(ctx, runner)
 }
 
 // preparedPruneTarget resolves the target a prune addresses, tolerating an
 // implicit target the runner's own CLI can still resolve.
 func preparedPruneTarget(ctx context.Context, eng engine, runner cli.Runner, timeout time.Duration) (engine, error) {
-	if !eng.capabilities().daemonTarget {
+	target := eng.target()
+	if target == nil {
 		return eng, nil
 	}
-	return eng.preparePruneTarget(ctx, runner, timeout)
+	return target.preparePruneTarget(ctx, runner, timeout)
 }
 
 // capabilities implements the engine contract for Docker.
 func (dockerEngine) capabilities() engineCapabilities {
 	return engineCapabilities{
 		immutableID:          true,
-		daemonTarget:         true,
 		defaultNetwork:       true,
 		copyOutVersionCheck:  true,
 		healthcheck:          true,

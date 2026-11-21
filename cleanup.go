@@ -745,16 +745,18 @@ func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *
 	cfg := &config{eng: eng, reuseGroup: reuseGroup}
 	values := cfg.diagnosticValues()
 	boundaryValues := cfg.diagnosticBoundaryValues()
-	runnerValues, runnerBoundary := eng.runnerDiagnosticValues(runner)
-	for _, value := range runnerValues {
-		if len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
-			values = append(values, value)
+	if target := eng.target(); target != nil {
+		runnerValues, runnerBoundary := target.runnerDiagnosticValues(runner)
+		for _, value := range runnerValues {
+			if len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
+				values = append(values, value)
+			}
 		}
+		// Boundary values are intentionally not filtered by the stream window
+		// above. They only extend redaction and a boundary value that never
+		// appears changes nothing, so keeping them can never weaken redaction.
+		boundaryValues = append(boundaryValues, runnerBoundary...)
 	}
-	// Boundary values are intentionally not filtered by the stream window
-	// above. They only extend redaction and a boundary value that never
-	// appears changes nothing, so keeping them can never weaken redaction.
-	boundaryValues = append(boundaryValues, runnerBoundary...)
 	return cli.NewHashedContextRedactor(values...).WithBoundaryValues(boundaryValues...)
 }
 

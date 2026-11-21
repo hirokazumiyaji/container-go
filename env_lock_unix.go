@@ -109,7 +109,11 @@ func chmodEnvDirectory(path string) error {
 }
 
 func openEnvFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
-	fd, err := syscall.Open(path, flag|syscall.O_NOFOLLOW, uint32(perm.Perm()))
+	// O_CLOEXEC is applied atomically by the kernel, so a concurrent fork or
+	// exec cannot inherit a descriptor to a secrets file or its flock. The
+	// descriptor is kept non-blocking as well: a FIFO swapped in at the path
+	// would otherwise block the open before the caller can reject its type.
+	fd, err := syscall.Open(path, flag|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, uint32(perm.Perm()))
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
@@ -117,7 +121,9 @@ func openEnvFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, err
 }
 
 func currentEnvFileUID() uint32 {
-	return uint32(os.Getuid())
+	// The kernel owns new files and directories with the effective UID, which
+	// can differ from the real UID for setuid processes.
+	return uint32(os.Geteuid())
 }
 
 func envFileUID(info os.FileInfo) (uint32, bool) {

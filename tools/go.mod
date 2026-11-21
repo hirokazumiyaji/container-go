@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/rhysd/actionlint v1.7.12
 	golang.org/x/tools v0.53.0
-	golang.org/x/vuln v1.9.0
+	golang.org/x/vuln v1.10.0
 )
 
 require (

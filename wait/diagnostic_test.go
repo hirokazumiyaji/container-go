@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +75,7 @@ func (t *errorTarget) ExecCommand(context.Context, []string) (int, error) { retu
 
 func TestDiagnosticValuesCarryCompleteStrategyContext(t *testing.T) {
 	const (
-		path     = "/private-health"
+		query    = "private-query-token"
 		port     = "8443/tcp"
 		header   = "private-header-value"
 		user     = "private-user"
@@ -83,16 +84,22 @@ func TestDiagnosticValuesCarryCompleteStrategyContext(t *testing.T) {
 		command  = "private-command-value"
 	)
 	strategy := ForAll(
-		ForHTTP(path).WithPort(port).WithHeader("X-Private", header).WithBasicAuth(user, password),
+		ForHTTP("/private-health?token="+query).WithPort(port).WithHeader("X-Private", header).WithBasicAuth(user, password),
 		ForLog(pattern),
 		ForExec([]string{"tool", command}),
 		ForListeningPort("9443/tcp"),
 	)
 	values := DiagnosticValues(strategy)
 	joined := strings.Join(values, "\x00")
-	for _, value := range []string{path, port, header, user, password, pattern, command, "9443/tcp", "cHJpdmF0ZS11c2VyOnByaXZhdGUtcGFzc3dvcmQ"} {
+	for _, value := range []string{query, header, user, password, pattern, command, "9443/tcp", "cHJpdmF0ZS11c2VyOnByaXZhdGUtcGFzc3dvcmQ"} {
 		if !strings.Contains(joined, value) {
 			t.Errorf("DiagnosticValues() = %v, missing %q", values, value)
+		}
+	}
+	// The HTTP path, method, and port are request metadata, not secrets.
+	for _, value := range []string{"/private-health", port, http.MethodGet} {
+		if strings.Contains(joined, value) {
+			t.Errorf("DiagnosticValues() = %v, contains request metadata %q", values, value)
 		}
 	}
 }
@@ -136,6 +143,107 @@ func TestDiagnosticValuesRegisterCookieComponentsAndEncodings(t *testing.T) {
 	}
 }
 
+func TestHTTPDiagnosticValuesRegisterQueryValuesOnly(t *testing.T) {
+	const (
+		querySecret = "query-secret-117"
+		headerValue = "application/json"
+	)
+	strategy := ForHTTP("/healthz?token="+querySecret).
+		WithPort("8080/tcp").
+		WithMethod(http.MethodGet).
+		WithHeader("Accept", headerValue)
+	values := DiagnosticValues(strategy)
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	for _, value := range []string{querySecret, headerValue} {
+		if _, ok := set[value]; !ok {
+			t.Errorf("DiagnosticValues() = %v, missing %q", values, value)
+		}
+	}
+	for _, metadata := range []string{http.MethodGet, "/healthz", "8080/tcp", "Accept"} {
+		if _, ok := set[metadata]; ok {
+			t.Errorf("DiagnosticValues() = %v, contains request metadata %q", values, metadata)
+		}
+	}
+}
+
+func TestHTTPWaitErrorRedactsQueryValueButKeepsRequestMetadata(t *testing.T) {
+	const querySecret = "query-secret-117"
+	target := newFakeTarget()
+	target.endpoint = "bad endpoint"
+	err := ForHTTP("/healthz?token="+querySecret).
+		WithStartupTimeout(20*time.Millisecond).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want HTTP wait error")
+	}
+	got := err.Error()
+	if strings.Contains(got, querySecret) {
+		t.Errorf("error = %q, contains query secret", got)
+	}
+	if !strings.Contains(got, http.MethodGet) || !strings.Contains(got, "/healthz?") {
+		t.Errorf("error = %q, want request method and path", got)
+	}
+}
+
+func TestHTTPDiagnosticValuesSplitQueryBySecretName(t *testing.T) {
+	strategy := ForHTTP("/healthz?token=tok-secret-1&api_key=k%2Fsecret&mode=standalone&verbose=1&ready=true;sig=abc%zz#frag")
+	secrets := DiagnosticValues(ForAll(strategy))
+	boundary := DiagnosticBoundaryValues(ForAll(strategy))
+	contains := func(values []string, want string) bool {
+		for _, value := range values {
+			if value == want {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []string{"tok-secret-1", "k%2Fsecret", "k/secret", "abc%zz"} {
+		if !contains(secrets, want) {
+			t.Errorf("DiagnosticValues() = %v, missing secret query value %q", secrets, want)
+		}
+	}
+	for _, unwanted := range []string{"standalone", "1", "true", "frag"} {
+		if contains(secrets, unwanted) {
+			t.Errorf("DiagnosticValues() = %v, contains non-secret query value %q", secrets, unwanted)
+		}
+	}
+	if !contains(boundary, "standalone") {
+		t.Errorf("DiagnosticBoundaryValues() = %v, missing %q", boundary, "standalone")
+	}
+	for _, unwanted := range []string{"1", "true", "tok-secret-1"} {
+		if contains(boundary, unwanted) {
+			t.Errorf("DiagnosticBoundaryValues() = %v, contains %q", boundary, unwanted)
+		}
+	}
+}
+
+func TestHTTPWaitErrorRedactsNonSecretQueryValuesAtBoundaries(t *testing.T) {
+	target := newFakeTarget()
+	target.endpoint = "bad endpoint"
+	err := ForHTTP("/healthz?verbose=1&mode=standalone").
+		WithStartupTimeout(20*time.Millisecond).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want HTTP wait error")
+	}
+	got := err.Error()
+	if strings.Contains(got, "standalone") {
+		t.Errorf("error = %q, contains boundary query value", got)
+	}
+	if !strings.Contains(got, "verbose=1") || !strings.Contains(got, http.MethodGet) {
+		t.Errorf("error = %q, want short query value and method visible", got)
+	}
+	r := cli.NewHashedContextRedactor().WithBoundaryValues(DiagnosticBoundaryValues(ForHTTP("/healthz?mode=standalone"))...)
+	if got := r.Text("standalones at 127.0.0.1"); got != "standalones at 127.0.0.1" {
+		t.Errorf("Text() = %q, boundary value replaced inside a word", got)
+	}
+}
+
 func TestHTTPWaitErrorUsesHeaderAndBasicAuthContext(t *testing.T) {
 	const (
 		path     = "/private-health"
@@ -154,9 +262,13 @@ func TestHTTPWaitErrorUsesHeaderAndBasicAuthContext(t *testing.T) {
 		t.Fatal("want HTTP wait error")
 	}
 	got := err.Error()
-	for _, secret := range []string{path, header, password} {
+	for _, secret := range []string{header, password} {
 		if strings.Contains(got, secret) {
 			t.Errorf("error = %q, contains %q", got, secret)
 		}
+	}
+	// The request metadata stays visible so the failure identifies the probe.
+	if !strings.Contains(got, http.MethodGet) || !strings.Contains(got, path) {
+		t.Errorf("error = %q, want request method and path", got)
 	}
 }

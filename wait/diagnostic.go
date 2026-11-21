@@ -73,6 +73,38 @@ func DiagnosticValues(strategy Strategy) []string {
 	return values
 }
 
+// diagnosticBoundaryProvider is implemented by strategies whose values are
+// worth hiding only as whole tokens, such as non-secret query values, so
+// a short value like "json" does not erase every occurrence inside words.
+type diagnosticBoundaryProvider interface {
+	diagnosticBoundaryValues() []string
+}
+
+// DiagnosticBoundaryValues returns the caller-provided values of strategy
+// that are redacted only at token boundaries. Composite strategies recurse
+// into their children.
+func DiagnosticBoundaryValues(strategy Strategy) []string {
+	var values []string
+	switch s := strategy.(type) {
+	case diagnosticBoundaryProvider:
+		values = s.diagnosticBoundaryValues()
+	case *AllStrategy:
+		for _, child := range s.strategies {
+			values = append(values, DiagnosticBoundaryValues(child)...)
+		}
+	case *AnyStrategy:
+		for _, child := range s.strategies {
+			values = append(values, DiagnosticBoundaryValues(child)...)
+		}
+	}
+	return values
+}
+
+func safeStrategyError(err error, strategy Strategy) error {
+	r := cli.NewHashedContextRedactor(DiagnosticValues(strategy)...).WithBoundaryValues(DiagnosticBoundaryValues(strategy)...)
+	return cli.WithRedactor(err, r)
+}
+
 func safeDiagnosticError(err error, values ...string) error {
 	return cli.WithRedactor(err, cli.NewHashedContextRedactor(values...))
 }

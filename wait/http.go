@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // maxDrainBytes bounds how much of a probe response body is read to
@@ -130,18 +132,78 @@ func (s *HTTPStrategy) WithPollInterval(d time.Duration) *HTTPStrategy {
 	return s
 }
 
+// DiagnosticValues returns the caller-provided secrets that can appear in a
+// wait failure. Request metadata (method, path, port, and header names) is
+// intentionally excluded: it is useful context, not a secret, and registering
+// it would mask ordinary words such as GET in every diagnostic. Values of
+// secret-named query parameters are included because a secret can be carried
+// in the URL; other query values are boundary values.
 func (s *HTTPStrategy) DiagnosticValues() []string {
-	values := []string{s.path, s.port, s.method, s.username, s.password}
+	var values []string
+	if s.username != "" {
+		values = append(values, s.username)
+	}
+	if s.password != "" {
+		values = append(values, s.password)
+	}
 	for key, value := range s.headers {
-		values = append(values, key, value, key+": "+value, key+"="+value)
-		if strings.EqualFold(key, "cookie") || strings.EqualFold(key, "set-cookie") || strings.EqualFold(key, "cookie2") {
+		values = append(values, value)
+		if isCookieHeader(key) {
 			values = append(values, cookieDiagnosticValues(value)...)
 		}
 	}
+	secrets, _ := queryDiagnosticValues(s.path)
+	values = append(values, secrets...)
 	if s.basicAuth {
 		values = append(values, basicAuthValues(s.username, s.password)...)
 	}
 	return values
+}
+
+func (s *HTTPStrategy) diagnosticBoundaryValues() []string {
+	_, boundary := queryDiagnosticValues(s.path)
+	return boundary
+}
+
+func isCookieHeader(key string) bool {
+	return strings.EqualFold(key, "cookie") || strings.EqualFold(key, "set-cookie") || strings.EqualFold(key, "cookie2")
+}
+
+// queryDiagnosticValues splits the query by hand rather than with
+// url.ParseQuery, which drops a pair containing ';' or a bad escape and would
+// leave its value unregistered. Each value is returned raw and, when it
+// decodes, unescaped. Values of secret-named parameters are secrets; other
+// values are boundary values unless they are too short or common to matter.
+func queryDiagnosticValues(rawPath string) (secrets, boundary []string) {
+	_, rawQuery, ok := strings.Cut(rawPath, "?")
+	if !ok {
+		return nil, nil
+	}
+	rawQuery, _, _ = strings.Cut(rawQuery, "#")
+	for _, pair := range strings.FieldsFunc(rawQuery, func(r rune) bool { return r == '&' || r == ';' }) {
+		key, value, _ := strings.Cut(pair, "=")
+		if value == "" {
+			continue
+		}
+		forms := []string{value}
+		if decoded, err := url.QueryUnescape(value); err == nil && decoded != value {
+			forms = append(forms, decoded)
+		}
+		decodedKey, err := url.QueryUnescape(key)
+		if err != nil {
+			decodedKey = key
+		}
+		if cli.IsSecretName(decodedKey) {
+			secrets = append(secrets, forms...)
+			continue
+		}
+		for _, form := range forms {
+			if len(form) >= 4 && !strings.EqualFold(form, "true") && !strings.EqualFold(form, "false") {
+				boundary = append(boundary, form)
+			}
+		}
+	}
+	return secrets, boundary
 }
 
 func (s *HTTPStrategy) validate() error {
@@ -185,7 +247,7 @@ func (s *HTTPStrategy) validate() error {
 }
 
 func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
-	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
+	defer func() { retErr = safeStrategyError(retErr, s) }()
 	if err := s.validate(); err != nil {
 		return err
 	}

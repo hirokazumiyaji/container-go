@@ -54,14 +54,159 @@ func TestRedactorHandlesStructuralSecretVariants(t *testing.T) {
 	}
 }
 
+func TestSecretNameMatchingUsesIdentifierComponents(t *testing.T) {
+	for _, name := range []string{
+		"password", "passwd", "passphrase", "passcode", "pass",
+		"secret", "client_secret", "clientSecret", "CLIENT_SECRET",
+		"token", "access_token", "refreshToken", "id-token", "csrf_token",
+		"api_key", "x-api-key", "apikey", "access_key", "private_key",
+		"credential", "credentials", "oauth", "auth", "authentication",
+		"authorization", "proxy-authorization", "bearer", "cookie", "set-cookie",
+		"session", "sessionId", "JSESSIONID", "connect.sid", "sid",
+		"jwt", "signature", "X-Amz-Signature", "sig", "hmac",
+		"PGPASSWORD", "DBPASSWORD", "dbpassword", "SECRETKEY", "githubtoken",
+		"authtoken", "x_signature", "MYSQL_PWD", "db-pwd", "adminPwd",
+		"secrets", "tokens", "passwords", "client_secrets", "access_tokens",
+		"AWS_SECRETS", "PHPSESSID", "cookies",
+	} {
+		if !isSecretName(name) {
+			t.Errorf("isSecretName(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{
+		"signal", "signup", "significant", "passed", "passthrough", "passive",
+		"bypass", "compass", "side", "sidebar", "path", "pattern", "patch",
+		"pwd", "PWD", "OLDPWD", "stdout", "stderr", "author", "authority", "tokenizer",
+		"sessionless", "design", "certificate", "certain", "key", "public_key",
+	} {
+		if isSecretName(name) {
+			t.Errorf("isSecretName(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestRedactorPreservesOrdinaryLogLines(t *testing.T) {
+	const input = "signal=SIGTERM\n" +
+		"passed=true\n" +
+		"stdout: starting server...\n" +
+		"stderr: listening on :8080\n" +
+		"sidebar=open\n" +
+		"path=/app\n" +
+		"pwd=/usr/src/app\n" +
+		"pattern=*.go\n" +
+		"goroutine 1 [running]:\n" +
+		"main.main()\n" +
+		"\t/app/main.go:12 +0x20\n"
+	got := NewRedactor().Text(input)
+	for _, want := range []string{
+		"signal=SIGTERM",
+		"passed=true",
+		"stdout: starting server...",
+		"stderr: listening on :8080",
+		"sidebar=open",
+		"path=/app",
+		"pwd=/usr/src/app",
+		"pattern=*.go",
+		"goroutine 1 [running]:",
+		"main.main()",
+		"/app/main.go:12",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Text() = %q, missing ordinary log text %q", got, want)
+		}
+	}
+}
+
+func TestRedactorMasksUnseparatedSecretNames(t *testing.T) {
+	const secret = "hunter2-value"
+	for _, name := range []string{"PGPASSWORD", "SECRETKEY", "githubtoken", "MYSQL_PWD"} {
+		got := NewRedactor().Text("env " + name + "=" + secret + " ready")
+		if strings.Contains(got, secret) {
+			t.Errorf("Text(%s=...) = %q, leaked the value", name, got)
+		}
+	}
+}
+
+func TestMultilineSecretExtensionKeepsFollowingLogLines(t *testing.T) {
+	const trace = "goroutine 1 [running]:\nmain.main()\n\t/app/main.go:12 +0x20\n"
+	for _, line := range []string{"token=abc", "password=abcd", "sid=abcd", "sig=abcd", "auth=abcd", "session=abcd", "stdout=abcd"} {
+		got := NewRedactor().Text(line + "\n" + trace)
+		for _, want := range []string{"goroutine 1 [running]:", "main.main()", "/app/main.go:12"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("Text(%q) = %q, swallowed %q", line, got, want)
+			}
+		}
+	}
+	got := NewRedactor().Text("token=abc\nlevel=info msg=ready\nDone.\n")
+	if !strings.Contains(got, "level=info msg=ready") || !strings.Contains(got, "Done.") {
+		t.Errorf("Text() = %q, swallowed a following log line", got)
+	}
+	for _, input := range []string{
+		"password=abcd\nDone\nexiting\n",
+		"token=abcd\n--------------------\nok\n",
+		"token=abc\ntoken_endpoint=https://example.com/oauth\ngoroutine 1 [running]:\n",
+	} {
+		got := NewRedactor().Text(input)
+		for _, want := range []string{"Done", "exiting", "--------------------", "ok", "token_endpoint=", "goroutine 1 [running]:"} {
+			if strings.Contains(input, want) && !strings.Contains(got, want) {
+				t.Errorf("Text(%q) = %q, swallowed %q", input, got, want)
+			}
+		}
+	}
+}
+
+func TestMultilineSecretExtensionCoversEncodedBody(t *testing.T) {
+	const (
+		first  = "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu"
+		second = "KUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwECAwEAAQ=="
+		next   = "server listening on :8080"
+	)
+	got := NewRedactor().Text("private_key=" + first + "\n" + second + "\n" + next + "\n")
+	if strings.Contains(got, first) || strings.Contains(got, second) {
+		t.Errorf("Text() = %q, leaked a wrapped key line", got)
+	}
+	if !strings.Contains(got, next) {
+		t.Errorf("Text() = %q, swallowed the following log line", got)
+	}
+
+	const tail = "AQAB0dQ=="
+	for _, prefix := range []string{
+		"private_key=",
+		"private_key: ",
+		"level=info private_key=",
+	} {
+		got = NewRedactor().Text(prefix + first + "\n" + tail + "\n" + next + "\n")
+		if strings.Contains(got, tail) {
+			t.Errorf("Text(%q...) = %q, leaked the short padded final line", prefix, got)
+		}
+		if !strings.Contains(got, next) {
+			t.Errorf("Text(%q...) = %q, swallowed the following log line", prefix, got)
+		}
+	}
+}
+
+func TestRedactorMasksDottedBearerTokens(t *testing.T) {
+	const token = "ya29.a0AfH6SMBxQ9K2mN7pR4sT1vW8"
+	got := NewRedactor().Text("probe failed: Bearer " + token + ".")
+	want := "probe failed: Bearer " + Redacted + "."
+	if got != want {
+		t.Fatalf("Text() = %q, want %q", got, want)
+	}
+}
+
 func TestRedactorHandlesQuotedMultilineAndPEMValues(t *testing.T) {
 	const secret = "multiline-secret-value"
 	text := "password=\"line-one\nline-two\"\n" +
 		"token=line-three\nline-four\n\n" +
 		"-----BEGIN PRIVATE KEY-----\n" + secret + "\n-----END PRIVATE KEY-----"
 	got := NewRedactor().Text(text)
-	if strings.Contains(got, secret) || strings.Contains(got, "line-one") || strings.Contains(got, "line-two") || strings.Contains(got, "line-three") || strings.Contains(got, "line-four") {
+	if strings.Contains(got, secret) || strings.Contains(got, "line-one") || strings.Contains(got, "line-two") || strings.Contains(got, "line-three") {
 		t.Fatalf("Text() = %q, contains multiline secret", got)
+	}
+	// A plain word after an unquoted credential is a following log line,
+	// not a wrapped encoded body.
+	if !strings.Contains(got, "line-four") {
+		t.Fatalf("Text() = %q, swallowed a plain continuation line", got)
 	}
 	if !strings.Contains(got, `\n`) {
 		t.Fatalf("Text() = %q, want escaped line break", got)

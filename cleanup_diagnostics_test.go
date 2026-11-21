@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 type pruneDiagnosticRunner struct {
@@ -654,5 +655,22 @@ func TestPackagePruneAmbientContextCommandUnavailableIsBestEffort(t *testing.T) 
 				t.Fatalf("listed=%v, err=%v", listed, err)
 			}
 		})
+	}
+}
+
+func TestWaitQueryValuesAreBoundaryRedacted(t *testing.T) {
+	cfg := &config{eng: appleEngine{}}
+	if err := WithWaitStrategy(wait.ForHTTP("/healthz?mode=standalone&verbose=1&token=q7v9"))(cfg); err != nil {
+		t.Fatal(err)
+	}
+	const text = "mode standalone; standalones verbose=1 at 127.0.0.1 q7v9x"
+	const want = "mode [REDACTED]; standalones verbose=1 at 127.0.0.1 [REDACTED]x"
+	if got := cfg.diagnosticRedactor().Text(text); got != want {
+		t.Errorf("config redactor Text() = %q, want %q", got, want)
+	}
+	ctr := &Container{}
+	ctr.applyConfigDiagnostics(cfg)
+	if got := ctr.diagnosticRedactor().Text(text); got != want {
+		t.Errorf("container redactor Text() = %q, want %q", got, want)
 	}
 }

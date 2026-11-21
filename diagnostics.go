@@ -223,16 +223,26 @@ func uniqueStrings(values []string) []string {
 }
 
 func (c *config) diagnosticBoundaryValues() []string {
-	if c.eng == nil {
-		return nil
+	values := wait.DiagnosticBoundaryValues(c.waitStrategy)
+	if c.eng != nil {
+		values = append(values, c.eng.diagnosticBoundaryValues()...)
 	}
-	values := c.eng.diagnosticBoundaryValues()
 	if c.dockerHost != nil {
 		if endpoint, err := parseDockerEndpoint(*c.dockerHost); err == nil && endpoint.isRemote {
 			values = append(values, dockerEndpointBoundaryValues(endpoint)...)
 		}
 	}
-	filtered := values[:0]
+	return streamFittingValues(values)
+}
+
+func (c *config) waitBoundaryValues() []string {
+	return streamFittingValues(wait.DiagnosticBoundaryValues(c.waitStrategy))
+}
+
+// streamFittingValues drops values the bounded streaming window cannot
+// redact, so one oversized value cannot make every stream on a handle fail.
+func streamFittingValues(values []string) []string {
+	var filtered []string
 	for _, value := range uniqueStrings(values) {
 		if len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
 			filtered = append(filtered, value)

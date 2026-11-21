@@ -25,6 +25,20 @@ func configureProcessTree(cmd *exec.Cmd) {
 // withholds TerminatedByCancellation even though the child was still alive.
 const processStoppedObservationWindow = 200 * time.Millisecond
 
+// ObserveProcessStopped reports whether process has been observed in a
+// stopped state. It leaves the process waitable so the owner's sole Wait
+// still receives the final status. Platforms without a stopped-state
+// primitive report false, so callers must fall back to a direct-handle kill
+// instead of signaling a numeric process group.
+func ObserveProcessStopped(process *os.Process) (bool, error) {
+	identity, err := openProcessIdentity(process)
+	if err != nil {
+		return false, err
+	}
+	defer identity.close()
+	return identity.stopped()
+}
+
 // stableProcessIdentity is an ownership-safe reference retained after Start.
 // A numeric PGID is never used until the identity has positively observed
 // SIGSTOP. Platforms without an identity implementation use the retained

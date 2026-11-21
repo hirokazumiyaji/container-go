@@ -79,12 +79,19 @@ func runReaperScriptStreams(t *testing.T, binary, subcommand, key string, entrie
 
 func runReaperScriptWithOptions(t *testing.T, binary, subcommand, key string, timeoutSeconds int, entries []string, env ...string) (string, string, error) {
 	t.Helper()
+	return runReaperScriptContext(t, context.Background(), binary, subcommand, key, timeoutSeconds, entries, env...)
+}
+
+// runReaperScriptContext runs the real script under a caller deadline so a
+// regression that blocks in the script fails the test instead of hanging it.
+func runReaperScriptContext(t *testing.T, parent context.Context, binary, subcommand, key string, timeoutSeconds int, entries []string, env ...string) (string, string, error) {
+	t.Helper()
 	requirePOSIXShell(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", reaperScript, "containergo-reaper",
-		binary, subcommand, breQuote(key), strconv.Itoa(timeoutSeconds), "1")
+		binary, subcommand, key, strconv.Itoa(timeoutSeconds), "1")
 	cmd.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
 	cmd.Env = append(os.Environ(), env...)
 	var stdout, stderr bytes.Buffer
@@ -167,8 +174,16 @@ sub="$1"
 shift
 if [ "$sub" = "inspect" ]; then
   cat <<'JSON'
-  "com.github.hirokazumiyaji.container-go.creation": "` + creation + `",
-  "Id": "` + uid + `"
+[
+  {
+    "Id": "` + uid + `",
+    "Config": {
+      "Labels": {
+        "` + creationLabel + `": "` + creation + `"
+      }
+    }
+  }
+]
 JSON
   exit 0
 fi
@@ -269,7 +284,7 @@ func TestReaperScriptBudgetStartsAfterEOF(t *testing.T) {
 	defer cancel()
 	id := dockerID('9')
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", reaperScript, "containergo-reaper",
-		probe.script(), "rm", breQuote(creationLabel), "30", "1")
+		probe.script(), "rm", creationLabel, "30", "1")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -697,7 +712,7 @@ func TestReaperScriptKeepsTheGenerationGuard(t *testing.T) {
 sub="$1"
 shift
 if [ "$sub" = "inspect" ]; then
-  echo '  "com.github.hirokazumiyaji.container-go.creation": "ffffffffffffffff",'
+  printf '%s\n' '[{"Id":"` + strings.Repeat("c", 64) + `","Config":{"Labels":{"` + creationLabel + `":"ffffffffffffffff"}}}]'
   exit 0
 fi
 printf '%s\n' "$*" >> "` + logPath + `"
@@ -714,5 +729,181 @@ exit 0
 	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 		t.Errorf("a replaced generation was deleted; the guard did not hold")
+	}
+}
+
+// TestReaperScriptParsesCompactInspectJSON pins the compact-output half of
+// the inspect projection: a backend may emit the whole array on one line,
+// which the old line-anchored sed expression could not match at all, so the
+// generation looked absent and the container leaked.
+func TestReaperScriptParsesCompactInspectJSON(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	creation := strings.Repeat("b", 16)
+	uid := strings.Repeat("c", 64)
+	script := filepath.Join(dir, "backend")
+	body := `#!/bin/sh
+sub="$1"
+shift
+if [ "$sub" = "inspect" ]; then
+  printf '%s\n' '[{"Id":"` + uid + `","Config":{"Labels":{"` + creationLabel + `":"` + creation + `"}}}]'
+  exit 0
+fi
+printf '%s\n' "$*" >> "` + logPath + `"
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runReaperScript(t, script, "rm", creationLabel,
+		[]string{lockedEntry("guarded", creation, filepath.Join(dir, "guarded.lock"))})
+	if err != nil {
+		t.Fatalf("reaper script: %v (output: %s)", err, out)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("no delete was issued for compact inspect output: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "--force "+uid {
+		t.Errorf("delete = %q, want %q", got, "--force "+uid)
+	}
+}
+
+// TestReaperScriptIgnoresNestedIDFields pins the depth guard: a nested "Id"
+// emitted after the top-level one must not become the delete target. The
+// line-anchored sed projection took the last match, so a nested field won.
+func TestReaperScriptIgnoresNestedIDFields(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	creation := strings.Repeat("b", 16)
+	uid := strings.Repeat("c", 64)
+	nested := strings.Repeat("d", 64)
+	script := filepath.Join(dir, "backend")
+	body := `#!/bin/sh
+sub="$1"
+shift
+if [ "$sub" = "inspect" ]; then
+  cat <<'JSON'
+[
+  {
+    "Id": "` + uid + `",
+    "Example": {
+      "Id": "` + nested + `"
+    },
+    "Config": {
+      "Labels": {
+        "` + creationLabel + `": "` + creation + `"
+      }
+    }
+  }
+]
+JSON
+  exit 0
+fi
+printf '%s\n' "$*" >> "` + logPath + `"
+exit 0
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runReaperScript(t, script, "rm", creationLabel,
+		[]string{lockedEntry("guarded", creation, filepath.Join(dir, "guarded.lock"))})
+	if err != nil {
+		t.Fatalf("reaper script: %v (output: %s)", err, out)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("no delete was issued: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "--force "+uid {
+		t.Errorf("delete = %q, want the top-level Id %q, not the nested Id", got, "--force "+uid)
+	}
+}
+
+// TestReaperScriptBoundsFlockAcquisition pins the flock timeout and the
+// per-entry isolation it exists for. The fake flock hangs when it is invoked
+// without -w (the pre-fix behavior) and reports a held lock only for the
+// blocked path; the free entry must still be deleted.
+func TestReaperScriptBoundsFlockAcquisition(t *testing.T) {
+	requirePOSIXShell(t)
+	dir := t.TempDir()
+	deletedLog := filepath.Join(dir, "deleted.log")
+	flockLog := filepath.Join(dir, "flock.log")
+	binDir := filepath.Join(dir, "bin")
+	if err := os.Mkdir(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fakeFlock := filepath.Join(binDir, "flock")
+	fakeBody := `#!/bin/sh
+printf '%s %s %s\n' "$1" "$2" "$3" >> "` + flockLog + `"
+case " $* " in
+  *" -w "*) ;;
+  *) sleep 30 ;;
+esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -x) shift ;;
+    -w) shift 2 ;;
+    *) lock="$1"; shift; break ;;
+  esac
+done
+case "$lock" in
+  *blocked*) exit 1 ;;
+esac
+"$@"
+`
+	if err := os.WriteFile(fakeFlock, []byte(fakeBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	creation := strings.Repeat("b", 16)
+	uid := strings.Repeat("c", 64)
+	backend := filepath.Join(dir, "backend")
+	body := `#!/bin/sh
+sub="$1"
+shift
+if [ "$sub" = "inspect" ]; then
+  printf '%s\n' '[{"Id":"` + uid + `","Config":{"Labels":{"` + creationLabel + `":"` + creation + `"}}}]'
+  exit 0
+fi
+printf '%s\n' "$*" >> "` + deletedLog + `"
+exit 0
+`
+	if err := os.WriteFile(backend, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := []string{
+		lockedEntry("blocked", creation, filepath.Join(dir, "blocked.lock")),
+		lockedEntry("free", creation, filepath.Join(dir, "free.lock")),
+	}
+	// On the pre-fix script the fake flock never sees -w and blocks, so the
+	// reap cannot exit before this deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	stdout, stderr, err := runReaperScriptContext(t, ctx, backend, "rm", creationLabel, 30, entries,
+		"REAPER_BUDGET_SECONDS=30", "REAPER_PARALLEL=2")
+	if err != nil {
+		t.Fatalf("reaper script: %v (stdout: %s, stderr: %s)", err, stdout, stderr)
+	}
+
+	lockCalls := readLogLines(t, flockLog)
+	if len(lockCalls) != len(entries) {
+		t.Fatalf("flock calls = %v, want one per entry", lockCalls)
+	}
+	for _, call := range lockCalls {
+		if call != "-x -w 30" {
+			t.Errorf("flock args = %q, want a bounded -x -w 30 acquisition", call)
+		}
+	}
+	got := readLogLines(t, deletedLog)
+	want := []string{"--force " + uid}
+	if !slices.Equal(got, want) {
+		t.Errorf("deleted %v, want %v; a timed-out lock must not stop other entries", got, want)
 	}
 }

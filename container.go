@@ -651,9 +651,9 @@ func unregisterReuseFromGlobalReaper(cfg *config) {
 }
 
 // unregisterContainerReaper removes only the records proven to belong to
-// a successfully deleted identity. It is intentionally best effort: an
-// absent global reaper is already safe, while a failed unregister leaves
-// the record available for replay rather than inventing a deletion.
+// the identity. It is intentionally best effort: an absent global reaper is
+// already safe, and the entry is dropped from the replay set before the
+// removal is written, so a failed write cannot resurrect it.
 func unregisterContainerReaper(cfg *config, name, creation, uid string) {
 	target, ok := runReaperTarget(cfg)
 	if !ok {

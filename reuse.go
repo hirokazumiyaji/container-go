@@ -394,24 +394,48 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		}
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
-		if err != nil {
-			if !isNotFoundFor(cfg.eng, err) {
-				if ctx.Err() != nil {
-					return nil, reuseInspectWaitError(cfg.name, ctx.Err(), lastInspectErr)
-				}
-				if errors.Is(err, context.Canceled) {
-					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
-				}
-				if err := inspectRetryError(ctx, err); err != nil {
-					return nil, err
-				}
-				lastInspectErr = err
-				if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
-					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
-				}
-				continue
+		if err != nil && !isNotFoundFor(cfg.eng, err) {
+			if ctx.Err() != nil {
+				return nil, reuseInspectWaitError(cfg.name, ctx.Err(), lastInspectErr)
 			}
-			lastInspectErr = nil
+			if errors.Is(err, context.Canceled) {
+				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
+			}
+			if err := inspectRetryError(ctx, err); err != nil {
+				return nil, err
+			}
+			lastInspectErr = err
+			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
+				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
+			}
+			continue
+		}
+		lastInspectErr = nil
+		exists := err == nil
+		var state domain.State
+		var ownedErr, imageErr error
+		if exists {
+			state = info.state
+			// Resolve the image and verify its presence and digest identity
+			// before the decision so the pure function only sees the result.
+			if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
+				return nil, err
+			}
+			ownedErr = checkReuseOwnership(info, cfg)
+			imageErr = ownedErr
+			if ownedErr == nil {
+				imageErr = checkReuseImageIdentity(info, resolvedImage, image, cfg)
+			}
+		}
+		decision := domain.DecideReuse(domain.ReuseInput{
+			Exists:            exists,
+			State:             state,
+			OwnershipVerified: ownedErr == nil,
+			ImageCompatible:   imageErr == nil,
+			Recreated:         recreated,
+		})
+		switch decision.Action {
+		case domain.ReuseCreateNew:
 			// Creation carries its own runTimeout budget detached from
 			// the attach deadline: a leader pulling a large image must
 			// not be cut off after reuseAttachTimeout.
@@ -447,46 +471,22 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				continue
 			}
 			return nil, createErr
-		}
-		lastInspectErr = nil
-
-		if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
-			return nil, err
-		}
-		if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
-			return nil, err
-		}
-		action, actionErr := domain.ReuseAction(info.state, recreated)
-		if actionErr != nil {
-			if info.state == StateStopped && recreated {
-				return nil, fmt.Errorf("reuse: %w", actionErr)
-			}
-			return nil, fmt.Errorf("reuse %s: %w", cfg.name, actionErr)
-		}
-		switch action {
-		case domain.ActionWait:
+		case domain.ReuseStartExisting:
 			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 			continue
-		case domain.ActionRecreate:
-			// Only recycle containers this library created for reuse
-			// with a compatible resolved image; never delete foreign leftovers.
-			if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
-				return nil, err
-			}
-			if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
-				return nil, err
-			}
+		case domain.ReuseRecreateIncompatible:
+			// Only recycle containers this library created for reuse with a
+			// compatible resolved image; never delete foreign leftovers. The
+			// pure decision selects this only after ownership and image
+			// identity matched above.
 			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
 				return nil, err
 			}
 			recreated = true
 			continue
-		case domain.ActionAttach:
-			if err := resolveImage(context.WithoutCancel(ctx)); err != nil {
-				return nil, err
-			}
+		case domain.ReuseAttachRunning:
 			ctr := &Container{
 				id:              cfg.name,
 				runner:          cfg.runner,
@@ -505,10 +505,19 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			}
 			ctr.applyConfigDiagnostics(cfg)
 			return ctr, nil
-		default:
-			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
-				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
+		case domain.ReuseFailMismatch:
+			if ownedErr != nil {
+				return nil, ownedErr
 			}
+			if imageErr != nil {
+				return nil, imageErr
+			}
+			if exists && info.state == StateStopped && recreated {
+				return nil, fmt.Errorf("reuse: %s", decision.Reason)
+			}
+			return nil, fmt.Errorf("reuse %s: %s", cfg.name, decision.Reason)
+		default:
+			return nil, fmt.Errorf("reuse %s: unexpected decision %q", cfg.name, decision.Action)
 		}
 	}
 }
@@ -1071,12 +1080,28 @@ func checkReuseIdentity(info *engineInfo, cfg *config) error {
 // the identity resolved immediately before the create/attach decision,
 // not the caller's mutable tag.
 func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
+	if err := checkReuseOwnership(info, cfg); err != nil {
+		return err
+	}
+	return checkReuseImageIdentity(info, requested, original, cfg)
+}
+
+// checkReuseOwnership verifies the ownership labels, generation, and reuse
+// group that prove the observed container belongs to this request.
+func checkReuseOwnership(info *engineInfo, cfg *config) error {
 	if err := checkReuseIdentity(info, cfg); err != nil {
 		return err
 	}
 	if info.labels[reuseGroupLabel] != cfg.reuseGroup {
 		return fmt.Errorf("%w: reuse group does not match the existing container", ErrReuseMismatch)
 	}
+	return nil
+}
+
+// checkReuseImageIdentity compares the resolved requested identity with the
+// identity inspect reported. The caller has already resolved the image and
+// verified its presence and digest; this comparison has no I/O.
+func checkReuseImageIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
 	if requested.pinned {
 		actual := imageFromInfo(info)
 		if !requestedImageIdentitiesCompatible(requested, actual) {
@@ -1538,49 +1563,61 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 		info, err := inspectReuseBase(ctx, base, cfg)
 		if err == nil {
 			pendingPort = nil
-			if base != nil {
-				base.pack().mu.Lock()
-				creation := base.creation
-				uid := base.immutableID()
-				base.pack().mu.Unlock()
-				if creation != "" && info.labels[creationLabel] != creation {
-					return nil, &reuseValidationError{fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)}
+			generationVerified := reuseGenerationMatches(base, info)
+			var ownershipErr, imageErr, configErr error
+			var waitForAddress bool
+			if generationVerified && info.state == StateRunning {
+				ownershipErr = checkReuseOwnership(info, cfg)
+				imageErr = ownershipErr
+				if ownershipErr == nil {
+					imageErr = checkReuseImageIdentity(info, requested, original, cfg)
 				}
-				if uid != "" && info.uid != "" && info.uid != uid {
-					return nil, &reuseValidationError{fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)}
+				if ownershipErr == nil && imageErr == nil {
+					if configNeedsDefaultNetwork(cfg) {
+						name, err := base.ensureDefaultNetworkForConfig(ctx, cfg)
+						if err != nil {
+							return nil, err
+						}
+						info.defaultNetwork = name
+					}
+					configErr = checkReuseConfigCompat(info, cfg)
+					if errors.Is(configErr, errReusePortPending) {
+						pendingPort = configErr
+					}
+					waitForAddress = configErr == nil && cfg.eng.directIP() &&
+						(len(cfg.exposed) > 0 || len(cfg.published) > 0) && info.ip == ""
 				}
 			}
-			if info.state == StateRunning {
-				if err := checkReuseOwnedIdentity(info, requested, original, cfg); err != nil {
-					return nil, &reuseValidationError{err}
+			decision := domain.DecideReuseCompat(domain.ReuseCompatInput{
+				State:              info.state,
+				GenerationVerified: generationVerified,
+				OwnershipVerified:  ownershipErr == nil,
+				ImageCompatible:    imageErr == nil,
+				ConfigCompatible:   configErr == nil,
+				PortPending:        errors.Is(configErr, errReusePortPending),
+				WaitForAddress:     waitForAddress,
+			})
+			switch decision.Action {
+			case domain.ReuseAttachRunning:
+				return info, nil
+			case domain.ReuseStartExisting:
+				// Poll below: the generation is still starting, a requested
+				// port is not published yet, or its address is not reported.
+			case domain.ReuseFailMismatch:
+				switch {
+				case !generationVerified:
+					return nil, &reuseValidationError{fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)}
+				case ownershipErr != nil:
+					return nil, &reuseValidationError{ownershipErr}
+				case imageErr != nil:
+					return nil, &reuseValidationError{imageErr}
+				case configErr != nil && !errors.Is(configErr, errReusePortPending):
+					return nil, &reuseValidationError{configErr}
+				default:
+					return nil, &reuseValidationError{fmt.Errorf("reuse %s: %s", cfg.name, decision.Reason)}
 				}
-				if configNeedsDefaultNetwork(cfg) {
-					name, err := base.ensureDefaultNetworkForConfig(ctx, cfg)
-					if err != nil {
-						return nil, err
-					}
-					info.defaultNetwork = name
-				}
-
-				if err := checkReuseConfigCompat(info, cfg); err != nil {
-					if !errors.Is(err, errReusePortPending) {
-						return nil, &reuseValidationError{err}
-					}
-					pendingPort = err
-				} else {
-					pendingPort = nil
-					if !cfg.eng.directIP() || (len(cfg.exposed) == 0 && len(cfg.published) == 0) || info.ip != "" {
-						return info, nil
-					}
-				}
-			}
-			switch info.state {
-			case StateStopping:
-				return nil, &reuseValidationError{fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)}
-			case StatePaused:
-				return nil, &reuseValidationError{fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)}
-			case StateStopped:
-				return nil, &reuseValidationError{fmt.Errorf("reuse %s: container stopped before becoming ready", cfg.name)}
+			default:
+				return nil, &reuseValidationError{fmt.Errorf("reuse %s: unexpected decision %q", cfg.name, decision.Action)}
 			}
 		} else {
 			if ctx.Err() != nil {
@@ -1604,6 +1641,23 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container, reque
 		return nil, fmt.Errorf("%w: %w", pendingPort, ctx.Err())
 	}
 	return nil, ctx.Err()
+}
+
+// reuseGenerationMatches reports whether the inspected container still
+// addresses the base generation the caller joined. The base identity is
+// snapshotted under its lock; the comparison itself has no side effects.
+func reuseGenerationMatches(base *Container, info *engineInfo) bool {
+	if base == nil {
+		return true
+	}
+	base.pack().mu.Lock()
+	creation := base.creation
+	uid := base.immutableID()
+	base.pack().mu.Unlock()
+	if creation != "" && info.labels[creationLabel] != creation {
+		return false
+	}
+	return uid == "" || info.uid == "" || info.uid == uid
 }
 
 func (c *config) reuseConfigHash() string {

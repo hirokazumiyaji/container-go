@@ -2,6 +2,7 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -280,6 +281,41 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	}
 	return info, nil
+}
+
+type dockerNetworkInfo struct {
+	Name     string
+	Driver   string
+	Internal bool
+	Options  map[string]string
+}
+
+func parseDockerNetworkInspect(data []byte, requested string) (dockerNetworkInfo, error) {
+	if requested == "" {
+		return dockerNetworkInfo{}, errors.New("docker network inspect requires a non-empty network name")
+	}
+	var networks []dockerNetworkInfo
+	if err := json.Unmarshal(data, &networks); err != nil {
+		return dockerNetworkInfo{}, fmt.Errorf("decode Docker network inspect output: %w", err)
+	}
+	var match *dockerNetworkInfo
+	for i := range networks {
+		network := &networks[i]
+		if network.Name != requested {
+			continue
+		}
+		if match != nil {
+			return dockerNetworkInfo{}, fmt.Errorf("docker network inspect returned duplicate entries for %q", requested)
+		}
+		match = network
+	}
+	if match == nil {
+		return dockerNetworkInfo{}, fmt.Errorf("docker network %q missing from inspect output", requested)
+	}
+	if strings.TrimSpace(match.Driver) == "" {
+		return dockerNetworkInfo{}, fmt.Errorf("docker network %q inspect returned no driver", requested)
+	}
+	return *match, nil
 }
 
 // parseDockerExtraHosts converts Docker's inspect form (host:ip, host=ip, or a

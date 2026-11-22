@@ -2,10 +2,7 @@ package container
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -53,23 +50,8 @@ func newDockerEngine(host, context, configDir, defaultPlatform string) dockerEng
 	}
 }
 
-// Verified against Docker Engine / CLI 29.x (local: 29.7.2); copy-out
-// requires client/server 29.7.0 or newer.
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
-// Observed wording:
-//   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
-//   - image missing: "Error response from daemon: No such image: …"
-//   - container missing: "error: no such object: …" (also historically
-//     "No such container" / "not found")
 const (
-	dockerDeleteVolumesFlag  = "--volumes"
-	dockerStderrConflict     = "conflict. the container name "
-	dockerStderrAlreadyInUse = "already in use"
-	dockerStderrName         = "name"
-	dockerStderrNoSuchImage  = "no such image:"
-	dockerStderrNotFound     = "not found"
-	dockerStderrNoSuchObj    = "no such object"
-	dockerStderrNoSuchCtr    = "no such container"
+	dockerDeleteVolumesFlag = "--volumes"
 
 	// Docker 29.7.0 is the first client/server combination accepted for
 	// this copy-out contract. Older cp extractors fail closed.
@@ -178,41 +160,6 @@ func (dockerEngine) validateConfig(cfg *config) error {
 		}
 	}
 	return nil
-}
-
-type dockerNetworkInfo struct {
-	Name     string
-	Driver   string
-	Internal bool
-	Options  map[string]string
-}
-
-func parseDockerNetworkInspect(data []byte, requested string) (dockerNetworkInfo, error) {
-	if requested == "" {
-		return dockerNetworkInfo{}, errors.New("docker network inspect requires a non-empty network name")
-	}
-	var networks []dockerNetworkInfo
-	if err := json.Unmarshal(data, &networks); err != nil {
-		return dockerNetworkInfo{}, fmt.Errorf("decode Docker network inspect output: %w", err)
-	}
-	var match *dockerNetworkInfo
-	for i := range networks {
-		network := &networks[i]
-		if network.Name != requested {
-			continue
-		}
-		if match != nil {
-			return dockerNetworkInfo{}, fmt.Errorf("docker network inspect returned duplicate entries for %q", requested)
-		}
-		match = network
-	}
-	if match == nil {
-		return dockerNetworkInfo{}, fmt.Errorf("docker network %q missing from inspect output", requested)
-	}
-	if strings.TrimSpace(match.Driver) == "" {
-		return dockerNetworkInfo{}, fmt.Errorf("docker network %q inspect returned no driver", requested)
-	}
-	return *match, nil
 }
 
 func dockerNetworkIsolationReason(network dockerNetworkInfo) string {
@@ -418,132 +365,6 @@ func (e dockerEngine) defaultHost() string {
 		}
 	}
 	return "127.0.0.1"
-}
-
-// normalizeDockerHost applies the same normalization the Docker CLI performs
-// before dialing: a value with no "://" is a TCP host (hostname, host:port, or
-// :port), so "tcp://" is prepended. A bare numeric value such as "2375" is a
-// hostname, not a port — matching the Docker CLI. Scheme-less ":2375" becomes
-// "tcp://:2375", after which isRemoteDockerHost applies Docker's empty-host
-// fallback (default hostname → local).
-//
-// url.Parse cannot read those forms — "127.0.0.1:2375" errors outright and
-// "localhost:2375" parses as an opaque scheme with no host — so without this
-// they would fall through to the fail-closed branch and be reported as remote.
-// That would bind auto-published ports to 0.0.0.0 on the developer's own
-// machine.
-func normalizeDockerHost(raw string) string {
-	if raw == "" || strings.Contains(raw, "://") {
-		return raw
-	}
-	return "tcp://" + raw
-}
-
-func parseDockerEndpoint(raw string) (dockerTargetEndpoint, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return dockerTargetEndpoint{
-			rawHost:    "",
-			scheme:     "unix",
-			host:       "",
-			isRemote:   false,
-			clientHost: "127.0.0.1",
-		}, nil
-	}
-	normalized := normalizeDockerHost(trimmed)
-	u, err := url.Parse(normalized)
-	if err != nil {
-		return dockerTargetEndpoint{}, fmt.Errorf("malformed Docker endpoint %q: %w", raw, err)
-	}
-	scheme := strings.ToLower(u.Scheme)
-	switch scheme {
-	case "unix", "npipe", "fd":
-		return dockerTargetEndpoint{
-			rawHost:    trimmed,
-			scheme:     scheme,
-			host:       "",
-			isRemote:   false,
-			clientHost: "127.0.0.1",
-		}, nil
-	case "tcp", "http", "https":
-		host := u.Hostname()
-		if host == "" {
-			return dockerTargetEndpoint{
-				rawHost:    trimmed,
-				scheme:     scheme,
-				host:       "",
-				isRemote:   false,
-				clientHost: "127.0.0.1",
-			}, nil
-		}
-		canonical := canonicalIP(host)
-		if isLoopbackOrUnspecified(host) {
-			clientHost := "127.0.0.1"
-			if ipIsUnspecified(canonical) && !ipIs4(canonical) {
-				clientHost = "::1"
-			}
-			return dockerTargetEndpoint{
-				rawHost:    trimmed,
-				scheme:     scheme,
-				host:       host,
-				isRemote:   false,
-				clientHost: clientHost,
-			}, nil
-		}
-		clientHost := host
-		if canonical != "" {
-			clientHost = canonical
-		}
-		return dockerTargetEndpoint{
-			rawHost:    trimmed,
-			scheme:     scheme,
-			host:       host,
-			isRemote:   true,
-			clientHost: clientHost,
-		}, nil
-	case "ssh":
-		host := u.Hostname()
-		if host == "" {
-			return dockerTargetEndpoint{}, fmt.Errorf("docker ssh endpoint %q missing host", raw)
-		}
-		canonical := canonicalIP(host)
-		if isLoopbackOrUnspecified(host) {
-			clientHost := "127.0.0.1"
-			if ipIsUnspecified(canonical) && !ipIs4(canonical) {
-				clientHost = "::1"
-			}
-			return dockerTargetEndpoint{
-				rawHost:    trimmed,
-				scheme:     scheme,
-				host:       host,
-				isRemote:   false,
-				clientHost: clientHost,
-			}, nil
-		}
-		clientHost := host
-		if canonical != "" {
-			clientHost = canonical
-		}
-		return dockerTargetEndpoint{
-			rawHost:    trimmed,
-			scheme:     scheme,
-			host:       host,
-			isRemote:   true,
-			clientHost: clientHost,
-		}, nil
-	default:
-		return dockerTargetEndpoint{}, fmt.Errorf("%w: unsupported Docker endpoint scheme %q", ErrInvalidConfig, scheme)
-	}
-}
-
-// isRemoteDockerHostValue reports whether the supplied DOCKER_HOST points at a
-// daemon that may live on another machine.
-func isRemoteDockerHostValue(rawHost string) bool {
-	ep, err := parseDockerEndpoint(rawHost)
-	if err != nil {
-		return true
-	}
-	return ep.isRemote
 }
 
 func (dockerEngine) platformCompatible(selector, actual string) bool {

@@ -57,7 +57,7 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 - `--label` は存在するが、ラベルの絞り込みは JSON 出力をクライアント側で行う必要がある。ラベルキーは小文字の Docker/OCI 形式に限られる。
 - `run`/`create` は Linux image のみを実行する。platform grammar は `os/arch[/variant]` で、bare `linux` や architecture に定義されていない variant を拒否する。Apple では platform 未指定時の `CONTAINER_DEFAULT_PLATFORM` を実効 cfg platform に解決し、image inspect、pull flight、pull、run で同じ値を使う。resource / forwarding の制約として memory は 200 MiB 以上、publish port は 2〜65535、publish descriptor は最大 64 個。network name は英小文字の 1〜63 文字で、英数字の途中にだけ dot/hyphen/underscore を使える。
 - `container cp` は実行中のコンテナに対してのみ使える。copy-out には型を保持し symlink を追跡しないモードがなく、確認したバージョンでは host 側の検証前に symlink、FIFO、device node を dereference/consume することがある。そのため `CopyFileFromContainer` は Apple Container では `ErrCopyFileFromContainerUnsupported` を返し fail closed する。Docker では型を保持する extractor を利用するため client/server の両方が 29.7.0 以上を必要とし、必要な flag を host が扱える場合に host 側の Lstat/open 検査を維持する。どちらの条件も満たさない場合は fail closed する。
-- エラー分類は `engine_apple_errors.go` と `engine_docker_errors.go` の、backend binary・command・行頭固定の CLI stderr 形式に依存する(名前衝突、image/container missing。Docker の共有 stderr 定数は現状 `engine_docker.go`)。1.2/1.3 と Docker 29 の記録フィクスチャ、および `cli_compat_integration_test.go` のライブ CLI で回帰を確認する。capability matrix はさらに `CONTAINERGO_BACKEND=apple` と `CONTAINERGO_APPLE_LIVE=1` を要求し、API サーババージョンを確認できない場合は skip する。
+- エラー分類は `engine_apple_errors.go` と `engine_docker_errors.go` の、backend binary・command・行頭固定の CLI stderr 形式に依存する(名前衝突、image/container missing)。1.2/1.3 と Docker 29 の記録フィクスチャ、および `cli_compat_integration_test.go` のライブ CLI で回帰を確認する。capability matrix はさらに `CONTAINERGO_BACKEND=apple` と `CONTAINERGO_APPLE_LIVE=1` を要求し、API サーババージョンを確認できない場合は skip する。
 - Apple の `run`/`create` には image 解決を止める `--pull=never` 相当がないため、厳密な `PullNever` は保証できない。backend は CLI 呼び出し前に `ErrPullNeverUnsupported` で拒否し、`PullMissing`/`PullAlways` を明示的な fallback とする。厳密な no-fetch は Docker だけが保証する。
 
 ## 実現方式の選定
@@ -700,7 +700,7 @@ container-go/
 ├── engine.go         // バックエンド interface、target scope と正規化情報
 ├── engine_capabilities.go // バックエンド capability と target-scope の共有ヘルパ
 ├── engine_apple.go   // Apple Container の engine 型・config 検証・platform ヘルパ
-├── engine_docker.go  // Docker の engine 型・config 検証・network/endpoint ヘルパ
+├── engine_docker.go  // Docker の engine 型・config 検証・default host・network ヘルパ
 ├── engine_*_args.go     // backend の argv ビルダー
 ├── engine_*_parse.go    // inspect・image・list・reuse group の JSON パース
 ├── engine_*_errors.go   // backend の stderr 分類

@@ -129,9 +129,8 @@ or differs from the CLI version, so this repository does not claim an
 unobserved API-server compatibility range. These entries describe repository
 evidence, not an exhaustive compatibility claim. Newer CLI releases may change
 error text or JSON fields; see the stderr matchers in `engine_apple_errors.go`
-and `engine_docker_errors.go` (Docker's shared stderr constants remain in
-`engine_docker.go`) and the fixtures under `internal/inspect/testdata/` and
-`testdata/`.
+and `engine_docker_errors.go` and the fixtures under
+`internal/inspect/testdata/` and `testdata/`.
 
 `WithName` and name-addressed reaper entries use the shared library guard
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63 characters). This is a

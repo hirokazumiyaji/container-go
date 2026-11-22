@@ -30,11 +30,17 @@ The current checkout still has these deliberate constraints:
   the parent pipe closes, and reclaims a name-addressed Docker create through
   the immutable ID its inspect reports. The reaper child runs in its own
   hidden console process group, so a console Ctrl+C does not take it down
-  with the parent. A remote daemon and a build without self-execution support
-  still rely on explicit `Terminate`, `Cleanup`, `TerminateContainer`,
-  `Prune`, and the rollback paths. `WithEnv` and `WithExecEnv` write the
-  secret env file under a current-logon-only DACL on Windows, and Docker
-  copy-out requires Go 1.26 or newer.
+  with the parent. The reaper is assigned to a Windows Job Object, so the
+  reaper and every process it starts share one teardown boundary and a stop
+  terminates that tree; the native loop starts no backend command before EOF,
+  so this is defense in depth rather than an observed leak fix. The job does
+  not set `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the kernel closing the
+  parent's handle at parent death leaves the watchdog running to reap. A
+  remote daemon and a build without self-execution support still rely on
+  explicit `Terminate`, `Cleanup`, `TerminateContainer`, `Prune`, and the
+  rollback paths. `WithEnv` and `WithExecEnv` write the secret env file under
+  a current-logon-only DACL on Windows, and Docker copy-out requires Go 1.26
+  or newer.
 - Network creation and lifecycle management are out of scope;
   `WithNetwork` attaches an existing network. Volume creation and lifecycle
   management are also out of scope; `WithMounts` accepts bind, named-volume,
@@ -1035,6 +1041,23 @@ internal marker and runs the same loop in Go. Windows has no shell and uses
 the native loop whenever self-execution is available. The native loop decodes
 inspect output with the library's strict JSON and inspect parsers instead of
 `sed` or `awk`.
+
+Stopping a live reaper (for example, after the last entry is unregistered, or
+when a failed pipe write forces a replacement) tears down the tree it owns.
+Unix signals the reaper's process group after confirming the shell stopped.
+Windows assigns the reaper to a Job Object and calls `TerminateJobObject`
+before the direct kill, so the reaper and every process it started are
+terminated as one tree. The native loop starts no backend command until EOF,
+and the stop path only runs while the parent is alive, so no `docker.exe` is in
+flight there today: this is defense in depth for a reaper that reports before
+EOF, and it replaces the direct-child-only limitation on Windows. The job
+deliberately does not set `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: the only job
+handle belongs to the parent, and the kernel closes it when the parent dies, so
+that limit would kill the watchdog exactly when it has to survive and reap. The
+existing hidden console and new process group are unchanged. If the job cannot
+be created or the reaper cannot be assigned to it (for example, an environment
+that does not allow nested jobs), the reaper still runs, and the stop path
+falls back to terminating the direct child only.
 
 Self-execution requires a main-package executable. The native loop is
 disabled for `-buildmode=c-shared` and `c-archive`, which carry their own Go

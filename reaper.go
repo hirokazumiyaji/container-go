@@ -511,6 +511,7 @@ type reaper struct {
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
 	exited        chan struct{}
+	job           reaperJob
 	entries       []reaperEntry
 	spawnFailures int
 	gaveUp        bool
@@ -1140,13 +1141,14 @@ func (r *reaper) spawnLocked() error {
 		_ = stdin.Close()
 		return err
 	}
+	job := attachReaperJob(cmd)
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
 		close(exited)
 	}()
 	r.mu.Lock()
-	r.cmd, r.stdin, r.exited = cmd, stdin, exited
+	r.cmd, r.stdin, r.exited, r.job = cmd, stdin, exited, job
 	r.mu.Unlock()
 	go r.monitorChild(cmd, exited)
 	return nil
@@ -1167,7 +1169,9 @@ func (r *reaper) monitorChild(cmd *exec.Cmd, exited <-chan struct{}) {
 func (r *reaper) stopCurrentProcess() {
 	r.mu.Lock()
 	cmd, stdin, exited := r.cmd, r.stdin, r.exited
+	job := r.job
 	r.cmd, r.stdin, r.exited = nil, nil, nil
+	r.job = reaperJob{}
 	r.mu.Unlock()
 	if cmd == nil {
 		return
@@ -1176,6 +1180,11 @@ func (r *reaper) stopCurrentProcess() {
 	// child an EOF, and a still-running child would start reaping entries
 	// this call is replacing. Only closeStdin is an intentional EOF.
 	if !channelClosed(exited) {
+		// On Windows the job owns every process the reaper started, so it is
+		// terminated before the direct kill and no backend command can be
+		// started in between. On Unix this is a no-op and killReaperProcess
+		// signals the process group.
+		job.terminate()
 		killReaperProcess(cmd)
 	}
 	if exited != nil {
@@ -1184,6 +1193,7 @@ func (r *reaper) stopCurrentProcess() {
 	if stdin != nil {
 		_ = stdin.Close()
 	}
+	job.close()
 }
 
 // closeStdin hands the reaper the intentional EOF used on parent death

@@ -359,6 +359,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsing helpers into `engine_docker_runtime.go`, completing the
   responsibility split from #377. This is an internal move with no behavior
   or public API change.
+- Assign the Windows watchdog reaper to a Job Object, so stopping a live
+  reaper terminates the reaper and every process it started as one tree
+  instead of only the direct child. The current native loop starts no backend
+  command before EOF and the stop path runs while the parent is alive, so this
+  is defense in depth for a loop that reports earlier rather than a fix for an
+  observed orphan. The job is created without
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: the only handle belongs to the parent,
+  so enabling that limit would make the kernel kill the watchdog when the
+  parent dies, exactly when it has to survive and reap. The hidden console and
+  new process group are unchanged, and a job that cannot be created or
+  assigned falls back to terminating the direct child as before (#380).
 
 
 ## [0.3.0] - 2026-10-26

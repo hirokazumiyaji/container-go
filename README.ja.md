@@ -26,6 +26,12 @@ Go 1.26 以降が必要です。`v0.3.0` モジュールにも Go 1.26 以降が
   Docker の immutable ID を回収し、name-addressed な Docker create は inspect が
   返す immutable ID で回収します。reaper 子プロセスは専用の非表示コンソール
   プロセスグループで動くため、コンソールの Ctrl+C では親と一緒に終了しません。
+  reaper は Windows の Job Object に割り当てられ、reaper とそれが起動した全
+  プロセスが同じ teardown 境界を共有するため、停止時はツリーごと終了します。
+  現在の native ループは EOF まで backend コマンドを起動しないため、これは
+  多層防御であり、観測されたリークの修正ではありません。job は
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` を設定しないため、親の死亡でカーネルが
+  親の handle を閉じても watchdog は残って reap できます。
   remote daemon や self-exec できない build では、明示的な `Terminate`、
   `Cleanup`、`TerminateContainer`、`Prune`、および rollback 経路に依存します。
   `WithEnv` と `WithExecEnv` は Windows では現在のログオンだけに許可した DACL で
@@ -902,6 +908,24 @@ Unix は既定で固定の `/bin/sh` スクリプトを起動し、
 `/bin/sh` がないため、self-exec が可能な場合はネイティブループを使います。
 ネイティブループは inspect 出力を `sed` や `awk` ではなく、ライブラリの
 strict JSON パーサと inspect パーサで解析します。
+
+動作中の reaper を停止する経路（最後の entry を unregister したときや、pipe
+への書き込み失敗で置き換えるときなど）では、その reaper が所有するプロセス
+ツリーをまとめて破棄します。Unix は shell が停止したことを確認してから
+reaper のプロセスグループへシグナルを送ります。Windows は reaper を
+Job Object に割り当て、直接の kill の前に `TerminateJobObject` を呼ぶため、
+reaper とそれが起動した全プロセスを 1 つのツリーとして終了します。現在の
+native ループは EOF まで backend コマンドを起動せず、停止経路は親が生きて
+いる間しか動かないため、現時点で in-flight の `docker.exe` は存在しません。
+これは EOF より前に backend を起動する将来のループに対する多層防御であり、
+Windows の「直接の子だけを kill する」制限を置き換えるものです。この job は
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` を意図的に設定しません。job handle を
+持つのは親だけで、親の死亡時にカーネルがそれを閉じるため、この制限を設定
+すると watchdog が reap のために生き残るべき瞬間に終了してしまいます。
+既存の非表示コンソールと新しいプロセスグループは変更しません。job を
+作成できない、または reaper を割り当てられない場合（ネストした job が許可
+されない環境など）でも reaper は動作し、停止経路は直接の子だけを終了する
+従来の動作に fallback します。
 
 self-exec には main package の実行ファイルが必要なため、ネイティブループは
 `-buildmode=c-shared` と `c-archive`（独自の Go runtime を持つ）では無効化され、

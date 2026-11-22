@@ -9,8 +9,12 @@
 // files for WithEnv and WithExecEnv are stored under a current-logon-only
 // DACL, and the watchdog reaper runs natively without /bin/sh to reclaim
 // Docker containers by immutable ID, including the ID an inspect reports for
-// a name-addressed create. A build that cannot re-execute itself has no
-// Windows reaper. A bind mount
+// a name-addressed create. The reaper is held in a Job Object with every
+// process it starts, so stopping it tears down that tree; the native loop
+// starts no backend command before EOF, so this is defense in depth. The job
+// is not configured to terminate the reaper when the parent's handle closes,
+// so the watchdog outlives the parent to reap. A build that cannot re-execute
+// itself has no Windows reaper. A bind mount
 // against a remote Docker daemon is rejected with ErrUnsupportedCapability
 // because the daemon resolves the source path on its own host. See README.md
 // for backend selection, environment validation, and endpoint differences.

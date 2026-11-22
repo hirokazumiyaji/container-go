@@ -17,6 +17,20 @@ func configureReaperProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// reaperJob carries no Unix state: the process group set up before Start is
+// the whole teardown, and killReaperProcess signals it. The type exists so
+// the reaper's stop path is written once for every platform.
+type reaperJob struct{}
+
+// attachReaperJob is a no-op on Unix; the group is configured in
+// configureReaperProcess, before the child exists.
+func attachReaperJob(*exec.Cmd) reaperJob { return reaperJob{} }
+
+// terminate is a no-op on Unix: killReaperProcess owns the group signal.
+func (j *reaperJob) terminate() {}
+
+func (j *reaperJob) close() {}
+
 func shellReaperAvailable() bool { return true }
 
 // killReaperProcess terminates the shell and every process in its group.

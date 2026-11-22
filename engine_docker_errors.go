@@ -6,6 +6,23 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+// Verified against Docker Engine / CLI 29.x (local: 29.7.2).
+// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// Observed wording:
+//   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
+//   - image missing: "Error response from daemon: No such image: …"
+//   - container missing: "error: no such object: …" (also historically
+//     "No such container" / "not found")
+const (
+	dockerStderrConflict     = "conflict. the container name "
+	dockerStderrAlreadyInUse = "already in use"
+	dockerStderrName         = "name"
+	dockerStderrNoSuchImage  = "no such image:"
+	dockerStderrNotFound     = "not found"
+	dockerStderrNoSuchObj    = "no such object"
+	dockerStderrNoSuchCtr    = "no such container"
+)
+
 type dockerContextUnavailableError struct {
 	cause  error
 	detail string

@@ -104,8 +104,7 @@ treated as verified. This is not an exhaustive compatibility claim for every
 - `--rm` removal leaves anonymous volumes behind.
 - Error classification depends on the backend binary, command, and
   anchored CLI stderr forms owned by `engine_apple_errors.go` and
-  `engine_docker_errors.go` (name conflict, image/container missing; Docker's
-  shared stderr constants remain in `engine_docker.go`). Those
+  `engine_docker_errors.go` (name conflict, image/container missing). Those
   matchers are regression-tested against recorded 1.2/1.3 and Docker 29
   fixtures and a live CLI in `cli_compat_integration_test.go`. The Apple
   capability matrix additionally requires `CONTAINERGO_BACKEND=apple` and
@@ -1430,7 +1429,7 @@ container-go/
 ├── engine.go         // backend interface, target scope, and normalized info
 ├── engine_capabilities.go // backend capability contract and target-scope helpers
 ├── engine_apple.go   // Apple Container engine type, config validation, and platform helpers
-├── engine_docker.go  // Docker engine type, config validation, and network/endpoint helpers
+├── engine_docker.go  // Docker engine type, config validation, default host, and network helpers
 ├── engine_*_args.go     // backend argv builders
 ├── engine_*_parse.go    // inspect, image, list, and reuse-group JSON parsing
 ├── engine_*_errors.go   // backend stderr classification

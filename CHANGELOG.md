@@ -354,6 +354,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in its own hidden console process group, so a console Ctrl+C no longer kills
   it together with the parent. A build that cannot self-execute has no
   Windows reaper; use `Prune` for those leftovers and remote daemons.
+- Move Docker's `dockerStderr*` constants into `engine_docker_errors.go`,
+  `parseDockerNetworkInspect` into `engine_docker_parse.go`, and the endpoint
+  parsing helpers into `engine_docker_runtime.go`, completing the
+  responsibility split from #377. This is an internal move with no behavior
+  or public API change.
 
 
 ## [0.3.0] - 2026-10-26

@@ -125,9 +125,8 @@ Apple の API サーババージョンは `container system version` または
 この表はリポジトリの根拠を示すもので、すべての release を確認済みだという
 互換性宣言ではありません。新しい CLI ではエラー文言や JSON フィールドが
 変わる可能性があります。stderr マッチャは `engine_apple_errors.go` /
-`engine_docker_errors.go` にあり（Docker の共有 stderr 定数は現状
-`engine_docker.go`）、`internal/inspect/testdata/`・`testdata/` のフィクスチャを
-参照してください。
+`engine_docker_errors.go` にあり、`internal/inspect/testdata/`・`testdata/` の
+フィクスチャを参照してください。
 
 `WithName` と name-addressed reaper entry は共有の library guard
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`（1～63 文字）を使う。これは保守的な安全

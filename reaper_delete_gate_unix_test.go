@@ -11,11 +11,11 @@ import (
 	"testing"
 )
 
-// reaperParityScenario is one delete-gate fixture. The same shell script and
-// the same registered entries are driven through both the /bin/sh reaper and
-// the native reaper, so a behavior change in either implementation fails the
-// parity check.
-type reaperParityScenario struct {
+// reaperDeleteGateScenario is one delete-gate fixture. Each scenario runs
+// through the real parent registration, the self-executed reaper child, and a
+// fake backend CLI, so the parent-side event protocol and the child-side gate
+// are both exercised.
+type reaperDeleteGateScenario struct {
 	name            string
 	subcommand      string
 	inspectJSON     string
@@ -24,19 +24,16 @@ type reaperParityScenario struct {
 	wantDelete      string // empty means no delete expected
 }
 
-func TestReaperImplementationsShareTheDeleteGate(t *testing.T) {
-	if raceDetectorEnabled {
-		t.Skip("subprocess fixture matrix; the quick native tests cover the worker pool under -race")
-	}
+func TestNativeReaperSelfExecDeleteGate(t *testing.T) {
 	requirePOSIXShell(t)
 	creation := strings.Repeat("a", 16)
 	uid := strings.Repeat("c", 64)
-	name := "parity-name"
+	name := "delete-gate-name"
 	matchingDocker := fmt.Sprintf(`[{"Id":%q,"Config":{"Labels":{%q:%q}}}]`, uid, creationLabel, creation)
 	mismatchedDocker := fmt.Sprintf(`[{"Id":%q,"Config":{"Labels":{%q:%q}}}]`, uid, creationLabel, strings.Repeat("d", 16))
 	matchingApple := fmt.Sprintf(`[{"id":%q,"configuration":{"labels":{%q:%q}}}]`, name, creationLabel, creation)
 
-	scenarios := []reaperParityScenario{
+	scenarios := []reaperDeleteGateScenario{
 		{name: "docker-name-match", subcommand: "rm", inspectJSON: matchingDocker, wantDelete: "--force " + uid},
 		{name: "docker-name-absent", subcommand: "rm", inspectJSON: "[]"},
 		{name: "docker-name-mismatch", subcommand: "rm", inspectJSON: mismatchedDocker},
@@ -44,56 +41,47 @@ func TestReaperImplementationsShareTheDeleteGate(t *testing.T) {
 		{name: "docker-name-pending", subcommand: "rm", inspectJSON: matchingDocker, inspectFailures: 1, pending: true, wantDelete: "--force " + uid},
 		{name: "apple-name-match", subcommand: "delete", inspectJSON: matchingApple, wantDelete: "--force " + name},
 	}
-	implementations := []struct {
-		name  string
-		build func(binary, subcommand string) *reaper
-	}{
-		{name: "shell", build: func(binary, subcommand string) *reaper { return newReaper(binary, subcommand) }},
-		{name: "native", build: func(binary, subcommand string) *reaper { return newNativeReaper(binary, subcommand) }},
-	}
 
-	for _, implementation := range implementations {
-		for _, scenario := range scenarios {
-			t.Run(implementation.name+"/"+scenario.name, func(t *testing.T) {
-				dir := t.TempDir()
-				binary, deleteLog, inspectLog := writeReaperParityBackend(t, dir, scenario)
-				r := implementation.build(binary, scenario.subcommand)
-				r.pendingAttempts = 2
-				var err error
-				if scenario.pending {
-					err = r.registerPending(name, creation)
-				} else {
-					err = r.register(name, creation)
-				}
-				if err != nil {
-					t.Fatalf("register: %v", err)
-				}
-				r.closeStdin()
-				waitForReaperTestExit(t, r)
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			binary, deleteLog, inspectLog := writeReaperDeleteGateBackend(t, dir, scenario)
+			r := newReaper(binary, scenario.subcommand)
+			r.pendingAttempts = 2
+			var err error
+			if scenario.pending {
+				err = r.registerPending(name, creation)
+			} else {
+				err = r.register(name, creation)
+			}
+			if err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			r.closeStdin()
+			waitForReaperTestExit(t, r)
 
-				got := readNativeReaperLog(t, deleteLog)
-				if scenario.wantDelete == "" {
-					if len(got) != 0 {
-						t.Fatalf("deleted %v, want no delete", got)
-					}
-					return
+			got := readNativeReaperLog(t, deleteLog)
+			if scenario.wantDelete == "" {
+				if len(got) != 0 {
+					t.Fatalf("deleted %v, want no delete", got)
 				}
-				want := []string{scenario.wantDelete}
-				if !slices.Equal(got, want) {
-					t.Fatalf("deleted %v, want %v", got, want)
-				}
-				if calls := len(readNativeReaperLog(t, inspectLog)); calls == 0 {
-					t.Fatal("deleted without inspecting the generation")
-				}
-			})
-		}
+				return
+			}
+			want := []string{scenario.wantDelete}
+			if !slices.Equal(got, want) {
+				t.Fatalf("deleted %v, want %v", got, want)
+			}
+			if calls := len(readNativeReaperLog(t, inspectLog)); calls == 0 {
+				t.Fatal("deleted without inspecting the generation")
+			}
+		})
 	}
 }
 
-// writeReaperParityBackend installs a fake CLI and returns its delete log and
-// inspect log. The script answers inspect with the scenario's JSON after the
-// configured number of failures, and records delete argv.
-func writeReaperParityBackend(t *testing.T, dir string, scenario reaperParityScenario) (binary, deleteLog, inspectLog string) {
+// writeReaperDeleteGateBackend installs a fake CLI and returns its delete log
+// and inspect log. The script answers inspect with the scenario's JSON after
+// the configured number of failures, and records delete argv.
+func writeReaperDeleteGateBackend(t *testing.T, dir string, scenario reaperDeleteGateScenario) (binary, deleteLog, inspectLog string) {
 	t.Helper()
 	deleteLog = filepath.Join(dir, "delete.log")
 	inspectLog = filepath.Join(dir, "inspect.log")

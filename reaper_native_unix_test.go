@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -135,7 +137,7 @@ func TestNativeReaperSelfExecReapsPendingCreate(t *testing.T) {
 	creation := strings.Repeat("b", 16)
 	t.Setenv(testNativeReaperInspectJSON, fmt.Sprintf(
 		`[{"id":%q,"configuration":{"labels":{%q:%q}}}]`, name, creationLabel, creation))
-	r := newNativeReaper(exe, "delete")
+	r := newReaper(exe, "delete")
 	if err := r.registerPending(name, creation); err != nil {
 		t.Fatalf("registerPending: %v", err)
 	}
@@ -186,7 +188,7 @@ func TestNativeReaperDoesNotNeedExternalInspectTools(t *testing.T) {
 	creation := strings.Repeat("b", 16)
 	t.Setenv(testNativeReaperInspectJSON, fmt.Sprintf(
 		`[{"id":%q,"configuration":{"labels":{%q:%q}}}]`, name, creationLabel, creation))
-	r := newNativeReaper(exe, "delete")
+	r := newReaper(exe, "delete")
 	if err := r.register(name, creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -207,11 +209,44 @@ func TestNativeReaperSelfExecAppleDelete(t *testing.T) {
 	creation := strings.Repeat("b", 16)
 	t.Setenv(testNativeReaperInspectJSON, fmt.Sprintf(
 		`[{"id":%q,"configuration":{"labels":{%q:%q}}}]`, name, creationLabel, creation))
-	r := newNativeReaper(exe, "delete")
+	r := newReaper(exe, "delete")
 	if err := r.register(name, creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
 	waitForNativeReaperLog(t, logPath, "--force "+name)
 	waitForNativeReaperExit(t, r)
+}
+
+// TestNativeReaperKillsTimedOutBackend pins that a backend call which outlives
+// its per-entry timeout does not leave the direct child running. The shell
+// reaper's timer cleanup test is gone; this is the native equivalent for the
+// process the reaper itself starts.
+func TestNativeReaperKillsTimedOutBackend(t *testing.T) {
+	cfg, _ := nativeReaperBackend(t, "rm")
+	cfg.timeout = 2 * time.Second
+	pidPath := filepath.Join(t.TempDir(), "backend.pid")
+	t.Setenv(testNativeReaperDeletePIDFile, pidPath)
+	t.Setenv(testNativeReaperDeleteSleepMS, "60000")
+	id := nativeReaperID('a')
+	var stderr strings.Builder
+	if code := runNativeReaper(cfg, strings.NewReader("+\t"+id+"\n"), &stderr); code != 0 {
+		t.Fatalf("runNativeReaper = %d; stderr: %s", code, stderr.String())
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("backend did not report its PID: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("backend PID = %q: %v", data, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed-out backend process %d survived the reap", pid)
 }

@@ -21,20 +21,20 @@ Go 1.26 以降が必要です。`v0.3.0` モジュールにも Go 1.26 以降が
 
 現在のチェックアウトには、次の意図的な制約があります。
 
-- Windows では Go ネイティブの watchdog リーパーを使います。`/bin/sh` が
-  ないため、ライブラリ自身の実行ファイルを再実行して、親の pipe が閉じた後に
-  Docker の immutable ID を回収し、name-addressed な Docker create は inspect が
-  返す immutable ID で回収します。reaper 子プロセスは専用の非表示コンソール
-  プロセスグループで動くため、コンソールの Ctrl+C では親と一緒に終了しません。
-  reaper は Windows の Job Object に割り当てられ、reaper とそれが起動した全
-  プロセスが同じ teardown 境界を共有するため、停止時はツリーごと終了します。
-  現在の native ループは EOF まで backend コマンドを起動しないため、これは
-  多層防御であり、観測されたリークの修正ではありません。job は
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` を設定しないため、親の死亡でカーネルが
-  親の handle を閉じても watchdog は残って reap できます。
+- すべてのプラットフォームで Go ネイティブの watchdog リーパーを使います。
+  ライブラリ自身の実行ファイルを再実行して、親の pipe が閉じた後に Docker の
+  immutable ID を回収し、name-addressed な Docker create は inspect が返す
+  immutable ID で回収します。`/bin/sh` の helper はありません。Windows では
+  reaper 子プロセスが専用の非表示コンソールプロセスグループで動くため、
+  コンソールの Ctrl+C では親と一緒に終了しません。また reaper は Job Object に
+  割り当てられ、reaper とそれが起動した全プロセスが同じ teardown 境界を共有
+  するため、停止時はツリーごと終了します。reaper は EOF まで backend コマンドを
+  起動しないため、これは多層防御であり、観測されたリークの修正ではありません。
+  job は `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` を設定しないため、親の死亡で
+  カーネルが親の handle を閉じても watchdog は残って reap できます。
   remote daemon や self-exec できない build では、明示的な `Terminate`、
   `Cleanup`、`TerminateContainer`、`Prune`、および rollback 経路に依存します。
-  `WithEnv` と `WithExecEnv` は Windows では現在のログオンだけに許可した DACL で
+  Windows では `WithEnv` と `WithExecEnv` が現在のログオンだけに許可した DACL で
   環境ファイルを書き、Docker の copy-out には Go 1.26 以降が必要です。
 - network の作成とライフサイクル管理はスコープ外です。`WithNetwork` は既存の
   network へ接続します。volume の作成とライフサイクル管理もスコープ外で、
@@ -99,11 +99,11 @@ macOS で Docker（Docker Desktop など）を使う場合は
 `CONTAINERGO_BACKEND=docker` を、Apple Container を明示する場合は
 `CONTAINERGO_BACKEND=apple` を設定します。
 
-Windows の watchdog リーパーは Docker コンテナを immutable ID で回収し、
-name-addressed create も inspect が返す immutable ID で回収します。remote
-daemon はローカルのテスト環境より長く残り、self-exec できない build では
-reaper 自体がありません。リーパーによる残骸の回収を期待せず、クリーンアップの
-契約に従って `TestMain` の前後で `Prune` を実行してください。
+watchdog リーパーは Docker コンテナを immutable ID で回収し、name-addressed
+create も inspect が返す immutable ID で回収します。テストプロセスのローカルな
+子プロセスなので remote daemon はローカルのテスト環境より長く残り、self-exec
+できない build では reaper 自体がありません。リーパーによる残骸の回収を期待せず、
+クリーンアップの契約に従って `TestMain` の前後で `Prune` を実行してください。
 
 本ライブラリはバックエンドの CLI（`container` / `docker`）を子プロセスとして
 呼び出します。cgo もデーモン API クライアントも使いません。
@@ -902,16 +902,14 @@ CLI がヘルパーをデタッチする設計の場合は、子孫の終了を�
    `Run` へ返されません。
 
 reaper は実 CLI コンテナを非 reuse 経路で登録した場合に遅延起動します。
-Unix は既定で固定の `/bin/sh` スクリプトを起動し、
-`CONTAINERGO_REAPER_NATIVE=1` を設定するとライブラリ自身の実行ファイルを
-内部マーカー付きで再実行して同じループを Go で動かします。Windows は
-`/bin/sh` がないため、self-exec が可能な場合はネイティブループを使います。
-ネイティブループは inspect 出力を `sed` や `awk` ではなく、ライブラリの
-strict JSON パーサと inspect パーサで解析します。
+対応するすべてのプラットフォームで Go ネイティブのループを使います。
+ライブラリ自身の実行ファイルを内部マーカー付きで再実行し、inspect 出力を
+`sed` や `awk` ではなく、ライブラリの strict JSON パーサと inspect パーサで
+解析します。`/bin/sh` の実装も機能フラグもありません。
 
 動作中の reaper を停止する経路（最後の entry を unregister したときや、pipe
 への書き込み失敗で置き換えるときなど）では、その reaper が所有するプロセス
-ツリーをまとめて破棄します。Unix は shell が停止したことを確認してから
+ツリーをまとめて破棄します。Unix は reaper が停止したことを確認してから
 reaper のプロセスグループへシグナルを送ります。Windows は reaper を
 Job Object に割り当て、直接の kill の前に `TerminateJobObject` を呼ぶため、
 reaper とそれが起動した全プロセスを 1 つのツリーとして終了します。現在の
@@ -927,13 +925,19 @@ Windows の「直接の子だけを kill する」制限を置き換えるもの
 されない環境など）でも reaper は動作し、停止経路は直接の子だけを終了する
 従来の動作に fallback します。
 
-self-exec には main package の実行ファイルが必要なため、ネイティブループは
-`-buildmode=c-shared` と `c-archive`（独自の Go runtime を持つ）では無効化され、
-Unix では setuid/setgid バイナリでも無効化されます。Unix はその場合
-`/bin/sh` に fallback し、Windows は host process を再実行せず reaper なしに
-なります。`-buildmode=plugin` と `shared` は未サポートです。runtime が host
-実行ファイルの build info を返す可能性があり buildmode を確実に検出できない
-ため、これらの build では `CONTAINERGO_REAPER_NATIVE` を有効にしないでください。
+self-exec にはこの package を含む main package の実行ファイルが必要なため、
+reaper は `-buildmode=c-shared` と `c-archive`（独自の Go runtime を持つ）では
+無効化され、Unix では setuid/setgid バイナリでも無効化されます。さらに build
+information の main module または dependency にこの module
+(`github.com/hirokazumiyaji/container-go`) が含まれることを要求します。
+`/bin/sh` への fallback はないため、条件を満たさない host では watchdog を
+作らず、登録は no-op になります。異常終了時の回収は利用できず、明示的な
+`Terminate`、`Cleanup`、`Prune`、rollback 経路だけが cleanup 手段です。
+`-buildmode=plugin` と `shared` は runtime が host 実行ファイルの build info を
+返す可能性があり buildmode を確実に検出できませんが、module 検査により、この
+package を link していない plugin host は re-exec されません。link している
+host は安全に reaper を実行できます。これらの build mode は引き続き未サポート
+です。
 また再実行はその時点の executable path を起動するため、実行中に
 バイナリを置き換えると respawn 後の reaper は新しい版になります。Windows
 では実行中の reaper が executable image を終了まで開いたままにするため、
@@ -946,7 +950,7 @@ reaper entry として保持します。名前で address する entry（Apple �
 Docker は `run` が ID を返すまで）は、lock を持つ場合は通常の
 generation-checked 削除と同じ名前単位 `flock` の下で inspect・削除されます。
 Docker の generation 削除は inspect が返す immutable ID に束縛されるため、
-lock のない name-addressed Docker entry（Windows の場合）もその ID で安全に
+lock のない name-addressed Docker entry（name lock を持たないホスト）もその ID で安全に
 回収されます。Apple の name 削除は常に lock を必要とします。Docker ID entry は
 name lookup なしで ID により削除されます。backend が解析可能な ID を返さない
 場合は、name と generation の経路が削除対象として残ります。
@@ -955,7 +959,7 @@ reaper の spawn failure は retry 上限後に一度だけ log へ残ります�
 delete failure は reaper が無視します。reaper の動作を cleanup の成功確認に
 使わないでください。
 
-現在の reaper は inspect output を構造化フィルタへ流し、raw JSON を disk へ
+現在の reaper は inspect output をメモリ上で解析し、raw JSON を disk へ
 書きません。変更前のバージョンは namespace のない `mktemp` file を使って
 いたため、inspect 中に reaper が kill されると環境 data を含む file が残る
 可能性があります。旧バージョンの file を扱う場合は、cleanup 前に
@@ -1042,15 +1046,14 @@ filter します。`container.WithPruneDryRun()` は ownership、state、age、l
 同じ検証を行い、実際に削除する ID を削除せずに返します。reaper の状態も
 変更しません。
 
-### Windows と remote daemon の cleanup
+### remote daemon と非対応 host の cleanup
 
-リーパーはローカルの子プロセスです（Unix の既定は `/bin/sh`、ネイティブ
-ループではライブラリ自身の実行ファイル）。CI の job cancel や
-`go test -timeout` でローカルの process tree や runner VM が破棄された後には
-動作できません。remote Docker daemon 上のコンテナもローカル環境より長く
-残ります。Windows は Docker コンテナを immutable ID で回収しますが、
-self-exec できない build では reaper がありません。リーパーが動作する場合でも
-登録と削除は best-effort であり、cleanup の成功確認には使えません。
+リーパーはローカルの子プロセスです（ライブラリ自身の実行ファイル）。CI の
+job cancel や `go test -timeout` でローカルの process tree や runner VM が
+破棄された後には動作できません。remote Docker daemon 上のコンテナも
+ローカル環境より長く残ります。self-exec できない build では reaper が
+ありません。リーパーが動作する場合でも登録と削除は best-effort であり、
+cleanup の成功確認には使えません。
 
 そのような環境では、suite の前後に `TestMain` から停止済みの managed
 コンテナを掃除します。次の helper を `TestMain` から呼び、その戻り値で
@@ -1208,10 +1211,9 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
 
 ## セキュリティ上の注意
 
-- すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。Unix の
-  リーパーの `/bin/sh` スクリプトは固定文字列で、コンテナ ID は検証済みの
-  stdin データとしてのみ渡します。ネイティブリーパーは同じストリームを
-  シェルなしで解析します。name-addressed entry には共有の `nameRE`
+- すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。リーパーは
+  コンテナ ID を検証済みの stdin データとしてのみ受け取り、メモリ上で解析
+  します。name-addressed entry には共有の `nameRE`
   トークン規則を、Docker の full 64-hex immutable ID は別に受け付けます。
   Apple のより厳密な 2〜63 文字の名前チェックはコンテナ作成前に適用します。
 - Unix では環境変数を、正規化済みの `os.UserCacheDir()` 配下の、所有者と
@@ -1266,10 +1268,10 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
 
 ### 旧バージョンの reaper staging ファイル
 
-現在の watchdog は inspect 出力を構造化フィルタへ流すか、ネイティブループで
-メモリ上で解析して処理し、raw 出力をディスクへ書きません。旧バージョンは
-名前空間もない `mktemp` ファイルを使っていたため、inspect 中に reaper が
-kill されると、コンテナの環境変数を含むファイルが残る可能性があります。旧バージョンのファイル名は本ライブラリの
+現在の watchdog は inspect 出力をメモリ上で解析して処理し、raw 出力を
+ディスクへ書きません。旧バージョンは名前空間もない `mktemp` ファイルを
+使っていたため、inspect 中に reaper が kill されると、コンテナの環境変数を
+含むファイルが残る可能性があります。旧バージョンのファイル名は本ライブラリの
 ものと安全に特定できません。調査・削除する場合は、先にすべての container-go と
 watchdog プロセスを停止し、実効 `TMPDIR`(`/tmp` と決めつけません)でメタデータ
 だけを列挙し、そのユーザーと該当時間帯の通常ファイルに範囲を絞ります。ファイル

@@ -148,13 +148,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an internal marker instead of starting `/bin/sh`, reads the same stdin event
   stream, and reaps pending entries after EOF. It decodes inspect output with
   `internal/strictjson` and the existing Apple/Docker inspect models, so no
-  `sed` or `awk` is involved. Unix opts in with `CONTAINERGO_REAPER_NATIVE=1`
-  while the `/bin/sh` script remains the default; Windows has no shell and uses
-  the native loop whenever self-execution is available. Self-execution is
-  skipped for `c-shared` and `c-archive` build modes and for setuid/setgid
-  Unix binaries, where Unix falls back to the script and Windows has no
-  reaper. `plugin` and `shared` builds are unsupported because their runtime
-  may report the host's build information; do not use the native flag there.
+  `sed` or `awk` is involved. The native loop is the reaper on every supported
+  platform.
+
+### Removed
+
+- Remove the `/bin/sh` watchdog reaper implementation and the
+  `CONTAINERGO_REAPER_NATIVE` feature flag; the Go-native loop is now the
+  default on Unix and remains the only implementation on Windows. A host that
+  cannot self-execute (`-buildmode=c-shared`, `c-archive`, setuid/setgid Unix
+  binaries, or build information that does not name this module) has no
+  reaper: registration is a no-op and abnormal-exit cleanup relies on explicit
+  `Terminate`, `Cleanup`, and `Prune` instead of a shell fallback. A
+  `-buildmode=plugin` or `shared` host may report the host executable's build
+  information, so the build-mode check cannot reliably detect it; the module
+  check keeps a host that did not link this package from being re-executed,
+  and those build modes remain unsupported (#381).
 
 ### Fixed
 

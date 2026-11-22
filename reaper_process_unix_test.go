@@ -101,9 +101,3 @@ func TestKillReaperProcessRequiresStoppedBarrier(t *testing.T) {
 	}
 	t.Fatalf("group member %d did not exit after cleanup", child)
 }
-
-func TestReaperScriptKeepsDescendantsInShellProcessGroup(t *testing.T) {
-	if strings.Contains(reaperScript, "set -m") {
-		t.Fatal("reaper script enables job control; descendants can leave the shell process group and survive killReaperProcess")
-	}
-}

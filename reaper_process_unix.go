@@ -10,9 +10,9 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// configureReaperProcess gives each reaper shell its own process group.
-// Backend commands and the timeout helper can then be terminated as a
-// unit when the child is stopped or replaced.
+// configureReaperProcess gives each self-executed reaper its own process
+// group. Backend commands can then be terminated as a unit when the child is
+// stopped or replaced.
 func configureReaperProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
@@ -31,14 +31,11 @@ func (j *reaperJob) terminate() {}
 
 func (j *reaperJob) close() {}
 
-func shellReaperAvailable() bool { return true }
-
-// killReaperProcess terminates the shell and every process in its group.
-// configureReaperProcess makes the shell a group leader, and the reaper
-// script deliberately does not enable job control, so helpers and backend
-// commands stay in that group. The caller waits for the shell, which reaps
-// it before its PID can be reused; this function must not hold or signal
-// numeric descendant PIDs.
+// killReaperProcess terminates the reaper and every process in its group.
+// configureReaperProcess makes the reaper a group leader, and backend
+// commands it starts stay in that group. The caller waits for the reaper,
+// which reaps the children before its PID can be reused; this function must
+// not hold or signal numeric descendant PIDs.
 func killReaperProcess(cmd *exec.Cmd) {
 	killReaperProcessWithObserver(cmd, cli.ObserveProcessStopped)
 }

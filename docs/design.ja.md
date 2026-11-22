@@ -36,7 +36,7 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 設計上の制約は次の三つである。
 
 - **最小依存**：標準ライブラリと、プラットフォームの process と file 操作に使う `golang.org/x/sys` のみを依存する。コンテナクライアントのサードパーティ Go モジュールは使わない。
-- **セキュリティ**：subprocess argv でインジェクションを防ぐ。現在の watchdog reaper は inspect output を構造化フィルタへ流し、raw JSON を disk に staging しない。旧バージョンの staging file には環境データが残り得るため、そのバージョンを実行した環境では後述の Security 節の cleanup 手順に従う。
+- **セキュリティ**：subprocess argv でインジェクションを防ぐ。現在の watchdog reaper は inspect output をメモリ上で解析し、raw JSON を disk に staging しない。旧バージョンの staging file には環境データが残り得るため、そのバージョンを実行した環境では後述の Security 節の cleanup 手順に従う。
 - **パフォーマンス**：テストスイートを左右するのはコンテナ（VM）の起動時間である。ライブラリ側のオーバーヘッドをそれに対して無視できる水準に保ち、並列起動を妨げない。
 
 ## 前提とする Apple Container の仕様
@@ -428,22 +428,23 @@ creation label は存在し、この run と一致しなければならず、lab
 あり、トランザクション保証ではない。lock、inspect、delete の error は `Run` の
 返り値に連結されない。
 
-**異常終了**：親 process が終了して reaper pipe が閉じられると、外部
-`/bin/sh` の watchdog が強制削除を試みる。process を終了させる未 recover の
+**異常終了**：親 process が終了して reaper pipe が閉じられると、self-exec
+した Go の watchdog が強制削除を試みる。process を終了させる未 recover の
 panic、`SIGKILL`、`os.Exit` では pipe が閉じる。recover した panic では閉じない。
 reaper は親が生きている間は登録を蓄積し、EOF のあとだけ削除する。reaper は
-保険であり、トランザクション保証ではなく、Windows では利用できない。登録
-error と各 entry の delete error は `Run` に返らない。spawn failure が retry
-上限に達した場合は一度だけ log に残り、delete failure は shell が無視する。
-各 backend 呼び出しには POSIX の `sleep` / `kill` による 10–30 秒の期限があり、
-timer process も回収する。reap 全体にも overall budget があり、それを超えると
-新規の backend 呼び出しは発行しない。worker pool は並列度を制限し、
-いずれかの worker が終了すると次の entry を開始する。budget が切れて
-未開始の entry が残る場合、container ID を出さず残件数を stderr に報告する。
+保険であり、トランザクション保証ではない。self-exec できない host には
+reaper がなく、shell へ fallback せず登録を no-op にして fail-closed とする。
+登録 error と各 entry の delete error は `Run` に返らない。spawn failure が
+retry 上限に達した場合は一度だけ log に残り、delete failure は無視する。
+各 backend 呼び出しには `exec.CommandContext` による 10–30 秒の期限があり、
+reap 全体にも overall budget があり、それを超えると新規の backend 呼び出しは
+発行しない。worker pool は並列度を制限し、いずれかの worker が終了すると次の
+entry を開始する。budget が切れて未開始の entry が残る場合、container ID を
+出さず残件数を stderr に報告する。
 
-**残骸の回収**：watchdog は Windows では使えず、CI のキャンセルや
-`go test -timeout` などでローカルの process tree や runner VM が破棄された
-後、または remote Docker daemon 上でローカル環境より長く残るコンテナには
+**残骸の回収**：watchdog は、CI のキャンセルや `go test -timeout` などで
+ローカルの process tree や runner VM が破棄された後、self-exec できない host、
+または remote Docker daemon 上でローカル環境より長く残るコンテナには
 動作できません。対応策は `TestMain` の前後で `Prune(ctx)` を呼ぶことです。
 `Prune` は session に関係なく停止済みの managed コンテナを削除し、running と
 created は残します。`WithPruneOlderThan(d)` は backend が報告する作成時刻が
@@ -465,7 +466,7 @@ entry として登録する。名前で address する entry（Apple は常に�
 Docker ID entry は name lookup なしで ID により削除される。backend が解析可能な
 ID を返さない場合は、name と generation の経路が削除対象として残る。
 
-現在の reaper は inspect output を構造化フィルタへ流し、raw JSON を disk へ
+現在の reaper は inspect output をメモリ上で解析し、raw JSON を disk へ
 書きません。旧バージョンは namespace のない `mktemp` file を使っていたため、
 inspect 中に reaper が kill されると環境 data を含む file が残る可能性が
 あります。旧バージョンの file を扱う場合は、container-go と reaper の
@@ -517,13 +518,11 @@ Option を `Run` 間で再利用する必要がある。新しい呼び出しは
 
 ## セキュリティ設計
 
-外部プロセスを起動するライブラリとして、次の原則は security boundary を表す。現在の reaper は inspect output を構造化フィルタへ流し、raw JSON を staging しない。旧バージョンの staging file は後述の cleanup 手順の対象であり、それらの環境では end-to-end の no-leak 保証にはならない。
+外部プロセスを起動するライブラリとして、次の原則は security boundary を表す。現在の reaper は inspect output をメモリ上で解析し、raw JSON を staging しない。旧バージョンの staging file は後述の cleanup 手順の対象であり、それらの環境では end-to-end の no-leak 保証にはならない。
 
 **シェルを経由しない**。
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
-唯一の例外は watchdog リーパーのシェルスクリプトである。
-ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
+コンテナ ID は watchdog へ標準入力のデータとしてのみ渡し、self-exec した子プロセスがメモリ上で解析する。
 リーパーは name-addressed entry を共有の generic `nameRE`
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証し、Docker の 64 桁 16 進数 ID も受け付ける。
 この shared guard は Apple の契約全体ではない。`appleEngine.checkConfig` がコンテナ作成前に Apple 固有の 2〜63 文字の `appleContainerNameRE` を適用する。
@@ -558,8 +557,8 @@ cleanup は一時的な sharing violation / access denied を有界の指数バ�
 **汎用ログ注入 API はない**。公開 API に汎用ロガーフックはない。テスト専用の `WithTestLogger` は `t.Logf` へ転送するだけで、backend のコマンドデータを任意の sink へ公開しない。`CLIError` は診断用に失敗したコマンドの引数と上限付き stderr を提供するが、環境変数の値は一時 env ファイルにあり argv には現れない。watchdog は起動を繰り返し失敗した場合に標準ログへ一度だけメッセージを出す。
 
 **旧バージョンの reaper staging ファイル**。
-現在の reaper は inspect 出力を構造化フィールドフィルタへ流して処理し、raw
-inspect ファイルを作成しません。変更前のバージョンは名前空間もない `mktemp`
+現在の reaper は inspect 出力をメモリ上で解析して処理し、raw inspect ファイルを
+作成しません。変更前のバージョンは名前空間もない `mktemp`
 ファイルを使っていたため、inspect 中の reaper が kill されると環境値を含む
 ファイルが残る可能性があります。その名前から本ライブラリのファイルとして
 安全に特定することはできません。運用者はまず container-go と reaper の
@@ -690,7 +689,8 @@ container-go/
 ├── pull.go           // pull policy とプロセス内 pull 集約
 ├── reuse.go          // WithReuse と PruneReuseGroup
 ├── cleanup.go        // Cleanup、TerminateContainer、Prune
-├── reaper.go         // watchdog reaper
+├── reaper.go         // watchdog reaper の登録、spawn、replay
+├── reaper_native.go  // self-exec する watchdog loop と delete gate
 ├── exec.go           // Exec、ExecTo、ExecOption
 ├── logs.go           // Logs、LogsWithOptions、LogsTo、FollowLogs
 ├── output.go         // bounded reader、sink、truncation error
@@ -771,9 +771,8 @@ unspecified 束縛は loopback へ解決しながら IPv4 と IPv6 のファミ�
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。
 
-**クリーンアップの違い**: watchdog リーパーは削除サブコマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force`)。
-リーパーは `/bin/sh` に依存するため Windows では動かない。
-v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
+**クリーンアップの違い**: watchdog リーパーは削除サブコマンドをバックエンドごとに切り替え(Apple は `delete --force`、Docker は `rm --force`)、対応するすべてのプラットフォームで同じ Go ループを動かす。
+self-exec できない build (`c-shared`、`c-archive`、setuid/setgid、build info がこの module を含まない host) にはリーパーがなく、異常終了時の回収は通常経路(`Cleanup`、ロールバック)と `Prune` に依存する。
 `Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited --filter status=dead`)を使える。`dead` はデーモンが回収できない停止済みコンテナで、`exited` だけだと取りこぼす。出力は `--no-trunc --format {{.ID}}` の full container ID である。
 
 **liveness detection**：probe command は backend ごとに切り替える（Apple は `system status`、Docker は `version --format {{.Server.Version}}`）。

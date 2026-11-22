@@ -25,22 +25,22 @@ repository's documentation test.
 
 The current checkout still has these deliberate constraints:
 
-- Windows uses the Go-native watchdog reaper: there is no `/bin/sh`, so the
-  reaper re-executes the library executable, reaps immutable Docker IDs once
-  the parent pipe closes, and reclaims a name-addressed Docker create through
-  the immutable ID its inspect reports. The reaper child runs in its own
-  hidden console process group, so a console Ctrl+C does not take it down
-  with the parent. The reaper is assigned to a Windows Job Object, so the
-  reaper and every process it starts share one teardown boundary and a stop
-  terminates that tree; the native loop starts no backend command before EOF,
-  so this is defense in depth rather than an observed leak fix. The job does
-  not set `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the kernel closing the
-  parent's handle at parent death leaves the watchdog running to reap. A
-  remote daemon and a build without self-execution support still rely on
-  explicit `Terminate`, `Cleanup`, `TerminateContainer`, `Prune`, and the
-  rollback paths. `WithEnv` and `WithExecEnv` write the secret env file under
-  a current-logon-only DACL on Windows, and Docker copy-out requires Go 1.26
-  or newer.
+- Every supported platform uses the Go-native watchdog reaper: the library
+  re-executes its own executable with an internal marker, reaps immutable
+  Docker IDs once the parent pipe closes, and reclaims a name-addressed Docker
+  create through the immutable ID its inspect reports. There is no `/bin/sh`
+  helper. On Windows the reaper child runs in its own hidden console process
+  group, so a console Ctrl+C does not take it down with the parent, and it is
+  assigned to a Job Object so the reaper and every process it starts share one
+  teardown boundary. The reaper starts no backend command before EOF, so this
+  is defense in depth rather than an observed leak fix. The job does not set
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the kernel closing the parent's
+  handle at parent death leaves the watchdog running to reap. A remote daemon
+  and a build without self-execution support still rely on explicit
+  `Terminate`, `Cleanup`, `TerminateContainer`, `Prune`, and the rollback
+  paths. On Windows, `WithEnv` and `WithExecEnv` write the secret env file
+  under a current-logon-only DACL, and Docker copy-out requires Go 1.26 or
+  newer.
 - Network creation and lifecycle management are out of scope;
   `WithNetwork` attaches an existing network. Volume creation and lifecycle
   management are also out of scope; `WithMounts` accepts bind, named-volume,
@@ -103,10 +103,10 @@ func TestRedis(t *testing.T) {
 Set `CONTAINERGO_BACKEND=docker` to use Docker on macOS (e.g. Docker
 Desktop), or `CONTAINERGO_BACKEND=apple` to insist on Apple Container.
 
-On Windows the watchdog reaper reclaims Docker containers by immutable ID,
-including the ID an inspect reports for a name-addressed create. A remote
-daemon outlives the local test environment, and a build that cannot
-self-execute (see the reaper section) has no reaper there. Schedule `Prune`
+The watchdog reaper reclaims Docker containers by immutable ID, including the
+ID an inspect reports for a name-addressed create. It is a local child of the
+test process, so a remote daemon outlives it, and a build that cannot
+self-execute (see the reaper section) has no reaper at all. Schedule `Prune`
 from `TestMain` before and after the suite, as described in the Cleanup
 contract, rather than relying on the reaper to remove leftovers.
 
@@ -1035,16 +1035,14 @@ different error visibility.
    deletion errors are not returned to `Run`.
 
 The reaper is started lazily only for a real CLI container on the non-reuse
-path. Unix starts a fixed `/bin/sh` script by default; setting
-`CONTAINERGO_REAPER_NATIVE=1` re-executes the library executable with an
-internal marker and runs the same loop in Go. Windows has no shell and uses
-the native loop whenever self-execution is available. The native loop decodes
+path. It is the Go-native loop on every supported platform: the library
+re-executes its own executable with an internal marker, and the child decodes
 inspect output with the library's strict JSON and inspect parsers instead of
-`sed` or `awk`.
+`sed` or `awk`. There is no `/bin/sh` implementation and no feature flag.
 
 Stopping a live reaper (for example, after the last entry is unregistered, or
 when a failed pipe write forces a replacement) tears down the tree it owns.
-Unix signals the reaper's process group after confirming the shell stopped.
+Unix signals the reaper's process group after confirming the reaper stopped.
 Windows assigns the reaper to a Job Object and calls `TerminateJobObject`
 before the direct kill, so the reaper and every process it started are
 terminated as one tree. The native loop starts no backend command until EOF,
@@ -1059,25 +1057,32 @@ be created or the reaper cannot be assigned to it (for example, an environment
 that does not allow nested jobs), the reaper still runs, and the stop path
 falls back to terminating the direct child only.
 
-Self-execution requires a main-package executable. The native loop is
-disabled for `-buildmode=c-shared` and `c-archive`, which carry their own Go
-runtime, and, on Unix, for setuid/setgid binaries; Unix falls back to the
-`/bin/sh` script in those cases, and Windows has no reaper rather than
-re-running a host process. `-buildmode=plugin` and `shared` are unsupported:
-their runtime may report the host executable's build information, so the
-build-mode check cannot reliably detect them; do not enable
-`CONTAINERGO_REAPER_NATIVE` in those builds. Re-executing also means a
-respawn starts whatever binary now occupies the executable path, so replacing the binary on disk
-mid-run changes the reaper version. On Windows the running reaper keeps the
-executable image open until it exits, so a reap can briefly outlive the
+Self-execution requires a main-package executable that contains this package.
+The reaper is disabled for `-buildmode=c-shared` and `c-archive`, which carry
+their own Go runtime, and, on Unix, for setuid/setgid binaries. It also
+requires this module (`github.com/hirokazumiyaji/container-go`) to appear as
+the main module or a dependency in the build information. There is no
+`/bin/sh` fallback: on such a host the library creates no watchdog and
+registration is a no-op, so abnormal-exit cleanup is unavailable and explicit
+`Terminate`, `Cleanup`, `Prune`, and the rollback paths are the only cleanup.
+`-buildmode=plugin` and `shared` may report the host executable's build
+information, so the build-mode check cannot reliably detect them; the module
+check keeps a plugin host that did not link this package from being
+re-executed, while a host that did link it can run the reaper safely. Those
+build modes remain unsupported. Re-executing also means a respawn starts
+whatever binary now occupies the executable path, so replacing the binary on
+disk mid-run changes the reaper version. On Windows the running reaper keeps
+the executable image open until it exits, so a reap can briefly outlive the
 process that spawned it; a test that starts one should let it finish before
-the test binary exits. Every created container is
-pre-registered under its name and creation generation before the backend
-create starts; after a successful create, the library verifies the
-managed/session/creation labels and then retains Docker's full 64-hex
-immutable ID as an additional reaper entry. Name-addressed entries (Apple
-always, and a Docker create until `run` returns its ID) are inspected and
-deleted under the same per-name `flock` as ordinary generation-checked
+the test binary exits.
+
+Every created container is pre-registered under its name and creation
+generation before the backend create starts; after a successful create, the
+library verifies the managed/session/creation labels and then retains
+Docker's full 64-hex immutable ID as an additional reaper entry.
+Name-addressed entries (Apple always, and a Docker create until `run` returns
+its ID) are inspected and deleted under the same per-name `flock` as ordinary
+generation-checked
 deletion when the entry carries a lock. A Docker generation delete is bound
 to the immutable ID the inspect reports, so a name-addressed Docker entry
 without a lock (the Windows case) is still safe and is reclaimed by that ID;
@@ -1169,16 +1174,15 @@ verified candidate; Apple Container filters the listed candidates client-side.
 label checks and returns the IDs a real prune would remove, without deleting
 them or touching reaper state.
 
-### Windows and remote-daemon cleanup
+### Remote-daemon and unsupported-host cleanup
 
-The reaper is a local child process (`/bin/sh` on Unix by default, or the
-library executable itself with the native loop). It cannot act after the
-local process tree or runner VM is destroyed, for example when CI cancels a
-job or `go test -timeout` kills the process. Containers on a remote Docker
-daemon also outlive that local environment. Windows reclaims Docker
-containers by immutable ID, and a build where self-execution is unavailable
-has no reaper at all. Registration and deletion are best effort even when the
-reaper runs; do not treat the reaper as a cleanup acknowledgement.
+The reaper is a local child process (the library executable itself). It cannot
+act after the local process tree or runner VM is destroyed, for example when
+CI cancels a job or `go test -timeout` kills the process. Containers on a
+remote Docker daemon also outlive that local environment. A build where
+self-execution is unavailable has no reaper at all. Registration and deletion
+are best effort even when the reaper runs; do not treat the reaper as a
+cleanup acknowledgement.
 
 For those environments, sweep stopped managed containers from `TestMain`
 before and after the suite. Call the helper below from `TestMain` and exit
@@ -1332,10 +1336,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 
 ## Security notes
 
-- Every CLI call is an argv vector; no shell is involved. The Unix reaper's
-  `/bin/sh` script is a fixed string that receives container IDs only as
-  validated stdin data; the native reaper decodes the same stream without a
-  shell. Name-addressed entries use the shared `nameRE` token rule, while
+- Every CLI call is an argv vector; no shell is involved anywhere. The reaper
+  receives container IDs only as validated stdin data and decodes them in
+  memory. Name-addressed entries use the shared `nameRE` token rule, while
   Docker's full 64-hex immutable IDs are accepted separately; Apple's
   stricter 2–63-character name check runs before container creation.
 - `CopyToContainer` opens regular files and directories without following
@@ -1413,10 +1416,10 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 
 ### Legacy reaper staging files
 
-The current watchdog streams inspect output through a structural filter (or
-decodes it in memory with the native loop) and never writes the raw output to
-disk. Older versions used an un-namespaced `mktemp` file, so a reaper killed
-during inspect can leave a file containing container environment data. Those legacy names cannot be safely attributed
+The current watchdog decodes inspect output in memory and never writes the
+raw output to disk. Older versions used an un-namespaced `mktemp` file, so a
+reaper killed during inspect can leave a file containing container environment
+data. Those legacy names cannot be safely attributed
 to this library. To investigate or clean them up, first stop all
 container-go and watchdog processes, inspect the per-user temporary directory
 (the effective `TMPDIR`, not an assumed `/tmp`) using a metadata-only listing

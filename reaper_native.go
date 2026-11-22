@@ -9,7 +9,6 @@ import (
 	"math"
 	"os"
 	"os/exec"
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -21,16 +20,12 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
-// The native reaper is the same watchdog loop as reaperScript, run by
-// re-executing this executable with an internal marker instead of starting
-// /bin/sh. The parent side is unchanged: entries arrive on stdin, the loop
-// does nothing until EOF, and EOF starts the bounded reap. Inspect output is
-// decoded with the same parsers the library uses for the backend, so neither
-// sed nor awk is needed.
+// The native reaper is a watchdog loop run by re-executing this executable
+// with an internal marker instead of starting /bin/sh. The parent side is
+// unchanged: entries arrive on stdin, the loop does nothing until EOF, and EOF
+// starts the bounded reap. Inspect output is decoded with the same parsers the
+// library uses for the backend, so neither sed nor awk is needed.
 const (
-	// reaperNativeEnv opts a Unix process into the native reaper. Windows
-	// has no /bin/sh, so the native loop is the only reaper there.
-	reaperNativeEnv = "CONTAINERGO_REAPER_NATIVE"
 	// reaperInternalEnv marks the self-executed reaper child. It is set by
 	// the parent only, and the marker is removed from backend commands.
 	reaperInternalEnv     = "CONTAINERGO_INTERNAL_REAPER"
@@ -62,54 +57,62 @@ var (
 // and a backend may omit state fields on an entry that is already gone.
 var reaperDockerInspectFields = []string{"Id"}
 
-// nativeReaperEnabled reports whether a newly created reaper uses the native
-// loop. Unix keeps the /bin/sh script unless the feature flag is set, so the
-// script is not replaced until the native loop has proven itself; Windows
-// has no shell and uses the native loop whenever self-execution is possible.
-func nativeReaperEnabled() bool {
-	if !nativeReaperSupported() {
-		return false
-	}
-	if runtime.GOOS == "windows" {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(reaperNativeEnv))) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
-}
+// reaperModulePath identifies the module that contains the reaper init hook.
+// A -buildmode=plugin child reports the host executable's build information,
+// so the module must appear there before the child can be trusted to re-enter
+// this package instead of running the host main.
+const reaperModulePath = "github.com/hirokazumiyaji/container-go"
 
 // nativeReaperSupported guards self-execution on hosts where re-running
-// os.Executable() would not start this program as a main package. Unix still
-// has the /bin/sh script to fall back to; Windows has no shell, so the
-// reaper is unavailable there rather than exec'ing a host process.
-//
-// plugin and shared builds are rejected when detected, but their runtime may
-// report the host executable's build information instead, so the README marks
-// them unsupported rather than relying on this check.
+// os.Executable() would not start a process that contains this package. There
+// is no /bin/sh fallback, so an unsupported host has no reaper and
+// registration is a no-op; explicit cleanup paths remain.
 func nativeReaperSupported() bool {
-	mode, ok := nativeReaperBuildMode()
-	if !ok || !nativeReaperBuildModeSupported(mode) {
-		return false
-	}
-	return nativeReaperPlatformSupported()
-}
-
-func nativeReaperBuildMode() (string, bool) {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
 		// Without build metadata the executable may be a library host
 		// rather than a main package, so fail closed instead of assuming
 		// re-execution is safe.
-		return "", false
+		return false
 	}
+	return nativeReaperSupportedInfo(info)
+}
+
+// nativeReaperSupportedInfo applies every self-execution prerequisite to
+// info. The module check rejects a plugin host that did not link this package:
+// the plugin's reported build information belongs to the host, and re-running
+// that executable with the internal marker would start the host main again.
+func nativeReaperSupportedInfo(info *debug.BuildInfo) bool {
+	if !nativeReaperBuildInfoSupported(info) {
+		return false
+	}
+	return nativeReaperPlatformSupported()
+}
+
+func nativeReaperBuildInfoSupported(info *debug.BuildInfo) bool {
+	if info == nil || !nativeReaperBuildInfoIncludesModule(info) {
+		return false
+	}
+	mode := "exe"
 	for _, setting := range info.Settings {
 		if setting.Key == "-buildmode" {
-			return setting.Value, true
+			mode = setting.Value
+			break
 		}
 	}
-	return "exe", true
+	return nativeReaperBuildModeSupported(mode)
+}
+
+func nativeReaperBuildInfoIncludesModule(info *debug.BuildInfo) bool {
+	if info.Main.Path == reaperModulePath {
+		return true
+	}
+	for _, dep := range info.Deps {
+		if dep != nil && dep.Path == reaperModulePath {
+			return true
+		}
+	}
+	return false
 }
 
 func nativeReaperBuildModeSupported(mode string) bool {
@@ -245,7 +248,7 @@ func (n *nativeReaper) reap(entries []nativeReaperEntry) {
 	wg.Wait()
 }
 
-// processEntry applies the same delete gate as the script: the entry must be
+// processEntry applies the delete gate: the entry must be
 // a validated name or immutable ID, a name-addressed entry must hold the
 // shared name lock, and a generation entry must observe its exact creation
 // generation before anything is deleted.
@@ -380,7 +383,7 @@ func nativeReaperBackendEnv() []string {
 // parseNativeReaperInspect reuses the ordinary inspect decoders. Apple
 // output nests labels under configuration.labels; Docker output nests them
 // under Config.Labels. The parser keeps only the immutable top-level Docker
-// ID, matching the script's depth guard.
+// ID from the top-level object, matching the other inspect parsers.
 func parseNativeReaperInspect(data []byte, subcommand, key string) (uid, creation string) {
 	switch subcommand {
 	case "delete":
@@ -484,49 +487,27 @@ func removeNativeReaperKey(order []nativeReaperKey, key nativeReaperKey) []nativ
 	return order
 }
 
-// parseNativeReaperEvent accepts the tab-separated protocol and the legacy
-// whitespace forms the script normalized with awk, so an event stream written
-// by either reaper is readable by the other.
+// parseNativeReaperEvent parses one tab-separated event line written by
+// writeReaperEntry and its siblings: <event>\t<id>[\t<creation>][\t<lock>].
+// The parent is the only writer, so no other encoding is accepted.
 func parseNativeReaperEvent(line string) (event, id, creation, lock string, ok bool) {
 	line = strings.TrimSuffix(line, "\n")
 	line = strings.TrimSuffix(line, "\r")
-	if strings.TrimSpace(line) == "" {
+	fields := strings.Split(line, "\t")
+	if len(fields) < 2 {
 		return "", "", "", "", false
 	}
-	var fields []string
-	if strings.Contains(line, "\t") {
-		fields = strings.Split(line, "\t")
-	} else {
-		fields = strings.Fields(line)
-	}
-	if len(fields) == 0 {
+	switch fields[0] {
+	case "+", "P", "C", "S", "-":
+	default:
 		return "", "", "", "", false
 	}
-	first := fields[0]
-	known := first == "+" || first == "P" || first == "C" || first == "S" || first == "-"
-	if !known {
-		// A line whose first field is not an event prefix is an older
-		// id/create/lock record; a single field is a plain ID.
-		event = "+"
-		id = first
-		if len(fields) >= 2 {
-			creation = fields[1]
-		}
-		if len(fields) >= 3 {
-			lock = fields[2]
-		}
-	} else {
-		if len(fields) < 2 {
-			return "", "", "", "", false
-		}
-		event = first
-		id = fields[1]
-		if len(fields) >= 3 {
-			creation = fields[2]
-		}
-		if len(fields) >= 4 {
-			lock = fields[3]
-		}
+	event, id = fields[0], fields[1]
+	if len(fields) >= 3 {
+		creation = fields[2]
+	}
+	if len(fields) >= 4 {
+		lock = fields[3]
 	}
 	if creation == "-" {
 		creation = ""

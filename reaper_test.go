@@ -30,6 +30,11 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 	return binPath, logPath
 }
 
+// shellSingleQuote quotes s as a POSIX shell literal for a fixture script.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -215,48 +220,6 @@ func TestReaperSIGKILLDoesNotStageInspectSecrets(t *testing.T) {
 	}
 }
 
-func TestReaperScriptHasTimeoutAndStructuralJSONMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, `sleep "$seconds"`) || !strings.Contains(reaperScript, "kill -9") {
-		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
-	}
-	// Inspect output is projected by object depth and string boundaries. A
-	// line-anchored sed expression only matched indented multi-line JSON, so
-	// compact output hid the generation and a nested "Id" could be chosen.
-	if strings.Contains(reaperScript, "sed -n") {
-		t.Error("reaper script must not depend on line-anchored sed JSON parsing")
-	}
-	if !strings.Contains(reaperScript, `awk -v want_key="$key"`) ||
-		!strings.Contains(reaperScript, `project(last_key, depth, text)`) {
-		t.Error("reaper script must project inspect JSON structurally")
-	}
-	if !strings.Contains(reaperScript, `[ "$got" = "$entry_creation" ] || return 0`) {
-		t.Error("reaper script must compare the extracted generation exactly")
-	}
-	// One wedged lock holder must not stall every entry behind it, so lock
-	// acquisition needs the same bounded timeout as the lockf fallback.
-	if !strings.Contains(reaperScript, `lock_timeout=30`) ||
-		!strings.Contains(reaperScript, `"$flock_bin" -x -w "$lock_timeout"`) {
-		t.Error("reaper script must bound flock acquisition with a timeout")
-	}
-	if strings.Contains(reaperScript, "mktemp") {
-		t.Error("reaper must not stage raw inspect output")
-	}
-	// The reap is bounded overall and concurrent after EOF, not only
-	// per entry: it is last-resort insurance and must finish even when
-	// the backend answers nothing.
-	if !strings.Contains(reaperScript, "remaining") {
-		t.Error("reaper script must bound the total reap time, not only each entry")
-	}
-	if !strings.Contains(reaperScript, `run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &`) {
-		t.Error("reaper script must process independent entries concurrently")
-	}
-	budgetAt := strings.Index(reaperScript, `if [ "$started" -eq 0 ]; then`)
-	reapAt := strings.Index(reaperScript, `run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &`)
-	if budgetAt < 0 || reapAt < 0 || budgetAt >= reapAt {
-		t.Error("reaper script must arm the overall budget before concurrent reap work")
-	}
-}
-
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
@@ -317,10 +280,11 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/container"
-	// Stub: inspect prints the creation it was told to know; delete is logged.
+	// Stub: inspect reports one current generation; delete is logged.
+	inspectJSON := fmt.Sprintf(`[{"id":"ctr","configuration":{"labels":{%q:%q}}}]`, creationLabel, "0123456789abcdef")
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n" +
+		"if [ \"$1\" = \"inspect\" ]; then printf '%s\\n' " + shellSingleQuote(inspectJSON) + "; fi\n" +
 		"exit 0\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -356,14 +320,14 @@ func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
 	// The live creation label differs; the old generation appears only
 	// inside user label values, in both key=value and (JSON-escaped)
 	// quoted forms, and under a look-alike key. None is the field.
+	inspectJSON := fmt.Sprintf(`[{"id":"ctr","configuration":{"labels":{%q:%q,%q:%q,%q:%q,%q:%q}}}]`,
+		creationLabel, "ffffffffffffffff",
+		"user.a", creationLabel+"="+oldCreation,
+		"user.b", `"`+creationLabel+`": "`+oldCreation+`"`,
+		strings.ReplaceAll(creationLabel, ".", "-"), oldCreation)
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then\n" +
-		"  echo '  \"" + creationLabel + "\": \"ffffffffffffffff\",'\n" +
-		"  echo '  \"user.a\": \"" + creationLabel + "=" + oldCreation + "\",'\n" +
-		"  echo '  \"user.b\": \"\\\"" + creationLabel + "\\\": \\\"" + oldCreation + "\\\"\",'\n" +
-		"  echo '  \"" + strings.ReplaceAll(creationLabel, ".", "-") + "\": \"" + oldCreation + "\",'\n" +
-		"fi\n"
+		"if [ \"$1\" = \"inspect\" ]; then printf '%s\\n' " + shellSingleQuote(inspectJSON) + "; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -428,6 +392,7 @@ func TestReaperPendingRegistrationRetriesSettlingCreate(t *testing.T) {
 	countPath := filepath.Join(dir, "inspect-count")
 	binPath := filepath.Join(dir, "container")
 	creation := "0123456789abcdef"
+	inspectJSON := fmt.Sprintf(`[{"id":"settling","configuration":{"labels":{%q:%q}}}]`, creationLabel, creation)
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
 		"if [ \"$1\" = inspect ]; then\n" +
@@ -436,7 +401,7 @@ func TestReaperPendingRegistrationRetriesSettlingCreate(t *testing.T) {
 		"  count=$((count + 1))\n" +
 		"  echo \"$count\" > " + countPath + "\n" +
 		"  [ \"$count\" -ge 2 ] || exit 1\n" +
-		"  echo '  \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"  printf '%s\\n' " + shellSingleQuote(inspectJSON) + "\n" +
 		"fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -455,9 +420,10 @@ func TestReaperRestartsAndReplaysAfterUnexpectedChildExit(t *testing.T) {
 	logPath := filepath.Join(dir, "calls.log")
 	binPath := filepath.Join(dir, "container")
 	creation := "0123456789abcdef"
+	inspectJSON := fmt.Sprintf(`[{"id":"replayed","configuration":{"labels":{%q:%q}}}]`, creationLabel, creation)
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = inspect ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\"'; fi\n"
+		"if [ \"$1\" = inspect ]; then printf '%s\\n' " + shellSingleQuote(inspectJSON) + "; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -512,9 +478,10 @@ func TestReaperSharedEntryIsNotDeletedOnEOF(t *testing.T) {
 	logPath := filepath.Join(dir, "calls.log")
 	binPath := filepath.Join(dir, "container")
 	creation := "0123456789abcdef"
+	inspectJSON := fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{%q:%q}}}]`, creationLabel, creation)
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = inspect ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\"'; fi\n"
+		"if [ \"$1\" = inspect ]; then printf '%s\\n' " + shellSingleQuote(inspectJSON) + "; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

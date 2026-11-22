@@ -3,11 +3,13 @@ package container
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,6 +29,7 @@ const (
 	testNativeReaperInspectFailCount = "CONTAINERGO_TEST_NATIVE_REAPER_INSPECT_FAIL_COUNT"
 	testNativeReaperInspectSleepMS   = "CONTAINERGO_TEST_NATIVE_REAPER_INSPECT_SLEEP_MS"
 	testNativeReaperDeleteSleepMS    = "CONTAINERGO_TEST_NATIVE_REAPER_DELETE_SLEEP_MS"
+	testNativeReaperDeletePIDFile    = "CONTAINERGO_TEST_NATIVE_REAPER_DELETE_PID_FILE"
 	testNativeReaperRankDir          = "CONTAINERGO_TEST_NATIVE_REAPER_RANK_DIR"
 	testNativeReaperRankSleepMS      = "CONTAINERGO_TEST_NATIVE_REAPER_RANK_SLEEP_MS"
 	testNativeReaperBusyDir          = "CONTAINERGO_TEST_NATIVE_REAPER_BUSY_DIR"
@@ -59,7 +62,7 @@ func runTestNativeReaperParent() int {
 	if err != nil {
 		return 2
 	}
-	r := newNativeReaper(exe, "rm")
+	r := newReaper(exe, "rm")
 	if err := r.register(os.Getenv(testNativeReaperParentID), ""); err != nil {
 		return 1
 	}
@@ -88,6 +91,9 @@ func runTestNativeReaperBackend() int {
 		sleepTestMS(os.Getenv(testNativeReaperInspectSleepMS))
 		fmt.Print(os.Getenv(testNativeReaperInspectJSON))
 		return 0
+	}
+	if pidPath := os.Getenv(testNativeReaperDeletePIDFile); pidPath != "" {
+		_ = os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600)
 	}
 	target := args[len(args)-1]
 	if busyDir := os.Getenv(testNativeReaperBusyDir); busyDir != "" {
@@ -268,15 +274,15 @@ func TestParseNativeReaperEvent(t *testing.T) {
 		lock     string
 		ok       bool
 	}{
-		{line: "plain-id\n", event: "+", id: "plain-id", ok: true},
 		{line: "+\tentry\t0123456789abcdef\t/lock\n", event: "+", id: "entry", creation: "0123456789abcdef", lock: "/lock", ok: true},
 		{line: "+\tentry\t-\n", event: "+", id: "entry", ok: true},
 		{line: "P\tsettling\t0123456789abcdef\t/lock\n", event: "P", id: "settling", creation: "0123456789abcdef", lock: "/lock", ok: true},
 		{line: "C\tsettling\t0123456789abcdef\n", event: "C", id: "settling", creation: "0123456789abcdef", ok: true},
 		{line: "S\tshared\t0123456789abcdef\n", event: "S", id: "shared", creation: "0123456789abcdef", ok: true},
 		{line: "-\tgone\t-\n", event: "-", id: "gone", ok: true},
-		{line: "legacy 0123456789abcdef /lock\n", event: "+", id: "legacy", creation: "0123456789abcdef", lock: "/lock", ok: true},
-		{line: "   \n", ok: false},
+		{line: "\n", ok: false},
+		{line: "entry-without-event\n", ok: false},
+		{line: "+\n", ok: false},
 	}
 	for _, tc := range tests {
 		event, id, creation, lock, ok := parseNativeReaperEvent(tc.line)
@@ -314,7 +320,7 @@ func TestNativeReaperDeletesEveryRegisteredEntry(t *testing.T) {
 	cfg, logPath := nativeReaperBackend(t, "rm")
 	a, b := nativeReaperID('1'), nativeReaperID('2')
 	var stderr strings.Builder
-	code := runNativeReaper(cfg, strings.NewReader(a+"\n"+b+"\n"), &stderr)
+	code := runNativeReaper(cfg, strings.NewReader("+\t"+a+"\n+\t"+b+"\n"), &stderr)
 	if code != 0 {
 		t.Fatalf("runNativeReaper = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -428,6 +434,10 @@ func TestNativeReaperSkipsSharedAndRemovedEntries(t *testing.T) {
 
 func TestNativeReaperSkipsUnlockedAppleEntry(t *testing.T) {
 	cfg, logPath := nativeReaperBackend(t, "delete")
+	// The old shell reaper invented a lock under TMPDIR for an entry without
+	// a lock path. Pin that the native loop never fabricates one.
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
 	stream := "+\tunlocked-apple\t" + strings.Repeat("a", 16) + "\n"
 	var stderr strings.Builder
 	if code := runNativeReaper(cfg, strings.NewReader(stream), &stderr); code != 0 {
@@ -439,6 +449,13 @@ func TestNativeReaperSkipsUnlockedAppleEntry(t *testing.T) {
 	if got := readNativeReaperLog(t, logPath+".inspect"); len(got) != 0 {
 		t.Fatalf("inspect calls = %v, want none for an unlocked Apple entry", got)
 	}
+	fabricated, err := filepath.Glob(filepath.Join(tmpDir, "containergo-*.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fabricated) != 0 {
+		t.Fatalf("fabricated lock files under TMPDIR: %v", fabricated)
+	}
 }
 
 func TestNativeReaperStopsAtTheOverallBudget(t *testing.T) {
@@ -447,9 +464,11 @@ func TestNativeReaperStopsAtTheOverallBudget(t *testing.T) {
 	}
 	cfg, logPath := nativeReaperBackend(t, "rm")
 	cfg.timeout = 5 * time.Second
-	t.Setenv(testNativeReaperInspectSleepMS, "1500")
+	// The first inspect outlives the whole budget, so exactly one entry can
+	// start before the loop stops.
+	t.Setenv(testNativeReaperInspectSleepMS, "2500")
 	t.Setenv(testNativeReaperInspectJSON, "[]")
-	t.Setenv("REAPER_BUDGET_SECONDS", "1")
+	t.Setenv("REAPER_BUDGET_SECONDS", "2")
 	t.Setenv("REAPER_PARALLEL", "1")
 
 	creation := strings.Repeat("b", 16)
@@ -467,8 +486,11 @@ func TestNativeReaperStopsAtTheOverallBudget(t *testing.T) {
 	if elapsed > 10*time.Second {
 		t.Errorf("reap took %v; the overall budget did not stop the entry loop", elapsed)
 	}
-	if inspected := len(readNativeReaperLog(t, logPath+".inspect")); inspected >= len(entries) {
-		t.Errorf("inspected %d entries, want fewer than %d", inspected, len(entries))
+	// Every started generation entry issues exactly one inspect, so this is
+	// the number of entries the loop started before the budget expired.
+	started := len(readNativeReaperLog(t, logPath+".inspect"))
+	if started != 1 {
+		t.Fatalf("started %d entries, want exactly 1 before the budget expired", started)
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
 	if len(lines) != 1 || !strings.HasPrefix(lines[0], "container-go: reaper budget expired with ") {
@@ -480,6 +502,11 @@ func TestNativeReaperStopsAtTheOverallBudget(t *testing.T) {
 	}
 	if remaining != 3 {
 		t.Fatalf("remaining = %d, want 3", remaining)
+	}
+	// Every registered entry is either started or reported as remaining;
+	// the diagnostic must not lose one.
+	if started+remaining != len(entries) {
+		t.Fatalf("started %d + remaining %d != %d; the report lost entries", started, remaining, len(entries))
 	}
 }
 
@@ -495,7 +522,7 @@ func TestNativeReaperProcessesEntriesConcurrently(t *testing.T) {
 
 	var entries []string
 	for i := 1; i <= 8; i++ {
-		entries = append(entries, fmt.Sprintf("%064x", i))
+		entries = append(entries, fmt.Sprintf("+\t%064x", i))
 	}
 	start := time.Now()
 	var stderr strings.Builder
@@ -530,7 +557,7 @@ func TestNativeReaperStartsNextEntryWhenAnyWorkerFinishes(t *testing.T) {
 	const count = 16
 	var entries []string
 	for i := 1; i <= count; i++ {
-		entries = append(entries, fmt.Sprintf("%064x", i))
+		entries = append(entries, fmt.Sprintf("+\t%064x", i))
 	}
 	start := time.Now()
 	var stderr strings.Builder
@@ -559,7 +586,7 @@ func TestNativeReaperFinishesWhenTheBackendNeverAnswers(t *testing.T) {
 	id := nativeReaperID('a')
 	start := time.Now()
 	var stderr strings.Builder
-	code := runNativeReaper(cfg, strings.NewReader(id+"\n"), &stderr)
+	code := runNativeReaper(cfg, strings.NewReader("+\t"+id+"\n"), &stderr)
 	elapsed := time.Since(start)
 	if code != 0 {
 		t.Fatalf("runNativeReaper = %d; stderr: %s", code, stderr.String())
@@ -583,7 +610,7 @@ func TestNativeReaperSelfExecDeletesRegisteredContainers(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "backend.log")
 	t.Setenv(testNativeReaperBackend, "1")
 	t.Setenv(testNativeReaperLog, logPath)
-	r := newNativeReaper(exe, "rm")
+	r := newReaper(exe, "rm")
 	uid := nativeReaperID('a')
 	if err := r.register(uid, ""); err != nil {
 		t.Fatalf("register: %v", err)
@@ -601,7 +628,7 @@ func TestNativeReaperSelfExecRespawnsAndReplays(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "backend.log")
 	t.Setenv(testNativeReaperBackend, "1")
 	t.Setenv(testNativeReaperLog, logPath)
-	r := newNativeReaper(exe, "rm")
+	r := newReaper(exe, "rm")
 	t.Cleanup(r.closeStdin)
 	if err := r.register(nativeReaperID('b'), ""); err != nil {
 		t.Fatalf("register before crash: %v", err)
@@ -666,22 +693,57 @@ func TestNativeReaperBuildModeGuard(t *testing.T) {
 	if !nativeReaperSupported() {
 		t.Fatal("this test binary should be a supported self-execution host")
 	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		t.Fatal("test binary has no build information")
+	}
+	if !nativeReaperBuildInfoIncludesModule(info) {
+		t.Fatalf("test binary build information does not name %s", reaperModulePath)
+	}
 }
 
-func TestReaperUnavailableFor(t *testing.T) {
+// TestNativeReaperBuildInfoRequiresThisModule is the plugin-host regression:
+// debug.ReadBuildInfo reports the host executable's information for a plugin,
+// so a supported build mode alone does not prove the child contains the reaper
+// init hook. A host that did not link this module must fail closed.
+func TestNativeReaperBuildInfoRequiresThisModule(t *testing.T) {
+	moduleInfo := &debug.BuildInfo{Main: debug.Module{Path: reaperModulePath}}
 	tests := []struct {
-		native bool
-		shell  bool
-		want   bool
+		name string
+		info *debug.BuildInfo
+		want bool
 	}{
-		{native: true, shell: true, want: false},
-		{native: true, shell: false, want: false},
-		{native: false, shell: true, want: false},
-		{native: false, shell: false, want: true},
+		{name: "main module", info: moduleInfo, want: true},
+		{name: "dependency", info: &debug.BuildInfo{
+			Main: debug.Module{Path: "example.com/host"},
+			Deps: []*debug.Module{{Path: reaperModulePath}},
+		}, want: true},
+		{name: "host main without dependency", info: &debug.BuildInfo{
+			Main: debug.Module{Path: "example.com/host"},
+		}, want: false},
+		{name: "empty build info", info: &debug.BuildInfo{}, want: false},
+		{name: "nil build info", info: nil, want: false},
 	}
 	for _, tc := range tests {
-		if got := reaperUnavailableFor(tc.native, tc.shell); got != tc.want {
-			t.Errorf("reaperUnavailableFor(native=%v, shell=%v) = %v, want %v", tc.native, tc.shell, got, tc.want)
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nativeReaperBuildInfoSupported(tc.info); got != tc.want {
+				t.Errorf("nativeReaperBuildInfoSupported(%+v) = %v, want %v", tc.info, got, tc.want)
+			}
+		})
+	}
+	if !nativeReaperSupportedInfo(moduleInfo) {
+		t.Fatal("build information naming this module should support self-execution")
+	}
+}
+
+func TestNativeReaperBuildInfoRejectsUnsupportedMode(t *testing.T) {
+	for _, mode := range []string{"c-shared", "c-archive", "plugin", "shared", "unknown"} {
+		info := &debug.BuildInfo{
+			Main:     debug.Module{Path: reaperModulePath},
+			Settings: []debug.BuildSetting{{Key: "-buildmode", Value: mode}},
+		}
+		if nativeReaperBuildInfoSupported(info) {
+			t.Errorf("build information with -buildmode=%s must not self-execute", mode)
 		}
 	}
 }
@@ -857,20 +919,87 @@ func TestReaperBudgetDurationClampsOverflow(t *testing.T) {
 	}
 }
 
-func TestNativeReaperFeatureFlag(t *testing.T) {
+// TestNativeReaperIsTheDefault pins the platform default: registration must
+// create a watchdog on every host that can self-execute, without a feature
+// flag and on Unix without a /bin/sh fallback.
+func TestNativeReaperIsTheDefault(t *testing.T) {
 	if !nativeReaperSupported() {
 		t.Skip("self-execution is unavailable in this build")
 	}
-	t.Setenv(reaperNativeEnv, "1")
-	if !nativeReaperEnabled() {
-		t.Fatal("native reaper was not enabled by the feature flag")
+	if reaperUnavailable() {
+		t.Fatal("reaper is unavailable on a host that can self-execute")
 	}
-	if runtime.GOOS == "windows" {
-		return
+	key := nativeReaperName("default")
+	global := getGlobalReaperTarget(key, "unused", "rm", nil, nil)
+	if global == nil {
+		t.Fatal("getGlobalReaperTarget returned nil; registration would be a no-op")
 	}
-	t.Setenv(reaperNativeEnv, "")
-	if nativeReaperEnabled() {
-		t.Fatal("native reaper was enabled without the feature flag on a Unix host")
+	globalReapersMu.Lock()
+	delete(globalReapers, key)
+	globalReapersMu.Unlock()
+	global.closeStdin()
+
+	// Drive the real spawn path so a reintroduced shell fallback cannot pass
+	// under this test name.
+	r := newReaper("unused", "rm")
+	t.Cleanup(r.closeStdin)
+	if err := r.spawnLocked(); err != nil {
+		t.Fatalf("spawnLocked: %v", err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	cmd := r.cmd
+	r.mu.Unlock()
+	if cmd == nil || cmd.Path != exe {
+		t.Fatalf("reaper command path = %v, want %q", cmd, exe)
+	}
+	if len(cmd.Args) < 2 || cmd.Args[1] != reaperInternalCommand {
+		t.Fatalf("reaper args = %v, want args[1] = %q", cmd.Args, reaperInternalCommand)
+	}
+	if !slices.Contains(cmd.Env, reaperInternalEnv+"=1") {
+		t.Fatalf("reaper environment lacks %s=1", reaperInternalEnv)
+	}
+	r.closeStdin()
+	waitForNativeReaperExit(t, r)
+}
+
+// TestNativeReaperBudgetStartsAfterEOF covers the clock starting at cleanup
+// time rather than at spawn: a parent that stays alive longer than the budget
+// must still get a full cleanup window after EOF.
+func TestNativeReaperBudgetStartsAfterEOF(t *testing.T) {
+	if testing.Short() {
+		t.Skip("holds stdin open past the reap budget")
+	}
+	cfg, logPath := nativeReaperBackend(t, "rm")
+	t.Setenv("REAPER_BUDGET_SECONDS", "2")
+	id := nativeReaperID('9')
+	reader, writer := io.Pipe()
+	codes := make(chan int, 1)
+	var stderr strings.Builder
+	go func() { codes <- runNativeReaper(cfg, reader, &stderr) }()
+	if _, err := io.WriteString(writer, "+\t"+id+"\n"); err != nil {
+		t.Fatalf("write entry: %v", err)
+	}
+	// Hold the pipe open past the configured budget. If the clock started
+	// at spawn, closing stdin now would observe a spent budget and skip the
+	// entry entirely.
+	time.Sleep(3 * time.Second)
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stdin: %v", err)
+	}
+	select {
+	case code := <-codes:
+		if code != 0 {
+			t.Fatalf("runNativeReaper = %d; stderr: %s", code, stderr.String())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("native reaper did not exit")
+	}
+	if got := readNativeReaperLog(t, logPath); !slices.Equal(got, []string{"--force " + id}) {
+		t.Fatalf("deleted %v, want --force %s after a long-lived parent", got, id)
 	}
 }
 

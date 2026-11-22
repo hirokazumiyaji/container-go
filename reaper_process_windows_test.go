@@ -58,7 +58,7 @@ func TestReaperStopTerminatesJobDescendants(t *testing.T) {
 	release := filepath.Join(dir, "release")
 	pidPath := filepath.Join(dir, "child.pid")
 
-	r := newNativeReaper(os.Args[0], "rm")
+	r := newReaper(os.Args[0], "rm")
 	r.spawnCommand = func() (*exec.Cmd, error) {
 		cmd := exec.Command(os.Args[0], "-test.run=^TestReaperJobParentHelper$")
 		cmd.Env = append(os.Environ(),

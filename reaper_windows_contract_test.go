@@ -17,8 +17,8 @@ func TestReaperRegistrationIsNativeOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("the Windows reaper contract is specific to Windows")
 	}
-	if !nativeReaperEnabled() {
-		t.Fatal("Windows must use the native reaper")
+	if !nativeReaperSupported() {
+		t.Fatal("the Windows test binary must be able to self-execute the reaper")
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -49,9 +49,6 @@ func TestReaperRegistrationIsNativeOnWindows(t *testing.T) {
 	globalReapersMu.Unlock()
 	if watchdog == nil {
 		t.Fatal("registration was a no-op on Windows")
-	}
-	if !watchdog.native {
-		t.Fatal("Windows reaper did not select the native loop")
 	}
 	watchdog.closeStdin()
 	waitForNativeReaperLog(t, logPath, "--force "+uid)

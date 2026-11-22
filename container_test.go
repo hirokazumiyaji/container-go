@@ -37,10 +37,6 @@ func TestMain(m *testing.M) {
 	os.Unsetenv("CONTAINERGO_BACKEND")
 	os.Unsetenv(defaultPlatformEnv)
 	os.Unsetenv("CONTAINERGO_KEEP")
-	// Fixture-backed reaper tests need the default /bin/sh path; a
-	// developer testing the native loop must not redirect them. Native
-	// tests opt in explicitly with newNativeReaper.
-	os.Unsetenv(reaperNativeEnv)
 	// Keep the name lock out of the developer's cache directory so unit
 	// tests cannot depend on (or disturb) the host's cache permissions. A
 	// test that isolates its own lock directory passes the override on to

@@ -101,9 +101,6 @@ func (j *reaperJob) close() {
 	j.handle = 0
 }
 
-// shellReaperAvailable reports that Windows has no /bin/sh fallback.
-func shellReaperAvailable() bool { return false }
-
 func killReaperProcess(cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()

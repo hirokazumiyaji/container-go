@@ -47,8 +47,8 @@ Three constraints shape the design.
 - **Minimal dependencies**: the standard library plus `golang.org/x/sys`
   for platform process and file handling; no third-party container-client module.
 - **Security**: subprocess argv prevents injection. The watchdog reaper
-  projects inspect output through a structural field filter and does not
-  stage raw JSON. Legacy staging files from older versions can still contain
+  decodes inspect output in memory and does not stage raw JSON. Legacy
+  staging files from older versions can still contain
   environment data; the cleanup notes in the Security design section apply
   to deployments that ran those versions.
 - **Performance**: container (VM) startup dominates test suite time;
@@ -852,25 +852,26 @@ from its lock, inspect, or delete operations are not joined to the
 returned `Run` error.
 
 **Abnormal exit**: when the parent process exits and its reaper pipe
-closes, an external `/bin/sh` watchdog attempts force-deletion. An
+closes, a self-executed Go watchdog attempts force-deletion. An
 uncaught process-terminating panic, `SIGKILL`, and `os.Exit` close the
 pipe; a recovered panic does not. The reaper accumulates registrations
 while the parent is alive and only deletes after EOF. It is insurance,
-not a transactional guarantee, and it is unavailable on Windows.
-Registration and per-entry delete errors are not returned to `Run`;
-repeated spawn failures are logged once after the retry limit, and
-delete failures are ignored by the shell. Each backend call is bounded
-by a POSIX `sleep`/`kill` timeout that cleans up its timer process, and
-the whole reap has an overall budget past which no new backend calls
-are issued. A bounded worker pool starts the next entry as soon as any
-worker finishes. If the budget expires with entries still queued, the
-reaper reports the unstarted count on stderr without naming container IDs.
+not a transactional guarantee, and a host that cannot self-execute has
+no reaper at all: registration is a no-op instead of falling back to a
+shell. Registration and per-entry delete errors are not returned to
+`Run`; repeated spawn failures are logged once after the retry limit,
+and delete failures are ignored. Each backend call is bounded with an
+`exec.CommandContext` timeout, and the whole reap has an overall budget
+past which no new backend calls are issued. A bounded worker pool starts
+the next entry as soon as any worker finishes. If the budget expires with
+entries still queued, the reaper reports the unstarted count on stderr
+without naming container IDs.
 
-**Recovering leftovers**: the watchdog cannot help on Windows, after the
-local process tree or runner VM is destroyed (for example on CI
-cancellation or `go test -timeout`), or for containers that outlive the
-local environment on a remote Docker daemon. The supported recovery
-pattern is to call `Prune(ctx)` from `TestMain` before and after the
+**Recovering leftovers**: the watchdog cannot help after the local
+process tree or runner VM is destroyed (for example on CI cancellation or
+`go test -timeout`), on a host that cannot self-execute, or for containers
+that outlive the local environment on a remote Docker daemon. The supported
+recovery pattern is to call `Prune(ctx)` from `TestMain` before and after the
 suite. `Prune` removes stopped managed containers from any session;
 running and created containers remain. `WithPruneOlderThan(d)` restricts
 a sweep to candidates the backend reports as created before now-d and
@@ -896,9 +897,9 @@ Docker ID entries are deleted by ID without a name lookup. If a backend
 returns no parseable ID, the name-and-generation path remains the deletion
 target.
 
-**Reaper staging exposure (legacy)**: the current reaper projects inspect
-output through a structural field filter and does not write raw JSON to
-disk. Versions before that change used an un-namespaced `mktemp` file;
+**Reaper staging exposure (legacy)**: the current reaper decodes inspect
+output in memory and does not write raw JSON to disk. Versions before that
+change used an un-namespaced `mktemp` file;
 a reaper killed during inspect could therefore leave a file containing
 environment data. Those names are not safely attributable to this library.
 Before cleanup, stop container-go and reaper processes, then use a
@@ -1031,12 +1032,12 @@ is not a general fail-closed guarantee against an untrusted process that
 uses the backend CLI directly.
 
 The watchdog reaper registers name-addressed containers by name and
-generation, reads the label as a line-anchored JSON field
-(`"key": "value"`, never a substring), and skips deletion on mismatch.
-Docker's immutable ID is registered as an additional ID entry and does not
-need a name lookup. Each backend call carries a 10-30s timeout via POSIX
-`sleep`/`kill` (no `timeout(1)` dependency) so one hung daemon call cannot
-wedge the rest. The leader's own pull/create uses an independent
+generation, decodes the creation label from the backend's inspect JSON
+(never a substring match), and skips deletion on mismatch. Docker's
+immutable ID is registered as an additional ID entry and does not need a
+name lookup. Each backend call carries a 10-30s context timeout so one
+hung daemon call cannot wedge the rest. The leader's own pull/create uses
+an independent
 `runTimeout` budget; `reuseAttachTimeout` bounds only attach polling for
 another process's container.
 
@@ -1060,16 +1061,14 @@ absent, so a cached answer must not stand in for the check.
 ## Security design
 
 As a library that spawns subprocesses, these rules describe the intended
-security boundary. The current reaper streams inspect output through a
-structural filter and does not stage raw JSON; legacy staging files from
-older versions are covered by the cleanup note below.
+security boundary. The current reaper decodes inspect output in memory
+and does not stage raw JSON; legacy staging files from older versions are
+covered by the cleanup note below.
 
 **No shell involvement**. Every CLI call passes an argv array to
-`exec.Command`; no shell string is ever assembled. The single
-exception is the watchdog reaper's shell script. Its body is a fixed
-string; container IDs enter only as stdin data. The script defeats word
-splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted expansions), and
-the library validates each target before writing it to the pipe. Name-addressed
+`exec.Command`; no shell string is ever assembled. Container IDs enter the
+watchdog only as validated stdin data, and the self-executed child decodes
+that stream in memory. Name-addressed
 entries must match the shared generic `nameRE` form
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`; full Docker IDs must be lowercase
 64-character hexadecimal strings matching `^[0-9a-f]{64}$`. The shared guard is
@@ -1140,8 +1139,8 @@ for diagnostics, while environment values remain in the temporary env
 file rather than appearing in argv. The watchdog can emit one
 standard-log message if it cannot be started after repeated attempts.
 
-**Legacy reaper staging files**. The current reaper streams inspect output
-through the structural field filter and does not create a raw inspect file.
+**Legacy reaper staging files**. The current reaper decodes inspect output
+in memory and does not create a raw inspect file.
 Versions before that change used an un-namespaced `mktemp` file; a reaper
 killed during inspect could therefore leave a file containing environment
 values. Those names are not safely attributable to this library. An
@@ -1419,7 +1418,8 @@ container-go/
 ├── pull.go           // pull policies and in-process pull aggregation
 ├── reuse.go          // WithReuse and PruneReuseGroup
 ├── cleanup.go        // Cleanup, TerminateContainer, Prune
-├── reaper.go         // watchdog reaper
+├── reaper.go         // watchdog reaper registration, spawn, and replay
+├── reaper_native.go  // self-executed watchdog loop and delete gate
 ├── exec.go           // Exec, ExecTo, and ExecOption
 ├── logs.go           // Logs, LogsWithOptions, LogsTo, FollowLogs
 ├── output.go         // bounded readers, sinks, and truncation errors
@@ -1574,9 +1574,12 @@ The Apple backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
 subcommand per backend (`delete --force` for Apple, `rm --force` for
-Docker). The reaper depends on `/bin/sh` and thus does not run on
-Windows; v0.2 documents that Windows relies on the normal cleanup
-paths (`Cleanup`, rollback) only. `Prune` uses daemon-side filters on
+Docker) and runs the same Go loop on every supported platform. A build
+that cannot self-execute (`c-shared`, `c-archive`, setuid/setgid, or build
+information that does not name this module) has no reaper; abnormal-exit
+cleanup then relies on the normal cleanup paths (`Cleanup`, rollback) and
+`Prune`. `Prune` uses
+daemon-side filters on
 Docker (`--filter label=... --filter status=exited --filter
 status=dead`; `dead` is a stopped container the daemon can no longer
 reap, so listing only `exited` would miss it). Output is full container

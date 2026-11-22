@@ -11,17 +11,6 @@ import (
 	"time"
 )
 
-func TestReaperPrefersFlockBeforeLockf(t *testing.T) {
-	flock := strings.Index(reaperScript, `flock_bin=$(command -v flock`)
-	lockf := strings.Index(reaperScript, `lockf_bin=$(command -v lockf`)
-	if flock < 0 || lockf < 0 {
-		t.Fatalf("reaper script lock helpers = flock:%d lockf:%d, want both", flock, lockf)
-	}
-	if flock > lockf {
-		t.Fatalf("reaper script checks lockf before flock (flock=%d, lockf=%d)", flock, lockf)
-	}
-}
-
 func waitForReaperTestExit(t *testing.T, r *reaper) {
 	t.Helper()
 	r.mu.Lock()
@@ -55,9 +44,15 @@ func TestReaperSpawnRecoveryIsBoundedAndReplaysEntries(t *testing.T) {
 		if failSpawn {
 			return nil, errors.New("synthetic reaper spawn failure")
 		}
-		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, creationLabel, "1", "1"}
+		exe, err := os.Executable()
+		if err != nil {
+			return nil, err
+		}
+		args := []string{reaperInternalCommand, r.binary, r.subcommand, creationLabel, "1", "1"}
 		args = append(args, r.deleteFlags...)
-		return exec.Command("/bin/sh", args...), nil
+		cmd := exec.Command(exe, args...)
+		cmd.Env = append(os.Environ(), reaperInternalEnv+"=1")
+		return cmd, nil
 	}
 	ids := []string{
 		strings.Repeat("a", 64),

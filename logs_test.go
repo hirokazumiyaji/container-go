@@ -743,3 +743,41 @@ func TestLogsToRejectsNilWriter(t *testing.T) {
 		})
 	}
 }
+
+// settledNilTerminalStatus is a closed process status whose TerminalError has
+// not settled yet, like a status sampled while the child is being reaped.
+type settledNilTerminalStatus struct{ done chan struct{} }
+
+func (s *settledNilTerminalStatus) Done() <-chan struct{} { return s.done }
+func (*settledNilTerminalStatus) TerminalError() error    { return nil }
+
+// TestClassifyingStatusStreamKeepsReadCachedTerminalError covers a readiness
+// check that asks the status after Read already classified the CLI failure:
+// the late nil status must not hide the cached error.
+func TestClassifyingStatusStreamKeepsReadCachedTerminalError(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", testDockerUID},
+		ExitCode: 1,
+		Stderr:   "logs stream failed",
+	}
+	underlying := &lateTerminalReader{Reader: &stagedTerminalReader{terminalErr: terminal}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: &fakeRunner{systemUp: false, binary: "docker"}, eng: dockerEngine{}}
+	done := make(chan struct{})
+	close(done)
+	stream := &classifyingStatusStream{
+		classifyingStream: &classifyingStream{ReadCloser: underlying, ctx: context.Background(), container: ctr},
+		status:            &settledNilTerminalStatus{done: done},
+	}
+
+	if _, err := stream.Read(make([]byte, 16)); err != nil {
+		t.Fatalf("first Read = %v, want the available output", err)
+	}
+	if _, err := stream.Read(make([]byte, 16)); err == nil {
+		t.Fatal("terminal Read returned nil")
+	}
+	var got *CLIError
+	if err := stream.TerminalError(); !errors.As(err, &got) || got.ExitCode != terminal.ExitCode {
+		t.Fatalf("TerminalError = %v, want the CLIError cached by Read", err)
+	}
+}

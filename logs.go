@@ -281,7 +281,12 @@ func (s *classifyingStatusStream) Done() <-chan struct{} {
 }
 
 func (s *classifyingStatusStream) TerminalError() error {
-	return s.classifyTerminal(s.status.TerminalError())
+	if err := s.status.TerminalError(); err != nil {
+		return s.classifyTerminal(err)
+	}
+	// The underlying status can settle after Read already classified a CLI
+	// error; keep that cached cause instead of reporting a late nil.
+	return s.terminalError()
 }
 
 // Drain forwards the optional process-stream drain operation so wait.ForLog

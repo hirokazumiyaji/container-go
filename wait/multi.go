@@ -111,11 +111,10 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 					term = newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed in strategy %d", s.startupTimeout, i), context.DeadlineExceeded)
 				}
 				if term != nil {
-					primary := term
-					if cause := errors.Unwrap(term); cause != nil {
-						primary = cause
-					}
-					return newWaitError(fmt.Sprintf("wait for all: %v (strategy %d: %v)", term, i, err), primary, term, err)
+					// Unwrap now exposes the complete child tree, so the
+					// termination reason's own context error stays reachable
+					// without extracting a single primary cause here.
+					return newWaitError(fmt.Sprintf("wait for all: %v (strategy %d: %v)", term, i, err), term, err)
 				}
 				return err
 			}

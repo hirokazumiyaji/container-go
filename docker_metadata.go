@@ -78,8 +78,20 @@ func (c *dockerMetadataCache) currentTime() time.Time {
 // concurrent callers with that key. A nil cache still runs fn, which keeps the
 // process-global Run path working without a package-level cache.
 func (c *dockerMetadataCache) lookup(ctx context.Context, key string, timeout time.Duration, fn func(context.Context) (string, error)) (string, error) {
+	return c.lookupWithStore(ctx, key, timeout, func(ctx context.Context) (string, bool, error) {
+		value, err := fn(ctx)
+		return value, err == nil, err
+	})
+}
+
+// lookupWithStore is lookup for a value that can be usable to its caller
+// without being safe to reuse. keep reports whether the value may be cached;
+// a rejected value still reaches the caller so it can report its own error.
+// Only successful, reusable lookups are stored.
+func (c *dockerMetadataCache) lookupWithStore(ctx context.Context, key string, timeout time.Duration, fn func(context.Context) (value string, keep bool, err error)) (string, error) {
 	if c == nil {
-		return fn(ctx)
+		value, _, err := fn(ctx)
+		return value, err
 	}
 	if value, ok := c.get(key); ok {
 		return value, nil
@@ -96,13 +108,31 @@ func (c *dockerMetadataCache) lookup(ctx context.Context, key string, timeout ti
 		}
 		lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
-		value, err := fn(lookupCtx)
+		value, keep, err := fn(lookupCtx)
 		if err != nil {
 			return "", err
+		}
+		if !keep {
+			return value, nil
 		}
 		c.store(key, value)
 		return value, nil
 	})
+}
+
+// delete removes a cached answer that a consumer found unusable, so the next
+// caller retries the lookup instead of reusing the failure until the TTL.
+func (c *dockerMetadataCache) delete(key string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.entries[key]; !ok {
+		return
+	}
+	delete(c.entries, key)
+	c.recomputeNextExpiryLocked()
 }
 
 func (c *dockerMetadataCache) get(key string) (string, bool) {
@@ -226,15 +256,41 @@ func dockerVersionJSON(ctx context.Context, runner cli.Runner, timeouts opTimeou
 }
 
 // dockerVersionJSONCached shares one raw version response through the
-// optional Client cache. Only successful queries are stored, so a failed
-// lookup is retried by the next caller.
+// optional Client cache. Only a response carrying the metadata both consumers
+// need (a decodable server OS) is stored, so a successful but unusable query
+// is not reused. A caller that rejects the response for another reason (for
+// example an unsupported client version) deletes it so the next call retries
+// instead of serving the failure until the TTL.
 func dockerVersionJSONCached(ctx context.Context, cache *dockerMetadataCache, runner cli.Runner, eng engine, timeouts opTimeouts) (string, error) {
-	if cache == nil {
-		return dockerVersionJSON(ctx, runner, timeouts)
+	fetch := func(ctx context.Context) (string, bool, error) {
+		raw, err := dockerVersionJSON(ctx, runner, timeouts)
+		if err != nil {
+			return "", false, err
+		}
+		return raw, dockerVersionResponseUsable(raw), nil
 	}
-	return cache.lookup(ctx, dockerVersionJSONKey(eng, runner), timeouts.query, func(ctx context.Context) (string, error) {
-		return dockerVersionJSON(ctx, runner, timeouts)
-	})
+	if cache == nil {
+		raw, _, err := fetch(ctx)
+		return raw, err
+	}
+	return cache.lookupWithStore(ctx, dockerVersionJSONKey(eng, runner), timeouts.query, fetch)
+}
+
+// dockerVersionResponseUsable reports whether raw carries the metadata the
+// shared consumers need: a decodable version response naming a server OS the
+// library understands. Version policy is left to the copy-out check, which
+// drops the entry when the reported versions are rejected.
+func dockerVersionResponseUsable(raw string) bool {
+	var output dockerVersionOutput
+	if err := json.Unmarshal([]byte(raw), &output); err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(output.Server.Os)) {
+	case "linux", "windows":
+		return true
+	default:
+		return false
+	}
 }
 
 // dockerRunnerKey distinguishes CLI executables without treating an opaque
@@ -313,5 +369,11 @@ func dockerCopyFileFromContainerVersionCached(ctx context.Context, cache *docker
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return checkDockerCopyVersion(raw)
+	if err := checkDockerCopyVersion(raw); err != nil {
+		// The daemon answer is cached for the default-network probe; do not
+		// let a version policy rejection become sticky for copy-out callers.
+		cache.delete(dockerVersionJSONKey(eng, runner))
+		return err
+	}
+	return nil
 }

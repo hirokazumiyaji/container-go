@@ -96,3 +96,42 @@ func TestScanLogStreamKeepsReplayLineCountConsistent(t *testing.T) {
 		t.Fatalf("line count = %d, want 3 observed lines", second.lineCount)
 	}
 }
+
+// A matcher such as "foo$" can accept a fragment at clean EOF while the
+// eventual terminated line is "foobar" and must be rejected. The wait must
+// reconnect and re-evaluate the grown line instead of reporting readiness.
+func TestForLogReevaluatesGrownUnterminatedFragment(t *testing.T) {
+	target := newLifecycleTarget(StateRunning)
+	target.logStreams = []io.ReadCloser{
+		io.NopCloser(strings.NewReader("foo")),
+		io.NopCloser(strings.NewReader("foobar\nfoo\n")),
+	}
+
+	err := ForLog("foo$").AsRegexp().
+		WithStartupTimeout(time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := target.logCalls; got != 2 {
+		t.Fatalf("FollowLogs calls = %d, want the grown line re-evaluated before readiness", got)
+	}
+}
+
+// A stopped container cannot extend its final line, so a provisional match on
+// the unterminated tail is accepted as readiness.
+func TestForLogAcceptsUnterminatedFinalLineWhenStopped(t *testing.T) {
+	target := newLifecycleTarget(StateStopped)
+	target.logStreams = []io.ReadCloser{io.NopCloser(strings.NewReader("ready"))}
+
+	err := ForLog("ready").
+		WithStartupTimeout(time.Second).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := target.logCalls; got != 1 {
+		t.Fatalf("FollowLogs calls = %d, want the final unterminated line accepted", got)
+	}
+}

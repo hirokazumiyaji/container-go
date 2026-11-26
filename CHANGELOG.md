@@ -135,8 +135,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `WithExecStdin` to attach a caller reader to an exec'd process's stdin
   with `exec -i`. `ExecRunner` implements the optional internal stdin
   extension so the existing `Runner` interface stays compatible, a typed-nil
-  reader is a `*ValidationError`, and cancellation closes the stdin pipe and a
-  closable reader so no copy goroutine or child outlives the run.
+  reader is a `*ValidationError`, and command completion or cancellation
+  closes the stdin pipe and a closable reader so no copy goroutine or child
+  outlives the run.
 - Add `FollowLogsOptions`, `FollowLogsWithOptions`, and
   `FollowLogsToWithOptions`, and add `LogsOptions.Timestamps`. Docker emits
   `--tail`, `--since`, and `--timestamps`; the Apple backend maps `Tail` to

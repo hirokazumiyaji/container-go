@@ -42,10 +42,10 @@ func TestExecRunnerRunWithStdinLeavesStdinClosedWhenUnset(t *testing.T) {
 
 func TestExecRunnerRunWithStdinCancellationClosesBlockingReader(t *testing.T) {
 	requirePOSIXShell(t)
-	// cat blocks on an open stdin that never reaches EOF. Cancellation must
-	// still terminate the child and release the copy goroutine by closing
-	// the closable caller reader.
-	r := &ExecRunner{Binary: writeStub(t, `cat >/dev/null`)}
+	// The child does not consume stdin, so the copy goroutine is blocked on
+	// the caller reader. Cancellation must still terminate the child and
+	// release the copy goroutine by closing the closable caller reader.
+	r := &ExecRunner{Binary: writeStub(t, `sleep 5`)}
 	reader, writer := io.Pipe()
 	t.Cleanup(func() { _ = writer.Close() })
 
@@ -68,6 +68,35 @@ func TestExecRunnerRunWithStdinCancellationClosesBlockingReader(t *testing.T) {
 	}
 	if _, err := writer.Write([]byte("late")); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("pipe write after cancellation = %v, want ErrClosedPipe (reader was not closed)", err)
+	}
+}
+
+func TestExecRunnerRunWithStdinChildExitClosesBlockingReader(t *testing.T) {
+	requirePOSIXShell(t)
+	// The child exits without reading stdin, so the copy goroutine is blocked
+	// on the caller reader. Completion must close the closable reader rather
+	// than leaving that goroutine behind.
+	r := &ExecRunner{Binary: writeStub(t, `exit 0`)}
+	reader, writer := io.Pipe()
+	t.Cleanup(func() { _ = writer.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := r.RunWithStdin(ctx, reader, io.Discard, io.Discard, "exec")
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("RunWithStdin: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunWithStdin did not return after the child exited")
+	}
+	if _, err := writer.Write([]byte("late")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("pipe write after completion = %v, want ErrClosedPipe (reader was not closed)", err)
 	}
 }
 

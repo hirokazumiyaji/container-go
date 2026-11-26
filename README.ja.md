@@ -217,8 +217,9 @@ nil または typed-nil の reader は `*ValidationError` で拒否します。r
 `ExecRunner`(およびそれを embed する wrapper)が実装する任意の stdin capability を
 満たす必要があり、満たさない場合は backend を起動する前に
 `ErrUnsupportedCapability` を返します。
-context 取消時は child の stdin pipe を閉じ、`io.Closer` を実装する reader も閉じるため、
-blocked な copy が CLI lifecycle より長く残りません。
+command の終了時または context 取消時は child の stdin pipe を閉じ、
+`io.Closer` を実装する reader も閉じるため、blocked な copy が CLI lifecycle
+より長く残りません。
 bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の
 terminal read error が `ErrOutputTruncated` になります。backend の
 infrastructure、cancellation、launch、missing-container エラー時も

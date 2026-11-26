@@ -457,9 +457,9 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 }
 
 // RunWithStdin is RunTo with stdin wired to the child process. When the
-// caller's context is cancelled, the child's input pipe is closed and a
-// closable reader is closed as well so a blocked copy cannot keep the
-// lifecycle from completing.
+// command exits or the caller's context is cancelled, the child's input pipe
+// is closed and a closable reader is closed as well so a blocked copy cannot
+// keep the lifecycle from completing or outlive it.
 func (r *ExecRunner) RunWithStdin(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
 	return r.runTo(ctx, stdin, stdout, stderr, args...)
 }
@@ -521,7 +521,7 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdin io.Reade
 			cancelObservedOnce.Do(hooks.cancelObserved)
 		}
 		if feed != nil {
-			feed.abort()
+			feed.stop()
 		}
 		return lifecycle.cancel()
 	}
@@ -537,7 +537,7 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdin io.Reade
 	if err := start(cmd); err != nil {
 		lifecycle.failStart()
 		if feed != nil {
-			feed.close()
+			feed.stop()
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			contextErr := commandContextError(bin, args, ctxErr)
@@ -573,9 +573,9 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdin io.Reade
 	// stale process-handle or numeric process-group signal.
 	err := lifecycle.result()
 	if feed != nil {
-		// The child is gone; stop a pump blocked writing into its closed
-		// stdin pipe. A blocked read is released by abort on cancellation.
-		feed.close()
+		// The child is gone. Stop the pump and close a closable reader so a
+		// read blocked past the child's exit cannot outlive the run.
+		feed.stop()
 	}
 	status := lifecycle.status()
 	stdout, stderr := captured()
@@ -586,17 +586,18 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdin io.Reade
 	return markRunStatus(commandErr, status)
 }
 
-// stdinAbortGrace bounds how long cancellation waits for a stdin copy to
-// observe a closed reader. Standard library readers unblock immediately; the
-// bound only protects against an exotic Closer whose Close does not interrupt
-// a concurrent Read.
-const stdinAbortGrace = time.Second
+// stdinStopGrace bounds how long command completion or cancellation waits for
+// a stdin copy to observe a closed reader. Standard library readers unblock
+// immediately; the bound only protects against an exotic Closer whose Close
+// does not interrupt a concurrent Read.
+const stdinStopGrace = time.Second
 
 // stdinFeed copies a caller reader into a child's stdin pipe. The feed owns
 // the pipe instead of handing the reader to os/exec, because Wait can block
 // on a Stdin read that never returns even when WaitDelay is set. Owning the
-// pipe keeps child termination independent of the caller's reader, and
-// cancellation closes a closable reader so the copy goroutine can exit.
+// pipe keeps child termination independent of the caller's reader, and stop
+// closes a closable reader so a blocked copy goroutine can exit when the
+// command finishes or is cancelled.
 type stdinFeed struct {
 	reader io.Reader
 	pipe   io.WriteCloser
@@ -605,7 +606,6 @@ type stdinFeed struct {
 	mu      sync.Mutex
 	started bool
 	closed  bool
-	aborted bool
 }
 
 func newStdinFeed(reader io.Reader, pipe io.WriteCloser) *stdinFeed {
@@ -631,33 +631,18 @@ func (f *stdinFeed) copy() {
 	_ = f.pipe.Close()
 }
 
-// close stops the feed after the child is gone. It closes the pipe so a
-// pending write fails; a read blocked on the caller's reader is not
-// interrupted outside cancellation.
-func (f *stdinFeed) close() {
+// stop ends the feed after the child is gone or cancellation terminates it.
+// Closing the child's pipe releases a blocked write, and closing a closable
+// reader releases a blocked read. The bounded wait keeps the copy goroutine
+// from outliving the run when the reader honors Close.
+func (f *stdinFeed) stop() {
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
 		return
 	}
 	f.closed = true
-	f.mu.Unlock()
-	_ = f.pipe.Close()
-}
-
-// abort stops the feed on context cancellation. Closing the child's pipe
-// releases a blocked write, and closing a closable reader releases a blocked
-// read. The bounded wait keeps the copy goroutine from outliving the run when
-// the reader honors Close.
-func (f *stdinFeed) abort() {
-	f.mu.Lock()
-	if f.aborted {
-		f.mu.Unlock()
-		return
-	}
-	f.aborted = true
 	started := f.started
-	f.closed = true
 	f.mu.Unlock()
 	_ = f.pipe.Close()
 	closer, closable := f.reader.(io.Closer)
@@ -667,7 +652,7 @@ func (f *stdinFeed) abort() {
 	if !started || !closable {
 		return
 	}
-	timer := time.NewTimer(stdinAbortGrace)
+	timer := time.NewTimer(stdinStopGrace)
 	defer timer.Stop()
 	select {
 	case <-f.done:

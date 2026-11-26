@@ -1642,6 +1642,32 @@ func TestExecToWithStdinWiresReader(t *testing.T) {
 	}
 }
 
+func TestExecWithStdinHonorsMaxBytes(t *testing.T) {
+	f := &stdinExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+	payload := strings.Repeat("x", 64)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"cat"},
+		WithExecStdin(strings.NewReader(payload)), WithExecMaxBytes(8))
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	data, readErr := io.ReadAll(out)
+	if len(data) != 8 {
+		t.Errorf("retained output = %q, want the 8-byte prefix", data)
+	}
+	if !errors.Is(readErr, ErrOutputTruncated) {
+		t.Errorf("read error = %v, want ErrOutputTruncated", readErr)
+	}
+	stdin, _ := f.capturedStdin()
+	if len(stdin) != len(payload) {
+		t.Errorf("stdin length = %d, want the full %d-byte dump", len(stdin), len(payload))
+	}
+}
+
 func TestExecWithStdinRejectsTypedNilReader(t *testing.T) {
 	f := &stdinExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)

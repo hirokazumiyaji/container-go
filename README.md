@@ -234,9 +234,10 @@ container cannot make the host allocate an unbounded response:
   rejected as a `*ValidationError`. The runner must provide the optional
   stdin capability that `ExecRunner` (and any wrapper embedding it)
   implements; otherwise `Exec`/`ExecTo` return `ErrUnsupportedCapability`
-  before invoking the backend. On context cancellation the child's stdin pipe is closed and a
-  reader that implements `io.Closer` is closed too, so a blocked copy cannot
-  outlive the CLI lifecycle.
+  before invoking the backend. When the command exits or the context is
+  cancelled the child's stdin pipe is closed and a reader that implements
+  `io.Closer` is closed too, so a blocked copy cannot outlive the CLI
+  lifecycle.
 - A bounded reader returns `ErrOutputTruncated` as its terminal read
   error, while still returning all retained bytes. Check
   `errors.Is(readErr, container.ErrOutputTruncated)` or the

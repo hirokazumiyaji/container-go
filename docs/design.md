@@ -416,8 +416,8 @@ distinct wrappers and non-comparable dynamic types are not detected.
 and adds `exec -i`; a nil or typed-nil reader is a `*ValidationError`. The
 runner must provide the optional stdin capability (`ExecRunner` does),
 otherwise Exec/ExecTo return `ErrUnsupportedCapability` before invoking the
-backend. Cancellation closes the child's stdin pipe and a closable reader so
-the copy cannot outlive the local lifecycle. When the
+backend. Command completion and cancellation close the child's stdin pipe and
+a closable reader so the copy cannot outlive the local lifecycle. When the
 caller's context has no deadline, Exec applies a 30-second default. For a positive
 `WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
 the caller's deadline. `WithExecTimeout(0)` only disables the library

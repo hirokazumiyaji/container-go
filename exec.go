@@ -97,11 +97,10 @@ func WithExecStderr(w io.Writer) ExecOption {
 // Exec and ExecTo need a runner with the optional stdin capability; ExecRunner
 // provides it, and wrappers that embed ExecRunner inherit it. A runner without
 // that capability is rejected with ErrUnsupportedCapability before the backend
-// is invoked. When the context is
-// cancelled, the child's stdin pipe is closed and r is closed as well if it
-// implements io.Closer, so a blocked read cannot keep the CLI lifecycle from
-// completing; pass a reader whose Close is safe, or one that returns when the
-// cancellation is observed.
+// is invoked. When the command exits or the context is cancelled, the child's
+// stdin pipe is closed and r is closed as well if it implements io.Closer, so
+// a blocked read cannot keep the CLI lifecycle from completing or outlive it.
+// Pass a reader whose Close is safe for the operation.
 func WithExecStdin(r io.Reader) ExecOption {
 	return func(c *execConfig) error {
 		if nilReader(r) {

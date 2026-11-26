@@ -335,10 +335,11 @@ described below are not.
   empty, malformed, and flag-shaped values are rejected before any backend
   call. Docker and Apple Container both accept repeated `--dns`.
 - `WithStopSignal(signal string)`: Docker's `--stop-signal`. The value is
-  validated as a positive signal number or an uppercase signal name such
-  as `SIGTERM`, `TERM`, or `SIGRTMIN+3`; lowercase, empty, and flag-shaped
-  values are rejected. Apple Container has no run-time stop-signal flag
-  and rejects it with `ErrUnsupportedCapability`.
+  validated as a Linux signal number in 1–64, a standard uppercase signal
+  name such as `SIGTERM` or `TERM`, or a realtime spelling such as
+  `SIGRTMIN+3` or `SIGRTMAX-1`; lowercase, unknown, out-of-range, and
+  flag-shaped values are rejected. Apple Container has no run-time
+  stop-signal flag and rejects it with `ErrUnsupportedCapability`.
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory.
 - `WithNetwork(name string)`: attach to an existing named network; when

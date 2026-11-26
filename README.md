@@ -895,9 +895,10 @@ init process that forwards signals and reaps orphaned children.
 server must be a literal IPv4 or IPv6 address, and empty, malformed, or
 flag-shaped values are rejected while the option is evaluated.
 `WithStopSignal(signal string)` passes `--stop-signal` and accepts a
-positive signal number or an uppercase signal name such as `SIGTERM`,
-`TERM`, or `SIGRTMIN+3`; lowercase, empty, and flag-shaped values are
-rejected. Docker supports all four options.
+Linux signal number from 1 to 64, a standard uppercase signal name such
+as `SIGTERM` or `TERM`, or a realtime spelling such as `SIGRTMIN+3` or
+`SIGRTMAX-1`; lowercase, unknown, out-of-range, and flag-shaped values
+are rejected. Docker supports all four options.
 
 Apple Container supports `--shm-size`, `--cap-add`, `--cap-drop`, and
 `--ulimit` and receives the same flags. It also supports `--read-only`,

@@ -171,7 +171,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithReadOnlyRootFS()`：コンテナのルート filesystem を読み取り専用にする（Docker と Apple Container の `--read-only`）。書き込みが必要な path は `WithMounts` で渡す。
 - `WithInit()`：signal を転送して孤児 process を回収する軽量 init を有効にする（Docker と Apple Container の `--init`）。
 - `WithDNS(servers ...string)`：カスタム DNS nameserver を繰り返し指定可能な `--dns` flag として追加する。各値は IPv4 または IPv6 の IP address リテラルでなければならず、空文字、不正な値、flag 形式の値は backend 呼び出し前に拒否する。Docker と Apple Container はどちらも繰り返し指定を受け付ける。
-- `WithStopSignal(signal string)`：Docker の `--stop-signal`。正の signal 番号、または `SIGTERM`、`TERM`、`SIGRTMIN+3` のような大文字の signal 名として検証し、小文字、空文字、flag 形式の値は拒否する。Apple Container に実行時の stop-signal flag はなく、`ErrUnsupportedCapability` で拒否する。
+- `WithStopSignal(signal string)`：Docker の `--stop-signal`。1〜64 の Linux signal 番号、`SIGTERM` や `TERM` のような標準の大文字 signal 名、または `SIGRTMIN+3` や `SIGRTMAX-1` のような realtime 表記として検証し、小文字、未知の名前、範囲外の番号、flag 形式の値は拒否する。Apple Container に実行時の stop-signal flag はなく、`ErrUnsupportedCapability` で拒否する。
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリを指定する。
 - `WithNetwork(name string)`：既存の名前付きネットワークへ接続する。省略時は Docker が daemon の既定 network（Linux では `bridge`、native Windows では `nat`）を使う。
 - `WithNetworkAliases(aliases ...string)`：Docker の `--network-alias` として network-scoped DNS alias を追加する。明示的な user-defined `WithNetwork` が必要で、default bridge（`bridge`/`nat`）、`host`、`none` は `*ConfigError`、Apple は `ErrUnsupportedCapability` で拒否する。alias は DNS label として検証し、reuse の互換性比較にも含める。

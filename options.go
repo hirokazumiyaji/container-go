@@ -880,21 +880,71 @@ func WithDNS(servers ...string) Option {
 	}
 }
 
-// stopSignalRE accepts the signal spellings the backends understand for a
-// stop signal: a positive signal number, a signal name such as SIGTERM or
-// KILL, or a realtime signal spelling such as SIGRTMIN+3. A leading sign,
-// whitespace, control character, or flag-shaped value must never reach the
-// CLI argv.
-var stopSignalRE = regexp.MustCompile(`^(?:[1-9][0-9]*|(?:SIG)?[A-Z][A-Z0-9]*(?:[+-][0-9]+)?)$`)
+// stopSignalNames is the set of Linux signal names a stop signal accepts
+// without the SIG prefix. The aliases IOT, CLD, and POLL are the traditional
+// names for ABRT, CHLD, and IO. Docker's signal parser understands the same
+// set, with the SIG prefix optional.
+var stopSignalNames = map[string]struct{}{
+	"ABRT": {}, "ALRM": {}, "BUS": {}, "CHLD": {}, "CLD": {}, "CONT": {},
+	"FPE": {}, "HUP": {}, "ILL": {}, "INT": {}, "IO": {}, "IOT": {},
+	"KILL": {}, "PIPE": {}, "POLL": {}, "PROF": {}, "PWR": {}, "QUIT": {},
+	"SEGV": {}, "STKFLT": {}, "STOP": {}, "SYS": {}, "TERM": {}, "TRAP": {},
+	"TSTP": {}, "TTIN": {}, "TTOU": {}, "URG": {}, "USR1": {}, "USR2": {},
+	"VTALRM": {}, "WINCH": {}, "XCPU": {}, "XFSZ": {},
+}
+
+// maxStopSignalNumber is the highest realtime signal number Linux defines.
+const maxStopSignalNumber = 64
+
+// validStopSignal reports whether signal is one of the spellings a container
+// stop signal accepts: a positive signal number in Linux's 1..64 range, a
+// standard signal name, or a realtime spelling such as SIGRTMIN+3 or
+// SIGRTMAX-1. A leading sign, whitespace, control character, or flag-shaped
+// value is not accepted, and neither is a non-realtime name with an offset.
+func validStopSignal(signal string) bool {
+	if number, err := strconv.Atoi(signal); err == nil {
+		return number >= 1 && number <= maxStopSignalNumber && strconv.Itoa(number) == signal
+	}
+	name := strings.TrimPrefix(signal, "SIG")
+	if _, ok := stopSignalNames[name]; ok {
+		return true
+	}
+	return validRealtimeStopSignal(name)
+}
+
+// validRealtimeStopSignal accepts the realtime spellings Docker's signal
+// parser maps: RTMIN with offsets 0..15 and RTMAX with offsets 0..14 fill
+// the Linux realtime signal range.
+func validRealtimeStopSignal(name string) bool {
+	switch name {
+	case "RTMIN", "RTMAX":
+		return true
+	}
+	if offset, ok := strings.CutPrefix(name, "RTMIN+"); ok {
+		return stopSignalOffset(offset, 15)
+	}
+	if offset, ok := strings.CutPrefix(name, "RTMAX-"); ok {
+		return stopSignalOffset(offset, 14)
+	}
+	return false
+}
+
+// stopSignalOffset returns whether offset is a canonical decimal integer in
+// 0..max.
+func stopSignalOffset(offset string, max int) bool {
+	number, err := strconv.Atoi(offset)
+	return err == nil && number >= 0 && number <= max && strconv.Itoa(number) == offset
+}
 
 // WithStopSignal sets the signal sent to the container's main process when it
 // is stopped (Docker's --stop-signal). The value must be a positive signal
-// number or an uppercase signal name such as SIGTERM or SIGRTMIN+3.
+// number in Linux's 1..64 range, a standard signal name such as SIGTERM or
+// TERM, or a realtime spelling such as SIGRTMIN+3.
 // Apple Container has no run-time stop-signal flag and rejects it with
 // ErrUnsupportedCapability before invoking its CLI.
 func WithStopSignal(signal string) Option {
 	return func(c *config) error {
-		if !stopSignalRE.MatchString(signal) {
+		if !validStopSignal(signal) {
 			// Do not echo the rejected value: it may contain control
 			// characters or a flag-shaped spelling.
 			return newValidationErrorWithField("WithStopSignal", "signal", nil,

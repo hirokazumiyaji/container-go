@@ -48,7 +48,10 @@ func TestWithDNSValidation(t *testing.T) {
 }
 
 func TestWithStopSignalValidation(t *testing.T) {
-	for _, signal := range []string{"SIGTERM", "TERM", "SIGKILL", "KILL", "9", "34", "SIGRTMIN+3"} {
+	for _, signal := range []string{
+		"SIGTERM", "TERM", "SIGKILL", "KILL", "SIGUSR1", "9", "34", "64",
+		"SIGRTMIN", "SIGRTMIN+3", "RTMIN+15", "SIGRTMAX-1", "RTMAX-14", "RTMAX",
+	} {
 		t.Run("valid "+signal, func(t *testing.T) {
 			cfg := newConfig()
 			if err := WithStopSignal(signal)(cfg); err != nil {
@@ -60,8 +63,9 @@ func TestWithStopSignalValidation(t *testing.T) {
 		})
 	}
 	for _, signal := range []string{
-		"", "term", "sigterm", "0", "-9", "--signal", "SIGTERM\n",
-		"NOT-A-SIGNAL", "SIGTERM;", " SIGTERM", "SIGTERM ",
+		"", "term", "sigterm", "0", "65", "999", "09", "-9", "--signal",
+		"SIGTERM\n", "NOT-A-SIGNAL", "FOO", "SIGTERM+3", "SIGRTMIN+16",
+		"RTMIN-3", "SIGRTMAX-15", "SIGTERM;", " SIGTERM", "SIGTERM ",
 	} {
 		t.Run("invalid "+signal, func(t *testing.T) {
 			err := WithStopSignal(signal)(newConfig())

@@ -425,10 +425,17 @@ func ReleasedWaitStrategies() {
 `wait.ForFunc`、`database/sql` の probe を行う `wait.ForSQL` も追加して
 います。`ForSQL` は driver を同梱せず、呼び出し側が driver を import して
 登録し、その名前を渡します。未登録の driver はコンテナ作成前の検証で拒否され、
-各 SQL probe の試行には deadline があり、応答しない handshake は再試行されます。`HTTPStrategy` には単一のステータスコードを
-受理する `WithStatusCode` と、リクエストボディを送る `WithBody` を、
-`ExecStrategy` にはコマンド出力を判定する `WithResponseMatcher` /
-`WithOutputContains` を追加しています。出力 matcher は任意の
+各 SQL probe の試行には deadline があり、応答しない handshake は再試行されます。
+`WithAttemptTimeout` でその試行ごとの deadline を指定でき、`WithQueryMatcher`
+は `WithQuery` が返す行が呼び出し側の条件を満たすまで poll を続けます。
+正でない attempt timeout と、query を伴わない matcher は
+`*wait.ConfigError` で拒否されます。`HTTPStrategy` には単一のステータスコードを
+受理する `WithStatusCode` と、リクエストボディを送る `WithBody`、さらに
+テスト用の自己署名証明書のための `WithAllowInsecureTLS`（証明書検証を無効化
+します）、リダイレクト応答自体を検証する `WithFollowRedirects`、startup
+timeout とは独立したリクエスト単位の期限を設定する `WithRequestTimeout` を
+追加しています。`ExecStrategy` にはコマンド出力を判定する
+`WithResponseMatcher` / `WithOutputContains` を追加しています。出力 matcher は任意の
 `wait.ExecOutputTarget` を実装する target を必要とし、container adapter は
 最大 64KiB のコマンド出力を保持します。ヘルスチェック戦略は Docker 専用で
 あり、Apple バックエンドはコンテナを作成する前にこの戦略を拒否します。
@@ -496,6 +503,7 @@ package docexample
 import (
     "context"
     "crypto/tls"
+    "database/sql"
     "fmt"
     "net/http"
     "time"
@@ -514,6 +522,10 @@ func DevelopmentWaitOptions() {
         WithHTTPClient(&http.Client{}).
         WithStartupTimeout(time.Second).
         WithPollInterval(time.Millisecond)
+    _ = wait.ForHTTP("/health").
+        WithAllowInsecureTLS().
+        WithFollowRedirects(false).
+        WithRequestTimeout(time.Second)
     _ = wait.ForExec([]string{"pg_isready"}).
         WithOutputContains("accepting connections")
     _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
@@ -522,7 +534,19 @@ func DevelopmentWaitOptions() {
             "host=%s port=%d user=postgres password=postgres sslmode=disable",
             host, port,
         )
-    })
+    }).
+        WithQuery("SELECT count(*) FROM migrations").
+        WithQueryMatcher(func(rows *sql.Rows) (bool, error) {
+            if !rows.Next() {
+                return false, rows.Err()
+            }
+            var count int
+            if err := rows.Scan(&count); err != nil {
+                return false, err
+            }
+            return count > 0, nil
+        }).
+        WithAttemptTimeout(time.Second)
     _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
     _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
 }

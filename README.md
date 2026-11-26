@@ -456,9 +456,16 @@ Docker's `HEALTHCHECK` status, `wait.ForFunc` for caller-supplied readiness
 callbacks, and `wait.ForSQL` for `database/sql` probes. `ForSQL` registers no
 driver itself; the caller imports and registers one and passes its name, and an
 unregistered driver is rejected by validation before container work. Each SQL
-probe attempt runs under a deadline so a stalled handshake is retried.
-`HTTPStrategy` gains `WithStatusCode` for a single accepted code and
-`WithBody` for request payloads, and `ExecStrategy` gains
+probe attempt runs under a deadline so a stalled handshake is retried;
+`WithAttemptTimeout` sets that per-attempt deadline, and `WithQueryMatcher`
+keeps polling until the rows returned by a `WithQuery` statement satisfy the
+caller's check. A non-positive attempt timeout and a matcher without a query
+are rejected with `*wait.ConfigError`. `HTTPStrategy` gains `WithStatusCode`
+for a single accepted code and `WithBody` for request payloads, plus
+`WithAllowInsecureTLS` for self-signed certificates in tests (it disables
+certificate verification), `WithFollowRedirects` to validate a redirect
+response instead of following it, and `WithRequestTimeout` for a per-request
+deadline independent of the startup timeout. `ExecStrategy` gains
 `WithResponseMatcher` / `WithOutputContains` for command output. An output
 matcher needs a target implementing the optional `wait.ExecOutputTarget`
 interface; the container adapter retains at most 64 KiB of command output for
@@ -533,6 +540,7 @@ package docexample
 import (
     "context"
     "crypto/tls"
+    "database/sql"
     "fmt"
     "net/http"
     "time"
@@ -551,6 +559,10 @@ func DevelopmentWaitOptions() {
         WithHTTPClient(&http.Client{}).
         WithStartupTimeout(time.Second).
         WithPollInterval(time.Millisecond)
+    _ = wait.ForHTTP("/health").
+        WithAllowInsecureTLS().
+        WithFollowRedirects(false).
+        WithRequestTimeout(time.Second)
     _ = wait.ForExec([]string{"pg_isready"}).
         WithOutputContains("accepting connections")
     _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
@@ -559,7 +571,19 @@ func DevelopmentWaitOptions() {
             "host=%s port=%d user=postgres password=postgres sslmode=disable",
             host, port,
         )
-    })
+    }).
+        WithQuery("SELECT count(*) FROM migrations").
+        WithQueryMatcher(func(rows *sql.Rows) (bool, error) {
+            if !rows.Next() {
+                return false, rows.Err()
+            }
+            var count int
+            if err := rows.Scan(&count); err != nil {
+                return false, err
+            }
+            return count > 0, nil
+        }).
+        WithAttemptTimeout(time.Second)
     _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
     _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
 }

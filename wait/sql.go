@@ -3,6 +3,7 @@ package wait
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -22,11 +23,14 @@ var sqlAttemptTimeout = 3 * time.Second
 // concurrent waits.
 type SQLStrategy struct {
 	options
-	port     string
-	driver   string
-	dsn      func(host string, port int) string
-	query    string
-	querySet bool
+	port              string
+	driver            string
+	dsn               func(host string, port int) string
+	query             string
+	querySet          bool
+	queryMatcher      func(*sql.Rows) (bool, error)
+	attemptTimeout    time.Duration
+	attemptTimeoutSet bool
 }
 
 // ForSQL waits until a SQL connection to port can execute a readiness probe.
@@ -38,7 +42,8 @@ type SQLStrategy struct {
 // before any container work, and again at the start of the wait. dsn is called
 // for every attempt with the host and port resolved from the target, so
 // credentials and connection options stay caller-owned. The default probe is
-// db.PingContext; WithQuery replaces it with a query that must succeed.
+// db.PingContext; WithQuery replaces it with a query that must succeed, and
+// WithQueryMatcher validates the rows that query returns.
 //
 // host is returned without IPv6 brackets (net.SplitHostPort removes them).
 // Build URL-style DSNs with net.JoinHostPort(host, strconv.Itoa(port)) instead
@@ -51,11 +56,13 @@ type SQLStrategy struct {
 //
 // An empty port asks the target for its first declared TCP port, like
 // ForExposedPort. The default startup timeout is 60s and the default poll
-// interval is 100ms. Each attempt runs under a 3s deadline; an expired attempt
-// is retried rather than reported as a configuration error. An
-// undeclared port, an empty or unregistered driver, a nil dsn function, an
-// invalid port specification, and an endpoint that is not host:port are
-// configuration errors that fail immediately.
+// interval is 100ms. Each attempt runs under a 3s deadline; WithAttemptTimeout
+// overrides that per-attempt deadline. An expired attempt is retried rather
+// than reported as a configuration error. An undeclared port, an empty or
+// unregistered driver, a nil dsn function, an invalid port specification, a
+// non-positive attempt timeout, a query matcher without a query, and an
+// endpoint that is not host:port are configuration errors that fail
+// immediately.
 //
 // The DSN is registered for redaction of the wait error produced here,
 // together with the password-derived forms recoverable with the standard
@@ -77,11 +84,41 @@ func (s *SQLStrategy) clone() *SQLStrategy {
 
 // WithQuery runs query instead of the default connection ping. The query must
 // be one that returns rows, such as "SELECT 1"; its rows are closed once the
-// driver accepts it. An empty or whitespace-only query is rejected as a
+// driver accepts it, or after the WithQueryMatcher configured for the strategy
+// has inspected them. An empty or whitespace-only query is rejected as a
 // *ConfigError.
 func (s *SQLStrategy) WithQuery(query string) *SQLStrategy {
 	cloned := s.clone()
 	cloned.query, cloned.querySet = query, true
+	return cloned
+}
+
+// WithQueryMatcher validates the rows returned by the WithQuery readiness
+// statement before the probe is accepted. The matcher runs with the open rows
+// after the query succeeds and must not close them; the strategy closes them
+// when the matcher returns.
+//
+// A false result, or an error, means the result is not ready yet: the wait
+// closes the rows and retries until the startup timeout. An error classified
+// as a permanent wait error (for example one wrapping ErrInvalidConfiguration)
+// ends the wait immediately instead. The matcher reads the rows like any other
+// caller: call Next and Scan, or use rows.Err for a failure while iterating.
+//
+// A matcher without a WithQuery statement is rejected as a *ConfigError,
+// because there are no rows to validate.
+func (s *SQLStrategy) WithQueryMatcher(matcher func(*sql.Rows) (bool, error)) *SQLStrategy {
+	cloned := s.clone()
+	cloned.queryMatcher = matcher
+	return cloned
+}
+
+// WithAttemptTimeout bounds one Ping or Query attempt independently of the
+// startup timeout, so a single stalled connection handshake cannot consume the
+// whole startup budget. A non-positive duration is rejected as a *ConfigError
+// before probing. When unset, each attempt keeps the default 3s deadline.
+func (s *SQLStrategy) WithAttemptTimeout(d time.Duration) *SQLStrategy {
+	cloned := s.clone()
+	cloned.attemptTimeout, cloned.attemptTimeoutSet = d, true
 	return cloned
 }
 
@@ -97,10 +134,12 @@ func (s *SQLStrategy) WithPollInterval(d time.Duration) *SQLStrategy {
 	return cloned
 }
 
-// DiagnosticValues returns only the strategy's static values. A DSN is built
-// during a wait and therefore stays with that wait's error.
+// DiagnosticValues returns no static values. A DSN is built during a wait and
+// is registered for that wait's error only, together with its password-derived
+// forms. The driver name, port, and readiness query are request metadata
+// rather than credentials, so they stay visible in diagnostics.
 func (s *SQLStrategy) DiagnosticValues() []string {
-	return []string{s.port, s.driver, s.query}
+	return nil
 }
 
 func (s *SQLStrategy) validate() error {
@@ -139,6 +178,21 @@ func (s *SQLStrategy) validate() error {
 			Strategy: "ForSQL",
 			Field:    "query",
 			Reason:   "query must not be empty",
+		}
+	}
+	if s.queryMatcher != nil && !s.querySet {
+		return &ConfigError{
+			Strategy: "ForSQL",
+			Field:    "query matcher",
+			Reason:   "query matcher requires a query set by WithQuery",
+		}
+	}
+	if s.attemptTimeoutSet && s.attemptTimeout <= 0 {
+		return &ConfigError{
+			Strategy: "ForSQL",
+			Field:    "attempt timeout",
+			Value:    s.attemptTimeout.String(),
+			Reason:   "must be positive",
 		}
 	}
 	return nil
@@ -189,7 +243,11 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		// One pool per attempt: a probe must not carry a stale connection or
 		// driver state into the next readiness check.
 		defer func() { _ = db.Close() }()
-		attemptCtx, cancel := context.WithTimeout(ctx, sqlAttemptTimeout)
+		attemptTimeout := sqlAttemptTimeout
+		if s.attemptTimeoutSet {
+			attemptTimeout = s.attemptTimeout
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		defer cancel()
 		if s.query == "" {
 			return db.PingContext(attemptCtx)
@@ -198,10 +256,24 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		if err != nil {
 			return err
 		}
-		if err := rows.Close(); err != nil {
-			return err
+		if s.queryMatcher == nil {
+			if err := rows.Close(); err != nil {
+				return err
+			}
+			return rows.Err()
 		}
-		return rows.Err()
+		matched, matchErr := s.queryMatcher(rows)
+		closeErr := rows.Close()
+		if matchErr != nil {
+			return matchErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if !matched {
+			return errors.New("query result was rejected by the matcher")
+		}
+		return nil
 	})
 }
 

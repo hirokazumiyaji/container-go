@@ -724,7 +724,7 @@ func waitForReusePoll(ctx context.Context, interval ...time.Duration) error {
 // labels were attached. The returned inspect describes the verified
 // generation so callers can reuse it instead of spawning another inspect.
 func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) (*engineInfo, error) {
-	if c == nil || cfg == nil || !validCreationID(c.creation) {
+	if c == nil || cfg == nil || !domain.IsCreationID(c.creation) {
 		return nil, fmt.Errorf("verify created container: invalid creation generation")
 	}
 	verifyCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
@@ -872,7 +872,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
 		return nil
 	}
-	if !validCreationID(cfg.creation) {
+	if !domain.IsCreationID(cfg.creation) {
 		return identityError("failed create has no valid creation generation")
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.effectiveQueryTimeout())
@@ -1927,7 +1927,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 		if uid != "" {
 			return identityError(fmt.Sprintf("%s inspect unexpectedly returned a container ID", c.eng.name()))
 		}
-		if !validCreationID(creation) {
+		if !domain.IsCreationID(creation) {
 			return identityError(fmt.Sprintf("%s handle has no valid creation generation", c.eng.name()))
 		}
 		unlock, err := lockName(ctx, c.id)
@@ -2054,7 +2054,7 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 
 // resolve maps a container port to the (host, port) pair to dial.
 func (c *Container) resolve(ctx context.Context, port, operation string) (string, int, error) {
-	spec, err := parsePortSpec(port)
+	spec, err := domain.ParsePortSpec(port)
 	if err != nil {
 		return "", 0, newValidationErrorWithField(operation, "port", port, err)
 	}
@@ -2599,7 +2599,7 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error)
 		if uid != "" {
 			return "", identityError(fmt.Sprintf("%s handle unexpectedly carries a container ID", c.eng.name()))
 		}
-		if !validCreationID(creation) {
+		if !domain.IsCreationID(creation) {
 			return "", identityError(fmt.Sprintf("%s operation has no valid creation generation", c.eng.name()))
 		}
 	}
@@ -2743,7 +2743,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 			return nil, identityError(fmt.Sprintf("refusing %s name inspect without a verified immutable ID", c.eng.name()))
 		}
 	}
-	if !c.nameInspect && c.eng.capabilities().nameAddressed && !validCreationID(c.creation) {
+	if !c.nameInspect && c.eng.capabilities().nameAddressed && !domain.IsCreationID(c.creation) {
 		return nil, identityError(fmt.Sprintf("%s handle has no valid creation generation", c.eng.name()))
 	}
 
@@ -2776,7 +2776,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		if info.uid != "" {
 			return nil, identityError(fmt.Sprintf("%s inspect unexpectedly returned a container ID", c.eng.name()))
 		}
-		if !validCreationID(c.creation) || !validCreationID(info.labels[creationLabel]) || info.labels[creationLabel] != c.creation {
+		if !domain.IsCreationID(c.creation) || !domain.IsCreationID(info.labels[creationLabel]) || info.labels[creationLabel] != c.creation {
 			return nil, identityError(fmt.Sprintf("%s inspect returned a different creation generation", c.eng.name()))
 		}
 	}

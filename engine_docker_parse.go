@@ -195,7 +195,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		uid:             c.ID,
 		image:           c.Config.Image,
 		imageID:         c.Image,
-		imageDigest:     imageDigest(c.Config.Image),
+		imageDigest:     domain.ImageDigest(c.Config.Image),
 		platform:        c.Platform,
 		platformMeta:    platformMetadataFromString(c.Platform),
 		ip:              c.NetworkSettings.IPAddress,
@@ -263,7 +263,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	}
 	for portProto, bindings := range c.NetworkSettings.Ports {
-		spec, err := parsePortSpec(portProto)
+		spec, err := domain.ParsePortSpec(portProto)
 		if err != nil {
 			continue
 		}
@@ -275,7 +275,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 			info.bound = append(info.bound, boundPort{
 				containerPort: spec.Port,
 				proto:         spec.Proto,
-				hostAddr:      canonicalIP(b.HostIP),
+				hostAddr:      domain.CanonicalIP(b.HostIP),
 				hostPort:      hostPort,
 			})
 		}
@@ -406,12 +406,12 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookup
 		return absentImage()
 	}
 	requestedID, requestedIsID := canonicalDockerImageID(image)
-	if image != "" && isBareImageReference(image) && !requestedIsID {
+	if image != "" && domain.IsBareImageReference(image) && !requestedIsID {
 		// A malformed or unprefixed digest/ID-shaped value is not a
 		// Docker image-ID request that inspect can verify.
 		return availableImage(imageIdentity{})
 	}
-	explicitPinned := requestedIsID || (image != "" && validImageDigest(imageDigest(image)))
+	explicitPinned := requestedIsID || (image != "" && validImageDigest(domain.ImageDigest(image)))
 	sawExplicitConflict := false
 	sawDifferentID := false
 	fallbackID := ""
@@ -432,22 +432,22 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookup
 			continue
 		}
 		for _, repoDigest := range img.RepoDigests {
-			digest := imageDigest(repoDigest)
-			if !validImageDigest(digest) || imageReferenceBase(repoDigest) == "" {
+			digest := domain.ImageDigest(repoDigest)
+			if !validImageDigest(digest) || domain.ImageReferenceBase(repoDigest) == "" {
 				continue
 			}
 			if image != "" {
-				requestedDigest := imageDigest(image)
+				requestedDigest := domain.ImageDigest(image)
 				if requestedDigest != "" {
 					// An explicit digest is a claim about both the
 					// manifest and its repository. A foreign RepoDigest
 					// is a conflict, even when its digest happens to be
 					// the same.
-					if !strings.EqualFold(requestedDigest, digest) || imageRepository(image) != imageRepository(repoDigest) {
+					if !strings.EqualFold(requestedDigest, digest) || domain.ImageRepository(image) != domain.ImageRepository(repoDigest) {
 						sawExplicitConflict = true
 						continue
 					}
-				} else if !imagesCompatible(image, repoDigest) && imageRepository(image) != imageRepository(repoDigest) {
+				} else if !domain.ImagesCompatible(image, repoDigest) && domain.ImageRepository(image) != domain.ImageRepository(repoDigest) {
 					// Docker's RepoDigests commonly omit the tag. In
 					// that form the repository still has to match.
 					continue
@@ -458,7 +458,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookup
 				identityID = inspectedID
 			}
 			identity := imageReferenceWithDigest(image, repoDigest, digest, identityID)
-			identity.repository = imageRepository(repoDigest)
+			identity.repository = domain.ImageRepository(repoDigest)
 			return availableImage(identity)
 		}
 		if inspectedIDOK {
@@ -469,7 +469,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookup
 			// it, even if the local content ID is available.
 			if !explicitPinned {
 				identity := imageReferenceWithDigest(image, "", "", inspectedID)
-				identity.repository = imageRepository(image)
+				identity.repository = domain.ImageRepository(image)
 				return availableImage(identity)
 			}
 			if fallbackID == "" {
@@ -485,7 +485,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookup
 		}
 		if fallbackID != "" {
 			identity := imageReferenceWithDigest(image, "", "", fallbackID)
-			identity.repository = imageRepository(image)
+			identity.repository = domain.ImageRepository(image)
 			return availableImage(identity)
 		}
 	}

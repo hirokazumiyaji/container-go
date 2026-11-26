@@ -1334,10 +1334,10 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 	}
 	if validImageDigest(info.imageDigest) {
 		reference := info.image
-		if imageReferenceBase(reference) == "" {
+		if domain.ImageReferenceBase(reference) == "" {
 			reference = imageID
 		}
-		if imageReferenceBase(reference) == "" && isImageID(imageID) {
+		if domain.ImageReferenceBase(reference) == "" && isImageID(imageID) {
 			return imageIdentity{
 				reference:     imageID,
 				digest:        info.imageDigest,
@@ -1349,7 +1349,7 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 				variantDigest: variantDigest,
 			}
 		}
-		if base := imageReferenceBase(reference); base != "" {
+		if base := domain.ImageReferenceBase(reference); base != "" {
 			// Container inspect may report a tag plus a separate
 			// configuration descriptor digest. Synthesize the same
 			// index@digest reference used for a new run so reuse compares
@@ -1362,7 +1362,7 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 				reference:     synthesized,
 				digest:        info.imageDigest,
 				rootDigest:    info.imageDigest,
-				repository:    imageRepository(base),
+				repository:    domain.ImageRepository(base),
 				id:            imageID,
 				pinned:        true,
 				platform:      platform,
@@ -1375,14 +1375,14 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 	if isImageID(imageID) {
 		return imageIdentity{reference: imageID, id: imageID, pinned: true, platform: platform, variantDigest: variantDigest}
 	}
-	if digest := imageDigest(info.image); validImageDigest(digest) && imageReferenceBase(info.image) != "" {
-		return imageIdentity{reference: info.image, digest: digest, rootDigest: digest, repository: imageRepository(info.image), pinned: true, platform: platform, variantDigest: variantDigest}
+	if digest := domain.ImageDigest(info.image); validImageDigest(digest) && domain.ImageReferenceBase(info.image) != "" {
+		return imageIdentity{reference: info.image, digest: digest, rootDigest: digest, repository: domain.ImageRepository(info.image), pinned: true, platform: platform, variantDigest: variantDigest}
 	}
 	// A bare sha256:... in a container's image field is not enough to
 	// establish a Docker local ID. Only info.imageID above is verified
 	// backend identity data.
-	if info.image != "" && !isBareImageReference(info.image) {
-		return imageIdentity{reference: info.image, repository: imageRepository(info.image), platform: platform, variantDigest: variantDigest}
+	if info.image != "" && !domain.IsBareImageReference(info.image) {
+		return imageIdentity{reference: info.image, repository: domain.ImageRepository(info.image), platform: platform, variantDigest: variantDigest}
 	}
 	return imageIdentity{}
 }
@@ -1404,54 +1404,24 @@ func matchingPublishedBinding(bound []boundPort, p publishSpec, eng engine) (bou
 	binding, ok := domain.MatchingPublishedBinding(domainPortBindings(bound), p, eng.isRemote())
 	return boundPortFromDomain(binding), ok
 }
-
-// imagesCompatible reports whether a requested image reference matches
-// what inspect reported.
-func imagesCompatible(requested, actual string) bool {
-	return domain.ImagesCompatible(requested, actual)
-}
-
-// imageRepository returns the canonical repository portion of an image
-// reference, discarding any tag or digest. It is used for a digest
-// response that has no tag but still must not cross a registry or
-// namespace boundary. A bare ID/digest has no repository and returns
-// the empty string.
-func imageRepository(ref string) string {
-	return domain.ImageRepository(ref)
-}
-
 func isUnqualifiedImageReference(ref string) bool {
-	base := imageReferenceBase(ref)
+	base := domain.ImageReferenceBase(ref)
 	if base == "" {
 		return false
 	}
-	base = imageRepositoryBaseWithoutTag(base)
+	base = domain.ImageRepositoryBaseWithoutTag(base)
 	first, _, _ := strings.Cut(base, "/")
 	return !domain.IsRegistry(first)
 }
 
 func isDockerRegistryReference(ref string) bool {
-	base := imageReferenceBase(ref)
+	base := domain.ImageReferenceBase(ref)
 	if base == "" {
 		return false
 	}
-	base = imageRepositoryBaseWithoutTag(base)
+	base = domain.ImageRepositoryBaseWithoutTag(base)
 	first, _, _ := strings.Cut(base, "/")
 	return domain.CanonicalDockerHubRegistry(first) == "docker.io"
-}
-
-func imageRepositoryBaseWithoutTag(base string) string {
-	return domain.ImageRepositoryBaseWithoutTag(base)
-}
-
-// imageRepositoryPathsCompatible compares the repository path and tag
-// while allowing one side to be an unqualified backend-default name. It is
-// intentionally separate from imagesCompatible: the latter retains the
-// historical Docker-Hub-only policy for arbitrary public comparisons, while
-// Apple inspect responses may legitimately contain a custom default
-// registry.
-func imageRepositoryPathsCompatible(a, b string) bool {
-	return domain.ImageRepositoryPathsCompatible(a, b)
 }
 
 // imageRepositoriesCompatible compares canonical repository keys captured
@@ -1459,16 +1429,8 @@ func imageRepositoryPathsCompatible(a, b string) bool {
 // once a backend has supplied a registry-qualified identity, another
 // registry is never interchangeable.
 func imageRepositoriesCompatible(a, b string) bool {
-	ak, bk := imageRepository(a), imageRepository(b)
+	ak, bk := domain.ImageRepository(a), domain.ImageRepository(b)
 	return ak != "" && bk != "" && strings.EqualFold(ak, bk)
-}
-
-func imageDigest(ref string) string {
-	return domain.ImageDigest(ref)
-}
-
-func stripImageDigest(ref string) string {
-	return domain.StripImageDigest(ref)
 }
 
 // PruneReuseGroup force-removes every container tagged with the given

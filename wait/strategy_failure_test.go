@@ -509,7 +509,6 @@ func TestScanLogStreamRollsBackTransientState(t *testing.T) {
 		previousStart: baseline.lineStart,
 		previousLines: baseline.lineCount,
 		count:         baseline.count,
-		partial:       baseline.partial,
 	}
 	transient := errors.New("transport interrupted")
 	result := scanLogStream(
@@ -529,9 +528,6 @@ func TestScanLogStreamRollsBackTransientState(t *testing.T) {
 			result.lineCount,
 			len(result.lines),
 		)
-	}
-	if string(result.partial) != string(replay.partial) {
-		t.Fatalf("transient partial = %q, want committed %q", result.partial, replay.partial)
 	}
 }
 
@@ -591,7 +587,6 @@ func TestScanLogStreamTreatsFinalAndTerminatedReadyAsSameFingerprint(t *testing.
 		previousStart: first.lineStart,
 		previousLines: first.lineCount,
 		count:         first.count,
-		partial:       first.partial,
 	}
 	matches := 0
 	second := scanLogStream(

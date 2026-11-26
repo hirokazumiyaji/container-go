@@ -1,9 +1,6 @@
 package container
 
-import (
-	"sync"
-	"time"
-)
+import "time"
 
 // Bound long-lived clients even when all cached answers are still fresh.
 const imageCacheLimit = 256
@@ -18,41 +15,23 @@ const imageCacheLimit = 256
 // presence is the direction that is cheap to reason about, and the TTL
 // bounds the cost of the mistake.
 //
-// The zero value is unusable; construct it with newImageCache. A zero TTL
-// means every lookup misses.
-type imageCacheEntry struct {
-	expiry   time.Time
-	identity imageIdentity
-}
-
+// The bounded TTL map is the shared ttlCache; this type adds the
+// backend/image/platform key. The zero value is unusable; construct it
+// with newImageCache. A zero TTL means every lookup misses, and a nil
+// cache is inert.
 type imageCache struct {
-	mu      sync.Mutex
-	entries map[string]imageCacheEntry // key -> entry
-	// nextExpiry is the earliest expiry among entries, or the zero time when
-	// no entry is known to expire. It lets remember skip its full sweep while
-	// no entry can be stale, even when the map is far below imageCacheLimit.
-	nextExpiry time.Time
-
-	// now is the clock, injectable so the expiry behavior is testable
-	// without sleeping.
-	now func() time.Time
-	// ttl is how long an entry stays valid.
-	ttl time.Duration
+	*ttlCache[string, imageIdentity]
 }
 
 // newImageCache returns a cache with the given entry lifetime. A ttl of
 // zero or less yields a cache that never hits.
 func newImageCache(ttl time.Duration) *imageCache {
-	return &imageCache{
-		entries: map[string]imageCacheEntry{},
-		now:     time.Now,
-		ttl:     ttl,
-	}
+	return &imageCache{ttlCache: newTTLCache[string, imageIdentity](ttl, imageCacheLimit)}
 }
 
 // enabled reports whether the cache can hold entries at all.
 func (c *imageCache) enabled() bool {
-	return c != nil && c.ttl > 0
+	return c != nil && c.ttlCache.enabled()
 }
 
 // key identifies one cached presence: one backend, one image store
@@ -68,20 +47,7 @@ func (c *imageCache) get(eng engine, image, platform string) (imageIdentity, boo
 	if !c.enabled() {
 		return imageIdentity{}, false
 	}
-	key := imageCacheKey(eng, image, platform)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.entries[key]
-	if !ok {
-		return imageIdentity{}, false
-	}
-	if !c.now().Before(entry.expiry) {
-		// Expired. Drop it so the map does not grow without bound when
-		// an image is looked up repeatedly past its TTL.
-		delete(c.entries, key)
-		return imageIdentity{}, false
-	}
-	return entry.identity, true
+	return c.ttlCache.get(imageCacheKey(eng, image, platform))
 }
 
 // seen reports whether a fresh entry exists for key.
@@ -90,12 +56,7 @@ func (c *imageCache) seen(eng engine, image, platform string) bool {
 	return ok
 }
 
-// remember records that the image is present. While inserting it also
-// drops expired entries and evicts the earliest-expiring entry at capacity.
-// A long-lived Option used with changing
-// image references does not retain dead keys forever; seen() already
-// drops an expired key on lookup, but keys that are never queried again
-// would otherwise linger until the Option itself is discarded.
+// remember records that the image is present.
 func (c *imageCache) remember(eng engine, image, platform string) {
 	c.rememberIdentity(eng, image, platform, imageIdentity{reference: image})
 }
@@ -106,61 +67,7 @@ func (c *imageCache) rememberIdentity(eng engine, image, platform string, identi
 	if !c.enabled() {
 		return
 	}
-	key := imageCacheKey(eng, image, platform)
-	now := c.now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.nextExpiry.IsZero() && !now.Before(c.nextExpiry) {
-		c.purgeExpiredLocked(now)
-	}
-	if _, exists := c.entries[key]; !exists && len(c.entries) >= imageCacheLimit {
-		c.evictEarliestExpiryLocked()
-	}
-	expiry := now.Add(c.ttl)
-	c.entries[key] = imageCacheEntry{
-		expiry:   expiry,
-		identity: identity,
-	}
-	if c.nextExpiry.IsZero() || expiry.Before(c.nextExpiry) {
-		c.nextExpiry = expiry
-	}
-}
-
-// purgeExpiredLocked drops entries whose expiry has passed and restores the
-// earliest-expiry hint. The hint keeps a remember from sweeping the whole map
-// when nothing can be stale, even though expired keys must still be reclaimed
-// before they are looked up again.
-func (c *imageCache) purgeExpiredLocked(now time.Time) {
-	for key, entry := range c.entries {
-		if !now.Before(entry.expiry) {
-			delete(c.entries, key)
-		}
-	}
-	c.recomputeNextExpiryLocked()
-}
-
-func (c *imageCache) evictEarliestExpiryLocked() {
-	var oldestKey string
-	var oldestExpiry time.Time
-	for key, entry := range c.entries {
-		if oldestKey == "" || entry.expiry.Before(oldestExpiry) {
-			oldestKey, oldestExpiry = key, entry.expiry
-		}
-	}
-	if oldestKey == "" {
-		return
-	}
-	delete(c.entries, oldestKey)
-	c.recomputeNextExpiryLocked()
-}
-
-func (c *imageCache) recomputeNextExpiryLocked() {
-	c.nextExpiry = time.Time{}
-	for _, entry := range c.entries {
-		if c.nextExpiry.IsZero() || entry.expiry.Before(c.nextExpiry) {
-			c.nextExpiry = entry.expiry
-		}
-	}
+	c.store(imageCacheKey(eng, image, platform), identity)
 }
 
 // forget drops any entry for key. Called after a pull, so that a pull of
@@ -170,16 +77,5 @@ func (c *imageCache) forget(eng engine, image, platform string) {
 	if !c.enabled() {
 		return
 	}
-	key := imageCacheKey(eng, image, platform)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.entries, key)
-}
-
-// size reports how many entries are held. Used by tests to observe
-// expiry without reaching into the map.
-func (c *imageCache) size() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.entries)
+	c.ttlCache.forget(imageCacheKey(eng, image, platform))
 }

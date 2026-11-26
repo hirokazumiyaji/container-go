@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -104,7 +105,7 @@ func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.
 	if err != nil {
 		return wait.PortListenUnsupported, err
 	}
-	spec, err := parsePortSpec(resolved)
+	spec, err := domain.ParsePortSpec(resolved)
 	if err != nil {
 		return wait.PortListenUnsupported, err
 	}

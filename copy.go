@@ -1151,14 +1151,13 @@ func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error
 // container and returns its content. It is supported by the Docker
 // backend when the host can open copied files without following links or
 // blocking on special files. Docker copy-out also requires client and
-// server versions >=29.7.0. Apple Container, unsupported hosts, unsupported
-// Docker versions, and Windows Go 1.23 through 1.25 return
-// ErrCopyFileFromContainerUnsupported before invoking the backend's
-// copy-out command. The copied regular file must not exceed
-// MaxCopyFileFromContainerSize. The returned reader provides only Read and
-// Close: a read past that limit, for example after the copy grows, fails with
-// ErrCopyFileFromContainerTooLarge. Close releases the temporary copy and
-// removes its private staging directory.
+// server versions >=29.7.0. Apple Container, unsupported hosts, and
+// unsupported Docker versions return ErrCopyFileFromContainerUnsupported
+// before invoking the backend's copy-out command. The copied regular file
+// must not exceed MaxCopyFileFromContainerSize. The returned reader provides
+// only Read and Close: a read past that limit, for example after the copy
+// grows, fails with ErrCopyFileFromContainerTooLarge. Close releases the
+// temporary copy and removes its private staging directory.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	return c.copyFileFromContainer(ctx, containerPath, copyOutHooks{})
 }

@@ -37,7 +37,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		image := c.Configuration.Image.Reference
 		imageDigest := c.Configuration.Image.Descriptor.Digest
 		if image != "" && validImageDigest(imageDigest) {
-			image = stripImageDigest(image) + "@" + imageDigest
+			image = domain.StripImageDigest(image) + "@" + imageDigest
 		}
 		platform := ""
 		if p := c.Configuration.Platform; p.OS != "" || p.Architecture != "" || p.Variant != "" {
@@ -123,7 +123,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			info.bound = append(info.bound, boundPort{
 				containerPort: p.ContainerPort,
 				proto:         p.Proto,
-				hostAddr:      canonicalIP(p.HostAddress),
+				hostAddr:      domain.CanonicalIP(p.HostAddress),
 				hostPort:      p.HostPort,
 			})
 		}
@@ -357,8 +357,8 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 	// repository reference. It is safe to handle only when the inspected
 	// Apple record proves the same identity through its descriptor and
 	// gives us a repository base for the normalized run reference.
-	if isImageID(requested) || isBareImageID(requested) {
-		if imageReferenceBase(reference) == "" || !validImageDigest(digest) {
+	if isImageID(requested) || domain.IsBareImageID(requested) {
+		if domain.ImageReferenceBase(reference) == "" || !validImageDigest(digest) {
 			return availableImage(imageIdentity{})
 		}
 		if !appleImageIDMatchesDescriptor(requested, record.ID, digest) {
@@ -376,13 +376,13 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		identity.rootDigest = digest
 		identity.platform = platform
 		identity.variantDigest = variantDigest
-		identity.repository = imageRepository(runReference)
+		identity.repository = domain.ImageRepository(runReference)
 		identity.appleSynthetic = appleSyntheticIndex(record, digest, variantDigest)
 		// A caller may pin the actual manifest of a single-manifest image.
 		// That digest is registry-addressable even though Apple's synthetic
 		// root index digest is not, so retain the caller's tag plus digest.
-		if requestedDigest := imageDigest(requested); validImageDigest(requestedDigest) && validImageDigest(variantDigest) && strings.EqualFold(requestedDigest, variantDigest) {
-			if base := imageReferenceBase(requested); base != "" {
+		if requestedDigest := domain.ImageDigest(requested); validImageDigest(requestedDigest) && validImageDigest(variantDigest) && strings.EqualFold(requestedDigest, variantDigest) {
+			if base := domain.ImageReferenceBase(requested); base != "" {
 				identity.reference = base + "@" + variantDigest
 				identity.appleSynthetic = false
 			}
@@ -403,7 +403,7 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		identity.rootDigest = digest
 		identity.platform = platform
 		identity.variantDigest = variantDigest
-		identity.repository = imageRepository(identity.reference)
+		identity.repository = domain.ImageRepository(identity.reference)
 		return availableImage(identity)
 	}
 	return availableImage(imageIdentity{})
@@ -436,8 +436,8 @@ func appleSyntheticIndex(record appleImageInspectRecord, _, _ string) bool {
 // name when the caller used an unqualified reference. Docker Hub's familiar
 // short form remains unchanged for compatibility.
 func appleRunReferenceBase(requested, reported string) string {
-	requestedBase := imageReferenceBase(requested)
-	reportedBase := imageReferenceBase(reported)
+	requestedBase := domain.ImageReferenceBase(requested)
+	reportedBase := domain.ImageReferenceBase(reported)
 	if requestedBase == "" {
 		return reportedBase
 	}
@@ -448,15 +448,15 @@ func appleRunReferenceBase(requested, reported string) string {
 }
 
 func appleImageReferencesCompatible(requested, actual string) bool {
-	requestedDigest := imageDigest(requested)
-	actualDigest := imageDigest(actual)
+	requestedDigest := domain.ImageDigest(requested)
+	actualDigest := domain.ImageDigest(actual)
 	if requestedDigest != "" && !validImageDigest(requestedDigest) {
 		return false
 	}
 	if actualDigest != "" && !validImageDigest(actualDigest) {
 		return false
 	}
-	if imagesCompatible(requested, actual) {
+	if domain.ImagesCompatible(requested, actual) {
 		return true
 	}
 	// A custom default registry is reported canonically by Apple, while the
@@ -471,13 +471,13 @@ func appleImageReferencesCompatible(requested, actual string) bool {
 	if requestedDigest != "" || actualDigest != "" {
 		return imageRepositoryPathsCompatibleIgnoringTags(requested, actual)
 	}
-	return imageRepositoryPathsCompatible(requested, actual)
+	return domain.ImageRepositoryPathsCompatible(requested, actual)
 }
 
 func imageRepositoryPathsCompatibleIgnoringTags(a, b string) bool {
-	abase := imageRepositoryBaseWithoutTag(imageReferenceBase(a))
-	bbase := imageRepositoryBaseWithoutTag(imageReferenceBase(b))
-	return imageRepositoryPathsCompatible(abase, bbase)
+	abase := domain.ImageRepositoryBaseWithoutTag(domain.ImageReferenceBase(a))
+	bbase := domain.ImageRepositoryBaseWithoutTag(domain.ImageReferenceBase(b))
+	return domain.ImageRepositoryPathsCompatible(abase, bbase)
 }
 
 // appleImageIDMatchesDescriptor verifies the only safe interpretation of
@@ -485,10 +485,10 @@ func imageRepositoryPathsCompatibleIgnoringTags(a, b string) bool {
 // report the same digest, and any non-empty Apple ID field must agree.
 func appleImageIDMatchesDescriptor(requested, recordID, digest string) bool {
 	requestedDigest := requested
-	if isBareImageID(requested) {
+	if domain.IsBareImageID(requested) {
 		requestedDigest = "sha256:" + requested
 	}
-	if (!isImageID(requested) && !isBareImageID(requested)) || !validImageDigest(digest) || !strings.EqualFold(digest, requestedDigest) {
+	if (!isImageID(requested) && !domain.IsBareImageID(requested)) || !validImageDigest(digest) || !strings.EqualFold(digest, requestedDigest) {
 		return false
 	}
 	if recordID == "" {

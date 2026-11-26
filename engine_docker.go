@@ -337,13 +337,6 @@ func firstNetworkNames(nameSets [][]string) []string {
 	return nameSets[0]
 }
 
-// dockerNetworkEndpointError is the Docker backend's spelling of the shared
-// network mode classification. Reuse compatibility and error-discrimination
-// tests classify through it.
-func dockerNetworkEndpointError(mode string) error {
-	return domain.NetworkEndpointError(mode)
-}
-
 // defaultHost returns the address the client should dial to reach the
 // container. For a remote daemon that is the remote endpoint host; otherwise it is
 // this machine's loopback.

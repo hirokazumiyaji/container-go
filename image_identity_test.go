@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 const (
@@ -139,7 +140,7 @@ func (r *appleTagSwapRunner) Run(_ context.Context, args ...string) ([]byte, []b
 		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
-		image := stripImageDigest(r.runImage)
+		image := domain.StripImageDigest(r.runImage)
 		if image == "" {
 			image = "redis:7-alpine"
 		}

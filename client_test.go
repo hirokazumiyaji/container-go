@@ -826,7 +826,7 @@ func TestPullOptionsAreHonored(t *testing.T) {
 			WithPullRunner(f), WithPullDockerContext("ctx")); err != nil {
 			t.Fatalf("Pull: %v", err)
 		}
-		if call := f.callWith("context"); len(call) != 3 || call[1] != "inspect" || call[2] != "ctx" {
+		if call := f.callWith("context"); len(call) != 4 || call[1] != "inspect" || call[2] != "--" || call[3] != "ctx" {
 			t.Fatalf("context was not inspected: %v", f.calls)
 		}
 		if f.callWith("pull") == nil {

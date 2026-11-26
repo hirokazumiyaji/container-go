@@ -831,9 +831,10 @@ termination error from `Cleanup` is sent to the test log;
 `TerminateContainer` returns its error to the caller.
 
 `Container.Kill(ctx, signal string)` takes exactly one signal. An empty
-string selects the default SIGKILL; a non-empty signal is passed to the
-backend unchanged, so an invalid spelling is rejected by the backend rather
-than by a variadic-argument check.
+string selects the default SIGKILL; a non-empty signal must be a positive
+number or an uppercase signal name, and is passed to the backend unchanged.
+A flag-shaped, lowercase, or control-character spelling is rejected as a
+validation error before the backend runs.
 
 **Post-create rollback**: when a non-reuse `Run` fails while copying
 files or waiting for readiness, it calls `Terminate` for the handle it

@@ -412,8 +412,9 @@ caller の context を使い、`Cleanup` と `StrictCleanup` は完全な teardo
 エラーを呼び出し元へ返す。
 
 `Container.Kill(ctx, signal string)` は signal を 1 つだけ取る。空文字列は
-既定の SIGKILL で、空でない signal は backend へそのまま渡す。そのため
-不正な綴りは可変長引数の検査ではなく backend が拒否する。
+既定の SIGKILL で、空でない signal は正の番号または大文字の signal 名でなけれ
+ばならない。フラグ形・小文字・制御文字を含む綴りは backend 実行前に検証エラー
+として拒否する。
 
 **作成後の rollback**：再利用でない `Run` が file copy または readiness 待ちの
 途中で失敗すると、作成した handle の `Terminate` を呼ぶ。削除にも失敗した場合、

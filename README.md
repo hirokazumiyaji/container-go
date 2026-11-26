@@ -1121,8 +1121,9 @@ package-level `Pull` accepts its own `WithPullDockerHost` and
 rejects them because the Client pins its target.
 
 `Container.Kill(ctx, signal string)` takes exactly one signal. An empty
-string selects the default SIGKILL. A non-empty signal is passed to the
-backend unchanged; multiple signals are now rejected at compile time.
+string selects the default SIGKILL. A non-empty signal must be a positive
+signal number or an uppercase signal name such as `SIGTERM`; any other
+spelling is rejected as a validation error before the backend runs.
 
 ```go
 package docexample

@@ -100,6 +100,10 @@ func WithExecStderr(w io.Writer) ExecOption {
 // is invoked. The child process is always terminated and reaped when the
 // command exits or the context is cancelled.
 //
+// A non-EOF failure from r is returned with the command result, even when the
+// command still exits successfully, because the command received truncated
+// input.
+//
 // The caller owns the input contract: r must either reach EOF or implement
 // io.Closer with a Close that unblocks a pending Read. On completion or
 // cancellation the child's stdin pipe and a closable r are closed, and a
@@ -371,6 +375,11 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 		err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
 		output = bytes.NewReader(stdout.Bytes())
 	}
+	// A stdin read failure is local evidence that must survive the
+	// application-result classification below; a successful command may
+	// still have received truncated input.
+	stdinErr := cli.StdinError(err)
+
 	// The CLI has finished reading the env file. Remove it before any
 	// result classification or caller-visible output processing. Retain
 	// envDir for a deferred retry if removal fails, and preserve the error.
@@ -420,6 +429,13 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 				classified = err
 			} else if !errors.Is(classified, cli.ErrOutputDelivery) {
 				classified = errors.Join(classified, deliveryErr)
+			}
+		}
+		if stdinErr != nil && !errors.Is(classified, stdinErr) {
+			if classified == nil {
+				classified = stdinErr
+			} else {
+				classified = errors.Join(classified, stdinErr)
 			}
 		}
 		if contextErr, ok := execContextualError(ctx, execCtx, classified, terminationUnknown); ok {

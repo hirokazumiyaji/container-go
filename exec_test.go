@@ -1565,6 +1565,7 @@ type stdinExecRunner struct {
 	*fakeRunner
 	stdin     []byte
 	stdinArgs []string
+	runErr    error
 }
 
 func (r *stdinExecRunner) RunWithStdin(_ context.Context, stdin io.Reader, stdout, _ io.Writer, args ...string) (cli.OutputStats, error) {
@@ -1577,8 +1578,11 @@ func (r *stdinExecRunner) RunWithStdin(_ context.Context, stdin io.Reader, stdou
 	r.stdinArgs = append([]string(nil), args...)
 	r.calls = append(r.calls, args)
 	r.mu.Unlock()
-	n, err := stdout.Write(data)
-	return cli.OutputStats{StdoutBytes: int64(n)}, err
+	n, writeErr := stdout.Write(data)
+	if r.runErr != nil {
+		return cli.OutputStats{StdoutBytes: int64(n)}, r.runErr
+	}
+	return cli.OutputStats{StdoutBytes: int64(n)}, writeErr
 }
 
 func (r *stdinExecRunner) capturedStdin() ([]byte, []string) {
@@ -1693,6 +1697,50 @@ func TestExecWithStdinRejectsTypedNilReader(t *testing.T) {
 	}
 	if call := f.callWith("exec"); call != nil {
 		t.Errorf("typed-nil stdin still invoked the CLI: %v", call)
+	}
+}
+
+func TestExecWithStdinReturnsReaderError(t *testing.T) {
+	readErr := errors.New("stdin source failed")
+	f := &stdinExecRunner{
+		fakeRunner: newTestRunner(),
+		runErr:     &cli.StdinReadError{Err: readErr},
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"cat"},
+		WithExecStdin(strings.NewReader("partial")))
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if !errors.Is(err, readErr) || !errors.Is(err, cli.ErrStdinRead) {
+		t.Fatalf("error = %v, want the reader failure and ErrStdinRead", err)
+	}
+	data, _ := io.ReadAll(out)
+	if string(data) != "partial" {
+		t.Errorf("output = %q, want the data read before the failure", data)
+	}
+}
+
+func TestExecWithStdinPreservesReaderErrorWithCommandExit(t *testing.T) {
+	readErr := errors.New("stdin source failed")
+	cliErr := &cli.CLIError{Binary: "container", Args: []string{"exec", "myctr", "cat"}, ExitCode: 7, Stderr: "command failed"}
+	f := &stdinExecRunner{
+		fakeRunner: newTestRunner(),
+		runErr:     errors.Join(cliErr, &cli.StdinReadError{Err: readErr}),
+	}
+	ctr := runTestContainer(t, f)
+
+	code, _, err := ctr.Exec(context.Background(), []string{"cat"},
+		WithExecStdin(strings.NewReader("partial")))
+	if code != 7 {
+		t.Errorf("exit code = %d, want the command status 7", code)
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("error = %v, want the reader failure alongside the command exit", err)
+	}
+	if !errors.Is(err, cli.ErrStdinRead) {
+		t.Fatalf("error = %v, want ErrStdinRead alongside the command exit", err)
 	}
 }
 

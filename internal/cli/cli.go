@@ -50,6 +50,44 @@ var ErrStreamSetup = errors.New("log stream setup failed")
 // requirement on every existing test double and embedding wrapper.
 var ErrStdinUnsupported = errors.New("runner does not support stdin")
 
+// ErrStdinRead identifies a failure while reading the caller's stdin. The
+// original reader error remains in the chain, so errors.Is(err, readerErr)
+// still works.
+var ErrStdinRead = errors.New("exec stdin read failed")
+
+// StdinReadError attaches ErrStdinRead to the caller reader's failure while
+// preserving the original error for errors.Is.
+type StdinReadError struct {
+	Err error
+}
+
+func (e *StdinReadError) Error() string {
+	if e == nil || e.Err == nil {
+		return ErrStdinRead.Error()
+	}
+	return fmt.Sprintf("%s: %v", ErrStdinRead, e.Err)
+}
+
+func (e *StdinReadError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *StdinReadError) Is(target error) bool {
+	return target == ErrStdinRead
+}
+
+// StdinError returns the stdin read failure contained in err, if any.
+func StdinError(err error) error {
+	var target *StdinReadError
+	if errors.As(err, &target) {
+		return target
+	}
+	return nil
+}
+
 type SystemNotRunningError struct {
 	hint      string
 	original  error
@@ -456,12 +494,14 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 	return r.runTo(ctx, nil, stdout, stderr, args...)
 }
 
-// RunWithStdin is RunTo with stdin wired to the child process. When the
-// command exits or the caller's context is cancelled, the child's input pipe
-// and a closable reader are closed, and the copy goroutine is awaited for a
-// bounded grace period. Go cannot interrupt a Read on a non-closable reader;
-// such a copy may outlive the command until the caller's reader returns, and
-// callers must provide input that reaches EOF or is closable.
+// RunWithStdin is RunTo with stdin wired to the child process. A reader error
+// is returned as *StdinReadError, including when the child exits successfully
+// after receiving truncated input. When the command exits or the caller's
+// context is cancelled, the child's input pipe and a closable reader are
+// closed, and the copy goroutine is awaited for a bounded grace period. Go
+// cannot interrupt a Read on a non-closable reader; such a copy may outlive
+// the command until the caller's reader returns, and callers must provide
+// input that reaches EOF or is closable.
 func (r *ExecRunner) RunWithStdin(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
 	return r.runTo(ctx, stdin, stdout, stderr, args...)
 }
@@ -586,6 +626,14 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdin io.Reade
 	if commandErr == nil && ctx.Err() != nil && status.TerminatedByCancellation {
 		commandErr = commandContextError(bin, args, ctx.Err())
 	}
+	if feed != nil {
+		// commandError rebuilds a CLIError from an exit status and would
+		// otherwise drop a read failure that happened while the command
+		// also exited non-zero.
+		if feedErr := feed.readError(); feedErr != nil && !errors.Is(commandErr, feedErr) {
+			commandErr = errors.Join(commandErr, feedErr)
+		}
+	}
 	return markRunStatus(commandErr, status)
 }
 
@@ -610,6 +658,7 @@ type stdinFeed struct {
 	mu      sync.Mutex
 	started bool
 	closed  bool
+	readErr error
 }
 
 func newStdinFeed(reader io.Reader, pipe io.WriteCloser) *stdinFeed {
@@ -631,8 +680,39 @@ func (f *stdinFeed) start() {
 
 func (f *stdinFeed) copy() {
 	defer close(f.done)
-	_, _ = io.Copy(f.pipe, f.reader)
-	_ = f.pipe.Close()
+	buffer := make([]byte, 32*1024)
+	for {
+		n, readErr := f.reader.Read(buffer)
+		if n > 0 {
+			if _, writeErr := f.pipe.Write(buffer[:n]); writeErr != nil {
+				// The command stopped reading or the feed was stopped; a
+				// write failure is expected teardown, not a caller error.
+				_ = f.pipe.Close()
+				return
+			}
+		}
+		if readErr == nil {
+			continue
+		}
+		_ = f.pipe.Close()
+		if errors.Is(readErr, io.EOF) {
+			return
+		}
+		f.mu.Lock()
+		if !f.closed && f.readErr == nil {
+			f.readErr = &StdinReadError{Err: readErr}
+		}
+		f.mu.Unlock()
+		return
+	}
+}
+
+// readError reports a reader failure observed while the command still owned
+// stdin. A read unblocked by stop is teardown, not a caller error.
+func (f *stdinFeed) readError() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.readErr
 }
 
 // stop ends the feed after the child is gone or cancellation terminates it.

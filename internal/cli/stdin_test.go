@@ -145,6 +145,44 @@ func TestExecRunnerRunWithStdinNonClosableReaderDoesNotBlockCancellation(t *test
 	}
 }
 
+type failingStdinReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failingStdinReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, r.err
+}
+
+func TestExecRunnerRunWithStdinReturnsReaderError(t *testing.T) {
+	requirePOSIXShell(t)
+	readErr := errors.New("stdin source failed")
+	r := &ExecRunner{Binary: writeStub(t, `cat`)}
+
+	var stdout bytes.Buffer
+	_, err := r.RunWithStdin(context.Background(),
+		&failingStdinReader{data: []byte("partial"), err: readErr},
+		&stdout, io.Discard, "exec")
+	if !errors.Is(err, ErrStdinRead) {
+		t.Fatalf("RunWithStdin error = %v, want ErrStdinRead", err)
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("RunWithStdin error = %v, want the original reader error", err)
+	}
+	var stdinErr *StdinReadError
+	if !errors.As(err, &stdinErr) {
+		t.Fatalf("RunWithStdin error = %v, want *StdinReadError", err)
+	}
+	if got, want := stdout.String(), "partial"; got != want {
+		t.Errorf("stdout = %q, want the data read before the failure", got)
+	}
+}
+
 type runStdinTestRunner struct {
 	Runner
 }

@@ -420,8 +420,9 @@ backend. Command completion and cancellation close the child's stdin pipe and
 a closable reader, then await that copy for a bounded grace. Go cannot
 interrupt a read on a non-closable reader: such a copy can outlive the run
 until the caller's reader returns, while the child is still terminated and
-reaped. Callers must supply input that reaches EOF or whose Close unblocks a
-pending read. When the
+reaped. A non-EOF read failure is returned with the command result even when
+the command exits successfully. Callers must supply input that reaches EOF or
+whose Close unblocks a pending read. When the
 caller's context has no deadline, Exec applies a 30-second default. For a positive
 `WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
 the caller's deadline. `WithExecTimeout(0)` only disables the library

@@ -14,11 +14,15 @@ import (
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
+	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
 func (e dockerEngine) effectiveHost() string {
 	if e.explicitHost || e.host != "" {
 		return e.host
+	}
+	if e.frozenEnv {
+		return ""
 	}
 	return os.Getenv("DOCKER_HOST")
 }
@@ -27,8 +31,10 @@ func (e dockerEngine) effectiveContext() string {
 	if e.explicitContext || e.context != "" {
 		return e.context
 	}
-	if env := os.Getenv("DOCKER_CONTEXT"); env != "" {
-		return env
+	if !e.frozenEnv {
+		if env := os.Getenv("DOCKER_CONTEXT"); env != "" {
+			return env
+		}
 	}
 	if e.resolvedTarget != nil && e.resolvedTarget.context != "" {
 		return e.resolvedTarget.context
@@ -40,12 +46,18 @@ func (e dockerEngine) effectiveConfigDir() string {
 	if e.explicitConfigDir || e.configDir != "" {
 		return e.configDir
 	}
+	if e.frozenEnv {
+		return ""
+	}
 	return os.Getenv("DOCKER_CONFIG")
 }
 
 func (e dockerEngine) effectiveDefaultPlatform() string {
 	if e.explicitDefaultPlatform || e.defaultPlatform != "" {
 		return e.defaultPlatform
+	}
+	if e.frozenEnv {
+		return ""
 	}
 	return os.Getenv("DOCKER_DEFAULT_PLATFORM")
 }
@@ -207,6 +219,12 @@ func inspectDockerNetwork(ctx context.Context, cfg *config) (dockerNetworkInfo, 
 	defer cancel()
 	stdout, _, err := cfg.runner.Run(queryCtx, "network", "inspect", cfg.network)
 	if err != nil {
+		// A query that exhausted its own budget is a timeout, not evidence
+		// that the daemon is unreachable: probing again would repeat the
+		// failed round trip with the unbounded operation context.
+		if contextErr := commandContextError(queryCtx, err); contextErr != nil {
+			return dockerNetworkInfo{}, fmt.Errorf("inspect Docker network %q before starting container: %w", cfg.network, contextErr)
+		}
 		classified := classifyErrorWithProbe(ctx, cfg.runner, err, cfg.eng, cfg.effectiveProbeTimeout())
 		return dockerNetworkInfo{}, fmt.Errorf("inspect Docker network %q before starting container: %w", cfg.network, classified)
 	}
@@ -373,8 +391,8 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 		}
 	}
 
-	var contexts []dockerContextInspect
-	if err := json.Unmarshal(stdout, &contexts); err != nil {
+	contexts, err := strictjson.Array[dockerContextInspect](stdout, nil)
+	if err != nil {
 		return "", "", fmt.Errorf("decode Docker context inspect output: %w", err)
 	}
 	if len(contexts) == 0 {
@@ -431,10 +449,17 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 
 	effectiveHost, effectiveCtx, runnerHasHost, runnerSelectedContext := e.targetSelection(runner)
 
+	// An explicit empty host clears the inherited DOCKER_HOST and leaves the
+	// active Docker context in charge, so the context still has to be
+	// inspected: the child CLI resolves a missing DOCKER_HOST from
+	// ~/.docker/config.json. Treating that form as a local default would let a
+	// remote active context bypass the remote-target checks.
+	clearedHost := e.explicitHost && !e.explicitContext && strings.TrimSpace(effectiveHost) == ""
+
 	resolvedCtx := effectiveCtx
 	var targetHost string
 
-	if e.explicitHost && !e.explicitContext {
+	if e.explicitHost && !e.explicitContext && !clearedHost {
 		// Explicit host requested by caller takes precedence over ambient context.
 		targetHost = effectiveHost
 	} else if effectiveCtx != "" {
@@ -458,7 +483,8 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		// No context set, explicit or ambient host is target.
 		targetHost = effectiveHost
 	} else if runner != nil {
-		// Neither context nor host is set: inspect active context.
+		// Neither context nor host is set (or the host was explicitly
+		// cleared): inspect the active context.
 		ctxName, ctxEndpoint, err := resolveDockerContextEndpoint(ctx, runner, "")
 		if err != nil {
 			var unavail *dockerContextUnavailableError
@@ -500,16 +526,22 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		ep.context = resolvedCtx
 	}
 	clone.resolvedTarget = &ep
-	if e.explicitHost && !e.explicitContext {
+	switch {
+	case e.explicitHost && !e.explicitContext && !clearedHost:
 		clone.host = effectiveHost
 		clone.explicitHost = true
 		clone.explicitTarget = true
-	} else if e.explicitContext || runnerSelectedContext {
+	case e.explicitContext || runnerSelectedContext || clearedHost:
 		clone.context = resolvedCtx
 		clone.host = ""
 		clone.explicitContext = true
 		clone.explicitTarget = true
-	} else if runnerHasHost && targetHost == effectiveHost {
+		if clearedHost {
+			// The cleared host must stay in effect even if a runner's own
+			// environment exports DOCKER_HOST.
+			clone.explicitHost = true
+		}
+	case runnerHasHost && targetHost == effectiveHost:
 		clone.host = effectiveHost
 		clone.explicitHost = true
 		clone.explicitTarget = true

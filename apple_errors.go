@@ -114,7 +114,9 @@ func parseAppleEscapedEnvelope(code, rest string, depth int) (appleContainerizat
 
 // parseAppleUnescapedEnvelope handles the older spelling, where Swift leaves
 // the nested cause's quotes unescaped. The explicit "(cause: " marker keeps
-// the unquoted portion bounded.
+// the unquoted portion bounded. A message may not contain a quote: in this
+// spelling quotes are structural, so an interior one is trailing garbage
+// that the escape-aware renderer would have escaped.
 func parseAppleUnescapedEnvelope(code, rest string, depth int) (appleContainerizationError, bool) {
 	rest = strings.TrimSpace(rest)
 	if !strings.HasPrefix(rest, `"`) {
@@ -123,7 +125,7 @@ func parseAppleUnescapedEnvelope(code, rest string, depth int) (appleContaineriz
 	const causeMarker = `" (cause: "`
 	if marker := strings.Index(rest, causeMarker); marker >= 0 {
 		message := rest[1:marker]
-		if appleApplicationPrefixed(message) {
+		if strings.Contains(message, `"`) || appleApplicationPrefixed(message) {
 			return appleContainerizationError{}, false
 		}
 		causeText := rest[marker+len(causeMarker):]
@@ -141,7 +143,7 @@ func parseAppleUnescapedEnvelope(code, rest string, depth int) (appleContaineriz
 		return appleContainerizationError{}, false
 	}
 	message := rest[1 : len(rest)-1]
-	if appleApplicationPrefixed(message) {
+	if strings.Contains(message, `"`) || appleApplicationPrefixed(message) {
 		return appleContainerizationError{}, false
 	}
 	return appleContainerizationError{code: code, message: message}, true

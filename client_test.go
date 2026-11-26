@@ -312,6 +312,77 @@ func TestDockerOptionsResolveBackendAndPreserveEnv(t *testing.T) {
 	}
 }
 
+func TestClientFreezesDockerTargetEnvironment(t *testing.T) {
+	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_DEFAULT_PLATFORM"} {
+		t.Setenv(key, "")
+	}
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientRunner(newDockerTestRunner()),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	t.Setenv("DOCKER_HOST", "tcp://late-host:2375")
+	t.Setenv("DOCKER_CONTEXT", "late-context")
+	t.Setenv("DOCKER_CONFIG", "/late/config")
+	t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/arm64")
+
+	de, ok := client.eng.(dockerEngine)
+	if !ok {
+		t.Fatalf("client engine is %T, want dockerEngine", client.eng)
+	}
+	if got := de.effectiveHost(); got != "" {
+		t.Errorf("effectiveHost() = %q after NewClient, want the frozen empty value", got)
+	}
+	if got := de.effectiveConfigDir(); got != "" {
+		t.Errorf("effectiveConfigDir() = %q after NewClient, want the frozen empty value", got)
+	}
+	if got := de.effectiveDefaultPlatform(); got != "" {
+		t.Errorf("effectiveDefaultPlatform() = %q after NewClient, want the frozen empty value", got)
+	}
+	for _, entry := range de.pinnedTargetEnv() {
+		if strings.Contains(entry, "late") {
+			t.Errorf("pinned target environment leaked a later value: %v", de.pinnedTargetEnv())
+			break
+		}
+	}
+}
+
+func TestClientEmptyDockerHostUsesActiveContext(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://inherited-daemon:2375")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	f := newDockerTestRunner()
+	f.contextJSON = `[{"Name":"active-remote","Endpoints":{"docker":{"Host":"tcp://remote-box:2375"}}}]`
+
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost(""),
+		WithClientRunner(f),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if !client.IsRemote() {
+		t.Fatal("WithClientDockerHost(\"\") was treated as a local daemon")
+	}
+	if got := client.DefaultHost(); got != "remote-box" {
+		t.Errorf("DefaultHost() = %q, want remote-box", got)
+	}
+
+	inspected := false
+	for _, call := range f.calls {
+		if len(call) == 2 && call[0] == "context" && call[1] == "inspect" {
+			inspected = true
+		}
+	}
+	if !inspected {
+		t.Fatalf("active context was not inspected: %v", f.calls)
+	}
+}
+
 func TestWithDockerHostEmptyClearsEnv(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://inherited-daemon:2375")
 

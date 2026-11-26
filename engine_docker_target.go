@@ -88,8 +88,12 @@ func (e dockerEngine) configureTarget(target engineTargetOverride) engine {
 
 // freezeTargetEnvironment snapshots the ambient Docker target settings so a
 // Client keeps addressing the same daemon after process environment changes.
+// The frozen flag stops the effective accessors from re-reading an unset
+// component: an unset component stays unset instead of picking up a variable
+// exported after the Client was created.
 func (e dockerEngine) freezeTargetEnvironment() engine {
 	e.explicitTarget = true
+	e.frozenEnv = true
 	if e.host == "" && !e.explicitHost {
 		e.host = os.Getenv("DOCKER_HOST")
 	}

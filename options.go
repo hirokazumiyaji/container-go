@@ -67,6 +67,10 @@ type config struct {
 	memory               domain.ByteSize
 	shmSize              domain.ByteSize
 	privileged           bool
+	readOnlyRootFS       bool
+	initProcess          bool
+	dnsServers           []string
+	stopSignal           string
 	capAdd               []string
 	capDrop              []string
 	ulimits              []ulimitSpec
@@ -82,6 +86,7 @@ type config struct {
 	allowMutableImageTag bool
 	reuse                bool
 	reuseGroup           string
+	reuseEnvFingerprint  bool
 	creation             string
 	// imageCache reuses image-presence answers across Runs when the
 	// caller applies a WithImagePresenceCache Option. The Option owns the
@@ -155,6 +160,9 @@ func (c *config) validate() error {
 	}
 	if c.reuseGroup != "" && !c.reuse {
 		return validationErrorf("WithReuseGroup", c.reuseGroup, "WithReuseGroup requires WithReuse")
+	}
+	if c.reuseEnvFingerprint && !c.reuse {
+		return validationErrorf("WithReuseEnvFingerprint", nil, "WithReuseEnvFingerprint requires WithReuse")
 	}
 	if c.reuse && c.attachOutput != nil {
 		// The reuse path attaches to a container this call may not have
@@ -258,6 +266,7 @@ func (c *config) allLabels() map[string]string {
 		// BuildLabels owns every reserved label, so the fingerprint is
 		// passed in instead of writing into the returned map.
 		cfg.ReuseConfig = c.reuseConfigHash()
+		cfg.ReuseEnvFingerprint = c.reuseEnvFingerprintValue()
 	}
 	return domain.BuildLabels(cfg)
 }
@@ -297,6 +306,18 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 	}
 	if c.privileged {
 		args = append(args, "--privileged")
+	}
+	if c.readOnlyRootFS {
+		args = append(args, "--read-only")
+	}
+	if c.initProcess {
+		args = append(args, "--init")
+	}
+	for _, server := range c.dnsServers {
+		args = append(args, "--dns", server)
+	}
+	if c.stopSignal != "" {
+		args = append(args, "--stop-signal", c.stopSignal)
 	}
 	for _, capability := range c.capAdd {
 		args = append(args, "--cap-add", capability)
@@ -344,10 +365,12 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // must match an existing container. Capabilities follow a requested-subset
 // rule: every requested --cap-add/--cap-drop value must be present, while
 // an empty request accepts any inspected capability set. Memory, user, working
-// directory, entrypoint, command, mounts, and custom labels must exactly match
-// the creation fingerprint, including omitted options. Reuse group must match.
+// directory, entrypoint, command, mounts, custom labels, read-only root
+// filesystem, init, DNS servers, and stop signal must exactly match the
+// creation fingerprint, including omitted options. Reuse group must match.
 // Unfingerprinted containers must be recreated before attaching. Environment
-// differences are ignored. Returned handles are shared: Cleanup, TerminateContainer,
+// differences are ignored unless WithReuseEnvFingerprint is also set.
+// Returned handles are shared: Cleanup, TerminateContainer,
 // and the watchdog reaper do not remove them. Stop, CopyToContainer,
 // CopyContentToContainer, and CopyFileFromContainer refuse with
 // ErrSharedContainer so one process cannot disturb peers; use Shared to
@@ -370,6 +393,19 @@ func WithReuseGroup(group string) Option {
 			return err
 		}
 		c.reuseGroup = group
+		return nil
+	}
+}
+
+// WithReuseEnvFingerprint opts into environment matching for WithReuse.
+// The library records a SHA-256 digest of the sorted environment key/value
+// pairs in a reserved label; raw values are never written to labels or argv.
+// An attach caller that sets this option must find the same digest and
+// otherwise receives ErrReuseMismatch. Without the option, environment
+// differences remain ignored on attach. Requires WithReuse.
+func WithReuseEnvFingerprint() Option {
+	return func(c *config) error {
+		c.reuseEnvFingerprint = true
 		return nil
 	}
 }
@@ -802,6 +838,69 @@ func WithShmSize(size string) Option {
 func WithPrivileged() Option {
 	return func(c *config) error {
 		c.privileged = true
+		return nil
+	}
+}
+
+// WithReadOnlyRootFS mounts the container's root filesystem read-only
+// (Docker and Apple Container --read-only). Writable paths must be supplied
+// with WithMounts.
+func WithReadOnlyRootFS() Option {
+	return func(c *config) error {
+		c.readOnlyRootFS = true
+		return nil
+	}
+}
+
+// WithInit runs a lightweight init process as the container's first process
+// (Docker and Apple Container --init). The init forwards signals and reaps
+// orphaned child processes.
+func WithInit() Option {
+	return func(c *config) error {
+		c.initProcess = true
+		return nil
+	}
+}
+
+// WithDNS adds custom DNS nameservers. Each server is passed as its own
+// --dns flag, and every value must be a literal IPv4 or IPv6 address.
+// Duplicate entries are preserved because resolver order can matter. Both
+// Docker and Apple Container accept repeated --dns flags.
+func WithDNS(servers ...string) Option {
+	return func(c *config) error {
+		for _, server := range servers {
+			parsed := net.ParseIP(server)
+			if parsed == nil {
+				return newValidationErrorWithField("WithDNS", "server", server,
+					fmt.Errorf("invalid DNS server %q: must be an IPv4 or IPv6 address", server))
+			}
+			c.dnsServers = append(c.dnsServers, parsed.String())
+		}
+		return nil
+	}
+}
+
+// stopSignalRE accepts the signal spellings the backends understand for a
+// stop signal: a positive signal number, a signal name such as SIGTERM or
+// KILL, or a realtime signal spelling such as SIGRTMIN+3. A leading sign,
+// whitespace, control character, or flag-shaped value must never reach the
+// CLI argv.
+var stopSignalRE = regexp.MustCompile(`^(?:[1-9][0-9]*|(?:SIG)?[A-Z][A-Z0-9]*(?:[+-][0-9]+)?)$`)
+
+// WithStopSignal sets the signal sent to the container's main process when it
+// is stopped (Docker's --stop-signal). The value must be a positive signal
+// number or an uppercase signal name such as SIGTERM or SIGRTMIN+3.
+// Apple Container has no run-time stop-signal flag and rejects it with
+// ErrUnsupportedCapability before invoking its CLI.
+func WithStopSignal(signal string) Option {
+	return func(c *config) error {
+		if !stopSignalRE.MatchString(signal) {
+			// Do not echo the rejected value: it may contain control
+			// characters or a flag-shaped spelling.
+			return newValidationErrorWithField("WithStopSignal", "signal", nil,
+				fmt.Errorf("invalid stop signal: want a positive number or an uppercase signal name"))
+		}
+		c.stopSignal = signal
 		return nil
 	}
 }

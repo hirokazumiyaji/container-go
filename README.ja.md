@@ -720,9 +720,11 @@ image が消えた場合はエントリ期限まで再 pull されないので�
 
 その他の option は run flag に直接対応します。`WithPrivileged`（`--privileged`）、`WithCapAdd` / `WithCapDrop`（`--cap-add` / `--cap-drop`。名前は optional な `CAP_` prefix 付きの大文字または `ALL` で、caller の表記をそのまま渡し、重複は prefix に関係なく無視する）、`WithUlimit(name, soft, hard)`（`--ulimit name=soft:hard`。Docker の小文字名集合を使い、`-1` は無制限を表す）、`WithExtraHost(host, ip)`（`--add-host host:ip`。IP に `host-gateway` を許可し、同名または衝突する host は拒否する）、`WithHostname`（`--hostname`。63 byte 以下の RFC 1123 hostname）である。先頭が `-` の文字列値や制御文字を含む値は拒否します。
 
-Apple Container は `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit` をサポートするため同じ flag を受け取ります。privileged container、extra host、`--hostname` に相当する機能はないため、`WithPrivileged`、`WithExtraHost`、`WithHostname` は image や container の command を実行する前に `ErrUnsupportedCapability` を返します。
+残りの option は security と process に関わる run flag に対応します。`WithReadOnlyRootFS()` は `--read-only` を渡し、コンテナのルート filesystem を読み取り専用にする。`WithInit()` は `--init` を渡し、signal を転送して孤児 process を回収する軽量 init を有効にする。`WithDNS(servers ...string)` は server ごとに `--dns` を 1 つ渡す。各 server は IPv4 または IPv6 の IP address リテラルでなければならず、空文字、不正な値、flag 形式の値は option 評価時に拒否する。`WithStopSignal(signal string)` は `--stop-signal` を渡し、正の signal 番号、または `SIGTERM`、`TERM`、`SIGRTMIN+3` のような大文字の signal 名を受け付ける。小文字、空文字、flag 形式の値は拒否する。Docker は 4 つすべてをサポートする。
 
-これらの option は `WithReuse` の互換性 identity に含まれます。再利用する container は CPU、shm、privilege、ulimit、extra host、hostname の設定が一致しなければなりません。capability は requested-subset rule で、caller が追加・削除を要求した capability がすべて存在する必要があり、capability の変更を要求しない caller は inspect された任意の set を受け入れます。これらの check に失敗すると `Run` は attach を拒否します。
+Apple Container は `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit` をサポートするため同じ flag を受け取ります。`--read-only`、`--init`、繰り返し指定可能な `--dns` もサポートするため、`WithReadOnlyRootFS`、`WithInit`、`WithDNS` はそのまま渡されます。privileged container、extra host、`--hostname`、実行時の stop signal に相当する機能はないため、`WithPrivileged`、`WithExtraHost`、`WithHostname`、`WithStopSignal` は image や container の command を実行する前に `ErrUnsupportedCapability` を返します。
+
+これらの option は `WithReuse` の互換性 identity に含まれます。再利用する container は CPU、shm、privilege、ulimit、extra host、hostname の設定が一致しなければなりません。capability は requested-subset rule で、caller が追加・削除を要求した capability がすべて存在する必要があり、capability の変更を要求しない caller は inspect された任意の set を受け入れます。read-only root filesystem、init、DNS server のリスト、stop signal は作成 fingerprint に記録されるため、異なる値（または option を省略）で作成された既存コンテナへの attach は `ErrReuseMismatch` を返します。環境変数の値は `WithReuseEnvFingerprint` が別に扱います。これらの check に失敗すると `Run` は attach を拒否します。
 
 ### Apple の capability validation
 
@@ -751,7 +753,7 @@ memory は 200 MiB 以上で、`WithMemory` と同じ整数(任意の `K`/`M`/`G
 publish port は 2〜65535、publish descriptor は最大 64 個です。
 `WithExposedPorts` は library 側の宣言であり、Apple の `--publish` flag には変換されません。
 
-Apple は `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit`、整数の `--cpus` をサポートするため、`WithShmSize`、`WithCapAdd`、`WithCapDrop`、`WithUlimit`、整数の `WithCPUs` はそのまま渡されます。`WithPrivileged`、`WithExtraHost`、`WithHostname`、小数の `WithCPUs` は CLI 実行前に `ErrUnsupportedCapability` で拒否されます。
+Apple は `--shm-size`、`--cap-add`、`--cap-drop`、`--ulimit`、`--read-only`、`--init`、繰り返し指定可能な `--dns`、整数の `--cpus` をサポートするため、`WithShmSize`、`WithCapAdd`、`WithCapDrop`、`WithUlimit`、`WithReadOnlyRootFS`、`WithInit`、`WithDNS`、整数の `WithCPUs` はそのまま渡されます。`WithPrivileged`、`WithExtraHost`、`WithHostname`、`WithStopSignal`、小数の `WithCPUs` は CLI 実行前に `ErrUnsupportedCapability` で拒否されます。
 
 ## イメージの解決と固定
 
@@ -1148,13 +1150,21 @@ func TestReuse(t *testing.T) {
   `WithExposedPorts` の宣言が残らないため、それを比較できません。Apple では
   新しい handle ごとに自分の exposed-port 宣言を共有コンテナ IP へ適用するので、
   宣言を分離したい場合は名前を変えてください。
-- memory、user、working directory、entrypoint、cmd、mounts、custom labels は、
-  省略時も含め作成時の fingerprint と一致する必要があります。
-  reuse group も一致しなければ `ErrReuseMismatch` を返します。
-  fingerprint のない既存コンテナは再作成してください。
-  `env` の差は attach 時に無視するため、重要なら別の名前を使ってください。`WithFiles` は attach caller を含むすべての reuse
+- memory、user、working directory、entrypoint、cmd、mounts、custom labels、
+  `WithReadOnlyRootFS`、`WithInit`、`WithDNS`、`WithStopSignal` は、省略時も
+  含め作成時の fingerprint と一致する必要があります。reuse group も一致
+  しなければ `ErrReuseMismatch` を返します。fingerprint のない既存コンテナは
+  再作成してください。`env` の差は attach 時に無視するため、重要なら別の
+  名前を使ってください。`WithFiles` は attach caller を含むすべての reuse
   caller でコピーされ、attach 時のコピー失敗は共有コンテナを削除せずに
   error を返します。`PullAlways` は attach 前にも各 caller で実行されます。
+- `WithReuseEnvFingerprint()` は `WithReuse` caller の環境変数一致を opt-in
+  します。library は環境変数の key と value の組を sort したものの SHA-256
+  digest を予約ラベルに保存し、生の値をラベルにも argv にも書きません。
+  この option を指定した attach caller は同じ digest を必要とし、見つから
+  ないか異なる場合は `ErrReuseMismatch` を返します。ラベルのない既存
+  コンテナは再作成してください。option を指定しない場合、attach 時の環境
+  変数差分は従来どおり無視されます。この option は `WithReuse` が必要です。
 - `Container.Created()` はその `Run` 呼び出しがコンテナを作成したかを返し、
   `Container.Reused()` はその逆を返します。`WithReuse` で作成した caller は
   `Created`、既存 generation へ attach した caller は `Reused` です。

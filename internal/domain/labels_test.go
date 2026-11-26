@@ -63,13 +63,14 @@ func TestLabelNamespace(t *testing.T) {
 func TestBuildLabelsDropsReservedCustomLabels(t *testing.T) {
 	labels := BuildLabels(LabelConfig{
 		Custom: map[string]string{
-			LabelManaged:     "false",
-			LabelSession:     "forged",
-			LabelCreation:    "forged",
-			LabelReuse:       "true",
-			LabelReuseGroup:  "forged",
-			LabelReuseConfig: "forged",
-			"app":            "web",
+			LabelManaged:             "false",
+			LabelSession:             "forged",
+			LabelCreation:            "forged",
+			LabelReuse:               "true",
+			LabelReuseGroup:          "forged",
+			LabelReuseConfig:         "forged",
+			LabelReuseEnvFingerprint: "forged",
+			"app":                    "web",
 		},
 	})
 	want := map[string]string{
@@ -151,9 +152,27 @@ func TestBuildLabelsReuseConfig(t *testing.T) {
 	}
 }
 
+// The environment fingerprint label obeys the same ownership rule as the
+// creation fingerprint: only reuse containers emit it, and custom labels
+// cannot forge it.
+func TestBuildLabelsReuseEnvFingerprint(t *testing.T) {
+	labels := BuildLabels(LabelConfig{Reuse: true, ReuseEnvFingerprint: "env-hash"})
+	if labels[LabelReuseEnvFingerprint] != "env-hash" {
+		t.Errorf("LabelReuseEnvFingerprint = %q, want env-hash", labels[LabelReuseEnvFingerprint])
+	}
+	labels = BuildLabels(LabelConfig{ReuseEnvFingerprint: "env-hash"})
+	if _, ok := labels[LabelReuseEnvFingerprint]; ok {
+		t.Errorf("LabelReuseEnvFingerprint emitted without reuse: %q", labels[LabelReuseEnvFingerprint])
+	}
+	labels = BuildLabels(LabelConfig{Reuse: true})
+	if _, ok := labels[LabelReuseEnvFingerprint]; ok {
+		t.Errorf("empty LabelReuseEnvFingerprint emitted: %q", labels[LabelReuseEnvFingerprint])
+	}
+}
+
 func TestIsReservedLabel(t *testing.T) {
 	for _, key := range []string{
-		LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup, LabelReuseConfig,
+		LabelManaged, LabelSession, LabelCreation, LabelReuse, LabelReuseGroup, LabelReuseConfig, LabelReuseEnvFingerprint,
 	} {
 		if !IsReservedLabel(key) {
 			t.Errorf("IsReservedLabel(%q) = false", key)

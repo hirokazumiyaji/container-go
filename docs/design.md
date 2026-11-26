@@ -281,13 +281,22 @@ described below are not.
   Capabilities use a requested-subset rule: every requested
   `--cap-add`/`--cap-drop` value must be present, while an empty request
   accepts any inspected capability set. Memory, user, working directory,
-  entrypoint, command, mounts, and custom labels must exactly match the
+  entrypoint, command, mounts, custom labels, read-only root filesystem,
+  init process, DNS server list, and stop signal must exactly match the
   creation fingerprint, including omitted values. Environment differences
-  are ignored on attach.
+  are ignored on attach unless `WithReuseEnvFingerprint` is also set.
 - `WithReuseGroup(group string)`: label a reused container for
   `PruneReuseGroup`; it requires `WithReuse` and an exact group match
   when attaching. The group is also part of the shared-flight key. `PruneReuseGroup` applies the same group grammar as
   `WithReuseGroup`.
+- `WithReuseEnvFingerprint()`: opt into environment matching for
+  `WithReuse`. The library stores a SHA-256 digest of the sorted
+  environment key/value pairs in a reserved label and never writes raw
+  values to labels or argv. An attach caller that sets the option must
+  find the same digest and otherwise returns `ErrReuseMismatch`; a
+  container created without the label must be recreated. Without the
+  option, environment differences remain ignored on attach. The option
+  requires `WithReuse`.
 - `WithCPUs(v float64)` / `WithMemory(size string)`: resource limits.
   `WithCPUs` accepts fractional values such as `0.5` and rejects
   non-positive or non-finite values; Apple Container requires a whole
@@ -316,6 +325,20 @@ described below are not.
   RFC 1123 hostname within the 63-byte UTS nodename limit. Apple
   Container has no `--hostname` flag and rejects it with
   `ErrUnsupportedCapability`.
+- `WithReadOnlyRootFS()`: mount the container's root filesystem read-only
+  (`--read-only` on Docker and Apple Container). Writable paths must be
+  supplied with `WithMounts`.
+- `WithInit()`: run a lightweight init process that forwards signals and
+  reaps orphaned children (`--init` on Docker and Apple Container).
+- `WithDNS(servers ...string)`: add custom DNS nameservers as repeatable
+  `--dns` flags. Every value must be a literal IPv4 or IPv6 address;
+  empty, malformed, and flag-shaped values are rejected before any backend
+  call. Docker and Apple Container both accept repeated `--dns`.
+- `WithStopSignal(signal string)`: Docker's `--stop-signal`. The value is
+  validated as a positive signal number or an uppercase signal name such
+  as `SIGTERM`, `TERM`, or `SIGRTMIN+3`; lowercase, empty, and flag-shaped
+  values are rejected. Apple Container has no run-time stop-signal flag
+  and rejects it with `ErrUnsupportedCapability`.
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory.
 - `WithNetwork(name string)`: attach to an existing named network; when
@@ -976,12 +999,14 @@ Reuse re-inspects by immutable Docker UID before compatibility checks and
 again before returning the handle.
 A loopback binding inspected on a remote daemon fails with
 `ErrEndpointUnreachable`.
-`WithMemory`, user, working directory, entrypoint, command, mounts, and custom
-labels must match the creation fingerprint stored in a reserved label on both
+`WithMemory`, user, working directory, entrypoint, command, mounts, custom
+labels, the read-only root filesystem, init, DNS servers, and stop signal
+must match the creation fingerprint stored in a reserved label on both
 backends. A missing or different fingerprint returns `ErrReuseMismatch`, including when
 all these options are omitted. The reuse group must also match exactly.
 Recreate older containers before attaching.
-Environment differences still attach; use distinct names when they matter.
+Environment differences still attach unless `WithReuseEnvFingerprint` is
+set; use distinct names when they matter.
 
 `Container.Created()` reports whether the call created the generation;
 `Container.Reused()` is its inverse, including through `Shared()`.
@@ -1535,12 +1560,13 @@ variants), Apple-invalid container/network names, memory below 200 MiB,
 published port 1, overlapping publishes, and more than 64 publish descriptors
 before invoking the CLI. Malformed and overflowing memory sizes are rejected
 by option validation before `checkConfig` runs. `WithPrivileged`,
-`WithExtraHost`, and `WithHostname` are rejected with
+`WithExtraHost`, `WithHostname`, and `WithStopSignal` are rejected with
 `ErrUnsupportedCapability`, and a fractional `WithCPUs` is rejected the same
 way because Apple's `--cpus` takes an integer. `WithShmSize`, `WithCapAdd`,
-`WithCapDrop`, `WithUlimit`, and whole-number CPU values are supported and
-passed to Apple's `--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`, and
-`--cpus` flags. `PullNever` is also rejected
+`WithCapDrop`, `WithUlimit`, `WithReadOnlyRootFS`, `WithInit`, `WithDNS`,
+and whole-number CPU values are supported and passed to Apple's
+`--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`, `--read-only`,
+`--init`, `--dns`, and `--cpus` flags. `PullNever` is also rejected
 with `ErrPullNeverUnsupported`, because Apple has no run-time no-fetch flag;
 `PullMissing` and `PullAlways` are the explicit documented fallbacks. The
 public `Pull` helper applies the same platform and capability validation.
@@ -1624,8 +1650,10 @@ These are deliberately recorded rather than implied by the current API:
   also checks published port bindings; Apple cannot compare
   `WithExposedPorts` declarations because they are not retained in its
   inspect data. Memory, user, working directory, entrypoint, command,
-  mounts, and custom labels are compared through a creation fingerprint.
-  Environment differences still attach; use distinct names when they matter.
+  mounts, custom labels, read-only root filesystem, init, DNS servers, and
+  stop signal are compared through a creation fingerprint.
+  Environment differences still attach unless `WithReuseEnvFingerprint`
+  is set; use distinct names when they matter.
 - **Logger injection**: no general logger hook exists. `WithTestLogger` is
   test-only and forwards container logs to `t.Logf`; a general hook would
   require a separate API and a decision about what command data may be

@@ -54,6 +54,9 @@ func TestExampleClientAndReuse(t *testing.T) {
 	if first.ID() != second.ID() {
 		t.Fatalf("reuse attached to a different container: %q != %q", first.ID(), second.ID())
 	}
+	if !second.Reused() {
+		t.Fatal("second Run did not attach to the existing reuse generation")
+	}
 	// Cleanup never deletes a reused container, so remove it explicitly.
 	if err := second.Terminate(ctx); err != nil {
 		t.Fatal(err)

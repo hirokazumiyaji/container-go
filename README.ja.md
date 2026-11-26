@@ -1227,7 +1227,9 @@ func TestReuse(t *testing.T) {
   `Exec`、`Logs` など）は対象外です。共有コンテナの lifecycle を自プロセスが
   掌握する場合は `ctr.Shared()` で拒否を解除したハンドルを得ます。
   `Cleanup` / `TerminateContainer` は依然として reused ハンドルを削除しません。
-  `WithFiles` は共有前に create 時に適用されるため、ガードの対象外です。
+  `WithFiles` は `Run` の一部として実行されるためガードの対象外です。
+  ファイルは create 時に stage され、attach するすべての caller が
+  コピーし直すため、後続 caller の上書きを peer が観測できます。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使って
@@ -1320,8 +1322,9 @@ symbol はここで説明します。
 **コンストラクタとパッケージ関数** — `Run` はコンテナを作成・起動・待機して
 handle を返します。`Pull` はコンテナを作らずに image を取得します。`Prune` は
 この library が管理する停止済みコンテナを force なしで削除するため、inspect
-後に再起動したコンテナは残ります。`PruneReuseGroup` は reuse group を持つ
-すべてのコンテナを、実行中も含めて強制削除します（CI teardown 用）。
+後に再起動したコンテナは残ります。`PruneReuseGroup` は指定した
+`WithReuseGroup` の値でタグ付けされたすべてのコンテナを、実行中も含めて
+強制削除します（CI teardown 用）。
 `NewClient` と `NewClientContext` は `Client.Run`、`Client.Pull`、
 `Client.Prune`、`Client.PruneReuseGroup` が使う backend・target・runner の
 設定を固定し、process の環境変数を構築時に一度だけ読んで凍結します。
@@ -1336,8 +1339,9 @@ nil 安全なヘルパーです。
 `ExecTo`、`Logs`、`LogsWithOptions`、`LogsTo`、`FollowLogs`、
 `FollowLogsTo`、copy 系のメソッド、および attachment の accessor
 `StopAttached`、`AttachedDone`、`AttachedError`。`WithAttachOutput` は作成中に
-writer を開始し、`StopAttached` がそれを閉じ、`AttachedDone` が完了を通知し、
-`AttachedError` がその error を返します。
+writer を開始し、`StopAttached` は log stream を停止しますが writer は閉じません
+（writer は caller が所有し、caller が閉じます）。`AttachedDone` が stream の
+完了を通知し、`AttachedError` がその error を返します。
 
 **実行オプション** — `Option` と、「実行オプション」節で説明するコンテナ
 option。`WithWaitStrategy`、`WithPullPolicy`、`WithLabels`、`WithMounts`、
@@ -1431,14 +1435,19 @@ func UsingClient(ctx context.Context) error {
         return err
     }
     fmt.Println(endpoint)
-    removed, err := client.Prune(ctx, container.WithPruneParallelism(2))
+    removed, err := client.Prune(ctx,
+        container.WithPruneDryRun(),
+        container.WithPruneParallelism(2),
+    )
     fmt.Println(removed)
     return err
 }
 ```
 
-次の例は host・tmpfs・volume の mount を設定し、ファイルを stage し、
-ディレクトリをコピーイン、ファイルをコピーアウトして、取得ログに上限を付けます:
+次の例は Docker backend を固定して host・tmpfs・volume の mount を設定し、
+ファイルを stage し、ディレクトリをコピーイン、ファイルをコピーアウトして、
+取得ログに上限を付けます。copy-out には Docker client と server の 29.7 以降が
+必要で、Apple Container は `ErrCopyFileFromContainerUnsupported` を返します。
 
 ```go
 package docexample
@@ -1453,7 +1462,11 @@ import (
 )
 
 func UsingMountsAndCopy(ctx context.Context, dir string) error {
-    ctr, err := container.Run(ctx, "alpine:3.20",
+    client, err := container.NewClient(container.WithClientBackend("docker"))
+    if err != nil {
+        return err
+    }
+    ctr, err := client.Run(ctx, "alpine:3.20",
         container.WithCmd("sh", "-c", "sleep 60"),
         container.WithMounts(
             container.BindMount(dir, "/host", true),

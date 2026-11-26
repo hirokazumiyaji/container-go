@@ -1346,8 +1346,9 @@ Contract:
   you would any other shared process. When this process owns the shared
   container's lifecycle, obtain a handle with the refusal lifted by calling
   `ctr.Shared()`. `Cleanup` and `TerminateContainer` still never delete a
-  reused handle. `WithFiles` is applied at create time before the container is
-  shared, so it is not guarded.
+  reused handle. `WithFiles` is not guarded because it runs as part of `Run`:
+  files are staged at create time and copied again by every caller that
+  attaches, so a peer can observe a later caller overwriting them.
 - `CONTAINERGO_KEEP=1` does not change this reuse contract: a stopped
   matching reuse container can still be deleted and recreated, and
   `PruneReuseGroup` can still remove the group.
@@ -1475,8 +1476,8 @@ described here.
 returns a handle. `Pull` fetches an image without creating a container.
 `Prune` removes this library's stopped containers without force, so a container
 that restarted after inspection is retained. `PruneReuseGroup` force-removes
-every container carrying a reuse group, including running ones, for CI
-teardown. `NewClient` and `NewClientContext` pin the backend, target, and
+every container tagged with the given `WithReuseGroup` value, running or
+stopped, for CI teardown. `NewClient` and `NewClientContext` pin the backend, target, and
 runner settings used by `Client.Run`, `Client.Pull`, `Client.Prune`, and
 `Client.PruneReuseGroup`; they read the process environment once and freeze it.
 `Cleanup` and `StrictCleanup` register test teardown, and `StrictCleanup` fails
@@ -1490,7 +1491,8 @@ deferred teardown.
 `Logs`, `LogsWithOptions`, `LogsTo`, `FollowLogs`, `FollowLogsTo`, the copy
 methods, and the attachment accessors `StopAttached`, `AttachedDone`, and
 `AttachedError`. `WithAttachOutput` starts a writer during creation;
-`StopAttached` closes it, `AttachedDone` reports when it finished, and
+`StopAttached` stops the log stream but does not close the writer, which the
+caller owns, `AttachedDone` reports when the stream finished, and
 `AttachedError` reports its error.
 
 **Run options** — `Option` with the container options described under
@@ -1586,14 +1588,19 @@ func UsingClient(ctx context.Context) error {
         return err
     }
     fmt.Println(endpoint)
-    removed, err := client.Prune(ctx, container.WithPruneParallelism(2))
+    removed, err := client.Prune(ctx,
+        container.WithPruneDryRun(),
+        container.WithPruneParallelism(2),
+    )
     fmt.Println(removed)
     return err
 }
 ```
 
-The second example mounts host, tmpfs, and volume sources, stages a file, copies
-a directory in and a file out, and bounds the captured logs:
+The second example pins the Docker backend, mounts host, tmpfs, and volume
+sources, stages a file, copies a directory in and a file out, and bounds the
+captured logs. Copy-out needs a Docker client and server 29.7 or newer; Apple
+Container returns `ErrCopyFileFromContainerUnsupported`.
 
 ```go
 package docexample
@@ -1608,7 +1615,11 @@ import (
 )
 
 func UsingMountsAndCopy(ctx context.Context, dir string) error {
-    ctr, err := container.Run(ctx, "alpine:3.20",
+    client, err := container.NewClient(container.WithClientBackend("docker"))
+    if err != nil {
+        return err
+    }
+    ctr, err := client.Run(ctx, "alpine:3.20",
         container.WithCmd("sh", "-c", "sleep 60"),
         container.WithMounts(
             container.BindMount(dir, "/host", true),

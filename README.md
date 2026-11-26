@@ -524,15 +524,41 @@ backend limit (`math.MaxInt32` seconds for both checked CLIs) is rejected
 before the CLI is called. The timeout is also added to the operation's
 context budget.
 
-The current development checkout adds the following APIs, which are not in
+The `v0.3.0` release added the following wait APIs, which are not in
 `v0.2.0`:
 
 ```go
 package docexample
 
 import (
-    "context"
     "crypto/tls"
+    "net/http"
+    "time"
+
+    "github.com/hirokazumiyaji/container-go/wait"
+)
+
+func ReleasedWaitOptions() {
+    _ = wait.ForHTTP("/health").
+        WithHeaders(map[string]string{"X-Test": "yes"}).
+        WithHeader("X-Other", "yes").
+        WithBasicAuth("user", "pass").
+        WithTLSConfig(&tls.Config{}).
+        WithHTTPClient(&http.Client{}).
+        WithStartupTimeout(time.Second).
+        WithPollInterval(time.Millisecond)
+    _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
+    _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
+}
+```
+
+The current development checkout adds these on top of `v0.3.0`:
+
+```go
+package docexample
+
+import (
+    "context"
     "fmt"
     "net/http"
     "time"
@@ -542,15 +568,9 @@ import (
 
 func DevelopmentWaitOptions() {
     _ = wait.ForHTTP("/health").
-        WithHeaders(map[string]string{"X-Test": "yes"}).
-        WithHeader("X-Other", "yes").
-        WithBasicAuth("user", "pass").
         WithStatusCode(http.StatusNoContent).
         WithBody([]byte(`{"probe":true}`)).
-        WithTLSConfig(&tls.Config{}).
-        WithHTTPClient(&http.Client{}).
-        WithStartupTimeout(time.Second).
-        WithPollInterval(time.Millisecond)
+        WithStartupTimeout(time.Second)
     _ = wait.ForExec([]string{"pg_isready"}).
         WithOutputContains("accepting connections")
     _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
@@ -560,8 +580,6 @@ func DevelopmentWaitOptions() {
             host, port,
         )
     })
-    _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
-    _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
 }
 ```
 
@@ -573,23 +591,26 @@ described below.
 ## Logs
 
 `Logs` and a supported `LogsWithOptions` call return a finite snapshot
-because the CLI process finishes, but neither method imposes a byte limit
-by itself. `Logs` requests all available output. `LogsOptions` is
+because the CLI process finishes. `Logs` requests all available output and
+imposes no byte limit. `LogsWithOptions` imposes a byte limit only when
+`LogsOptions.MaxBytes` is positive: it then retains at most that many bytes
+of the combined output as a prefix, following the output contract above.
+`LogsOptions` is
 backend-specific: Docker supports both `Tail` and `Since`. The checked
 Apple Container CLI versions use `-n` for a tail and have no `--since`
 option, so the Apple backend maps `Tail` to `-n` and rejects `Since` with
 `ErrUnsupportedCapability`. A requested window can still produce output
-whose size depends on the container, and `LogsWithOptions` does not add a
-byte cap. `FollowLogs` returns a streaming `io.ReadCloser`; close it or
+whose size depends on the container, so pass a positive `MaxBytes` when the
+output is large or untrusted. `FollowLogs` returns a streaming `io.ReadCloser`; close it or
 cancel its context to stop the backend CLI. `ForLog` uses `FollowLogs`,
 while `Logs` does not follow new output. `LogsOptions` and
-`LogsWithOptions` are current-development APIs, not part of `v0.2.0`.
+`LogsWithOptions` were added in `v0.3.0`.
 `LogsOptions.Tail` and `MaxBytes` are validated as non-negative, and
 `PruneReuseGroup` uses the same reuse-group grammar as `WithReuseGroup`.
 
 The example below is Docker-specific. It also shows the log stream, exec
-options, and public error symbols added after `v0.2.0`; it is not an Apple
-`LogsWithOptions` example.
+options, and public error symbols added in `v0.3.0` and later; it is not an
+Apple `LogsWithOptions` example.
 
 ```go
 package docexample
@@ -1313,6 +1334,16 @@ Contract:
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
+- A reused handle rejects operations that would change what a peer observes
+  with `ErrSharedContainer`: `Stop`, `CopyToContainer`,
+  `CopyContentToContainer`, and `CopyFileFromContainer`. Without that guard a
+  single package's `Stop` would stop a container another package is using,
+  and the damage would surface there as an unexplained connection failure.
+  Read-only methods such as `Endpoint`, `State`, `Exec`, and `Logs` are not
+  refused. When this process owns the shared container's lifecycle, obtain a
+  handle with the refusal lifted by calling `ctr.Shared()`. `Cleanup` and
+  `TerminateContainer` still never delete a reused handle. `WithFiles` is
+  applied at create time before the container is shared, so it is not guarded.
 - `CONTAINERGO_KEEP=1` does not change this reuse contract: a stopped
   matching reuse container can still be deleted and recreated, and
   `PruneReuseGroup` can still remove the group.
@@ -1429,6 +1460,163 @@ recursive delete. Remove only files that you can positively attribute to the
 affected run. Treat any credentials that may have appeared in inspect output
 as exposed and rotate them; deleting a stale file does not revoke a secret.
 
+
+## Public API index
+
+The sections above explain behavior. This index exists so that every exported
+symbol is reachable from the README; symbols without a section of their own are
+described here.
+
+**Constructors and package functions** — `Run` creates, starts, waits for, and
+returns a handle. `Pull` fetches an image without creating a container. `Prune`
+and `PruneReuseGroup` remove this library's stopped containers, optionally
+limited to a reuse group. `NewClient` and `NewClientContext` pin the backend,
+target, and runner settings used by `Client.Run`, `Client.Pull`,
+`Client.Prune`, and `Client.PruneReuseGroup`; they read the process environment
+once and freeze it. `Cleanup` and `StrictCleanup` register test teardown, and
+`StrictCleanup` fails the test when teardown fails. `TerminateContainer` is the
+nil-safe helper for deferred teardown.
+
+**Client** — `Client`, `ClientOption`, and the options `WithClientBackend`,
+`WithClientBinary`, `WithClientDockerHost`, `WithClientDockerContext`,
+`WithClientDockerConfig`, `WithClientPlatform`, `WithClientRunner`, and
+`WithClientQueryTimeout`. Its accessors are `Client.Backend`,
+`Client.DefaultHost`, and `Client.IsRemote`.
+
+**Pull** — `PullOption` with `WithPullBinary`, `WithPullRunner`,
+`WithPullPlatform`, `WithPullTimeout`, `WithPullDockerHost`, and
+`WithPullDockerContext`.
+
+**Prune** — `PruneOption` with `WithPruneBinary`, `WithPruneRunner`,
+`WithPruneLabel`, `WithPruneParallelism`, `WithPruneTimeout`, and
+`WithPruneOlderThan`.
+
+**Mounts** — `Mount`, `MountType`, `WithMounts`, and the constructors
+`BindMount`, `TmpfsMount`, and `VolumeMount`.
+
+**Files and copy** — `File`, `FileFromHost`, `FileFromContent`, `WithFiles`,
+`CopyContentToContainer`, `CopyToContainer`, `CopyFileFromContainer`, and
+`MaxCopyToContainerSize`.
+
+**Bounded and streaming output** — `ExecTo`, `LogsTo`, `FollowLogsTo`,
+`LogsWithOptions`, `OutputStats`, `TruncationReporter`, `Streamer`, and
+`ErrOutputTruncated`; see [Output contract](#output-contract).
+
+**Runners and CLI injection** — `Runner`, `ExecRunner`, `ExternalRunner`,
+`WithRunner`, `WithBinary`, `WithRunTimeout`, `WithProbeTimeout`,
+`WithDockerHost`, `WithDockerConfig`, `WithAttachOutput`,
+`WithReuseAttachTimeout`, and `WithReusePollInterval`.
+
+**Inspection** — `InspectInfo` and the `PortBinding` values it returns.
+
+**Errors** — `CLIError`, `ConfigError`, `ValidationError`, `CleanupError`,
+`ErrCleanupFailed`, `ExecTerminationError`, `ErrExecTerminationUnsupported`,
+`SystemNotRunningError`, `ErrSystemNotRunning`, `ErrContainerNotFound`,
+`ErrGenerationReplaced`, `ErrSharedContainer`, `ErrReuseMismatch`,
+`ErrUnsupportedCapability`, `ErrOutputTruncated`,
+`ErrImageIdentityUnavailable`, `ErrImageIdentityMismatch`,
+`ErrImageIdentityNotLocal`, `ErrImageNotFound`, `ErrPullNeverUnsupported`,
+`ErrContainerNotStopped`, `ErrExitCodeUnavailable`, `ErrPortNotExposed`,
+`ErrEndpointUnreachable`, `ErrNoReachableHost`, `ErrNetworkMismatch`,
+`ErrEnvFileUnsupported`, `ErrOutputDelivery`, `ErrLogStreamSetup`,
+`ErrCopySourceUnsupported`, `ErrCopySourceChanged`, `ErrCopySourceTooLarge`,
+`ErrCopySourceTooManyEntries`, `ErrCopySourceTooDeep`,
+`ErrCopySourceMetadataTooLarge`, `ErrCopyFileNotRegular`,
+`ErrCopyFileFromContainerTooLarge`, and
+`ErrCopyFileFromContainerUnsupported`.
+
+The first example pins a target with a `Client`, pulls an image, runs a
+container, resolves an endpoint, and prunes:
+
+```go
+package docexample
+
+import (
+    "context"
+    "fmt"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func UsingClient(ctx context.Context) error {
+    client, err := container.NewClient(
+        container.WithClientBackend("docker"),
+        container.WithClientDockerHost("unix:///var/run/docker.sock"),
+    )
+    if err != nil {
+        return err
+    }
+    if err := client.Pull(ctx, "redis:7-alpine",
+        container.WithPullPlatform("linux/amd64")); err != nil {
+        return err
+    }
+    ctr, err := client.Run(ctx, "redis:7-alpine",
+        container.WithExposedPorts("6379/tcp"),
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = ctr.Terminate(ctx) }()
+    endpoint, err := ctr.Endpoint(ctx, "6379/tcp")
+    if err != nil {
+        return err
+    }
+    fmt.Println(endpoint)
+    removed, err := client.Prune(ctx, container.WithPruneParallelism(2))
+    fmt.Println(removed)
+    return err
+}
+```
+
+The second example mounts host, tmpfs, and volume sources, stages a file, copies
+a directory in and a file out, and bounds the captured logs:
+
+```go
+package docexample
+
+import (
+    "bytes"
+    "context"
+    "io"
+    "os"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func UsingMountsAndCopy(ctx context.Context, dir string) error {
+    ctr, err := container.Run(ctx, "alpine:3.20",
+        container.WithCmd("sh", "-c", "sleep 60"),
+        container.WithMounts(
+            container.BindMount(dir, "/host", true),
+            container.TmpfsMount("/scratch"),
+            container.VolumeMount("data", "/data"),
+        ),
+        container.WithFiles(
+            container.FileFromContent("/etc/motd", []byte("hello\n"), 0o644),
+        ),
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = ctr.Terminate(ctx) }()
+
+    if err := ctr.CopyToContainer(ctx, dir, "/host/copy"); err != nil {
+        return err
+    }
+    reader, err := ctr.CopyFileFromContainer(ctx, "/etc/motd")
+    if err != nil {
+        return err
+    }
+    defer func() { _ = reader.Close() }()
+
+    var logs bytes.Buffer
+    if _, err := ctr.LogsTo(ctx, &logs, container.LogsOptions{MaxBytes: 4096}); err != nil {
+        return err
+    }
+    _, err = io.Copy(os.Stdout, reader)
+    return err
+}
+```
 
 ## Differences from testcontainers-go
 

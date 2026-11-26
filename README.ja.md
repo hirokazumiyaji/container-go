@@ -487,15 +487,41 @@ nil の `Container.Stop` timeout は backend CLI の既定の grace period を�
 値は CLI 呼び出し前に拒否されます。timeout は操作の context budget にも加算
 されます。
 
-現在の開発チェックアウトには次の API が追加されています。
+`v0.3.0` リリースで次の wait API が追加されました。
 これらは `v0.2.0` にはありません。
 
 ```go
 package docexample
 
 import (
-    "context"
     "crypto/tls"
+    "net/http"
+    "time"
+
+    "github.com/hirokazumiyaji/container-go/wait"
+)
+
+func ReleasedWaitOptions() {
+    _ = wait.ForHTTP("/health").
+        WithHeaders(map[string]string{"X-Test": "yes"}).
+        WithHeader("X-Other", "yes").
+        WithBasicAuth("user", "pass").
+        WithTLSConfig(&tls.Config{}).
+        WithHTTPClient(&http.Client{}).
+        WithStartupTimeout(time.Second).
+        WithPollInterval(time.Millisecond)
+    _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
+    _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
+}
+```
+
+現在の開発チェックアウトには、`v0.3.0` に加えて次の API が追加されています。
+
+```go
+package docexample
+
+import (
+    "context"
     "fmt"
     "net/http"
     "time"
@@ -505,15 +531,9 @@ import (
 
 func DevelopmentWaitOptions() {
     _ = wait.ForHTTP("/health").
-        WithHeaders(map[string]string{"X-Test": "yes"}).
-        WithHeader("X-Other", "yes").
-        WithBasicAuth("user", "pass").
         WithStatusCode(http.StatusNoContent).
         WithBody([]byte(`{"probe":true}`)).
-        WithTLSConfig(&tls.Config{}).
-        WithHTTPClient(&http.Client{}).
-        WithStartupTimeout(time.Second).
-        WithPollInterval(time.Millisecond)
+        WithStartupTimeout(time.Second)
     _ = wait.ForExec([]string{"pg_isready"}).
         WithOutputContains("accepting connections")
     _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
@@ -523,8 +543,6 @@ func DevelopmentWaitOptions() {
             host, port,
         )
     })
-    _ = wait.ForAll(wait.ForExposedPort()).WithStartupTimeout(time.Second)
-    _ = wait.ForAny(wait.ForExposedPort()).WithStartupTimeout(time.Second)
 }
 ```
 
@@ -533,21 +551,25 @@ func DevelopmentWaitOptions() {
 ## ログ
 
 `Logs` と、成功する `LogsWithOptions` 呼び出しは CLI process が終了するため
-有限のスナップショットを返しますが、単体で byte 上限は課しません。
-`Logs` は利用可能な出力をすべて要求します。`LogsOptions` は backend
+有限のスナップショットを返します。`Logs` は利用可能な出力をすべて要求し、
+byte 上限を課しません。`LogsWithOptions` は `LogsOptions.MaxBytes` が正の
+ときだけ byte 上限を課し、結合出力の先頭から最大その byte 数を保持します
+（前述の出力契約と同じ prefix 上限）。
+`LogsOptions` は backend
 固有です。Docker は `Tail` と `Since` の両方を受け付けます。確認した
 Apple Container CLI の各 version は tail に `-n` を使い、`--since` を
 実装していないため、Apple backend は `Tail` を `-n` に対応させ、`Since` を
 `ErrUnsupportedCapability` で拒否します。範囲を指定しても大きさは
-コンテナ出力に依存し、`LogsWithOptions` は byte 上限を追加しません。
+コンテナ出力に依存するため、出力が大きい、または信頼できない場合は
+正の `MaxBytes` を指定してください。
 `FollowLogs` はストリーミングする `io.ReadCloser` を返し、Close するか
 context をキャンセルするとバックエンド CLI を停止します。`ForLog` は
 `FollowLogs` を使い、`Logs` は新しい出力を追尾しません。
-`LogsOptions` と `LogsWithOptions` は開発版 API であり、`v0.2.0` には
-ありません。`LogsOptions.Tail` と `MaxBytes` は非負として検証され、
+`LogsOptions` と `LogsWithOptions` は `v0.3.0` で追加されました。
+`LogsOptions.Tail` と `MaxBytes` は非負として検証され、
 `PruneReuseGroup` は `WithReuseGroup` と同じ reuse-group grammar を使います。
 
-次の例は Docker 固有です。`v0.2.0` 以降に追加された log stream、exec
+次の例は Docker 固有です。`v0.3.0` 以降に追加された log stream、exec
 option、公開 error symbol も示しますが、Apple の
 `LogsWithOptions` の例ではありません。
 
@@ -846,7 +868,7 @@ backend 側 process が残っている可能性があるため、caller は cont
 `FollowLogs` は起動エラーを直接返します。ストリームを返した後は EOF まで `Read` してください。
 CLI の終端エラー(CLI status と context cancel が競合した場合も含む)は `Read` から返ります。
 `Close` と context cancel は意図的な終了経路なので、EOF または context error になることがあります。
-直接 child 終了後に descendant が stdout/stderr を保持しても、stream は 제한時間だけ drain してから endpoint を閉じるため、EOF が無期限に待ちません。
+直接 child 終了後に descendant が stdout/stderr を保持しても、stream は制限時間だけ drain してから endpoint を閉じるため、EOF が無期限に待ちません。
 `ForLog` は match を受け入れる前に終端 stream error を確認し、終端 error と context error を `errors.Join` または `%w` で保持します。
 cancel 後に caller context から外した state probe を開始しません。
 timeout の分類は structured context、`Timeout() bool`、signal、`CLIError.OperationTimeout` の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しません。
@@ -1190,8 +1212,9 @@ func TestReuse(t *testing.T) {
   Docker reaper entry は名前で address しないため lock を必要としません。
   外部ツールによる協調していない CLI 操作は非協調として扱ってください。
 - `container.PruneReuseGroup(ctx, "integration")` はその group の
-  コンテナを強制削除します（CI teardown）。group は再利用 key ではなく
-  label です。Apple Container では、削除前に名前単位 lock の下で fresh
+  コンテナを強制削除します（CI teardown）。group は label であり、
+  reuse 互換性と shared-flight key の一部です。attach には完全一致が必要です。
+  Apple Container では、削除前に名前単位 lock の下で fresh
   candidate 検査（世代、session、managed/reuse/group ラベル、running/stopped
   状態）を適用します。通常の `Prune` は上記の backend filter を使い、
   Docker では exited と dead コンテナが対象です。
@@ -1240,9 +1263,9 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   writer lock を解放するため、次回の scan が安全に回収できます。
   POSIX advisory lock の代わりに `LockFileEx` で作成とクラッシュ後の回収を直列化します。
 - 環境変数キーは、空でない有効な UTF-8 であり、`=`、Unicode 空白、制御
-  文字、先頭の `#`、先頭 BOM を含むできません。
+  文字、先頭の `#`、先頭 BOM を含むことはできません。
   値は有効な UTF-8 であり、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029
-  を含むできません。
+  を含むことはできません。
   制御文字でない Unicode、空白、`=` は値として許容します。
   制御文字(タブを含む)や不正な UTF-8 を拒否する方針は、backend が受け付ける
   値でも env ファイルには書かないという意図的な互換性変更です。
@@ -1286,6 +1309,163 @@ watchdog プロセスを停止し、実効 `TMPDIR`(`/tmp` と決めつけませ
   これは backend API の範囲での保証であり、mutable tag の pull から inspect までの操作を原子化するものではありません。
   identity を取得できない backend では `WithAllowMutableImageTag` による明示的な fallback が必要です。
 
+
+## 公開 API 一覧
+
+動作の説明は前述の各節にあります。この一覧は、エクスポートしているすべての
+symbol を README から辿れるようにするためのものです。独立した節を持たない
+symbol はここで説明します。
+
+**コンストラクタとパッケージ関数** — `Run` はコンテナを作成・起動・待機して
+handle を返します。`Pull` はコンテナを作らずに image を取得します。`Prune` と
+`PruneReuseGroup` はこの library が管理する停止済みコンテナを、必要なら reuse
+group に限定して削除します。`NewClient` と `NewClientContext` は
+`Client.Run`、`Client.Pull`、`Client.Prune`、`Client.PruneReuseGroup` が使う
+backend・target・runner の設定を固定し、process の環境変数を構築時に一度だけ
+読んで凍結します。`Cleanup` と `StrictCleanup` は test teardown を登録し、
+`StrictCleanup` は teardown の失敗を test の失敗にします。
+`TerminateContainer` は defer 用の nil 安全なヘルパーです。
+
+**Client** — `Client`、`ClientOption`、および option の `WithClientBackend`、
+`WithClientBinary`、`WithClientDockerHost`、`WithClientDockerContext`、
+`WithClientDockerConfig`、`WithClientPlatform`、`WithClientRunner`、
+`WithClientQueryTimeout`。accessor は `Client.Backend`、
+`Client.DefaultHost`、`Client.IsRemote` です。
+
+**Pull** — `PullOption` と `WithPullBinary`、`WithPullRunner`、
+`WithPullPlatform`、`WithPullTimeout`、`WithPullDockerHost`、
+`WithPullDockerContext`。
+
+**Prune** — `PruneOption` と `WithPruneBinary`、`WithPruneRunner`、
+`WithPruneLabel`、`WithPruneParallelism`、`WithPruneTimeout`、
+`WithPruneOlderThan`。
+
+**Mount** — `Mount`、`MountType`、`WithMounts`、およびコンストラクタ
+`BindMount`、`TmpfsMount`、`VolumeMount`。
+
+**ファイルとコピー** — `File`、`FileFromHost`、`FileFromContent`、`WithFiles`、
+`CopyContentToContainer`、`CopyToContainer`、`CopyFileFromContainer`、
+`MaxCopyToContainerSize`。
+
+**上限付き・ストリーミング出力** — `ExecTo`、`LogsTo`、`FollowLogsTo`、
+`LogsWithOptions`、`OutputStats`、`TruncationReporter`、`Streamer`、
+`ErrOutputTruncated`。詳細は「出力の契約」を参照してください。
+
+**Runner と CLI 注入** — `Runner`、`ExecRunner`、`ExternalRunner`、
+`WithRunner`、`WithBinary`、`WithRunTimeout`、`WithProbeTimeout`、
+`WithDockerHost`、`WithDockerConfig`、`WithAttachOutput`、
+`WithReuseAttachTimeout`、`WithReusePollInterval`。
+
+**Inspect** — `InspectInfo` と、それが返す `PortBinding`。
+
+**エラー** — `CLIError`、`ConfigError`、`ValidationError`、`CleanupError`、
+`ErrCleanupFailed`、`ExecTerminationError`、`ErrExecTerminationUnsupported`、
+`SystemNotRunningError`、`ErrSystemNotRunning`、`ErrContainerNotFound`、
+`ErrGenerationReplaced`、`ErrSharedContainer`、`ErrReuseMismatch`、
+`ErrUnsupportedCapability`、`ErrOutputTruncated`、
+`ErrImageIdentityUnavailable`、`ErrImageIdentityMismatch`、
+`ErrImageIdentityNotLocal`、`ErrImageNotFound`、`ErrPullNeverUnsupported`、
+`ErrContainerNotStopped`、`ErrExitCodeUnavailable`、`ErrPortNotExposed`、
+`ErrEndpointUnreachable`、`ErrNoReachableHost`、`ErrNetworkMismatch`、
+`ErrEnvFileUnsupported`、`ErrOutputDelivery`、`ErrLogStreamSetup`、
+`ErrCopySourceUnsupported`、`ErrCopySourceChanged`、`ErrCopySourceTooLarge`、
+`ErrCopySourceTooManyEntries`、`ErrCopySourceTooDeep`、
+`ErrCopySourceMetadataTooLarge`、`ErrCopyFileNotRegular`、
+`ErrCopyFileFromContainerTooLarge`、
+`ErrCopyFileFromContainerUnsupported`。
+
+最初の例は `Client` で target を固定し、image を pull してコンテナを起動し、
+endpoint を解決して prune します:
+
+```go
+package docexample
+
+import (
+    "context"
+    "fmt"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func UsingClient(ctx context.Context) error {
+    client, err := container.NewClient(
+        container.WithClientBackend("docker"),
+        container.WithClientDockerHost("unix:///var/run/docker.sock"),
+    )
+    if err != nil {
+        return err
+    }
+    if err := client.Pull(ctx, "redis:7-alpine",
+        container.WithPullPlatform("linux/amd64")); err != nil {
+        return err
+    }
+    ctr, err := client.Run(ctx, "redis:7-alpine",
+        container.WithExposedPorts("6379/tcp"),
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = ctr.Terminate(ctx) }()
+    endpoint, err := ctr.Endpoint(ctx, "6379/tcp")
+    if err != nil {
+        return err
+    }
+    fmt.Println(endpoint)
+    removed, err := client.Prune(ctx, container.WithPruneParallelism(2))
+    fmt.Println(removed)
+    return err
+}
+```
+
+次の例は host・tmpfs・volume の mount を設定し、ファイルを stage し、
+ディレクトリをコピーイン、ファイルをコピーアウトして、取得ログに上限を付けます:
+
+```go
+package docexample
+
+import (
+    "bytes"
+    "context"
+    "io"
+    "os"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func UsingMountsAndCopy(ctx context.Context, dir string) error {
+    ctr, err := container.Run(ctx, "alpine:3.20",
+        container.WithCmd("sh", "-c", "sleep 60"),
+        container.WithMounts(
+            container.BindMount(dir, "/host", true),
+            container.TmpfsMount("/scratch"),
+            container.VolumeMount("data", "/data"),
+        ),
+        container.WithFiles(
+            container.FileFromContent("/etc/motd", []byte("hello\n"), 0o644),
+        ),
+    )
+    if err != nil {
+        return err
+    }
+    defer func() { _ = ctr.Terminate(ctx) }()
+
+    if err := ctr.CopyToContainer(ctx, dir, "/host/copy"); err != nil {
+        return err
+    }
+    reader, err := ctr.CopyFileFromContainer(ctx, "/etc/motd")
+    if err != nil {
+        return err
+    }
+    defer func() { _ = reader.Close() }()
+
+    var logs bytes.Buffer
+    if _, err := ctr.LogsTo(ctx, &logs, container.LogsOptions{MaxBytes: 4096}); err != nil {
+        return err
+    }
+    _, err = io.Copy(os.Stdout, reader)
+    return err
+}
+```
 
 ## testcontainers-go との違い
 

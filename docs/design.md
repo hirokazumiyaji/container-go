@@ -215,9 +215,10 @@ shared-lifetime contract described below.
 
 Options use the functional options pattern. The following inventory
 describes the current development checkout. The core options listed here
-were already available in `v0.2.0`; the additional `LogsOptions` /
-`LogsWithOptions` API and the additional HTTP and composite-wait setters
-described below are not.
+were already available in `v0.2.0`; `LogsOptions` / `LogsWithOptions`, the
+additional HTTP setters, and the exported `AllStrategy` / `AnyStrategy`
+composite `WithStartupTimeout` were added in `v0.3.0`. Items this text marks
+as current-development additions were added after `v0.3.0`.
 
 - `WithExposedPorts(ports ...string)`: declare the container ports
   (`"6379/tcp"` form) that `MappedPort` and `Endpoint` may resolve.
@@ -526,8 +527,8 @@ backend maps `Tail` to `-n` and rejects `Since` with
 `ErrUnsupportedCapability`. A requested window's size still depends on the
 container output. `FollowLogs` is intentionally an unbounded stream and
 continues until its reader is closed or its context is cancelled.
-`LogsOptions` and `LogsWithOptions` are current-development APIs, not part
-of `v0.2.0`. `Terminate` is generation-guarded: Apple name deletion
+`LogsOptions` and `LogsWithOptions` were added in `v0.3.0`. `Terminate` is
+generation-guarded: Apple name deletion
 requires a valid creation generation, Docker deletion uses the immutable
 UID, and the reuse and failed-create paths require those ownership facts
 before deleting.
@@ -708,8 +709,8 @@ provides:
   until its status matches (2xx by default; change it with
   `WithStatusCodeMatcher` or a single accepted code with
   `WithStatusCode`). `WithPort` and `WithMethod` select the target, and
-  `WithBody` sends a request payload with every poll. The current
-  development checkout also adds `WithHeaders`, `WithHeader`,
+  `WithBody` sends a request payload with every poll. The `v0.3.0` release
+  added `WithHeaders`, `WithHeader`,
   `WithBasicAuth`, `WithTLS`, `WithTLSConfig`, and `WithHTTPClient`;
   these setters are not in `v0.2.0`.
   `WithResponseMatcher(func(io.Reader) bool)` checks up to 64KiB of an
@@ -754,9 +755,9 @@ provides:
   tail attached later by a higher-level helper is outside that
   redaction.
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`:
-  composition. Child strategies keep their own settings. In the current
-  development checkout, the exported `AllStrategy` and `AnyStrategy`
-  types expose `WithStartupTimeout` to bound the whole composition;
+  composition. Child strategies keep their own settings. The exported
+  `AllStrategy` and `AnyStrategy` types, added in `v0.3.0`, expose
+  `WithStartupTimeout` to bound the whole composition;
   they do not expose `WithPollInterval`. The `v0.2.0` functions return
   an interface without a composite timeout setter. Zero or a negative
   composition timeout leaves the composition unbounded; child timeouts
@@ -1355,10 +1356,10 @@ and cancellation paths.
 - `*CLIError`: a backend CLI exited non-zero. It carries the binary,
   arguments, exit code, and a bounded trailing stderr window for
   classification; the rendered diagnostic is redacted and capped at
-  64KiB. The root `CLIError` alias is a current-development addition and
+  64KiB. The root `CLIError` alias was added in `v0.3.0` and
   is not part of `v0.2.0`.
-- `ErrContainerNotFound` and `ErrGenerationReplaced` are also
-  current-development additions.
+- `ErrContainerNotFound` and `ErrGenerationReplaced` were also added in
+  `v0.3.0`.
 - `ErrOutputDelivery`: a caller-owned output sink rejected CLI output;
   the original writer error remains in the chain
 - `ErrImageIdentityUnavailable`: a successful image inspect returned no

@@ -2,7 +2,8 @@
 // throwaway containers from Go tests.
 //
 // It shells out to a backend CLI and depends only on the Go standard
-// library. Two backends are supported: Apple Container
+// library plus golang.org/x/sys, which supplies the platform syscall,
+// ACL, and process primitives. Two backends are supported: Apple Container
 // (github.com/apple/container) on macOS 26+ Apple Silicon (`container
 // system start`), and Docker on Linux, Windows, and macOS (`docker`,
 // selected with CONTAINERGO_BACKEND=docker). On Windows, secret environment

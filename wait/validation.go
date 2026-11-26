@@ -183,6 +183,9 @@ func canonicalPortSpec(strategy, port string) (string, error) {
 }
 
 func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error {
+	if isNilStrategy(strategy) {
+		return nil
+	}
 	switch s := strategy.(type) {
 	case *HostPortStrategy:
 		if s.portSet {

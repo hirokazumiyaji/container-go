@@ -64,23 +64,31 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 	}
 
 	callerCtx := ctx
-	waitCtx := ctx
-	var cancel context.CancelFunc
+	// Always derive a cancelable context, even without a composite timeout.
+	// The lifecycle monitor and the running child share it, so returning from
+	// this call stops the 1 Hz inspect before the caller's context ends.
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var startupDeadline time.Time
 	if s.startupTimeout > 0 {
 		startupDeadline = time.Now().Add(s.startupTimeout)
-		waitCtx, cancel = context.WithDeadline(ctx, startupDeadline)
-		defer cancel()
+		var timeoutCancel context.CancelFunc
+		waitCtx, timeoutCancel = context.WithDeadline(waitCtx, startupDeadline)
+		defer timeoutCancel()
 	}
 	callerDeadline, callerHasDeadline := callerCtx.Deadline()
 	if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, "before waiting"); err != nil {
 		return err
 	}
 
-	lifecycleErr, err := startLifecycleMonitor(waitCtx, target, "wait for all")
+	lifecycleErr, lifecycleDone, err := startLifecycleMonitor(waitCtx, target, "wait for all")
 	if err != nil {
 		return err
 	}
+	defer func() {
+		cancel()
+		<-lifecycleDone
+	}()
 
 	for i, strategy := range s.strategies {
 		if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("before strategy %d", i)); err != nil {
@@ -163,8 +171,11 @@ func allContextError(callerCtx, waitCtx context.Context, startupTimeout time.Dur
 	return nil
 }
 
+// callerOwnsDeadline reports whether the wait context's deadline comes from
+// the caller. A composite without its own startup deadline derives only a
+// cancel context from the caller, so any deadline there belongs to the caller.
 func callerOwnsDeadline(callerDeadline time.Time, callerHasDeadline bool, startupDeadline time.Time) bool {
-	return callerHasDeadline && !callerDeadline.After(startupDeadline)
+	return callerHasDeadline && (startupDeadline.IsZero() || !callerDeadline.After(startupDeadline))
 }
 
 // AnyStrategy waits until one of the strategies succeeds.
@@ -238,10 +249,14 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 	}
 	callerDeadline, callerHasDeadline := callerCtx.Deadline()
 
-	lifecycleErr, err := startLifecycleMonitor(waitCtx, target, "wait for any")
+	lifecycleErr, lifecycleDone, err := startLifecycleMonitor(waitCtx, target, "wait for any")
 	if err != nil {
 		return err
 	}
+	defer func() {
+		cancel()
+		<-lifecycleDone
+	}()
 
 	results := make(chan error, len(s.strategies))
 	for _, strategy := range s.strategies {
@@ -375,15 +390,20 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 	}
 }
 
-func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-chan error, error) {
+// startLifecycleMonitor reports a terminal lifecycle change on the returned
+// channel. The done channel closes when the monitor goroutine has stopped, so
+// a composite can wait for the 1 Hz inspect to end before returning.
+func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-chan error, <-chan struct{}, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("%s: %w", what, err)
+		return nil, nil, fmt.Errorf("%s: %w", what, err)
 	}
 	lifecycleErr := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		var lastStateErr error
 		check := func() bool {
-			probeCtx, cancel := context.WithTimeout(ctx, stateCheckInterval)
+			probeCtx, cancel := boundedProbeContext(ctx, lifecycleProbeTimeout)
 			state, err := targetState(probeCtx, target)
 			probeErr := probeCtx.Err()
 			cancel()
@@ -431,7 +451,7 @@ func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-c
 			}
 		}
 	}()
-	return lifecycleErr, nil
+	return lifecycleErr, done, nil
 }
 
 func drainCompositeResult(result <-chan error, contextErr error) error {

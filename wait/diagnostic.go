@@ -44,7 +44,7 @@ func DiagnosticValues(strategy Strategy) []string {
 	}
 	var collect func(Strategy)
 	collect = func(s Strategy) {
-		if s == nil {
+		if isNilStrategy(s) {
 			return
 		}
 		if provider, ok := s.(DiagnosticProvider); ok {
@@ -84,6 +84,9 @@ type diagnosticBoundaryProvider interface {
 // that are redacted only at token boundaries. Composite strategies recurse
 // into their children.
 func DiagnosticBoundaryValues(strategy Strategy) []string {
+	if isNilStrategy(strategy) {
+		return nil
+	}
 	var values []string
 	switch s := strategy.(type) {
 	case diagnosticBoundaryProvider:
@@ -101,6 +104,9 @@ func DiagnosticBoundaryValues(strategy Strategy) []string {
 }
 
 func safeStrategyError(err error, strategy Strategy) error {
+	if isNilStrategy(strategy) {
+		return err
+	}
 	r := cli.NewHashedContextRedactor(DiagnosticValues(strategy)...).WithBoundaryValues(DiagnosticBoundaryValues(strategy)...)
 	return cli.WithRedactor(err, r)
 }

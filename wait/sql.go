@@ -98,9 +98,11 @@ func (s *SQLStrategy) WithPollInterval(d time.Duration) *SQLStrategy {
 }
 
 // DiagnosticValues returns only the strategy's static values. A DSN is built
-// during a wait and therefore stays with that wait's error.
+// during a wait and therefore stays with that wait's error. The port and
+// driver are connection metadata, not secrets: registering them would turn
+// ordinary diagnostics such as "invalid driver \"...\"" into redacted noise.
 func (s *SQLStrategy) DiagnosticValues() []string {
-	return []string{s.port, s.driver, s.query}
+	return []string{s.query}
 }
 
 func (s *SQLStrategy) validate() error {
@@ -198,10 +200,16 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		if err != nil {
 			return err
 		}
-		if err := rows.Close(); err != nil {
+		// Iterate the result so a driver that defers a failure until the
+		// first row fetch reports it through rows.Err. database/sql only
+		// exposes such an error after Next has advanced the cursor.
+		for rows.Next() {
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
 			return err
 		}
-		return rows.Err()
+		return rows.Close()
 	})
 }
 

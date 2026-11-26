@@ -121,14 +121,16 @@ func (s *HTTPStrategy) WithResponseMatcher(matcher func(io.Reader) bool) *HTTPSt
 	return cloned
 }
 
-// WithHeaders adds request headers to the readiness probe.
+// WithHeaders adds request headers to the readiness probe. Header names are
+// stored in canonical form so differently-cased spellings address the same
+// entry.
 func (s *HTTPStrategy) WithHeaders(headers map[string]string) *HTTPStrategy {
 	cloned := s.clone()
 	if len(headers) > 0 && cloned.headers == nil {
 		cloned.headers = make(map[string]string, len(headers))
 	}
 	for k, v := range headers {
-		cloned.headers[k] = v
+		cloned.headers[http.CanonicalHeaderKey(k)] = v
 	}
 	return cloned
 }
@@ -153,10 +155,14 @@ func (s *HTTPStrategy) WithTLS() *HTTPStrategy {
 }
 
 // WithTLSConfig probes via https with a custom TLS config (e.g.,
-// InsecureSkipVerify for self-signed test certs).
+// InsecureSkipVerify for self-signed test certs). The config is cloned so a
+// caller mutation after the builder call cannot race with the wait.
 func (s *HTTPStrategy) WithTLSConfig(cfg *tls.Config) *HTTPStrategy {
 	cloned := s.clone()
 	cloned.useTLS = true
+	if cfg != nil {
+		cfg = cfg.Clone()
+	}
 	cloned.tlsConfig = cfg
 	return cloned
 }
@@ -454,6 +460,11 @@ func checkHTTPProbeRedirect(req *http.Request, via []*http.Request) error {
 	}
 	if !sameOrigin(via[0].URL, req.URL) {
 		return http.ErrUseLastResponse
+	}
+	// net/http only carries an explicit Host header through a relative
+	// redirect. Preserve it for an absolute same-origin Location as well.
+	if host := via[len(via)-1].Host; host != "" {
+		req.Host = host
 	}
 	return nil
 }

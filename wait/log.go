@@ -111,17 +111,18 @@ func (s *LogStrategy) validate() error {
 }
 
 type logScanResult struct {
-	found       bool
-	committed   bool
-	err         error
-	probeErr    error
-	terminalErr error
-	state       State
-	count       int
-	lines       [][sha256.Size]byte
-	lineStart   int
-	lineCount   int
-	partial     []byte
+	found        bool
+	committed    bool
+	err          error
+	probeErr     error
+	terminalErr  error
+	state        State
+	count        int
+	lines        [][sha256.Size]byte
+	lineStart    int
+	lineCount    int
+	partial      []byte
+	partialCount int
 }
 
 type logReplay struct {
@@ -129,7 +130,12 @@ type logReplay struct {
 	previousStart int
 	previousLines int
 	count         int
-	partial       []byte
+	// partial holds the unterminated tail of the last committed line and
+	// partialCount the occurrences of it already included in count. A
+	// reconnect may replay that line completed, so it must be reconciled
+	// instead of counted twice or recorded as a second line.
+	partial      []byte
+	partialCount int
 }
 
 // matchesPrevious reports whether index is in the replayed prefix. Only a
@@ -170,6 +176,7 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 		reader := bufio.NewReader(stream)
 		var lines [][sha256.Size]byte
 		partial := replay.partial
+		partialCount := replay.partialCount
 		lineStart := 0
 		observedLines := 0
 		lineCount := replay.previousLines
@@ -177,15 +184,16 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 		replaying := true
 		result := func(found, committed bool, scanErr, terminalErr error) logScanResult {
 			res := logScanResult{
-				found:       found,
-				committed:   committed,
-				err:         scanErr,
-				terminalErr: terminalErr,
-				count:       count,
-				lines:       lines,
-				lineStart:   lineStart,
-				lineCount:   lineCount,
-				partial:     partial,
+				found:        found,
+				committed:    committed,
+				err:          scanErr,
+				terminalErr:  terminalErr,
+				count:        count,
+				lines:        lines,
+				lineStart:    lineStart,
+				lineCount:    lineCount,
+				partial:      partial,
+				partialCount: partialCount,
 			}
 			if !committed && !found {
 				res.count = replay.count
@@ -193,6 +201,7 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 				res.lineStart = replay.previousStart
 				res.lineCount = replay.previousLines
 				res.partial = replay.partial
+				res.partialCount = replay.partialCount
 			}
 			return res
 		}
@@ -200,25 +209,63 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 			line, complete, err := readLogLine(reader)
 			if complete {
 				hash := sha256.Sum256(line)
-				if replaying && !replay.matchesPrevious(observedLines, hash) {
-					replaying = false
-					lineCount = observedLines
-				}
-				canCount := !replaying && (replay.count == 0 || observedLines >= replay.previousLines)
-				if canCount {
-					logical, reconcileErr := reconcileLogLine(partial, line)
-					if reconcileErr != nil {
-						results <- result(false, false, reconcileErr, nil)
-						return
+				replayed := false
+				if replaying {
+					switch {
+					case replay.matchesPrevious(observedLines, hash):
+						replayed = true
+						if replay.partial != nil && observedLines == replay.previousLines-1 {
+							// The committed unterminated tail arrived
+							// terminated; its occurrences are already counted.
+							partial, partialCount = nil, 0
+						}
+					case replay.partial != nil &&
+						observedLines == replay.previousLines-1 &&
+						bytes.HasPrefix(line, replay.partial):
+						// The committed unterminated tail grew into a complete
+						// line. It occupies the history slot of the fragment
+						// rather than adding a line.
+						logical, reconcileErr := reconcileLogLine(replay.partial, line)
+						if reconcileErr != nil {
+							results <- result(false, false, reconcileErr, nil)
+							return
+						}
+						delta, _ := logMatchProgress(match, string(logical), replay.partialCount)
+						count += delta
+						hash = sha256.Sum256(logical)
+						partial, partialCount = nil, 0
+						lineCount = replay.previousLines
+						replayed = true
+					default:
+						replaying = false
+						lineCount = observedLines
+						partial, partialCount = nil, 0
 					}
-					partial = nil
-					count += match(string(logical))
-					lineCount++
-					hash = sha256.Sum256(logical)
 				}
-				lines = appendReplayLine(lines, &lineStart, hash)
-				observedLines++
-			} else if line != nil {
+				if replayed {
+					lines = appendReplayLine(lines, &lineStart, hash)
+					observedLines++
+				} else {
+					canCount := replay.count == 0 || observedLines >= replay.previousLines
+					if canCount {
+						logical, reconcileErr := reconcileLogLine(partial, line)
+						if reconcileErr != nil {
+							results <- result(false, false, reconcileErr, nil)
+							return
+						}
+						partial, partialCount = nil, 0
+						count += match(string(logical))
+						hash = sha256.Sum256(logical)
+					}
+					// Advance the append-only history even when a match is
+					// conservatively skipped. Keeping lineCount and the
+					// fingerprint ring synchronized prevents a later reconnect
+					// from comparing against stale positions.
+					lineCount++
+					lines = appendReplayLine(lines, &lineStart, hash)
+					observedLines++
+				}
+			} else if line != nil && !errors.Is(err, io.EOF) {
 				var reconcileErr error
 				partial, reconcileErr = reconcileLogLine(partial, line)
 				if reconcileErr != nil {
@@ -233,6 +280,36 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 				}
 				if errors.Is(err, io.EOF) {
 					committed := observedLines >= replay.previousLines
+					if !complete && line != nil {
+						switch {
+						case replaying &&
+							replay.partial != nil &&
+							observedLines == replay.previousLines-1 &&
+							bytes.HasPrefix(line, replay.partial):
+							merged, reconcileErr := reconcileLogLine(replay.partial, line)
+							if reconcileErr != nil {
+								results <- result(false, false, reconcileErr, nil)
+								return
+							}
+							delta, total := logMatchProgress(match, string(merged), replay.partialCount)
+							count += delta
+							partial, partialCount = merged, total
+							lines = appendReplayLine(lines, &lineStart, sha256.Sum256(merged))
+							lineCount = replay.previousLines
+							committed = true
+						case observedLines >= replay.previousLines:
+							partial = line
+							partialCount = match(string(line))
+							count += partialCount
+							lines = appendReplayLine(lines, &lineStart, sha256.Sum256(line))
+							lineCount++
+							committed = true
+						default:
+							// A fragment inside the replayed prefix cannot be
+							// classified; retry it on the next connection.
+							committed = false
+						}
+					}
 					if count >= occurrences {
 						results <- publishObservedMatch(ctx, &matched, stream, reader, result, committed)
 					} else {
@@ -296,6 +373,9 @@ func receiveLogScanResult(ctx context.Context, target Target, results <-chan log
 		tickerChan = ticker.C
 	}
 
+	// Retain the latest non-context probe cause so a wait that ends while the
+	// stream is still open can report why the lifecycle probe kept failing.
+	var lastProbeErr error
 	for {
 		select {
 		case result := <-results:
@@ -311,6 +391,9 @@ func receiveLogScanResult(ctx context.Context, target Target, results <-chan log
 				continue
 			}
 			if err != nil {
+				if filtered := nonContextCause(err); filtered != nil {
+					lastProbeErr = filtered
+				}
 				// A stream that never closes must not hold the wait until
 				// the startup timeout when the target is gone for good
 				// (for example an externally removed container). The
@@ -326,7 +409,11 @@ func receiveLogScanResult(ctx context.Context, target Target, results <-chan log
 				return logScanResult{state: state}, true
 			}
 		case <-done:
-			return receiveLogScanResultAfterCancel(results, matched)
+			result, ok := receiveLogScanResultAfterCancel(results, matched)
+			if !ok || result.probeErr == nil {
+				result.probeErr = lastProbeErr
+			}
+			return result, ok
 		}
 	}
 }
@@ -384,10 +471,22 @@ func receiveLogScanResultAfterCancel(results <-chan logScanResult, matched *atom
 	}
 }
 
+// logMatchProgress returns how many occurrences a completed line adds beyond
+// those already counted for its unterminated fragment, together with the
+// fragment's full occurrence count for the next reconnect.
+func logMatchProgress(match func(string) int, line string, counted int) (delta, total int) {
+	total = match(line)
+	delta = total - counted
+	if delta < 0 {
+		delta = 0
+	}
+	return delta, total
+}
+
 // readLogLine returns bufio.ScanLines-compatible text: a line terminator is
-// removed, CRLF drops its carriage return, and data before a clean EOF is a
-// final token. A nil line with a non-EOF error is an incomplete transport
-// fragment and is not a logical line.
+// removed and CRLF drops its carriage return. Data before a clean EOF is
+// returned as an unterminated fragment so a reconnect can finish it; a nil
+// line with a non-EOF error is an incomplete transport fragment.
 func readLogLine(reader *bufio.Reader) ([]byte, bool, error) {
 	var line []byte
 	for {
@@ -406,7 +505,7 @@ func readLogLine(reader *bufio.Reader) ([]byte, bool, error) {
 			if line == nil {
 				return nil, false, err
 			}
-			return dropLogLineTerminator(line), true, err
+			return line, false, err
 		}
 		return line, false, err
 	}
@@ -753,6 +852,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 					previousLines: result.lineCount,
 					count:         result.count,
 					partial:       result.partial,
+					partialCount:  result.partialCount,
 				}
 			}
 			if result.err != nil {
@@ -788,6 +888,11 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
 		if err := probeCtx.Err(); err != nil {
 			probeCancel()
+			// Classify through the same caller/startup-timeout path as the
+			// final probe instead of reporting a bare context cause.
+			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
+				return terminalErr
+			}
 			return waitContextError(what, err, lastStreamErr, lastProbeErr)
 		}
 		state, probeErr := targetState(probeCtx, target)

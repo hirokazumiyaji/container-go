@@ -21,8 +21,11 @@ const (
 	defaultStartupTimeout = 60 * time.Second
 	defaultPollInterval   = 100 * time.Millisecond
 	stateCheckInterval    = time.Second
-	lifecycleProbeTimeout = 5 * time.Second
 )
+
+// lifecycleProbeTimeout bounds one lifecycle probe so a hung inspect cannot
+// consume a whole wait budget. Overridable in tests.
+var lifecycleProbeTimeout = 5 * time.Second
 
 // finalLifecycleProbeTimeout bounds composite final lifecycle retries even
 // when the wait context is otherwise unbounded. Overridable in tests.
@@ -853,7 +856,13 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		return err
 	}
 
-	state, err := targetState(waitCtx, target)
+	initialProbeCtx, initialProbeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
+	state, err := targetState(initialProbeCtx, target)
+	initialProbeErr := initialProbeCtx.Err()
+	initialProbeCancel()
+	if initialProbeErr != nil {
+		err = joinNonNil(err, initialProbeErr)
+	}
 	if terminalErr := terminationErr(); terminalErr != nil {
 		return terminalErr
 	}
@@ -878,7 +887,13 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			return nil
 		}
 		lastStateCheck = time.Now()
-		state, err := targetState(waitCtx, target)
+		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
+		state, err := targetState(probeCtx, target)
+		probeCtxErr := probeCtx.Err()
+		probeCancel()
+		if probeCtxErr != nil {
+			err = joinNonNil(err, probeCtxErr)
+		}
 		if err != nil {
 			if terminalErr := terminationErr(); terminalErr != nil {
 				if filtered := nonContextCause(err); filtered != nil {

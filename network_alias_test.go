@@ -471,3 +471,34 @@ func TestDockerReuseRejectsAliasOnAnotherNetwork(t *testing.T) {
 		t.Fatalf("alias on another network accepted: %v", err)
 	}
 }
+
+// cloneEngineInfo backs cached snapshots that callers may attach metadata to,
+// so a networkAliasMap left shallow-copied would let one handle mutate another
+// snapshot's aliases.
+func TestCloneEngineInfoDeepCopiesNetworkAliasMap(t *testing.T) {
+	info := &engineInfo{
+		networkAliases:  []string{"db"},
+		networkAliasMap: map[string][]string{"test-net": {"db", "myctr"}},
+	}
+	cloned := cloneEngineInfo(info)
+	if cloned == info {
+		t.Fatal("cloneEngineInfo returned the original pointer")
+	}
+	if got := cloned.networkAliasMap["test-net"]; !slices.Equal(got, []string{"db", "myctr"}) {
+		t.Fatalf("cloned aliases = %v, want [db myctr]", got)
+	}
+
+	cloned.networkAliasMap["test-net"][0] = "clone-only"
+	cloned.networkAliasMap["other-net"] = []string{"other"}
+	if got := info.networkAliasMap["test-net"][0]; got != "db" {
+		t.Fatalf("original alias = %q after mutating the clone, want db", got)
+	}
+	if _, ok := info.networkAliasMap["other-net"]; ok {
+		t.Fatal("adding a network to the clone mutated the original map")
+	}
+
+	info.networkAliasMap["test-net"][1] = "source-only"
+	if got := cloned.networkAliasMap["test-net"][1]; got != "myctr" {
+		t.Fatalf("cloned alias = %q after mutating the source, want myctr", got)
+	}
+}

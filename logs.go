@@ -101,6 +101,9 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 // returned stats count all bytes observed by the CLI. A sink failure is
 // returned together with the CLI's terminal error, if any.
 func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error) {
+	if nilWriter(output) {
+		return OutputStats{}, validationErrorf("LogsTo", output, "output writer cannot be nil")
+	}
 	if err := opts.validate(); err != nil {
 		return OutputStats{}, err
 	}
@@ -198,8 +201,9 @@ type classifyingStream struct {
 	ctx          context.Context
 	container    *Container
 	redactor     *cli.Redactor
-	terminalOnce sync.Once
+	terminalMu   sync.Mutex
 	terminalErr  error
+	terminalSeen bool
 }
 
 type terminalStreamStatus interface {
@@ -235,19 +239,35 @@ func (s *classifyingStream) Done() <-chan struct{} {
 }
 
 // TerminalError returns the classified terminal CLI error, if the stream
-// implementation exposes one. It is cached so Read and readiness handling
-// observe the same cause and classification probe result.
+// implementation exposes one. A nil observation is not cached because the
+// process may still be running; caching it would hide a later failure for the
+// life of the stream. The first non-nil result is cached so Read and readiness
+// handling observe the same cause and classification probe result.
 func (s *classifyingStream) TerminalError() error {
 	if status, ok := s.ReadCloser.(interface{ TerminalError() error }); ok {
-		return s.classifyTerminal(status.TerminalError())
+		if err := status.TerminalError(); err != nil {
+			return s.classifyTerminal(err)
+		}
 	}
+	return s.terminalError()
+}
+
+func (s *classifyingStream) terminalError() error {
+	s.terminalMu.Lock()
+	defer s.terminalMu.Unlock()
 	return s.terminalErr
 }
 
 func (s *classifyingStream) classifyTerminal(err error) error {
-	s.terminalOnce.Do(func() {
+	if err == nil {
+		return nil
+	}
+	s.terminalMu.Lock()
+	defer s.terminalMu.Unlock()
+	if !s.terminalSeen {
 		s.terminalErr = s.wrap(err)
-	})
+		s.terminalSeen = s.terminalErr != nil
+	}
 	return s.terminalErr
 }
 

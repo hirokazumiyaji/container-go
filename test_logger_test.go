@@ -157,3 +157,11 @@ func TestTestLoggerKeepsHistoryForCreatedHandle(t *testing.T) {
 		t.Errorf("created handle stream args = %v, want history replay", f.streamArgs)
 	}
 }
+
+func TestWithTestLoggerRejectsTypedNilTB(t *testing.T) {
+	var typedNil *testing.T
+	var tb testing.TB = typedNil
+	err := WithTestLogger(tb)(newConfig())
+	assertPublicValidationError(t, err, "WithTestLogger", "WithTestLogger", nil,
+		"testing.TB must not be nil")
+}

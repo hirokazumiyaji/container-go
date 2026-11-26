@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -618,4 +620,126 @@ exit 1
 		t.Fatal(err)
 	}
 	return path
+}
+
+// lateTerminalReader exposes TerminalError without Done, so Read cannot use
+// it as a settled process status: the early nil observation and the later
+// failure both come from the same stream, like a process that has not exited.
+type lateTerminalReader struct {
+	io.Reader
+	mu  sync.Mutex
+	err error
+}
+
+func (*lateTerminalReader) Close() error { return nil }
+
+func (r *lateTerminalReader) TerminalError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+func (r *lateTerminalReader) setTerminalError(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
+}
+
+func TestClassifyingStreamTerminalErrorDoesNotLatchNil(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", testDockerUID},
+		ExitCode: 1,
+		Stderr:   "logs stream failed",
+	}
+	underlying := &lateTerminalReader{Reader: strings.NewReader("")}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: &fakeRunner{systemUp: false, binary: "docker"}, eng: dockerEngine{}}
+	stream := &classifyingStream{ReadCloser: underlying, ctx: context.Background(), container: ctr}
+
+	if err := stream.TerminalError(); err != nil {
+		t.Fatalf("TerminalError before exit = %v, want nil", err)
+	}
+	underlying.setTerminalError(terminal)
+	var got *CLIError
+	if err := stream.TerminalError(); !errors.As(err, &got) || got.ExitCode != terminal.ExitCode {
+		t.Fatalf("TerminalError after exit = %v, want the settled CLIError", err)
+	}
+}
+
+func TestClassifyingStreamReadKeepsErrorAfterEarlyNilTerminal(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", testDockerUID},
+		ExitCode: 1,
+		Stderr:   "logs stream failed",
+	}
+	underlying := &lateTerminalReader{Reader: &stagedTerminalReader{terminalErr: terminal}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: &fakeRunner{systemUp: false, binary: "docker"}, eng: dockerEngine{}}
+	stream := &classifyingStream{ReadCloser: underlying, ctx: context.Background(), container: ctr}
+
+	if err := stream.TerminalError(); err != nil {
+		t.Fatalf("TerminalError before exit = %v, want nil", err)
+	}
+	if _, err := stream.Read(make([]byte, 16)); err != nil {
+		t.Fatalf("first Read = %v, want the available output", err)
+	}
+	_, err := stream.Read(make([]byte, 16))
+	var got *CLIError
+	if !errors.As(err, &got) || got.ExitCode != terminal.ExitCode {
+		t.Fatalf("terminal Read error = %v, want a non-nil CLIError", err)
+	}
+}
+
+// TestClassifyingStreamTerminalErrorRaceFreeAcrossRead is the regression for
+// the unlocked terminalErr read. Readers sample TerminalError while the first
+// terminal Read classifies and caches the error; without terminalMu, -race
+// reports an unsynchronized read/write.
+func TestClassifyingStreamTerminalErrorRaceFreeAcrossRead(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", testDockerUID},
+		ExitCode: 1,
+		Stderr:   "logs stream failed",
+	}
+	underlying := &lateTerminalReader{Reader: &stagedTerminalReader{terminalErr: terminal}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: &fakeRunner{systemUp: false, binary: "docker"}, eng: dockerEngine{}}
+	stream := &classifyingStream{ReadCloser: underlying, ctx: context.Background(), container: ctr}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 200 {
+				_ = stream.TerminalError()
+			}
+		}()
+	}
+	close(start)
+	_, _ = stream.Read(make([]byte, 16))
+	_, _ = stream.Read(make([]byte, 16))
+	wg.Wait()
+
+	if err := stream.TerminalError(); err == nil {
+		t.Fatal("terminal error was not classified")
+	}
+}
+
+func TestLogsToRejectsNilWriter(t *testing.T) {
+	ctr := runTestContainer(t, newTestRunner())
+	for _, tc := range []struct {
+		name   string
+		output io.Writer
+	}{
+		{name: "nil", output: nil},
+		{name: "typed nil", output: (*bytes.Buffer)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ctr.LogsTo(context.Background(), tc.output, LogsOptions{})
+			assertPublicValidationError(t, err, "LogsTo", "LogsTo", tc.output,
+				"output writer cannot be nil")
+		})
+	}
 }

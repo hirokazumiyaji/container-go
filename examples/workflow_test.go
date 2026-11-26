@@ -32,10 +32,16 @@ func TestExampleClientAndReuse(t *testing.T) {
 		container.WithReuse(),
 		container.WithCmd("sleep", "60"),
 	)
-	container.Cleanup(t, first)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Cleanup skips reused handles, so remove this one explicitly even if a
+	// later assertion fails.
+	t.Cleanup(func() {
+		if err := first.Terminate(context.Background()); err != nil {
+			t.Logf("terminate reused container: %v", err)
+		}
+	})
 
 	second, err := client.Run(ctx, integrationAlpine,
 		container.WithName(name),

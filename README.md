@@ -524,8 +524,8 @@ backend limit (`math.MaxInt32` seconds for both checked CLIs) is rejected
 before the CLI is called. The timeout is also added to the operation's
 context budget.
 
-The `v0.3.0` release added the following wait APIs, which are not in
-`v0.2.0`:
+The APIs recorded in the `0.3.0` section of [CHANGELOG.md](CHANGELOG.md) are
+in this checkout and are not in `v0.2.0`:
 
 ```go
 package docexample
@@ -604,12 +604,13 @@ whose size depends on the container, so pass a positive `MaxBytes` when the
 output is large or untrusted. `FollowLogs` returns a streaming `io.ReadCloser`; close it or
 cancel its context to stop the backend CLI. `ForLog` uses `FollowLogs`,
 while `Logs` does not follow new output. `LogsOptions` and
-`LogsWithOptions` were added in `v0.3.0`.
+`LogsWithOptions` are recorded in the `0.3.0` section of
+[CHANGELOG.md](CHANGELOG.md).
 `LogsOptions.Tail` and `MaxBytes` are validated as non-negative, and
 `PruneReuseGroup` uses the same reuse-group grammar as `WithReuseGroup`.
 
 The example below is Docker-specific. It also shows the log stream, exec
-options, and public error symbols added in `v0.3.0` and later; it is not an
+options, and public error symbols added after `v0.2.0`; it is not an
 Apple `LogsWithOptions` example.
 
 ```go
@@ -1334,16 +1335,19 @@ Contract:
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
-- A reused handle rejects operations that would change what a peer observes
-  with `ErrSharedContainer`: `Stop`, `CopyToContainer`,
-  `CopyContentToContainer`, and `CopyFileFromContainer`. Without that guard a
-  single package's `Stop` would stop a container another package is using,
-  and the damage would surface there as an unexplained connection failure.
-  Read-only methods such as `Endpoint`, `State`, `Exec`, and `Logs` are not
-  refused. When this process owns the shared container's lifecycle, obtain a
-  handle with the refusal lifted by calling `ctr.Shared()`. `Cleanup` and
-  `TerminateContainer` still never delete a reused handle. `WithFiles` is
-  applied at create time before the container is shared, so it is not guarded.
+- A reused handle rejects lifecycle and copy operations that would change what
+  a peer observes with `ErrSharedContainer`: `Start`, `Stop`, `Restart`,
+  `Kill`, `Pause`, `Unpause`, `CopyToContainer`, `CopyContentToContainer`, and
+  `CopyFileFromContainer`. Without that guard a single package's `Stop` would
+  stop a container another package is using, and the damage would surface
+  there as an unexplained connection failure. Other methods such as `Endpoint`,
+  `State`, `Exec`, `Logs`, and `Inspect` are permitted on a reused handle;
+  `Exec` still changes container state, so coordinate it with peers the way
+  you would any other shared process. When this process owns the shared
+  container's lifecycle, obtain a handle with the refusal lifted by calling
+  `ctr.Shared()`. `Cleanup` and `TerminateContainer` still never delete a
+  reused handle. `WithFiles` is applied at create time before the container is
+  shared, so it is not guarded.
 - `CONTAINERGO_KEEP=1` does not change this reuse contract: a stopped
   matching reuse container can still be deleted and recreated, and
   `PruneReuseGroup` can still remove the group.
@@ -1463,19 +1467,39 @@ as exposed and rotate them; deleting a stale file does not revoke a secret.
 
 ## Public API index
 
-The sections above explain behavior. This index exists so that every exported
-symbol is reachable from the README; symbols without a section of their own are
+The sections above explain behavior. This index lists the exported API so every
+symbol is findable from the README; symbols without a section of their own are
 described here.
 
 **Constructors and package functions** — `Run` creates, starts, waits for, and
-returns a handle. `Pull` fetches an image without creating a container. `Prune`
-and `PruneReuseGroup` remove this library's stopped containers, optionally
-limited to a reuse group. `NewClient` and `NewClientContext` pin the backend,
-target, and runner settings used by `Client.Run`, `Client.Pull`,
-`Client.Prune`, and `Client.PruneReuseGroup`; they read the process environment
-once and freeze it. `Cleanup` and `StrictCleanup` register test teardown, and
-`StrictCleanup` fails the test when teardown fails. `TerminateContainer` is the
-nil-safe helper for deferred teardown.
+returns a handle. `Pull` fetches an image without creating a container.
+`Prune` removes this library's stopped containers without force, so a container
+that restarted after inspection is retained. `PruneReuseGroup` force-removes
+every container carrying a reuse group, including running ones, for CI
+teardown. `NewClient` and `NewClientContext` pin the backend, target, and
+runner settings used by `Client.Run`, `Client.Pull`, `Client.Prune`, and
+`Client.PruneReuseGroup`; they read the process environment once and freeze it.
+`Cleanup` and `StrictCleanup` register test teardown, and `StrictCleanup` fails
+the test when teardown fails. `TerminateContainer` is the nil-safe helper for
+deferred teardown.
+
+**Container** — `ID`, `Image`, `State`, `Inspect`, `Created`, `Reused`,
+`Shared`, `TargetHost` (the effective backend host chosen for this handle),
+`Start`, `Stop`, `Restart`, `Kill`, `Pause`, `Unpause`, `Terminate`, `Wait`,
+`ExitCode`, `Endpoint`, `Host`, `MappedPort`, `ContainerIP`, `Exec`, `ExecTo`,
+`Logs`, `LogsWithOptions`, `LogsTo`, `FollowLogs`, `FollowLogsTo`, the copy
+methods, and the attachment accessors `StopAttached`, `AttachedDone`, and
+`AttachedError`. `WithAttachOutput` starts a writer during creation;
+`StopAttached` closes it, `AttachedDone` reports when it finished, and
+`AttachedError` reports its error.
+
+**Run options** — `Option` with the container options described under
+[Run options](#run-options), including `WithWaitStrategy`, `WithPullPolicy`,
+`WithLabels`, `WithMounts`, and the reuse options.
+
+**Exec options** — `ExecOption` with `WithExecEnv`, `WithExecUser`,
+`WithExecWorkDir`, `WithExecMaxBytes`, `WithExecStderr`, and
+`WithExecTimeout`.
 
 **Client** — `Client`, `ClientOption`, and the options `WithClientBackend`,
 `WithClientBinary`, `WithClientDockerHost`, `WithClientDockerContext`,
@@ -1488,8 +1512,8 @@ nil-safe helper for deferred teardown.
 `WithPullDockerContext`.
 
 **Prune** — `PruneOption` with `WithPruneBinary`, `WithPruneRunner`,
-`WithPruneLabel`, `WithPruneParallelism`, `WithPruneTimeout`, and
-`WithPruneOlderThan`.
+`WithPruneLabel`, `WithPruneParallelism`, `WithPruneTimeout`,
+`WithPruneOlderThan`, and `WithPruneDryRun`.
 
 **Mounts** — `Mount`, `MountType`, `WithMounts`, and the constructors
 `BindMount`, `TmpfsMount`, and `VolumeMount`.
@@ -1513,14 +1537,14 @@ nil-safe helper for deferred teardown.
 `ErrCleanupFailed`, `ExecTerminationError`, `ErrExecTerminationUnsupported`,
 `SystemNotRunningError`, `ErrSystemNotRunning`, `ErrContainerNotFound`,
 `ErrGenerationReplaced`, `ErrSharedContainer`, `ErrReuseMismatch`,
-`ErrUnsupportedCapability`, `ErrOutputTruncated`,
-`ErrImageIdentityUnavailable`, `ErrImageIdentityMismatch`,
-`ErrImageIdentityNotLocal`, `ErrImageNotFound`, `ErrPullNeverUnsupported`,
-`ErrContainerNotStopped`, `ErrExitCodeUnavailable`, `ErrPortNotExposed`,
-`ErrEndpointUnreachable`, `ErrNoReachableHost`, `ErrNetworkMismatch`,
-`ErrEnvFileUnsupported`, `ErrOutputDelivery`, `ErrLogStreamSetup`,
-`ErrCopySourceUnsupported`, `ErrCopySourceChanged`, `ErrCopySourceTooLarge`,
-`ErrCopySourceTooManyEntries`, `ErrCopySourceTooDeep`,
+`ErrUnsupportedCapability`, `ErrInvalidOption`, `ErrInvalidConfiguration`,
+`ErrOutputTruncated`, `ErrImageIdentityUnavailable`,
+`ErrImageIdentityMismatch`, `ErrImageIdentityNotLocal`, `ErrImageNotFound`,
+`ErrPullNeverUnsupported`, `ErrContainerNotStopped`, `ErrExitCodeUnavailable`,
+`ErrPortNotExposed`, `ErrEndpointUnreachable`, `ErrNoReachableHost`,
+`ErrNetworkMismatch`, `ErrEnvFileUnsupported`, `ErrOutputDelivery`,
+`ErrLogStreamSetup`, `ErrCopySourceUnsupported`, `ErrCopySourceChanged`,
+`ErrCopySourceTooLarge`, `ErrCopySourceTooManyEntries`, `ErrCopySourceTooDeep`,
 `ErrCopySourceMetadataTooLarge`, `ErrCopyFileNotRegular`,
 `ErrCopyFileFromContainerTooLarge`, and
 `ErrCopyFileFromContainerUnsupported`.
@@ -1600,7 +1624,7 @@ func UsingMountsAndCopy(ctx context.Context, dir string) error {
     }
     defer func() { _ = ctr.Terminate(ctx) }()
 
-    if err := ctr.CopyToContainer(ctx, dir, "/host/copy"); err != nil {
+    if err := ctr.CopyToContainer(ctx, dir, "/copied"); err != nil {
         return err
     }
     reader, err := ctr.CopyFileFromContainer(ctx, "/etc/motd")

@@ -487,8 +487,8 @@ nil の `Container.Stop` timeout は backend CLI の既定の grace period を�
 値は CLI 呼び出し前に拒否されます。timeout は操作の context budget にも加算
 されます。
 
-`v0.3.0` リリースで次の wait API が追加されました。
-これらは `v0.2.0` にはありません。
+`CHANGELOG.md` の `0.3.0` 節に記載された次の wait API は
+このチェックアウトに含まれ、`v0.2.0` にはありません。
 
 ```go
 package docexample
@@ -565,11 +565,12 @@ Apple Container CLI の各 version は tail に `-n` を使い、`--since` を
 `FollowLogs` はストリーミングする `io.ReadCloser` を返し、Close するか
 context をキャンセルするとバックエンド CLI を停止します。`ForLog` は
 `FollowLogs` を使い、`Logs` は新しい出力を追尾しません。
-`LogsOptions` と `LogsWithOptions` は `v0.3.0` で追加されました。
+`LogsOptions` と `LogsWithOptions` は `CHANGELOG.md` の `0.3.0` 節に
+記載されています。
 `LogsOptions.Tail` と `MaxBytes` は非負として検証され、
 `PruneReuseGroup` は `WithReuseGroup` と同じ reuse-group grammar を使います。
 
-次の例は Docker 固有です。`v0.3.0` 以降に追加された log stream、exec
+次の例は Docker 固有です。`v0.2.0` より後に追加された log stream、exec
 option、公開 error symbol も示しますが、Apple の
 `LogsWithOptions` の例ではありません。
 
@@ -1317,14 +1318,33 @@ symbol を README から辿れるようにするためのものです。独立�
 symbol はここで説明します。
 
 **コンストラクタとパッケージ関数** — `Run` はコンテナを作成・起動・待機して
-handle を返します。`Pull` はコンテナを作らずに image を取得します。`Prune` と
-`PruneReuseGroup` はこの library が管理する停止済みコンテナを、必要なら reuse
-group に限定して削除します。`NewClient` と `NewClientContext` は
-`Client.Run`、`Client.Pull`、`Client.Prune`、`Client.PruneReuseGroup` が使う
-backend・target・runner の設定を固定し、process の環境変数を構築時に一度だけ
-読んで凍結します。`Cleanup` と `StrictCleanup` は test teardown を登録し、
-`StrictCleanup` は teardown の失敗を test の失敗にします。
-`TerminateContainer` は defer 用の nil 安全なヘルパーです。
+handle を返します。`Pull` はコンテナを作らずに image を取得します。`Prune` は
+この library が管理する停止済みコンテナを force なしで削除するため、inspect
+後に再起動したコンテナは残ります。`PruneReuseGroup` は reuse group を持つ
+すべてのコンテナを、実行中も含めて強制削除します（CI teardown 用）。
+`NewClient` と `NewClientContext` は `Client.Run`、`Client.Pull`、
+`Client.Prune`、`Client.PruneReuseGroup` が使う backend・target・runner の
+設定を固定し、process の環境変数を構築時に一度だけ読んで凍結します。
+`Cleanup` と `StrictCleanup` は test teardown を登録し、`StrictCleanup` は
+teardown の失敗を test の失敗にします。`TerminateContainer` は defer 用の
+nil 安全なヘルパーです。
+
+**Container** — `ID`、`Image`、`State`、`Inspect`、`Created`、`Reused`、
+`Shared`、`TargetHost`（この handle で選ばれた実効 backend host）、`Start`、
+`Stop`、`Restart`、`Kill`、`Pause`、`Unpause`、`Terminate`、`Wait`、
+`ExitCode`、`Endpoint`、`Host`、`MappedPort`、`ContainerIP`、`Exec`、
+`ExecTo`、`Logs`、`LogsWithOptions`、`LogsTo`、`FollowLogs`、
+`FollowLogsTo`、copy 系のメソッド、および attachment の accessor
+`StopAttached`、`AttachedDone`、`AttachedError`。`WithAttachOutput` は作成中に
+writer を開始し、`StopAttached` がそれを閉じ、`AttachedDone` が完了を通知し、
+`AttachedError` がその error を返します。
+
+**実行オプション** — `Option` と、「実行オプション」節で説明するコンテナ
+option。`WithWaitStrategy`、`WithPullPolicy`、`WithLabels`、`WithMounts`、
+reuse 系の option を含みます。
+
+**Exec オプション** — `ExecOption` と `WithExecEnv`、`WithExecUser`、
+`WithExecWorkDir`、`WithExecMaxBytes`、`WithExecStderr`、`WithExecTimeout`。
 
 **Client** — `Client`、`ClientOption`、および option の `WithClientBackend`、
 `WithClientBinary`、`WithClientDockerHost`、`WithClientDockerContext`、
@@ -1338,7 +1358,7 @@ backend・target・runner の設定を固定し、process の環境変数を構�
 
 **Prune** — `PruneOption` と `WithPruneBinary`、`WithPruneRunner`、
 `WithPruneLabel`、`WithPruneParallelism`、`WithPruneTimeout`、
-`WithPruneOlderThan`。
+`WithPruneOlderThan`、`WithPruneDryRun`。
 
 **Mount** — `Mount`、`MountType`、`WithMounts`、およびコンストラクタ
 `BindMount`、`TmpfsMount`、`VolumeMount`。
@@ -1362,14 +1382,14 @@ backend・target・runner の設定を固定し、process の環境変数を構�
 `ErrCleanupFailed`、`ExecTerminationError`、`ErrExecTerminationUnsupported`、
 `SystemNotRunningError`、`ErrSystemNotRunning`、`ErrContainerNotFound`、
 `ErrGenerationReplaced`、`ErrSharedContainer`、`ErrReuseMismatch`、
-`ErrUnsupportedCapability`、`ErrOutputTruncated`、
-`ErrImageIdentityUnavailable`、`ErrImageIdentityMismatch`、
-`ErrImageIdentityNotLocal`、`ErrImageNotFound`、`ErrPullNeverUnsupported`、
-`ErrContainerNotStopped`、`ErrExitCodeUnavailable`、`ErrPortNotExposed`、
-`ErrEndpointUnreachable`、`ErrNoReachableHost`、`ErrNetworkMismatch`、
-`ErrEnvFileUnsupported`、`ErrOutputDelivery`、`ErrLogStreamSetup`、
-`ErrCopySourceUnsupported`、`ErrCopySourceChanged`、`ErrCopySourceTooLarge`、
-`ErrCopySourceTooManyEntries`、`ErrCopySourceTooDeep`、
+`ErrUnsupportedCapability`、`ErrInvalidOption`、`ErrInvalidConfiguration`、
+`ErrOutputTruncated`、`ErrImageIdentityUnavailable`、
+`ErrImageIdentityMismatch`、`ErrImageIdentityNotLocal`、`ErrImageNotFound`、
+`ErrPullNeverUnsupported`、`ErrContainerNotStopped`、`ErrExitCodeUnavailable`、
+`ErrPortNotExposed`、`ErrEndpointUnreachable`、`ErrNoReachableHost`、
+`ErrNetworkMismatch`、`ErrEnvFileUnsupported`、`ErrOutputDelivery`、
+`ErrLogStreamSetup`、`ErrCopySourceUnsupported`、`ErrCopySourceChanged`、
+`ErrCopySourceTooLarge`、`ErrCopySourceTooManyEntries`、`ErrCopySourceTooDeep`、
 `ErrCopySourceMetadataTooLarge`、`ErrCopyFileNotRegular`、
 `ErrCopyFileFromContainerTooLarge`、
 `ErrCopyFileFromContainerUnsupported`。
@@ -1449,7 +1469,7 @@ func UsingMountsAndCopy(ctx context.Context, dir string) error {
     }
     defer func() { _ = ctr.Terminate(ctx) }()
 
-    if err := ctr.CopyToContainer(ctx, dir, "/host/copy"); err != nil {
+    if err := ctr.CopyToContainer(ctx, dir, "/copied"); err != nil {
         return err
     }
     reader, err := ctr.CopyFileFromContainer(ctx, "/etc/motd")

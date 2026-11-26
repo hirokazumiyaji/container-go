@@ -13,10 +13,11 @@ Please report security issues privately rather than in a public issue.
 
 GitHub private vulnerability reporting is enabled for this repository. Open
 
-<https://github.com/hirokazumiyaji/container-go/security/advisories/new>
+<https://github.com/hirokazumiyaji/container-go/security/advisories>
 
-to start a private advisory. The report, the discussion, and any fix are
-visible only to the maintainers until an advisory is published.
+and select **Report a vulnerability** to start a private advisory. The report
+and the discussion are visible to you, the maintainers, and any collaborator
+the maintainers invite; they are not public until an advisory is published.
 
 If the form is unavailable, open a public issue that asks for a private
 channel without including vulnerability details, `@`-mentioning

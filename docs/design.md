@@ -215,10 +215,11 @@ shared-lifetime contract described below.
 
 Options use the functional options pattern. The following inventory
 describes the current development checkout. The core options listed here
-were already available in `v0.2.0`; `LogsOptions` / `LogsWithOptions`, the
-additional HTTP setters, and the exported `AllStrategy` / `AnyStrategy`
-composite `WithStartupTimeout` were added in `v0.3.0`. Items this text marks
-as current-development additions were added after `v0.3.0`.
+were already available in `v0.2.0`; the `0.3.0` section of `CHANGELOG.md`
+records `LogsOptions` / `LogsWithOptions`, the additional HTTP setters, and
+the exported `AllStrategy` / `AnyStrategy` composite `WithStartupTimeout`.
+Items this text marks as current-development additions are newer than that
+changelog section.
 
 - `WithExposedPorts(ports ...string)`: declare the container ports
   (`"6379/tcp"` form) that `MappedPort` and `Endpoint` may resolve.
@@ -527,8 +528,8 @@ backend maps `Tail` to `-n` and rejects `Since` with
 `ErrUnsupportedCapability`. A requested window's size still depends on the
 container output. `FollowLogs` is intentionally an unbounded stream and
 continues until its reader is closed or its context is cancelled.
-`LogsOptions` and `LogsWithOptions` were added in `v0.3.0`. `Terminate` is
-generation-guarded: Apple name deletion
+`LogsOptions` and `LogsWithOptions` are recorded in the `0.3.0` section of
+`CHANGELOG.md`. `Terminate` is generation-guarded: Apple name deletion
 requires a valid creation generation, Docker deletion uses the immutable
 UID, and the reuse and failed-create paths require those ownership facts
 before deleting.
@@ -709,10 +710,10 @@ provides:
   until its status matches (2xx by default; change it with
   `WithStatusCodeMatcher` or a single accepted code with
   `WithStatusCode`). `WithPort` and `WithMethod` select the target, and
-  `WithBody` sends a request payload with every poll. The `v0.3.0` release
-  added `WithHeaders`, `WithHeader`,
-  `WithBasicAuth`, `WithTLS`, `WithTLSConfig`, and `WithHTTPClient`;
-  these setters are not in `v0.2.0`.
+  `WithBody` sends a request payload with every poll. The `0.3.0` section of
+  `CHANGELOG.md` records `WithHeaders`, `WithHeader`, `WithBasicAuth`,
+  `WithTLS`, `WithTLSConfig`, and `WithHTTPClient`; these setters are not in
+  `v0.2.0`.
   `WithResponseMatcher(func(io.Reader) bool)` checks up to 64KiB of an
   accepted response body, and a false verdict is retried.
 - `wait.ForHealthcheck()`: wait until Docker reports the image's
@@ -756,8 +757,8 @@ provides:
   redaction.
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`:
   composition. Child strategies keep their own settings. The exported
-  `AllStrategy` and `AnyStrategy` types, added in `v0.3.0`, expose
-  `WithStartupTimeout` to bound the whole composition;
+  `AllStrategy` and `AnyStrategy` types, recorded in the `0.3.0` section of
+  `CHANGELOG.md`, expose `WithStartupTimeout` to bound the whole composition;
   they do not expose `WithPollInterval`. The `v0.2.0` functions return
   an interface without a composite timeout setter. Zero or a negative
   composition timeout leaves the composition unbounded; child timeouts
@@ -1356,10 +1357,10 @@ and cancellation paths.
 - `*CLIError`: a backend CLI exited non-zero. It carries the binary,
   arguments, exit code, and a bounded trailing stderr window for
   classification; the rendered diagnostic is redacted and capped at
-  64KiB. The root `CLIError` alias was added in `v0.3.0` and
-  is not part of `v0.2.0`.
-- `ErrContainerNotFound` and `ErrGenerationReplaced` were also added in
-  `v0.3.0`.
+  64KiB. The root `CLIError` alias is recorded in the `0.3.0` section of
+  `CHANGELOG.md` and is not part of `v0.2.0`.
+- `ErrContainerNotFound` and `ErrGenerationReplaced` are also recorded in the
+  `0.3.0` section.
 - `ErrOutputDelivery`: a caller-owned output sink rejected CLI output;
   the original writer error remains in the chain
 - `ErrImageIdentityUnavailable`: a successful image inspect returned no

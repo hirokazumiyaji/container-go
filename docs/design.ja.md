@@ -358,7 +358,8 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForExposedPort()`：最初の exposed TCP port を使い、TCP の exposed 宣言がなければ最初の published TCP port を選ぶ。
 - `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` または単一コードの `WithStatusCode` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定し、`WithBody` で各 poll のリクエストボディを送る。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。受理したレスポンスボディは `WithResponseMatcher` で最大 64KiB まで判定でき、false なら再試行する。
 - `wait.ForHealthcheck()`：Docker の `HEALTHCHECK` が healthy になるまで待つ。`starting` の間は poll を続け、`unhealthy` は終端エラーになる。`HEALTHCHECK` を持たないイメージは `*wait.ConfigError` で即座に失敗し、Apple バックエンドはコンテナ作成前にこの戦略を拒否する。
-- `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。各試行の timeout は poll interval から 1〜5 秒の範囲で導出し、`WithExecTimeout` で上書きできる。`WithResponseMatcher(func([]byte) bool)` と `WithOutputContains` を指定すると、終了コードの受理後にコマンド出力も判定する。これらは任意の `wait.ExecOutputTarget` インターフェースを使い、実装しない target には `*wait.ConfigError` を即座に返す。container adapter は最大 64KiB の出力を保持する。matcher を指定しない場合、出力は従来どおり破棄される。
+- `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。各試行の timeout は poll interval から 1〜5 秒の範囲で導出し、`WithExecTimeout` で上書きできる。`WithResponseMatcher(func([]byte) bool)` と `WithOutputContains` を指定すると、終了コードの受理後にコマンド出力も判定する。これらは任意の `wait.ExecOutputTarget` インターフェースを使い、実装しない target には `*wait.ConfigError` を即座に返す。container adapter は最大 64KiB の出力を保持する。matcher を指定しない場合、出力は従来どおり破棄される。`WithUser`、`WithWorkDir`、`WithEnv` は readiness コマンドの実行コンテキストを設定し、任意の `wait.ExecOptionsTarget` インターフェースを使う。実装しない target には `*wait.ConfigError` を即座に返し、環境変数の値は診断時の redaction 対象として登録される。
+- `wait.ForExit()`：ワンショットコンテナの停止を待つ。既定では終了コード 0 を受理し、それ以外は即座に失敗する。`WithExitCode` は単一のコードを受理し、`WithExitCodeMatcher` は判定自体を置き換える。任意の `wait.ExitCodeTarget` インターフェースを poll するため、カスタム target はこれを実装する必要がある（container adapter は 1 回の新しい inspect から状態と終了コードを返す）。停止しているがバックエンドが終了コードを報告しない場合は、0 とみなさず即座に失敗する。`ForExit` はマイグレーションや seed 投入などのジョブ向けで、長時間稼働するサービス向けではない。`ForAll` と `ForAny` は各子戦略の成功後にコンテナが Running であることを要求するため、`ForExit` は合成せず単独で使うこと。
 - `wait.ForFunc(fn)`：poll ごとに `fn(ctx, target)` を呼び、nil で準備完了とする。非 nil エラーは再試行し、timeout 時には最後のエラーを報告する。`context.Canceled` を包むエラーや、`ErrInvalidConfiguration` など恒久エラーとして分類されるエラーは即座に待機を終える。試行ごとの deadline エラーは再試行する。コンテナの終了そのものをコールバックで観測したい場合は `WithExitCheck(false)` で stopped コンテナのガードを無効化できるが、これは ForFunc 自身の poll に限られる。`ForAll` / `ForAny` は実 target に対して独自の lifecycle monitor と最終チェックを実行するため、合成戦略の中ではコンテナ終了時に失敗する。終了を観測する ForFunc は合成せず単独で使うこと。
 - `wait.ForSQL(port, driver, dsn)`：解決した host と port に対して `database/sql` の `db.PingContext`（または `WithQuery` の readiness 文）を poll する。各試行には 3 秒の deadline を渡すため、応答しない handshake は startup budget を消費せず再試行される。パッケージは driver を import せず、呼び出し側が driver を登録して名前を渡す。未登録の driver は `Validate`（したがってコンテナ作成前の `WithWaitStrategy`）と待機開始時の両方で `*wait.ConfigError` になる。`dsn(host, port)` が試行ごとに接続文字列を作り、host に IPv6 の角括弧は付かないため URL 形式では `net.JoinHostPort` を使う。戦略は待機ごとの状態を持たないので、同じ値を並行 wait で再利用できる。DSN とパスワード由来の派生値は、その wait のエラーの redaction にだけ登録され、後から上位ヘルパーが付ける log tail は対象外である。
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。合成 timeout が 0 または負の場合は合成全体を無制限とし、各子の timeout を適用する。
@@ -395,6 +396,11 @@ Docker のヘルスチェック待機では、任意の `HealthTarget` インタ
 `ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返す。
 `ForExec` の出力 matcher は任意の `ExecOutputTarget` インターフェースを使い、
 コマンド出力を返さないターゲットには `*wait.ConfigError` を返す。
+`ForExit` は任意の `ExitCodeTarget` インターフェースを使い、完了状態を返せない
+ターゲットには `*wait.ConfigError` を返す。
+`ForExec` の実行オプションは任意の `ExecOptionsTarget` インターフェースを使い、
+指定した user、working directory、environment に対応しないターゲットには
+`*wait.ConfigError` を返す。
 `container.Run` が `*container.Container` をこれらのインターフェースへ適合させる。
 依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避ける。
 

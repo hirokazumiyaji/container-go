@@ -430,12 +430,24 @@ func ReleasedWaitStrategies() {
 `ExecStrategy` にはコマンド出力を判定する `WithResponseMatcher` /
 `WithOutputContains` を追加しています。出力 matcher は任意の
 `wait.ExecOutputTarget` を実装する target を必要とし、container adapter は
-最大 64KiB のコマンド出力を保持します。ヘルスチェック戦略は Docker 専用で
-あり、Apple バックエンドはコンテナを作成する前にこの戦略を拒否します。
+最大 64KiB のコマンド出力を保持します。同じ戦略には readiness コマンドの
+実行コンテキストを指定する `WithUser`、`WithWorkDir`、`WithEnv` も追加して
+います。これらは任意の `wait.ExecOptionsTarget` インターフェースを必要とし、
+環境変数の値は診断時の redaction 対象として登録されます。
+`wait.ForExit()` はワンショットコンテナの停止を待ち、既定では終了コード 0 を
+成功、それ以外を即時失敗として扱います。受理する終了コードは `WithExitCode`
+と `WithExitCodeMatcher` で変更できます。任意の `wait.ExitCodeTarget`
+インターフェースを使い、マイグレーション、seed 投入、設定ファイル生成などの
+ジョブ向けで、長時間稼働するサービス向けではありません。ヘルスチェック戦略は
+Docker 専用であり、Apple バックエンドはコンテナを作成する前にこの戦略を
+拒否します。
 
 コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
 created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF は再-open します。終了コードを伴うログストリームエラーは返却します。
 成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理されます。`ForLog` はワンショットジョブではなく、長時間稼働するサービス向けです。
+`ForExit` は例外で、停止したコンテナが成功条件です。`ForAll` と `ForAny` は
+各子戦略の成功後にコンテナが Running であることを要求するため、`ForExit` は
+合成せず単独で使ってください。
 稼働中の follow ストリームでマーカーを観測した場合は追加の settle 待機をせずに受理し、CLI が既に終了しているストリームは終端エラーを隠さないよう drain してから受理します。
 `ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計します。
 待機に失敗した場合はロールバック削除し、エラーにログ末尾を添付します。
@@ -447,6 +459,10 @@ Docker のヘルスチェック待機では、任意の `wait.HealthTarget` イ�
 `ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返します。
 `ForExec` の出力 matcher は任意の `wait.ExecOutputTarget` インターフェースを
 同様に使い、実装しないターゲットには `*wait.ConfigError` を返します。
+`ForExit` は任意の `wait.ExitCodeTarget` インターフェースを、
+`ForExec` の実行オプションは任意の `wait.ExecOptionsTarget` インターフェースを
+使います。戦略が必要とするインターフェースを実装しないターゲットには
+`*wait.ConfigError` を返します。
 
 Docker では、公開ポートへの TCP 接続が成功してもコンテナ内のプロセスが
 listen しているとは限りません。`docker-proxy` や Docker Desktop の port
@@ -515,7 +531,11 @@ func DevelopmentWaitOptions() {
         WithStartupTimeout(time.Second).
         WithPollInterval(time.Millisecond)
     _ = wait.ForExec([]string{"pg_isready"}).
-        WithOutputContains("accepting connections")
+        WithOutputContains("accepting connections").
+        WithUser("app").
+        WithWorkDir("/srv/app").
+        WithEnv(map[string]string{"PGPASSWORD": "secret"})
+    _ = wait.ForExit().WithExitCode(0)
     _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
     _ = wait.ForSQL("5432/tcp", "postgres", func(host string, port int) string {
         return fmt.Sprintf(

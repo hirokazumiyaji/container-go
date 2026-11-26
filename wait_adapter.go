@@ -35,11 +35,13 @@ type waitTarget struct {
 }
 
 var (
-	_ wait.Target           = waitTarget{}
-	_ wait.StateTarget      = waitTarget{}
-	_ wait.PortListenTarget = waitTarget{}
-	_ wait.HealthTarget     = waitTarget{}
-	_ wait.ExecOutputTarget = waitTarget{}
+	_ wait.Target            = waitTarget{}
+	_ wait.StateTarget       = waitTarget{}
+	_ wait.PortListenTarget  = waitTarget{}
+	_ wait.HealthTarget      = waitTarget{}
+	_ wait.ExecOutputTarget  = waitTarget{}
+	_ wait.ExecOptionsTarget = waitTarget{}
+	_ wait.ExitCodeTarget    = waitTarget{}
 )
 
 // selectedPort resolves an empty port request the same way for Endpoint and
@@ -360,6 +362,56 @@ func (t waitTarget) ExecCommandOutput(ctx context.Context, cmd []string) (int, [
 	var output bytes.Buffer
 	code, _, err := t.c.ExecTo(ctx, cmd, &output, WithExecMaxBytes(waitExecOutputLimit))
 	return code, output.Bytes(), waitTargetError(err)
+}
+
+// ExecCommandWithOptions runs a readiness command with the ForExec execution
+// options, discarding its output.
+func (t waitTarget) ExecCommandWithOptions(ctx context.Context, cmd []string, options wait.ExecOptions) (int, error) {
+	code, _, err := t.c.ExecTo(ctx, cmd, io.Discard, waitExecOptions(options)...)
+	return code, waitTargetError(err)
+}
+
+// ExecCommandOutputWithOptions is ExecCommandWithOptions with the bounded
+// output retained for an output matcher.
+func (t waitTarget) ExecCommandOutputWithOptions(ctx context.Context, cmd []string, options wait.ExecOptions) (int, []byte, error) {
+	var output bytes.Buffer
+	opts := append(waitExecOptions(options), WithExecMaxBytes(waitExecOutputLimit))
+	code, _, err := t.c.ExecTo(ctx, cmd, &output, opts...)
+	return code, output.Bytes(), waitTargetError(err)
+}
+
+// waitExecOptions translates wait.ExecOptions into the public Exec options.
+// Empty fields keep the container default.
+func waitExecOptions(options wait.ExecOptions) []ExecOption {
+	var opts []ExecOption
+	if options.User != "" {
+		opts = append(opts, WithExecUser(options.User))
+	}
+	if options.WorkDir != "" {
+		opts = append(opts, WithExecWorkDir(options.WorkDir))
+	}
+	if len(options.Env) > 0 {
+		opts = append(opts, WithExecEnv(options.Env))
+	}
+	return opts
+}
+
+// ExitStatus adapts one fresh inspect snapshot to ForExit's optional target
+// interface. Container.Inspect reports the state and the exit code from the
+// same observation, so a stopped container cannot pair a new state with a
+// stale exit code.
+func (t waitTarget) ExitStatus(ctx context.Context) (wait.ExitStatus, error) {
+	info, err := t.c.Inspect(ctx)
+	if err != nil {
+		return wait.ExitStatus{}, waitTargetError(err)
+	}
+	status := wait.ExitStatus{State: info.State()}
+	if info.State() != StateStopped || !info.ExitCodeReported() {
+		return status, nil
+	}
+	status.Reported = true
+	status.Code = info.ExitCode()
+	return status, nil
 }
 
 func waitTargetError(err error) error {

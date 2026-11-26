@@ -236,8 +236,11 @@ container cannot make the host allocate an unbounded response:
   implements; otherwise `Exec`/`ExecTo` return `ErrUnsupportedCapability`
   before invoking the backend. When the command exits or the context is
   cancelled the child's stdin pipe is closed and a reader that implements
-  `io.Closer` is closed too, so a blocked copy cannot outlive the CLI
-  lifecycle.
+  `io.Closer` is closed too and its copy is awaited for a short grace.
+  Go cannot interrupt a read on a non-closable reader, so pass input that
+  reaches EOF or whose `Close` unblocks a pending read. A reader that stays
+  blocked leaves only its copy goroutine until the read returns; the child
+  is still terminated and reaped.
 - A bounded reader returns `ErrOutputTruncated` as its terminal read
   error, while still returning all retained bytes. Check
   `errors.Is(readErr, container.ErrOutputTruncated)` or the

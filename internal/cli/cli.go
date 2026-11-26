@@ -458,8 +458,10 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 
 // RunWithStdin is RunTo with stdin wired to the child process. When the
 // command exits or the caller's context is cancelled, the child's input pipe
-// is closed and a closable reader is closed as well so a blocked copy cannot
-// keep the lifecycle from completing or outlive it.
+// and a closable reader are closed, and the copy goroutine is awaited for a
+// bounded grace period. Go cannot interrupt a Read on a non-closable reader;
+// such a copy may outlive the command until the caller's reader returns, and
+// callers must provide input that reaches EOF or is closable.
 func (r *ExecRunner) RunWithStdin(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
 	return r.runTo(ctx, stdin, stdout, stderr, args...)
 }
@@ -573,8 +575,9 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdin io.Reade
 	// stale process-handle or numeric process-group signal.
 	err := lifecycle.result()
 	if feed != nil {
-		// The child is gone. Stop the pump and close a closable reader so a
-		// read blocked past the child's exit cannot outlive the run.
+		// The child is gone. Stop the pump and close a closable reader so
+		// a read blocked past the child's exit does not outlive the run
+		// when the reader honors Close.
 		feed.stop()
 	}
 	status := lifecycle.status()
@@ -597,7 +600,8 @@ const stdinStopGrace = time.Second
 // on a Stdin read that never returns even when WaitDelay is set. Owning the
 // pipe keeps child termination independent of the caller's reader, and stop
 // closes a closable reader so a blocked copy goroutine can exit when the
-// command finishes or is cancelled.
+// command finishes or is cancelled. A non-closable reader cannot be
+// interrupted; its copy goroutine may outlive the run until Read returns.
 type stdinFeed struct {
 	reader io.Reader
 	pipe   io.WriteCloser
@@ -634,7 +638,8 @@ func (f *stdinFeed) copy() {
 // stop ends the feed after the child is gone or cancellation terminates it.
 // Closing the child's pipe releases a blocked write, and closing a closable
 // reader releases a blocked read. The bounded wait keeps the copy goroutine
-// from outliving the run when the reader honors Close.
+// from outliving the run when the reader honors Close; a non-closable reader
+// or a Close that does not interrupt Read can leave the copy pending.
 func (f *stdinFeed) stop() {
 	f.mu.Lock()
 	if f.closed {

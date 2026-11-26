@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,6 +98,50 @@ func TestExecRunnerRunWithStdinChildExitClosesBlockingReader(t *testing.T) {
 	}
 	if _, err := writer.Write([]byte("late")); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("pipe write after completion = %v, want ErrClosedPipe (reader was not closed)", err)
+	}
+}
+
+// blockingStdinReader blocks every Read until release closes. It deliberately
+// does not implement io.Closer, so the library cannot interrupt a pending
+// read.
+type blockingStdinReader struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingStdinReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	return 0, io.EOF
+}
+
+func TestExecRunnerRunWithStdinNonClosableReaderDoesNotBlockCancellation(t *testing.T) {
+	requirePOSIXShell(t)
+	r := &ExecRunner{Binary: writeStub(t, `sleep 5`)}
+	reader := &blockingStdinReader{entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(reader.release) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := r.RunWithStdin(ctx, reader, io.Discard, io.Discard, "exec")
+		result <- err
+	}()
+	select {
+	case <-reader.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stdin copy did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunWithStdin error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunWithStdin did not return while a non-closable read was blocked")
 	}
 }
 

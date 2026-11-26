@@ -136,8 +136,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `exec -i`. `ExecRunner` implements the optional internal stdin
   extension so the existing `Runner` interface stays compatible, a typed-nil
   reader is a `*ValidationError`, and command completion or cancellation
-  closes the stdin pipe and a closable reader so no copy goroutine or child
-  outlives the run.
+  closes the stdin pipe and a closable reader. The child is always reaped;
+  because Go cannot interrupt a read on a non-closable reader, a permanently
+  blocked reader can leave only its copy goroutine until the read returns.
 - Add `FollowLogsOptions`, `FollowLogsWithOptions`, and
   `FollowLogsToWithOptions`, and add `LogsOptions.Timestamps`. Docker emits
   `--tail`, `--since`, and `--timestamps`; the Apple backend maps `Tail` to

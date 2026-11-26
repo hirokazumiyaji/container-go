@@ -218,8 +218,11 @@ nil または typed-nil の reader は `*ValidationError` で拒否します。r
 満たす必要があり、満たさない場合は backend を起動する前に
 `ErrUnsupportedCapability` を返します。
 command の終了時または context 取消時は child の stdin pipe を閉じ、
-`io.Closer` を実装する reader も閉じるため、blocked な copy が CLI lifecycle
-より長く残りません。
+`io.Closer` を実装する reader も閉じ、その copy を短い猶予だけ待ちます。
+Go は Closable でない reader の Read を中断できないため、EOF に達するか
+`Close` で pending Read が解除される入力を渡してください。blocked な
+reader は read が戻るまで copy goroutine だけを残し、child は terminate され
+reap されます。
 bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の
 terminal read error が `ErrOutputTruncated` になります。backend の
 infrastructure、cancellation、launch、missing-container エラー時も

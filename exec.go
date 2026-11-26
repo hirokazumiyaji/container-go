@@ -97,10 +97,17 @@ func WithExecStderr(w io.Writer) ExecOption {
 // Exec and ExecTo need a runner with the optional stdin capability; ExecRunner
 // provides it, and wrappers that embed ExecRunner inherit it. A runner without
 // that capability is rejected with ErrUnsupportedCapability before the backend
-// is invoked. When the command exits or the context is cancelled, the child's
-// stdin pipe is closed and r is closed as well if it implements io.Closer, so
-// a blocked read cannot keep the CLI lifecycle from completing or outlive it.
-// Pass a reader whose Close is safe for the operation.
+// is invoked. The child process is always terminated and reaped when the
+// command exits or the context is cancelled.
+//
+// The caller owns the input contract: r must either reach EOF or implement
+// io.Closer with a Close that unblocks a pending Read. On completion or
+// cancellation the child's stdin pipe and a closable r are closed, and a
+// closable reader's copy is awaited for a short grace period. Go cannot
+// interrupt a Read
+// on a non-closable reader, so a reader that stays blocked leaves its copy
+// goroutine until the Read returns; that pending read does not delay Exec's
+// result or keep the child alive.
 func WithExecStdin(r io.Reader) ExecOption {
 	return func(c *execConfig) error {
 		if nilReader(r) {

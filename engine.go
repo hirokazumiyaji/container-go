@@ -328,20 +328,9 @@ type engine interface {
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
 	listArgs() []string
-	// parseStoppedManaged extracts, from listArgs output, the
-	// identifiers of stopped containers this library created. The
-	// value is whatever the backend's own deleteArgs accepts: Apple
-	// returns container IDs, and Docker returns full IDs from
-	// --no-trunc --format {{.ID}}.
-	parseStoppedManaged(data []byte) ([]string, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.
 	listReuseGroupArgs(group string) []string
-	// parseReuseGroupIDs extracts, from listReuseGroupArgs output, the
-	// identifiers of containers carrying the given reuse group. As
-	// with parseStoppedManaged these are deleteArgs-compatible backend
-	// identifiers, not necessarily immutable IDs.
-	parseReuseGroupIDs(data []byte, group string) ([]string, error)
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool
@@ -417,9 +406,13 @@ type engine interface {
 	// defaultRunPlatform reports the platform the backend selects when the
 	// caller chose none, or "" when the backend leaves the default implicit.
 	defaultRunPlatform() string
-	// parsePruneCandidates returns list-time prune metadata keyed by the
-	// identifiers parseStoppedManaged returned.
-	parsePruneCandidates(data []byte) (map[string]pruneCandidate, error)
+	// parsePruneListed decodes one prune list response into the identifiers
+	// the delete path addresses and, for backends that delete by name, their
+	// list-time metadata. reuseGroup is empty for ordinary Prune. The value
+	// is whatever the backend's own deleteArgs accepts: Apple returns
+	// container IDs, and Docker returns full IDs from --no-trunc --format
+	// {{.ID}}. A backend without candidate metadata returns a nil map.
+	parsePruneListed(data []byte, reuseGroup string) ([]string, map[string]pruneCandidate, error)
 	// checkReuseNetworkCompat rejects an existing container whose network
 	// configuration cannot satisfy the requested reuse options.
 	checkReuseNetworkCompat(info *engineInfo, cfg *config) error

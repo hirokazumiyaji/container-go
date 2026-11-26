@@ -1,6 +1,7 @@
 package wait
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -417,7 +418,7 @@ func TestScanLogStreamBoundsReplayState(t *testing.T) {
 	result := scanLogStream(
 		context.Background(),
 		stream,
-		func(string) int { return 0 },
+		func([]byte) int { return 0 },
 		1,
 		logReplay{},
 	)
@@ -438,7 +439,7 @@ func TestScanLogStreamDeduplicatesReplayBeyondFingerprintWindow(t *testing.T) {
 	first := scanLogStream(
 		context.Background(),
 		io.NopCloser(strings.NewReader(history)),
-		func(string) int { return 0 },
+		func([]byte) int { return 0 },
 		1,
 		logReplay{},
 	)
@@ -455,8 +456,8 @@ func TestScanLogStreamDeduplicatesReplayBeyondFingerprintWindow(t *testing.T) {
 	second := scanLogStream(
 		context.Background(),
 		io.NopCloser(strings.NewReader(history+"ready\nready\n")),
-		func(line string) int {
-			lineMatches := strings.Count(line, "ready")
+		func(line []byte) int {
+			lineMatches := bytes.Count(line, []byte("ready"))
 			matches += lineMatches
 			return lineMatches
 		},
@@ -497,7 +498,7 @@ func TestScanLogStreamRollsBackTransientState(t *testing.T) {
 	baseline := scanLogStream(
 		context.Background(),
 		io.NopCloser(strings.NewReader("one\ntwo\n")),
-		func(string) int { return 0 },
+		func([]byte) int { return 0 },
 		1,
 		logReplay{},
 	)
@@ -515,7 +516,7 @@ func TestScanLogStreamRollsBackTransientState(t *testing.T) {
 	result := scanLogStream(
 		context.Background(),
 		&fragmentErrorReader{fragment: "ready", err: transient},
-		func(line string) int { return strings.Count(line, "ready") },
+		func(line []byte) int { return bytes.Count(line, []byte("ready")) },
 		1,
 		replay,
 	)
@@ -547,9 +548,9 @@ func TestScanLogStreamUsesScannerLineSemantics(t *testing.T) {
 			result := scanLogStream(
 				context.Background(),
 				io.NopCloser(strings.NewReader(input)),
-				func(line string) int {
-					matched = line
-					return strings.Count(line, "ready")
+				func(line []byte) int {
+					matched = string(line)
+					return bytes.Count(line, []byte("ready"))
 				},
 				1,
 				logReplay{},
@@ -579,7 +580,7 @@ func TestScanLogStreamTreatsFinalAndTerminatedReadyAsSameFingerprint(t *testing.
 	first := scanLogStream(
 		context.Background(),
 		io.NopCloser(strings.NewReader("ready")),
-		func(line string) int { return strings.Count(line, "ready") },
+		func(line []byte) int { return bytes.Count(line, []byte("ready")) },
 		1,
 		logReplay{},
 	)
@@ -597,9 +598,9 @@ func TestScanLogStreamTreatsFinalAndTerminatedReadyAsSameFingerprint(t *testing.
 	second := scanLogStream(
 		context.Background(),
 		io.NopCloser(strings.NewReader("ready\nready\n")),
-		func(line string) int {
-			matches += strings.Count(line, "ready")
-			return strings.Count(line, "ready")
+		func(line []byte) int {
+			matches += bytes.Count(line, []byte("ready"))
+			return bytes.Count(line, []byte("ready"))
 		},
 		2,
 		replay,

@@ -21,7 +21,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, err
 	}
 	for _, c := range containers {
-		if strings.TrimSpace(c.ID) == "" && strings.TrimSpace(c.Status.State) != "" {
+		if strings.TrimSpace(c.ID.Value) == "" && strings.TrimSpace(c.Status.Value.State.Value) != "" {
 			return nil, fmt.Errorf("decode container inspect output: container id is required")
 		}
 	}
@@ -30,17 +30,19 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if !appleInspectTargetMatches(c, id) {
 			continue
 		}
-		if strings.TrimSpace(c.Status.State) == "" {
+		status := c.Status.Value
+		if strings.TrimSpace(status.State.Value) == "" {
 			matchedMissingStatus = true
 			continue
 		}
-		image := c.Configuration.Image.Reference
-		imageDigest := c.Configuration.Image.Descriptor.Digest
+		configuration := c.Configuration.Value
+		image := configuration.Image.Reference
+		imageDigest := configuration.Image.Descriptor.Digest
 		if image != "" && validImageDigest(imageDigest) {
 			image = stripImageDigest(image) + "@" + imageDigest
 		}
 		platform := ""
-		if p := c.Configuration.Platform; p.OS != "" || p.Architecture != "" || p.Variant != "" {
+		if p := configuration.Platform; p.OS != "" || p.Architecture != "" || p.Variant != "" {
 			candidate := p.OS + "/" + p.Architecture
 			if p.Variant != "" {
 				candidate += "/" + p.Variant
@@ -53,36 +55,36 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		cpus := 0.0
 		cpusReported := false
-		if configured := c.Configuration.Resources.CPUS; configured != nil {
+		if configured := configuration.Resources.CPUS; configured != nil {
 			cpus = *configured
 			cpusReported = true
 		}
 		info := &engineInfo{
-			state:              appleState(c.Status.State),
-			name:               c.ID,
-			labels:             c.Configuration.Labels,
+			state:              appleState(status.State.Value),
+			name:               c.ID.Value,
+			labels:             configuration.Labels,
 			image:              image,
 			imageDigest:        imageDigest,
-			imageVariantDigest: c.Configuration.Image.VariantDigest,
+			imageVariantDigest: configuration.Image.VariantDigest,
 			runOptions: engineRunOptions{
 				cpus:         cpus,
 				cpusReported: cpusReported,
-				capAdd:       c.Configuration.CapAdd,
-				capDrop:      c.Configuration.CapDrop,
+				capAdd:       configuration.CapAdd,
+				capDrop:      configuration.CapDrop,
 			},
 		}
-		if c.Configuration.ShmSize != nil {
-			info.runOptions.shmSizeBytes = *c.Configuration.ShmSize
+		if configuration.ShmSize != nil {
+			info.runOptions.shmSizeBytes = *configuration.ShmSize
 			info.runOptions.shmSizeReported = true
 		}
-		for _, limit := range c.Configuration.InitProcess.Rlimits {
+		for _, limit := range configuration.InitProcess.Rlimits {
 			info.runOptions.ulimits = append(info.runOptions.ulimits, ulimitSpec{
 				name: appleRlimitName(limit.Limit),
 				soft: int64(limit.Soft),
 				hard: int64(limit.Hard),
 			})
 		}
-		pConfig := c.Configuration.Platform
+		pConfig := configuration.Platform
 		platformMeta := platformMetadataFromParts(
 			pConfig.OS,
 			pConfig.Architecture,
@@ -100,26 +102,26 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
 		}
-		networkNames := make([]string, 0, len(c.Status.Networks))
-		for _, network := range c.Status.Networks {
+		networkNames := make([]string, 0, len(status.Networks))
+		for _, network := range status.Networks {
 			if network.Network != "" {
 				networkNames = append(networkNames, network.Network)
 			}
 		}
 		sort.Strings(networkNames)
 		info.networkNames = networkNames
-		info.createdAt = parseInspectTime(c.Configuration.CreationDate)
-		if c.Status.StartedDate != nil {
-			info.startedAt = parseInspectTime(*c.Status.StartedDate)
+		info.createdAt = parseInspectTime(configuration.CreationDate)
+		if status.StartedDate != nil {
+			info.startedAt = parseInspectTime(*status.StartedDate)
 		}
-		if c.Status.ExitedAt != nil {
-			info.finishedAt = parseInspectTime(*c.Status.ExitedAt)
+		if status.ExitedAt != nil {
+			info.finishedAt = parseInspectTime(*status.ExitedAt)
 		}
-		if c.Status.ExitCode != nil {
-			info.exitCode = *c.Status.ExitCode
+		if status.ExitCode != nil {
+			info.exitCode = *status.ExitCode
 			info.exitCodeReported = true
 		}
-		for _, p := range c.Configuration.PublishedPorts {
+		for _, p := range configuration.PublishedPorts {
 			info.bound = append(info.bound, boundPort{
 				containerPort: p.ContainerPort,
 				proto:         p.Proto,
@@ -140,7 +142,7 @@ func appleInspectTargetMatches(c inspect.Container, target string) bool {
 	if target == "" {
 		return false
 	}
-	return strings.TrimPrefix(strings.TrimSpace(c.ID), "/") == target
+	return strings.TrimPrefix(strings.TrimSpace(c.ID.Value), "/") == target
 }
 
 // appleRlimitName maps Apple's inspected RLIMIT_* spelling to the lowercase
@@ -164,20 +166,54 @@ func appleState(state string) State {
 	}
 }
 
-// parseStoppedManaged filters client-side: the Apple CLI exposes no
-// label or status filter.
-func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
+// applePruneList decodes one list response into its entries and the
+// list-time prune metadata keyed by container ID, so a prune run derives the
+// IDs and the metadata it revalidates candidates with from one decode.
+func applePruneList(data []byte) ([]inspect.Container, map[string]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var ids []string
+	candidates := make(map[string]pruneCandidate, len(containers))
 	for _, c := range containers {
-		if c.Configuration.Labels[managedLabel] == "true" && c.Status.State == string(StateStopped) {
-			ids = append(ids, c.ID)
+		configuration := c.Configuration.Value
+		labels := make(map[string]string, len(configuration.Labels))
+		for key, value := range configuration.Labels {
+			labels[key] = value
+		}
+		candidates[c.ID.Value] = pruneCandidate{
+			id:        c.ID.Value,
+			labels:    labels,
+			creation:  labels[creationLabel],
+			createdAt: parseInspectTime(configuration.CreationDate),
+			state:     State(c.Status.Value.State.Value),
 		}
 	}
-	return ids, nil
+	return containers, candidates, nil
+}
+
+// parsePruneListed applies Apple's client-side prune selection: the CLI
+// exposes no label or status filter, so ordinary Prune selects managed
+// stopped containers and a reuse-group prune selects by the group label.
+func (appleEngine) parsePruneListed(data []byte, reuseGroup string) ([]string, map[string]pruneCandidate, error) {
+	containers, candidates, err := applePruneList(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	ids := make([]string, 0, len(containers))
+	for _, c := range containers {
+		configuration := c.Configuration.Value
+		if reuseGroup == "" {
+			if configuration.Labels[managedLabel] == "true" && c.Status.Value.State.Value == string(StateStopped) {
+				ids = append(ids, c.ID.Value)
+			}
+			continue
+		}
+		if configuration.Labels[reuseGroupLabel] == reuseGroup {
+			ids = append(ids, c.ID.Value)
+		}
+	}
+	return ids, candidates, nil
 }
 
 type appleImageDescriptor struct {
@@ -498,18 +534,4 @@ func appleImageIDMatchesDescriptor(requested, recordID, digest string) bool {
 		return isImageID(recordID) && strings.EqualFold(recordID, digest)
 	}
 	return len(recordID) == 64 && domain.IsHex(recordID) && strings.EqualFold("sha256:"+recordID, digest)
-}
-
-func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, error) {
-	containers, err := inspect.Decode(data)
-	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	for _, c := range containers {
-		if c.Configuration.Labels[reuseGroupLabel] == group {
-			ids = append(ids, c.ID)
-		}
-	}
-	return ids, nil
 }

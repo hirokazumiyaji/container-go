@@ -610,7 +610,7 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	switch args[0] {
 	case "ps":
 		r.listCalls++
-		// docker parseReuseGroupIDs splits lines; return the stub ids.
+		// docker parsePruneListed splits lines; return the stub ids.
 		return []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"), nil, nil
 	case "inspect":
 		id := args[len(args)-1]

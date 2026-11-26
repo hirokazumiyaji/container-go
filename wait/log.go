@@ -10,7 +10,6 @@ import (
 	"io"
 	"regexp"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -159,11 +158,11 @@ func appendReplayLine(lines [][sha256.Size]byte, start *int, line [sha256.Size]b
 // scanLogStream reads Scanner-like logical lines unless the requested number
 // of occurrences is found. Only a clean EOF commits replay, count, and
 // partial state; a non-EOF transport error rolls the scan back.
-func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string) int, occurrences int, replay logReplay) logScanResult {
+func scanLogStream(ctx context.Context, stream io.ReadCloser, match func([]byte) int, occurrences int, replay logReplay) logScanResult {
 	return scanLogStreamTarget(ctx, nil, stream, match, occurrences, replay)
 }
 
-func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadCloser, match func(string) int, occurrences int, replay logReplay) logScanResult {
+func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadCloser, match func([]byte) int, occurrences int, replay logReplay) logScanResult {
 	results := make(chan logScanResult, 1)
 	var matched atomic.Bool
 	go func() {
@@ -199,22 +198,35 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 		for {
 			line, complete, err := readLogLine(reader)
 			if complete {
-				hash := sha256.Sum256(line)
-				if replaying && !replay.matchesPrevious(observedLines, hash) {
+				// Hash and copy each line at most once: history replay
+				// fingerprints the raw line, while a counted line
+				// fingerprints the reconciled logical line without
+				// round-tripping through string.
+				var hash [sha256.Size]byte
+				hashed := false
+				if replaying {
+					hash = sha256.Sum256(line)
+					hashed = true
+					if replay.matchesPrevious(observedLines, hash) {
+						lines = appendReplayLine(lines, &lineStart, hash)
+						observedLines++
+						goto scanned
+					}
 					replaying = false
 					lineCount = observedLines
 				}
-				canCount := !replaying && (replay.count == 0 || observedLines >= replay.previousLines)
-				if canCount {
+				if replay.count == 0 || observedLines >= replay.previousLines {
 					logical, reconcileErr := reconcileLogLine(partial, line)
 					if reconcileErr != nil {
 						results <- result(false, false, reconcileErr, nil)
 						return
 					}
 					partial = nil
-					count += match(string(logical))
+					count += match(logical)
 					lineCount++
 					hash = sha256.Sum256(logical)
+				} else if !hashed {
+					hash = sha256.Sum256(line)
 				}
 				lines = appendReplayLine(lines, &lineStart, hash)
 				observedLines++
@@ -226,6 +238,7 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 					return
 				}
 			}
+		scanned:
 			if err != nil {
 				if isPermanentCheckError(err) || isTerminalStreamError(err) {
 					results <- result(false, false, err, nil)
@@ -668,7 +681,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 	defer cancel()
 	what := fmt.Sprintf("wait for log %q", s.pattern)
 
-	var match func(line string) int
+	var match func(line []byte) int
 	if s.isRegexp {
 		re, err := regexp.Compile(s.pattern)
 		if err != nil {
@@ -679,9 +692,10 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 				Reason:   err.Error(),
 			}
 		}
-		match = func(line string) int { return len(re.FindAllString(line, -1)) }
+		match = func(line []byte) int { return len(re.FindAllIndex(line, -1)) }
 	} else {
-		match = func(line string) int { return strings.Count(line, s.pattern) }
+		pattern := []byte(s.pattern)
+		match = func(line []byte) int { return bytes.Count(line, pattern) }
 	}
 
 	var replay logReplay

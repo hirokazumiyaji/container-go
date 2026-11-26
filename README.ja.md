@@ -211,6 +211,14 @@ stderr を `w` へ流します。この場合 `WithExecMaxBytes` は stdout だ�
 stdout と stderr に同じ比較可能な writer 値（通常は同じポインタ）を渡すこともでき、
 その場合は書き込みが直列化されます。異なる wrapper や比較不能な動的型は
 同じ writer として検出されず、直列化されません。
+`WithExecStdin(r)` は `r` を exec した process の stdin へ接続し、`exec -i` を付与します。
+`psql`、`mysql`、`redis-cli --pipe` へ一時ファイルなしで dump を流し込めます。
+nil または typed-nil の reader は `*ValidationError` で拒否します。runner は
+`ExecRunner`(およびそれを embed する wrapper)が実装する任意の stdin capability を
+満たす必要があり、満たさない場合は backend を起動する前に
+`ErrUnsupportedCapability` を返します。
+context 取消時は child の stdin pipe を閉じ、`io.Closer` を実装する reader も閉じるため、
+blocked な copy が CLI lifecycle より長く残りません。
 bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の
 terminal read error が `ErrOutputTruncated` になります。backend の
 infrastructure、cancellation、launch、missing-container エラー時も
@@ -228,10 +236,11 @@ caller-owned sink の上限ではありません。
 ソース互換性のため従来の全量保持を維持します。これは信頼できない
 出力には deprecated であり、新コードでは正の制限値または
 `ExecTo` / `LogsTo` を選んでください。
-`LogsOptions` に `MaxBytes` を追加したため、Go の構造体の性質上、旧
-2 要素 unkeyed literal はコンパイルできません。`LogsOptions{Tail: ...,
-Since: ...}` の keyed literal へ移行してください。これは pre-1.0 の
-意図的な source compatibility tradeoff として明記しています。
+`LogsOptions` は `Tail`、`Since`、`Timestamps`、`MaxBytes` を持ちます。
+Go の構造体の性質上、旧 unkeyed literal はコンパイルできません。
+`LogsOptions{Tail: ..., Since: ...}` の keyed literal へ移行してください
+（`Timestamps` を false のままにすれば従来の出力を維持できます）。
+これは pre-1.0 の意図的な source compatibility tradeoff として明記しています。
 大きな出力の integration test は bounded forwarding と draining のみを
 確認し、peak host memory は外部の RSS sampler なしには測定しません。
 
@@ -535,17 +544,21 @@ func DevelopmentWaitOptions() {
 `Logs` と、成功する `LogsWithOptions` 呼び出しは CLI process が終了するため
 有限のスナップショットを返しますが、単体で byte 上限は課しません。
 `Logs` は利用可能な出力をすべて要求します。`LogsOptions` は backend
-固有です。Docker は `Tail` と `Since` の両方を受け付けます。確認した
-Apple Container CLI の各 version は tail に `-n` を使い、`--since` を
-実装していないため、Apple backend は `Tail` を `-n` に対応させ、`Since` を
-`ErrUnsupportedCapability` で拒否します。範囲を指定しても大きさは
-コンテナ出力に依存し、`LogsWithOptions` は byte 上限を追加しません。
-`FollowLogs` はストリーミングする `io.ReadCloser` を返し、Close するか
-context をキャンセルするとバックエンド CLI を停止します。`ForLog` は
-`FollowLogs` を使い、`Logs` は新しい出力を追尾しません。
-`LogsOptions` と `LogsWithOptions` は開発版 API であり、`v0.2.0` には
-ありません。`LogsOptions.Tail` と `MaxBytes` は非負として検証され、
-`PruneReuseGroup` は `WithReuseGroup` と同じ reuse-group grammar を使います。
+固有です。Docker は `Tail`、`Since`、`Timestamps` を受け付けます。確認した
+Apple Container CLI の各 version は tail に `-n` を使い、`--since` と
+`--timestamps` を実装していないため、Apple backend は `Tail` を `-n` に
+対応させ、`Since` と `Timestamps` を `ErrUnsupportedCapability` で拒否します。
+範囲を指定しても大きさはコンテナ出力に依存し、`LogsWithOptions` は byte 上限を
+追加しません。`FollowLogs` はストリーミングする `io.ReadCloser` を返し、
+Close するか context をキャンセルするとバックエンド CLI を停止します。
+`FollowLogsWithOptions` と `FollowLogsToWithOptions` は
+`FollowLogsOptions{Tail, Since, Timestamps}` を stream に適用します。
+`Tail` が 0 の場合は利用可能な履歴をすべて replay し、Apple の capability rule は
+snapshot と同じです。`ForLog` は `FollowLogs` を使い、`Logs` は新しい出力を
+追尾しません。`LogsOptions`、`LogsWithOptions`、`FollowLogsOptions` 系 API は
+開発版 API であり、`v0.2.0` にはありません。`LogsOptions.Tail`/`MaxBytes` と
+`FollowLogsOptions.Tail` は非負として検証され、`PruneReuseGroup` は
+`WithReuseGroup` と同じ reuse-group grammar を使います。
 
 次の例は Docker 固有です。`v0.2.0` 以降に追加された log stream、exec
 option、公開 error symbol も示しますが、Apple の
@@ -557,6 +570,7 @@ package docexample
 import (
     "context"
     "errors"
+    "strings"
     "time"
 
     container "github.com/hirokazumiyaji/container-go"
@@ -564,21 +578,26 @@ import (
 
 func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
     logs, err := ctr.LogsWithOptions(ctx, container.LogsOptions{
-        Tail:  10,
-        Since: time.Now(),
+        Tail:       10,
+        Since:      time.Now(),
+        Timestamps: true,
     })
     if err != nil {
         return err
     }
     defer logs.Close()
 
-    stream, err := ctr.FollowLogs(ctx)
+    stream, err := ctr.FollowLogsWithOptions(ctx, container.FollowLogsOptions{
+        Tail:       10,
+        Timestamps: true,
+    })
     if err != nil {
         return err
     }
     defer stream.Close()
 
     _, _, err = ctr.Exec(ctx, []string{"true"},
+        container.WithExecStdin(strings.NewReader("SELECT 1;")),
         container.WithExecEnv(map[string]string{"MODE": "test"}),
         container.WithExecUser("test"),
         container.WithExecWorkDir("/tmp"),
@@ -1172,7 +1191,10 @@ func TestReuse(t *testing.T) {
   `WithTestLogger(t)` はコンテナ log を test の間 `t.Logf` へ転送します。
   新規コンテナは履歴を replay し、Docker の reuse attach は時計ずれで直後の log を
   落とさないよう attach の少し前から resume します（Apple は `--since` を持たないため
-  履歴を replay します）。
+  履歴を replay します）。どちらの test logger も CR/CRLF を改行へ正規化し、
+  terminal 制御文字を escape します。
+  `WithTestLogOnFailure(t)` は bounded な代替で、直近 64 KiB を ring buffer に保持し、
+  `t.Cleanup` 時に `t.Failed()` が真のときだけ sanitize 済み log を出力します。
 - 各作成は generation label を持ちます。`Terminate`、stopped 再作成経路、
   watchdog reaper は置き換わった generation の削除を拒否します。Docker の
   handle は `docker run` が出力した（または inspect で検証した）immutable ID で

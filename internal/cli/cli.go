@@ -44,6 +44,12 @@ var ErrSystemNotRunning = errors.New("container backend is not running")
 // Retrying the same runner and backend path cannot recover from it.
 var ErrStreamSetup = errors.New("log stream setup failed")
 
+// ErrStdinUnsupported reports that a Runner cannot attach a caller reader to
+// the child's standard input. Runner stays a single-method interface for
+// compatibility, so stdin is an optional extension rather than a new
+// requirement on every existing test double and embedding wrapper.
+var ErrStdinUnsupported = errors.New("runner does not support stdin")
+
 type SystemNotRunningError struct {
 	hint      string
 	original  error
@@ -124,6 +130,29 @@ type Probe struct {
 // Runner executes one backend CLI invocation.
 type Runner interface {
 	Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
+}
+
+// StdinRunner is the optional stdin extension of Runner. Its RunWithStdin
+// follows the WriterRunner contract for output and additionally feeds stdin
+// to the child. A runner that cannot own the child's standard input must not
+// implement this interface: there is no safe fallback that leaves the
+// command's stdin closed while the caller asked for input.
+type StdinRunner interface {
+	Runner
+
+	RunWithStdin(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (OutputStats, error)
+}
+
+// RunWithStdin executes a CLI invocation through the optional StdinRunner
+// extension. Unlike RunTo there is no legacy fallback: a runner without
+// stdin support reports ErrStdinUnsupported, and the caller can decide
+// whether that is a capability error.
+func RunWithStdin(r Runner, ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
+	sr, ok := r.(StdinRunner)
+	if !ok {
+		return OutputStats{}, fmt.Errorf("%w: runner %T cannot attach stdin", ErrStdinUnsupported, r)
+	}
+	return sr.RunWithStdin(ctx, stdin, stdout, stderr, args...)
 }
 
 // ExternalRunner identifies runners that execute the CLI as real child
@@ -410,7 +439,7 @@ func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
-	err := r.execute(ctx, hooks, &stdout, &stderr, func() ([]byte, []byte) {
+	err := r.execute(ctx, hooks, nil, &stdout, &stderr, func() ([]byte, []byte) {
 		return stdout.Bytes(), stderr.Bytes()
 	}, args)
 	return stdout.Bytes(), stderr.Bytes(), err
@@ -424,6 +453,18 @@ func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([
 // status. A CLIError diagnostic is taken from a bounded stderr tail, and
 // its stdout side channel is empty because stdout is not retained.
 func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
+	return r.runTo(ctx, nil, stdout, stderr, args...)
+}
+
+// RunWithStdin is RunTo with stdin wired to the child process. When the
+// caller's context is cancelled, the child's input pipe is closed and a
+// closable reader is closed as well so a blocked copy cannot keep the
+// lifecycle from completing.
+func (r *ExecRunner) RunWithStdin(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
+	return r.runTo(ctx, stdin, stdout, stderr, args...)
+}
+
+func (r *ExecRunner) runTo(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
 	if stdout == nil {
 		stdout = io.Discard
 	}
@@ -433,7 +474,7 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 	stdoutCount := &countingWriter{dst: stdout}
 	stderrCount := &countingWriter{dst: stderr}
 	diagnostic := newTailBuffer(maxStderrContext)
-	runErr := r.execute(ctx, runHooks{}, stdoutCount, &diagnosticWriter{output: stderrCount, diagnostic: diagnostic}, func() ([]byte, []byte) {
+	runErr := r.execute(ctx, runHooks{}, stdin, stdoutCount, &diagnosticWriter{output: stderrCount, diagnostic: diagnostic}, func() ([]byte, []byte) {
 		return nil, []byte(diagnostic.String())
 	}, args)
 	stdoutBytes, stdoutErr := stdoutCount.snapshot()
@@ -451,10 +492,12 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 	)
 }
 
-// execute owns one command lifecycle. stdoutW and stderrW receive the
-// child's streams; captured returns the stdout and stderr bytes available
-// for the CLIError diagnostic once the child has been reaped.
-func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stderrW io.Writer, captured func() ([]byte, []byte), args []string) error {
+// execute owns one command lifecycle. stdin, when non-nil, is copied to the
+// child's standard input by a feed the lifecycle can stop. stdoutW and
+// stderrW receive the child's streams; captured returns the stdout and
+// stderr bytes available for the CLIError diagnostic once the child has
+// been reaped.
+func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdin io.Reader, stdoutW, stderrW io.Writer, captured func() ([]byte, []byte), args []string) error {
 	bin := r.binary()
 	identity := r.identity()
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -463,10 +506,22 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	}
 	configureProcessTree(cmd)
 	lifecycle := newCommandLifecycle(ctx, cmd)
+	var feed *stdinFeed
+	if stdin != nil {
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			lifecycle.failStart()
+			return markRunStatus(fmt.Errorf("%s: %w", commandText(bin, args), err), lifecycle.status())
+		}
+		feed = newStdinFeed(stdin, pipe)
+	}
 	var cancelObservedOnce sync.Once
 	cmd.Cancel = func() error {
 		if hooks.cancelObserved != nil {
 			cancelObservedOnce.Do(hooks.cancelObserved)
+		}
+		if feed != nil {
+			feed.abort()
 		}
 		return lifecycle.cancel()
 	}
@@ -481,11 +536,17 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	}
 	if err := start(cmd); err != nil {
 		lifecycle.failStart()
+		if feed != nil {
+			feed.close()
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			contextErr := commandContextError(bin, args, ctxErr)
 			return markRunStatus(errors.Join(contextErr, err), lifecycle.status())
 		}
 		return markRunStatus(err, lifecycle.status())
+	}
+	if feed != nil {
+		feed.start()
 	}
 	if hooks.beforePublish != nil {
 		hooks.beforePublish()
@@ -511,6 +572,11 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	// This keeps context cancellation and the eventual reap from racing a
 	// stale process-handle or numeric process-group signal.
 	err := lifecycle.result()
+	if feed != nil {
+		// The child is gone; stop a pump blocked writing into its closed
+		// stdin pipe. A blocked read is released by abort on cancellation.
+		feed.close()
+	}
 	status := lifecycle.status()
 	stdout, stderr := captured()
 	commandErr := commandError(ctx, bin, identity, args, stdout, stderr, err)
@@ -518,6 +584,95 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 		commandErr = commandContextError(bin, args, ctx.Err())
 	}
 	return markRunStatus(commandErr, status)
+}
+
+// stdinAbortGrace bounds how long cancellation waits for a stdin copy to
+// observe a closed reader. Standard library readers unblock immediately; the
+// bound only protects against an exotic Closer whose Close does not interrupt
+// a concurrent Read.
+const stdinAbortGrace = time.Second
+
+// stdinFeed copies a caller reader into a child's stdin pipe. The feed owns
+// the pipe instead of handing the reader to os/exec, because Wait can block
+// on a Stdin read that never returns even when WaitDelay is set. Owning the
+// pipe keeps child termination independent of the caller's reader, and
+// cancellation closes a closable reader so the copy goroutine can exit.
+type stdinFeed struct {
+	reader io.Reader
+	pipe   io.WriteCloser
+	done   chan struct{}
+
+	mu      sync.Mutex
+	started bool
+	closed  bool
+	aborted bool
+}
+
+func newStdinFeed(reader io.Reader, pipe io.WriteCloser) *stdinFeed {
+	return &stdinFeed{reader: reader, pipe: pipe, done: make(chan struct{})}
+}
+
+// start begins the copy after the child has started. If cancellation already
+// closed the feed, no goroutine is created.
+func (f *stdinFeed) start() {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return
+	}
+	f.started = true
+	f.mu.Unlock()
+	go f.copy()
+}
+
+func (f *stdinFeed) copy() {
+	defer close(f.done)
+	_, _ = io.Copy(f.pipe, f.reader)
+	_ = f.pipe.Close()
+}
+
+// close stops the feed after the child is gone. It closes the pipe so a
+// pending write fails; a read blocked on the caller's reader is not
+// interrupted outside cancellation.
+func (f *stdinFeed) close() {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return
+	}
+	f.closed = true
+	f.mu.Unlock()
+	_ = f.pipe.Close()
+}
+
+// abort stops the feed on context cancellation. Closing the child's pipe
+// releases a blocked write, and closing a closable reader releases a blocked
+// read. The bounded wait keeps the copy goroutine from outliving the run when
+// the reader honors Close.
+func (f *stdinFeed) abort() {
+	f.mu.Lock()
+	if f.aborted {
+		f.mu.Unlock()
+		return
+	}
+	f.aborted = true
+	started := f.started
+	f.closed = true
+	f.mu.Unlock()
+	_ = f.pipe.Close()
+	closer, closable := f.reader.(io.Closer)
+	if closable {
+		_ = closer.Close()
+	}
+	if !started || !closable {
+		return
+	}
+	timer := time.NewTimer(stdinAbortGrace)
+	defer timer.Stop()
+	select {
+	case <-f.done:
+	case <-timer.C:
+	}
 }
 
 func commandError(ctx context.Context, bin, identity string, args []string, stdout, stderr []byte, err error) error {

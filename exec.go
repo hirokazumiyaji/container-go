@@ -29,6 +29,7 @@ type execConfig struct {
 	timeoutSet bool
 	maxBytes   int64
 	stderr     io.Writer
+	stdin      io.Reader
 }
 
 // WithExecTimeout sets an upper bound for one Exec invocation. A
@@ -83,6 +84,30 @@ func WithExecStderr(w io.Writer) ExecOption {
 			return validationErrorf("WithExecStderr", nil, "stderr writer cannot be nil")
 		}
 		c.stderr = w
+		return nil
+	}
+}
+
+// WithExecStdin attaches r to the exec'd process's standard input and adds the
+// backend's interactive flag to the exec argv, so commands such as psql,
+// mysql, and redis-cli --pipe can read a dump from the caller instead of a
+// temporary file. The reader is consumed until EOF or until the command
+// exits. A nil or typed-nil reader is rejected as a validation error.
+//
+// Exec and ExecTo need a runner with the optional stdin capability; ExecRunner
+// provides it, and wrappers that embed ExecRunner inherit it. A runner without
+// that capability is rejected with ErrUnsupportedCapability before the backend
+// is invoked. When the context is
+// cancelled, the child's stdin pipe is closed and r is closed as well if it
+// implements io.Closer, so a blocked read cannot keep the CLI lifecycle from
+// completing; pass a reader whose Close is safe, or one that returns when the
+// cancellation is observed.
+func WithExecStdin(r io.Reader) ExecOption {
+	return func(c *execConfig) error {
+		if nilReader(r) {
+			return validationErrorf("WithExecStdin", nil, "stdin reader cannot be nil")
+		}
+		c.stdin = r
 		return nil
 	}
 }
@@ -210,6 +235,14 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 			return 0, nil, OutputStats{}, optionBoundaryError(err)
 		}
 	}
+	// Stdin is an optional runner capability. Reject it before any backend
+	// operation so an unsupported custom runner costs no inspect or exec.
+	if cfg.stdin != nil {
+		if _, ok := c.runner.(cli.StdinRunner); !ok {
+			return 0, emptyExecOutput(), OutputStats{}, fmt.Errorf(
+				"%w: exec stdin requires a runner that supports stdin", ErrUnsupportedCapability)
+		}
+	}
 
 	// Exec is a buffered, bounded operation by default. An explicit zero
 	// timeout opts out of the library default. A positive custom timeout
@@ -261,6 +294,12 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 	}
 
 	args := c.eng.execArgs(target, cfg, envFile, cmd)
+	runTo := func(stdout, stderr io.Writer) (cli.OutputStats, error) {
+		if cfg.stdin != nil {
+			return cli.RunWithStdin(c.runner, execCtx, cfg.stdin, stdout, stderr, args...)
+		}
+		return cli.RunTo(c.runner, execCtx, stdout, stderr, args...)
+	}
 	switch {
 	case streaming:
 		var limited *limitedWriter
@@ -284,7 +323,7 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 			stderrSink = stderrTracked
 		}
 		var runStats cli.OutputStats
-		runStats, err = cli.RunTo(c.runner, execCtx, sink, stderrSink, args...)
+		runStats, err = runTo(sink, stderrSink)
 		err = preserveOutputDeliveryError(err, tracked)
 		err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
 		stats = newOutputStats(runStats, limited)
@@ -292,14 +331,28 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 	case cfg.maxBytes > 0:
 		capture := newBoundedBuffer(cfg.maxBytes)
 		if cfg.stderr == nil {
-			_, err = cli.RunTo(c.runner, execCtx, capture, capture, args...)
+			_, err = runTo(capture, capture)
 		} else {
 			stderrTracked := newOutputTrackingWriter(cfg.stderr)
-			_, err = cli.RunTo(c.runner, execCtx, capture, stderrTracked, args...)
+			_, err = runTo(capture, stderrTracked)
 			err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
 		}
 		output = capture.reader()
 	default:
+		if cfg.stdin != nil {
+			// A stdin-capable runner reports output through writers. Keep
+			// the historical stdout-then-stderr concatenation.
+			var stdout, stderr bytes.Buffer
+			if cfg.stderr == nil {
+				_, err = cli.RunWithStdin(c.runner, execCtx, cfg.stdin, &stdout, &stderr, args...)
+			} else {
+				stderrTracked := newOutputTrackingWriter(cfg.stderr)
+				_, err = cli.RunWithStdin(c.runner, execCtx, cfg.stdin, &stdout, stderrTracked, args...)
+				err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
+			}
+			output = io.MultiReader(bytes.NewReader(stdout.Bytes()), bytes.NewReader(stderr.Bytes()))
+			break
+		}
 		if cfg.stderr == nil {
 			var stdout, stderr []byte
 			stdout, stderr, err = c.runner.Run(execCtx, args...)

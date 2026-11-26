@@ -619,3 +619,137 @@ exit 1
 	}
 	return path
 }
+
+// TestLogsOptionsTimestamps fixes the snapshot argv for the added Timestamps
+// field on both backends. Apple Container has no --timestamps equivalent.
+func TestLogsOptionsTimestamps(t *testing.T) {
+	const testDockerUID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	t.Run("docker", func(t *testing.T) {
+		f := newDockerTestRunner()
+		ctr := &Container{id: "myctr", creation: "bbbbbbbbbbbbbbbb", runner: f, eng: dockerEngine{}}
+		ctr.setImmutableID(testDockerUID)
+
+		rc, err := ctr.LogsWithOptions(context.Background(), LogsOptions{Tail: 5, Timestamps: true})
+		if err != nil {
+			t.Fatalf("LogsWithOptions: %v", err)
+		}
+		_ = rc.Close()
+		want := []string{"logs", "--tail", "5", "--timestamps", testDockerUID}
+		if call := f.callWith("logs"); !slices.Equal(call, want) {
+			t.Errorf("logs args = %v, want %v", call, want)
+		}
+	})
+
+	t.Run("apple rejects", func(t *testing.T) {
+		f := newTestRunner()
+		ctr := &Container{id: "myctr", creation: "bbbbbbbbbbbbbbbb", runner: f, eng: appleEngine{}}
+
+		_, err := ctr.LogsWithOptions(context.Background(), LogsOptions{Timestamps: true})
+		if !errors.Is(err, ErrUnsupportedCapability) {
+			t.Fatalf("LogsWithOptions error = %v, want ErrUnsupportedCapability", err)
+		}
+		if call := f.callWith("logs"); call != nil {
+			t.Errorf("unsupported timestamps must not invoke the CLI: %v", call)
+		}
+	})
+}
+
+func TestFollowLogsWithOptionsBackendMatrix(t *testing.T) {
+	since := time.Date(2026, 9, 11, 3, 4, 5, 600000000, time.UTC)
+	sinceArg := since.Format(time.RFC3339Nano)
+	const testDockerUID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const testCreation = "bbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name            string
+		eng             engine
+		opts            FollowLogsOptions
+		wantArgs        []string
+		wantUnsupported bool
+		wantValidation  bool
+	}{
+		{name: "apple tail only", eng: appleEngine{}, opts: FollowLogsOptions{Tail: 50}, wantArgs: []string{"logs", "--follow", "-n", "50", "myctr"}},
+		{name: "apple since rejected", eng: appleEngine{}, opts: FollowLogsOptions{Since: since}, wantUnsupported: true},
+		{name: "apple timestamps rejected", eng: appleEngine{}, opts: FollowLogsOptions{Timestamps: true}, wantUnsupported: true},
+		{name: "apple neither", eng: appleEngine{}, wantArgs: []string{"logs", "--follow", "myctr"}},
+		{name: "docker all options", eng: dockerEngine{}, opts: FollowLogsOptions{Tail: 50, Since: since, Timestamps: true},
+			wantArgs: []string{"logs", "--follow", "--tail", "50", "--since", sinceArg, "--timestamps", testDockerUID}},
+		{name: "docker since only", eng: dockerEngine{}, opts: FollowLogsOptions{Since: since},
+			wantArgs: []string{"logs", "--follow", "--since", sinceArg, testDockerUID}},
+		{name: "docker timestamps only", eng: dockerEngine{}, opts: FollowLogsOptions{Timestamps: true},
+			wantArgs: []string{"logs", "--follow", "--timestamps", testDockerUID}},
+		{name: "docker neither", eng: dockerEngine{}, wantArgs: []string{"logs", "--follow", testDockerUID}},
+		{name: "negative tail", eng: appleEngine{}, opts: FollowLogsOptions{Tail: -1}, wantValidation: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &streamRunner{fakeRunner: newTestRunner()}
+			ctr := &Container{id: "myctr", creation: testCreation, runner: f, eng: tc.eng}
+			if _, ok := tc.eng.(dockerEngine); ok {
+				ctr.setImmutableID(testDockerUID)
+			}
+
+			rc, err := ctr.FollowLogsWithOptions(context.Background(), tc.opts)
+			if tc.wantUnsupported {
+				if !errors.Is(err, ErrUnsupportedCapability) {
+					t.Fatalf("FollowLogsWithOptions error = %v, want ErrUnsupportedCapability", err)
+				}
+				if f.streamArgs != nil {
+					t.Errorf("unsupported options started a stream: %v", f.streamArgs)
+				}
+				return
+			}
+			if tc.wantValidation {
+				if !errors.Is(err, ErrInvalidOption) {
+					t.Fatalf("FollowLogsWithOptions error = %v, want ErrInvalidOption", err)
+				}
+				if f.streamArgs != nil {
+					t.Errorf("invalid options started a stream: %v", f.streamArgs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FollowLogsWithOptions: %v", err)
+			}
+			_ = rc.Close()
+			if !slices.Equal(f.streamArgs, tc.wantArgs) {
+				t.Errorf("follow args = %v, want %v", f.streamArgs, tc.wantArgs)
+			}
+		})
+	}
+}
+
+func TestFollowLogsToWithOptionsUsesFollowArgs(t *testing.T) {
+	f := &streamRunner{fakeRunner: newTestRunner(), streamData: "line\n"}
+	ctr := &Container{id: "myctr", creation: "bbbbbbbbbbbbbbbb", runner: f, eng: dockerEngine{}}
+	ctr.setImmutableID(testDockerUID)
+
+	var output strings.Builder
+	err := ctr.FollowLogsToWithOptions(context.Background(), &output, FollowLogsOptions{Timestamps: true})
+	if err != nil {
+		t.Fatalf("FollowLogsToWithOptions: %v", err)
+	}
+	if got, want := output.String(), "line\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+	wantArgs := []string{"logs", "--follow", "--timestamps", testDockerUID}
+	if !slices.Equal(f.streamArgs, wantArgs) {
+		t.Errorf("follow args = %v, want %v", f.streamArgs, wantArgs)
+	}
+}
+
+func TestFollowLogsToWithOptionsRejectsUnsupportedAppleLogOptions(t *testing.T) {
+	f := &streamRunner{fakeRunner: newTestRunner()}
+	ctr := &Container{id: "myctr", creation: "bbbbbbbbbbbbbbbb", runner: f, eng: appleEngine{}}
+
+	for _, opts := range []FollowLogsOptions{{Since: time.Now()}, {Timestamps: true}} {
+		err := ctr.FollowLogsToWithOptions(context.Background(), io.Discard, opts)
+		if !errors.Is(err, ErrUnsupportedCapability) {
+			t.Errorf("FollowLogsToWithOptions(%+v) error = %v, want ErrUnsupportedCapability", opts, err)
+		}
+	}
+	if f.streamArgs != nil {
+		t.Errorf("unsupported options started a stream: %v", f.streamArgs)
+	}
+}

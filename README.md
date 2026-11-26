@@ -228,6 +228,15 @@ container cannot make the host allocate an unbounded response:
   mode. Supplying the same comparable writer value for both streams (typically
   the same pointer) is allowed and writes are serialized; distinct wrappers or
   non-comparable dynamic types are not detected.
+- `WithExecStdin(r)` attaches `r` to the exec'd process's stdin and adds
+  `exec -i`, so a dump can be piped into `psql`, `mysql`, or
+  `redis-cli --pipe` without a temporary file. A nil or typed-nil reader is
+  rejected as a `*ValidationError`. The runner must provide the optional
+  stdin capability that `ExecRunner` (and any wrapper embedding it)
+  implements; otherwise `Exec`/`ExecTo` return `ErrUnsupportedCapability`
+  before invoking the backend. On context cancellation the child's stdin pipe is closed and a
+  reader that implements `io.Closer` is closed too, so a blocked copy cannot
+  outlive the CLI lifecycle.
 - A bounded reader returns `ErrOutputTruncated` as its terminal read
   error, while still returning all retained bytes. Check
   `errors.Is(readErr, container.ErrOutputTruncated)` or the
@@ -252,12 +261,13 @@ new code should select a positive limit or use a streaming method.
 The legacy path will be reconsidered in a future minor release, but
 this change does not silently discard existing output.
 
-`LogsOptions` now has a `MaxBytes` field. Go cannot add a field to a
-struct without breaking old unkeyed literals, so this release
-intentionally requires keyed `LogsOptions` literals; update existing
-`LogsOptions{tail, since}` calls to `LogsOptions{Tail: tail, Since:
-since}`. The repository is pre-1.0 and documents this narrow source
-compatibility tradeoff rather than hiding it behind a second option
+`LogsOptions` now has `Tail`, `Since`, `Timestamps`, and `MaxBytes`
+fields. Go cannot add a field to a struct without breaking old unkeyed
+literals, so this release intentionally requires keyed `LogsOptions`
+literals; update existing `LogsOptions{tail, since}` calls to
+`LogsOptions{Tail: tail, Since: since}` (leaving `Timestamps` false keeps
+the previous output). The repository is pre-1.0 and documents this narrow
+source compatibility tradeoff rather than hiding it behind a second option
 representation. The large-output integration check verifies bounded
 forwarding and draining; it does not measure peak host memory, which
 would require an external RSS sampler.
@@ -575,17 +585,22 @@ described below.
 `Logs` and a supported `LogsWithOptions` call return a finite snapshot
 because the CLI process finishes, but neither method imposes a byte limit
 by itself. `Logs` requests all available output. `LogsOptions` is
-backend-specific: Docker supports both `Tail` and `Since`. The checked
-Apple Container CLI versions use `-n` for a tail and have no `--since`
-option, so the Apple backend maps `Tail` to `-n` and rejects `Since` with
+backend-specific: Docker supports `Tail`, `Since`, and `Timestamps`. The
+checked Apple Container CLI versions use `-n` for a tail and have no
+`--since` or `--timestamps` option, so the Apple backend maps `Tail` to
+`-n` and rejects `Since` and `Timestamps` with
 `ErrUnsupportedCapability`. A requested window can still produce output
 whose size depends on the container, and `LogsWithOptions` does not add a
 byte cap. `FollowLogs` returns a streaming `io.ReadCloser`; close it or
-cancel its context to stop the backend CLI. `ForLog` uses `FollowLogs`,
-while `Logs` does not follow new output. `LogsOptions` and
-`LogsWithOptions` are current-development APIs, not part of `v0.2.0`.
-`LogsOptions.Tail` and `MaxBytes` are validated as non-negative, and
-`PruneReuseGroup` uses the same reuse-group grammar as `WithReuseGroup`.
+cancel its context to stop the backend CLI. `FollowLogsWithOptions` and
+`FollowLogsToWithOptions` apply `FollowLogsOptions{Tail, Since,
+Timestamps}` to that stream; a zero `Tail` replays all available history
+and the same Apple capability rules apply. `ForLog` uses `FollowLogs`,
+while `Logs` does not follow new output. `LogsOptions`, `LogsWithOptions`,
+and the `FollowLogsOptions` variants are current-development APIs, not part
+of `v0.2.0`. `LogsOptions.Tail`/`MaxBytes` and `FollowLogsOptions.Tail` are
+validated as non-negative, and `PruneReuseGroup` uses the same reuse-group
+grammar as `WithReuseGroup`.
 
 The example below is Docker-specific. It also shows the log stream, exec
 options, and public error symbols added after `v0.2.0`; it is not an Apple
@@ -597,6 +612,7 @@ package docexample
 import (
     "context"
     "errors"
+    "strings"
     "time"
 
     container "github.com/hirokazumiyaji/container-go"
@@ -604,21 +620,26 @@ import (
 
 func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
     logs, err := ctr.LogsWithOptions(ctx, container.LogsOptions{
-        Tail:  10,
-        Since: time.Now(),
+        Tail:       10,
+        Since:      time.Now(),
+        Timestamps: true,
     })
     if err != nil {
         return err
     }
     defer logs.Close()
 
-    stream, err := ctr.FollowLogs(ctx)
+    stream, err := ctr.FollowLogsWithOptions(ctx, container.FollowLogsOptions{
+        Tail:       10,
+        Timestamps: true,
+    })
     if err != nil {
         return err
     }
     defer stream.Close()
 
     _, _, err = ctr.Exec(ctx, []string{"true"},
+        container.WithExecStdin(strings.NewReader("SELECT 1;")),
         container.WithExecEnv(map[string]string{"MODE": "test"}),
         container.WithExecUser("test"),
         container.WithExecWorkDir("/tmp"),
@@ -1303,7 +1324,11 @@ Contract:
   verified only on hosts where that test ran. `WithTestLogger(t)` forwards a
   container's logs to `t.Logf` for the test's lifetime; new containers replay
   history and Docker reuse attaches resume just before attach time to tolerate
-  clock skew (Apple has no `--since` and replays history).
+  clock skew (Apple has no `--since` and replays history). Both test loggers
+  normalize CR/CRLF to line breaks and escape terminal control characters.
+  `WithTestLogOnFailure(t)` is the bounded alternative: it keeps the most
+  recent 64 KiB in a ring buffer and emits sanitized lines at `t.Cleanup`
+  only when `t.Failed()` is true.
 - Each creation carries a generation label; `Terminate`, the
   stopped-recreate path, and the watchdog reaper refuse to delete a replaced
   generation. Docker handles delete by the immutable ID printed by

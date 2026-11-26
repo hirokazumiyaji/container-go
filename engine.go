@@ -308,6 +308,9 @@ type engine interface {
 	// logsFollowArgs builds the streaming follow argv. It replays the
 	// backend's available history before following new output.
 	logsFollowArgs(id string) []string
+	// logsFollowArgsWithOptions builds the streaming follow argv for caller
+	// options and rejects options the backend cannot honor.
+	logsFollowArgsWithOptions(id string, opts FollowLogsOptions) ([]string, error)
 	// logsFollowResumeArgs builds the streaming follow argv for a
 	// replacement attach stream. Docker retains logs across a restart, so
 	// it must be told to start at since; replaying from the beginning
@@ -448,9 +451,13 @@ func copyFromArgsFor(id, containerPath, hostPath string) []string {
 	return []string{"cp", id + ":" + containerPath, hostPath}
 }
 
-// execArgsFor builds the shared exec argv.
+// execArgsFor builds the shared exec argv. Both backends accept -i to keep the
+// remote process's stdin open and attached to the CLI's stdin.
 func execArgsFor(id string, cfg *execConfig, envFile string, cmd []string) []string {
 	args := []string{"exec"}
+	if cfg.stdin != nil {
+		args = append(args, "-i")
+	}
 	if envFile != "" {
 		args = append(args, "--env-file", envFile)
 	}

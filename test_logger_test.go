@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"strings"
@@ -155,5 +156,193 @@ func TestTestLoggerKeepsHistoryForCreatedHandle(t *testing.T) {
 	})
 	if slices.Contains(f.streamArgs, "--since") {
 		t.Errorf("created handle stream args = %v, want history replay", f.streamArgs)
+	}
+}
+
+// recordingTestLogSink implements testLogSink so buffering and flush behavior
+// can be observed without depending on a real testing.T's output.
+type recordingTestLogSink struct {
+	mu       sync.Mutex
+	logs     []string
+	cleanups []func()
+	failed   bool
+}
+
+func (s *recordingTestLogSink) Logf(format string, args ...any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logs = append(s.logs, fmt.Sprintf(format, args...))
+}
+
+func (s *recordingTestLogSink) Cleanup(fn func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanups = append(s.cleanups, fn)
+}
+
+func (s *recordingTestLogSink) Failed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
+func (s *recordingTestLogSink) runCleanups() {
+	s.mu.Lock()
+	cleanups := append([]func(){}, s.cleanups...)
+	s.cleanups = nil
+	s.mu.Unlock()
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		cleanups[i]()
+	}
+}
+
+func (s *recordingTestLogSink) logged() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.logs...)
+}
+
+func newBufferedLogContainer(t *testing.T, data string) (*Container, *streamRunner) {
+	t.Helper()
+	f := &streamRunner{fakeRunner: newTestRunner(), streamData: data}
+	c := &Container{
+		id:     "myctr",
+		runner: f,
+		eng:    dockerEngine{},
+		sync:   &lockPack{uid: dockerFixtureID},
+	}
+	return c, f
+}
+
+func TestTestLogOnFailureOnlyFlushesFailedTests(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		name := "passing"
+		if failed {
+			name = "failing"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctr, _ := newBufferedLogContainer(t, "ready\r\n")
+			sink := &recordingTestLogSink{failed: failed}
+
+			startTestLogger(&config{testLogger: sink, testLogOnFailure: true}, ctr)
+			sink.runCleanups()
+
+			logs := sink.logged()
+			if !failed {
+				if len(logs) != 0 {
+					t.Fatalf("passing test logged container output: %v", logs)
+				}
+				return
+			}
+			if len(logs) != 1 || !strings.Contains(logs[0], "myctr: ready") {
+				t.Fatalf("failing test logs = %v, want the container line", logs)
+			}
+		})
+	}
+}
+
+func TestTestLogOnFailureBufferIsBounded(t *testing.T) {
+	var data strings.Builder
+	for i := 0; i < 3000; i++ {
+		fmt.Fprintf(&data, "line-%04d-%s\n", i, strings.Repeat("x", 60))
+	}
+	ctr, _ := newBufferedLogContainer(t, data.String())
+	sink := &recordingTestLogSink{failed: true}
+
+	startTestLogger(&config{testLogger: sink, testLogOnFailure: true}, ctr)
+	sink.runCleanups()
+
+	logs := sink.logged()
+	joined := strings.Join(logs, "\n")
+	total := 0
+	for _, line := range logs {
+		total += len(line) + 1
+	}
+	if total >= testLogOnFailureLimit {
+		t.Fatalf("buffered logs = %d bytes, want less than the %d-byte ring", total, testLogOnFailureLimit)
+	}
+	if !strings.Contains(joined, "line-2999") {
+		t.Error("missing the most recent line")
+	}
+	if strings.Contains(joined, "line-0000") {
+		t.Error("kept the oldest line instead of a bounded tail")
+	}
+	if len(logs) == 0 || !strings.HasPrefix(logs[0], "myctr: line-") {
+		t.Errorf("first flushed line = %q, want a complete prefixed record", logs[0])
+	}
+}
+
+func TestTestLogOnFailureSanitizesControlCharacters(t *testing.T) {
+	ctr, _ := newBufferedLogContainer(t, "before\x1b[31mred\x1b[0m\rprogress\n")
+	sink := &recordingTestLogSink{failed: true}
+
+	startTestLogger(&config{testLogger: sink, testLogOnFailure: true}, ctr)
+	sink.runCleanups()
+
+	joined := strings.Join(sink.logged(), "\n")
+	if strings.ContainsAny(joined, "\x1b\r") {
+		t.Fatalf("flushed logs contain raw terminal controls: %q", joined)
+	}
+	for _, want := range []string{"red", "progress"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("flushed logs = %q, want %q", joined, want)
+		}
+	}
+}
+
+func TestTestLogOnFailureRecordsStreamError(t *testing.T) {
+	ctr, _ := newBufferedLogContainer(t, "")
+	sink := &recordingTestLogSink{failed: true}
+	_, cancel := context.WithCancel(context.Background())
+
+	startTestLogOnFailure(sink, ctr, cancel, nil, errors.New("stream refused"))
+	sink.runCleanups()
+
+	joined := strings.Join(sink.logged(), "\n")
+	if !strings.Contains(joined, "stream logs for myctr: stream refused") {
+		t.Fatalf("flushed logs = %q, want the stream setup diagnostic", joined)
+	}
+
+	passing := &recordingTestLogSink{}
+	_, cancel = context.WithCancel(context.Background())
+	startTestLogOnFailure(passing, ctr, cancel, nil, errors.New("stream refused"))
+	passing.runCleanups()
+	if logs := passing.logged(); len(logs) != 0 {
+		t.Fatalf("passing test logged a stream setup error: %v", logs)
+	}
+}
+
+func TestWithTestLoggerSanitizesForwardedLines(t *testing.T) {
+	ctr, _ := newBufferedLogContainer(t, "")
+	sink := &recordingTestLogSink{}
+
+	forwardTestLogs(sink, ctr, strings.NewReader("before\x1b[31mred\x1b[0m\rprogress\n"))
+
+	logs := sink.logged()
+	joined := strings.Join(logs, "\n")
+	if strings.ContainsAny(joined, "\x1b\r") {
+		t.Fatalf("forwarded logs contain raw terminal controls: %q", joined)
+	}
+	if len(logs) != 2 {
+		t.Fatalf("forwarded logs = %v, want two CR-normalized lines", logs)
+	}
+	if !strings.Contains(logs[0], "red") || !strings.Contains(logs[1], "progress") {
+		t.Errorf("forwarded logs = %v", logs)
+	}
+}
+
+func TestWithTestLogOnFailureRejectsNil(t *testing.T) {
+	runner := newCountingRunner(newTestRunner())
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithTestLogOnFailure(nil))
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	if !strings.Contains(err.Error(), "testing.TB must not be nil") {
+		t.Fatalf("error = %v, want nil testing.TB validation", err)
+	}
+	if got := runner.count(); got != 0 {
+		t.Fatalf("backend CLI calls = %d, want 0", got)
 	}
 }

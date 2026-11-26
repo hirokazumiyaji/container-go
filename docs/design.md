@@ -265,6 +265,10 @@ described below are not.
 - `WithTestLogger(t testing.TB)`: stream the container's logs into `t.Logf`
   for the test's lifetime. New containers replay available history; Docker
   reuse attaches resume slightly before attach time to tolerate clock skew.
+  Lines are CR/CRLF-normalized and terminal control characters are escaped.
+  `WithTestLogOnFailure(t testing.TB)` is the bounded alternative: it keeps
+  the latest 64 KiB in a ring buffer and emits sanitized lines at
+  `t.Cleanup` only when the test failed.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
   Apple normally uses the container's direct IP, while Docker
   auto-publishes ports declared with `WithExposedPorts` to
@@ -331,9 +335,9 @@ described below are not.
   `linux/amd64` (including Rosetta use on Apple Container).
 
 Options outside the backend-neutral CLI surface are intentionally
-omitted. `WithTestLogger` is the supported test logger; for general log
-consumers, `FollowLogs` returns a stream and `Logs`/`LogsWithOptions`
-return snapshots.
+omitted. `WithTestLogger` and `WithTestLogOnFailure` are the supported test
+loggers; for general log consumers, `FollowLogs`/`FollowLogsWithOptions`
+return streams and `Logs`/`LogsWithOptions` return snapshots.
 
 ### Public input validation
 
@@ -382,6 +386,8 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
 func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
+func (c *Container) FollowLogsWithOptions(ctx context.Context, opts FollowLogsOptions) (io.ReadCloser, error)
+func (c *Container) FollowLogsToWithOptions(ctx context.Context, output io.Writer, opts FollowLogsOptions) error
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
@@ -405,7 +411,13 @@ this is kept for v1 compatibility. `WithExecStderr(w)` separates stderr:
 `Exec` then returns only stdout and `ExecTo` streams stderr to `w`;
 `WithExecMaxBytes` bounds stdout in that mode. If both streams use the same
 comparable writer value (typically the same pointer), writes are serialized;
-distinct wrappers and non-comparable dynamic types are not detected. When the
+distinct wrappers and non-comparable dynamic types are not detected.
+`WithExecStdin(io.Reader)` attaches the reader to the command's standard input
+and adds `exec -i`; a nil or typed-nil reader is a `*ValidationError`. The
+runner must provide the optional stdin capability (`ExecRunner` does),
+otherwise Exec/ExecTo return `ErrUnsupportedCapability` before invoking the
+backend. Cancellation closes the child's stdin pipe and a closable reader so
+the copy cannot outlive the local lifecycle. When the
 caller's context has no deadline, Exec applies a 30-second default. For a positive
 `WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
 the caller's deadline. `WithExecTimeout(0)` only disables the library
@@ -500,8 +512,8 @@ peak-memory bound before their own `Run` returns. The large-output
 integration check verifies bounded forwarding and draining, not peak
 host memory; RSS measurement would require an external sampler.
 
-`LogsOptions` now contains `MaxBytes` in addition to `Tail` and
-`Since`. Go cannot extend a struct without breaking old unkeyed
+`LogsOptions` now contains `Tail`, `Since`, `Timestamps`, and
+`MaxBytes`. Go cannot extend a struct without breaking old unkeyed
 literals, so this pre-1.0 release makes the source break explicit:
 callers must use keyed `LogsOptions` literals. This is preferable to
 maintaining a second, subtly different options representation. The
@@ -520,17 +532,19 @@ values use the same temporary-file mechanism as `WithEnv`. `Logs` and
 a supported `LogsWithOptions` call return a finite snapshot because the
 backend command finishes, but neither imposes a byte limit by itself.
 `Logs` requests all output. `LogsOptions` is backend-specific: Docker
-supports `Tail` and `Since`, while the checked Apple Container CLI
-versions use `-n` for a tail and have no `--since` option. The Apple
-backend maps `Tail` to `-n` and rejects `Since` with
-`ErrUnsupportedCapability`. A requested window's size still depends on the
-container output. `FollowLogs` is intentionally an unbounded stream and
-continues until its reader is closed or its context is cancelled.
-`LogsOptions` and `LogsWithOptions` are current-development APIs, not part
-of `v0.2.0`. `Terminate` is generation-guarded: Apple name deletion
-requires a valid creation generation, Docker deletion uses the immutable
-UID, and the reuse and failed-create paths require those ownership facts
-before deleting.
+supports `Tail`, `Since`, and `Timestamps`, while the checked Apple Container
+CLI versions use `-n` for a tail and have no `--since` or `--timestamps`
+option. The Apple backend maps `Tail` to `-n` and rejects `Since` and
+`Timestamps` with `ErrUnsupportedCapability`. A requested window's size still
+depends on the container output. `FollowLogs` is intentionally an unbounded
+stream and continues until its reader is closed or its context is cancelled;
+`FollowLogsWithOptions`/`FollowLogsToWithOptions` apply the same fields to that
+stream through `FollowLogsOptions`, where a zero `Tail` replays all available
+history. `LogsOptions`, `LogsWithOptions`, and the `FollowLogsOptions`
+variants are current-development APIs, not part of `v0.2.0`.
+`Terminate` is generation-guarded: Apple name deletion requires a valid
+creation generation, Docker deletion uses the immutable UID, and the reuse
+and failed-create paths require those ownership facts before deleting.
 
 `Terminate` maps to `container delete --force` on Apple Container and
 `docker rm --force` on Docker. It treats a recognized backend not-found
@@ -1227,11 +1241,13 @@ Docker's daemon assigns published ports atomically.
 
 **Bound snapshots only when requested**. `Logs` and a supported
 `LogsWithOptions` call finish a finite CLI snapshot, but `Logs` can buffer
-all available output. `LogsOptions{Tail, Since}` is backend-specific:
-Docker accepts both options, while the checked Apple Container CLI
-versions use `-n` for Tail and have no Since option. The Apple backend maps
-Tail to `-n` and rejects Since with `ErrUnsupportedCapability`. Neither
-option adds a byte cap; `LogsOptions.MaxBytes`, `WithExecMaxBytes`,
+all available output. `LogsOptions{Tail, Since, Timestamps}` is backend-specific:
+Docker accepts all three options, while the checked Apple Container CLI
+versions use `-n` for Tail and have no Since or Timestamps option. The Apple
+backend maps Tail to `-n` and rejects Since and Timestamps with
+`ErrUnsupportedCapability`. `FollowLogsOptions` exposes Tail, Since, and
+Timestamps for the streaming variants under the same rules. None of these
+options adds a byte cap; `LogsOptions.MaxBytes`, `WithExecMaxBytes`,
 `ExecTo`, and `LogsTo` provide a prefix cap or a caller-owned sink, and
 bounded captures report truncation through `Truncated` and
 `ErrOutputTruncated`. `ForExec` discards its output unless an output

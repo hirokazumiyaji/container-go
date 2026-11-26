@@ -64,7 +64,7 @@ func TestWithStopSignalValidation(t *testing.T) {
 	}
 	for _, signal := range []string{
 		"", "term", "sigterm", "0", "65", "999", "09", "-9", "--signal",
-		"SIGTERM\n", "NOT-A-SIGNAL", "FOO", "SIGTERM+3", "SIGRTMIN+16",
+		"SIGTERM\n", "NOT-A-SIGNAL", "FOO", "SIGTERM+3", "SIGRTMIN+16", "SIGRTMIN+0", "RTMIN+0", "SIGRTMAX-0", "RTMAX-0",
 		"RTMIN-3", "SIGRTMAX-15", "SIGTERM;", " SIGTERM", "SIGTERM ",
 	} {
 		t.Run("invalid "+signal, func(t *testing.T) {

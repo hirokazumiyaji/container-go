@@ -930,10 +930,12 @@ func validRealtimeStopSignal(name string) bool {
 }
 
 // stopSignalOffset returns whether offset is a canonical decimal integer in
-// 0..max.
+// 1..max. A zero offset is rejected: Docker's signal parser accepts SIGRTMIN
+// and SIGRTMAX on their own but rejects the explicit "+0" and "-0" spellings,
+// so accepting them here would only move the failure to the CLI.
 func stopSignalOffset(offset string, max int) bool {
 	number, err := strconv.Atoi(offset)
-	return err == nil && number >= 0 && number <= max && strconv.Itoa(number) == offset
+	return err == nil && number >= 1 && number <= max && strconv.Itoa(number) == offset
 }
 
 // WithStopSignal sets the signal sent to the container's main process when it

@@ -460,18 +460,24 @@ func publishObservedMatch(
 
 func receiveLogScanResultAfterCancel(results <-chan logScanResult, matched *atomic.Bool) (logScanResult, bool) {
 	if matched == nil || !matched.Load() {
-		// No pre-cancel match. Do not wait: cancellation may unblock a
-		// custom reader that then emits a matching line for the first time.
+		// No pre-cancel match. A match published after cancellation is not
+		// readiness, because a custom reader can unblock on cancel and then
+		// emit a buffered line that was never observed in time. A settled
+		// diagnostic is still worth waiting for: the scanner may have been
+		// about to publish the stream cause the caller needs to explain the
+		// deadline. Bound the wait so a reader that never unblocks cannot
+		// hold WaitUntilReady open.
 		select {
 		case result := <-results:
-			if result.found {
-				result.found = false
-				if result.err == nil {
-					result.err = context.Canceled
-				}
-			}
-			return result, true
+			return cancelLogScanResult(result), true
 		default:
+		}
+		timer := time.NewTimer(terminalSettleWindow)
+		defer timer.Stop()
+		select {
+		case result := <-results:
+			return cancelLogScanResult(result), true
+		case <-timer.C:
 			return logScanResult{}, false
 		}
 	}
@@ -491,6 +497,18 @@ func receiveLogScanResultAfterCancel(results <-chan logScanResult, matched *atom
 			return logScanResult{}, false
 		}
 	}
+}
+
+// cancelLogScanResult keeps a settled diagnostic but never a post-cancel
+// match: readiness has to be observed before the caller's deadline.
+func cancelLogScanResult(result logScanResult) logScanResult {
+	if result.found {
+		result.found = false
+		if result.err == nil {
+			result.err = context.Canceled
+		}
+	}
+	return result
 }
 
 // logMatchProgress returns how many occurrences a completed line adds to or

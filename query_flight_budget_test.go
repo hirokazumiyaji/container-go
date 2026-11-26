@@ -108,7 +108,7 @@ func TestDockerMetadataSeparatesQueryBudgets(t *testing.T) {
 					_, err := dockerDefaultNetworkCached(ctx, cache, runner, dockerEngine{}, timeouts)
 					return err
 				}
-				return dockerCopyFileFromContainerVersionCached(ctx, cache, runner, dockerEngine{}, timeouts)
+				return dockerCopyFileFromContainerVersionCached(ctx, cache, runner, dockerEngine{}, dockerEngine{}, timeouts)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()

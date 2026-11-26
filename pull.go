@@ -514,7 +514,10 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 	if err != nil {
 		return imageIdentity{}, err
 	}
-	complete := c.eng.imageIdentityComplete(pinned, platform)
+	complete := true
+	if verifier, ok := c.eng.(engineImageVerifier); ok {
+		complete = verifier.imageIdentityComplete(pinned, platform)
+	}
 	if !imageIdentityNeedsLocalAddressCheck(c.eng, pinned, c.pullPolicy) ||
 		(pinned.reference == image && pinned.pinned && !pinned.appleSynthetic && complete) {
 		return pinned, nil
@@ -585,13 +588,19 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 		}
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not report an immutable identity", ErrImageIdentityUnavailable, pinned.reference)
 	}
-	if err := c.eng.verifyPinnedImageIdentity(pinned, checked.identity, platform); err != nil {
-		return imageIdentity{}, err
+	verifier, hasVerifier := c.eng.(engineImageVerifier)
+	if hasVerifier {
+		if err := verifier.verifyPinnedImageIdentity(pinned, checked.identity, platform); err != nil {
+			return imageIdentity{}, err
+		}
 	}
 	if !requestedImageIdentitiesCompatible(pinned, checked.identity) {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s changed before run", ErrImageIdentityMismatch, pinned.reference)
 	}
-	return c.eng.reconcileImageIdentity(pinned, checked.identity), nil
+	if hasVerifier {
+		return verifier.reconcileImageIdentity(pinned, checked.identity), nil
+	}
+	return pinned, nil
 }
 
 // verifyStrictCreatedImage closes the final addressability window for a

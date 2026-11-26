@@ -53,6 +53,3 @@ func (appleEngine) imageReferencesCompatible(requested, actual string) bool {
 func (appleEngine) parsePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
 	return applePruneCandidates(data)
 }
-
-// checkReuseNetworkCompat has no Docker network model to verify.
-func (appleEngine) checkReuseNetworkCompat(*engineInfo, *config) error { return nil }

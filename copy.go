@@ -1125,9 +1125,9 @@ func noCopyStagingRootCleanup() error { return nil }
 // describe a different daemon. Failures are not recorded and a later copy
 // retries them. Concurrent copies share the check through copyVersionMu; a
 // waiting caller's context still bounds the wait.
-func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error {
+func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context, copyOut engineCopyOut) error {
 	if !c.eng.capabilities().copyOutVersionCheck {
-		return c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()})
+		return copyOut.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()})
 	}
 	p := c.pack()
 	if p.copyVersionOK.Load() {
@@ -1140,7 +1140,7 @@ func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error
 	if p.copyVersionOK.Load() {
 		return nil
 	}
-	if err := dockerCopyFileFromContainerVersionCached(ctx, c.dockerMeta, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
+	if err := dockerCopyFileFromContainerVersionCached(ctx, c.dockerMeta, c.runner, c.eng, copyOut, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
 		return err
 	}
 	p.copyVersionOK.Store(true)
@@ -1194,8 +1194,9 @@ func (c *Container) copyFileFromContainer(ctx context.Context, containerPath str
 	if err := ctx.Err(); err != nil {
 		return nil, c.publicError(err)
 	}
-	if err := c.eng.checkCopyFileFromContainer(); err != nil {
-		return nil, c.publicError(err)
+	copyOut, ok := c.eng.(engineCopyOut)
+	if !ok {
+		return nil, c.publicError(unsupportedCopyOut(c.eng))
 	}
 	if err := checkCopyFileOpenCapability(); err != nil {
 		return nil, c.publicError(err)
@@ -1207,7 +1208,7 @@ func (c *Container) copyFileFromContainer(ctx context.Context, containerPath str
 	if err != nil {
 		return nil, c.publicError(err)
 	}
-	if err := c.checkCopyFileFromContainerVersion(qCtx); err != nil {
+	if err := c.checkCopyFileFromContainerVersion(qCtx, copyOut); err != nil {
 		return nil, c.publicError(err)
 	}
 
@@ -1240,7 +1241,7 @@ func (c *Container) copyFileFromContainer(ctx context.Context, containerPath str
 	if err := ctx.Err(); err != nil {
 		return nil, c.publicError(err)
 	}
-	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
+	if _, _, err := c.runner.Run(qCtx, copyOut.copyFromArgs(target, containerPath, dst)...); err != nil {
 		classified := wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "cp"), "cp", target, c.id)
 		return nil, c.redactError(classified, target, containerPath)
 	}

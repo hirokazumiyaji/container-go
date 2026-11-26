@@ -223,9 +223,9 @@ const dockerCopyVersionOK = "ok"
 // client/server versions through the optional shared cache. Only a successful
 // check is stored, so a failed probe never poisons the next caller. A nil
 // cache performs the check directly.
-func dockerCopyFileFromContainerVersionCached(ctx context.Context, cache *dockerMetadataCache, runner cli.Runner, eng engine, timeouts opTimeouts) error {
+func dockerCopyFileFromContainerVersionCached(ctx context.Context, cache *dockerMetadataCache, runner cli.Runner, eng engine, copyOut engineCopyOut, timeouts opTimeouts) error {
 	check := func(ctx context.Context) (string, error) {
-		if err := eng.checkCopyFileFromContainerVersion(ctx, runner, timeouts); err != nil {
+		if err := copyOut.checkCopyFileFromContainerVersion(ctx, runner, timeouts); err != nil {
 			return "", err
 		}
 		return dockerCopyVersionOK, nil

@@ -686,8 +686,6 @@ func dockerBindingConnectHost(b boundPort, eng engine) (string, error) {
 	return domain.BindingConnectHost(domainPortBinding(b), endpointBackendFor(eng))
 }
 
-func (dockerEngine) checkCopyFileFromContainer() error { return nil }
-
 type dockerVersionOutput struct {
 	Client struct {
 		Version string `json:"Version"`

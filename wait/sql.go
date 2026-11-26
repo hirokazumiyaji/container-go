@@ -200,11 +200,12 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		if err != nil {
 			return err
 		}
-		// Iterate the result so a driver that defers a failure until the
-		// first row fetch reports it through rows.Err. database/sql only
-		// exposes such an error after Next has advanced the cursor.
-		for rows.Next() {
-		}
+		// Advance once so a driver that defers a failure until the first
+		// row fetch reports it through rows.Err; database/sql only exposes
+		// such an error after Next has moved the cursor. One advance is
+		// enough for readiness, and it keeps a large or unbounded result from
+		// extending the probe.
+		rows.Next()
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
 			return err

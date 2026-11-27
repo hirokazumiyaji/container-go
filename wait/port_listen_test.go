@@ -251,3 +251,33 @@ func TestForListeningPortContainerCheckHonorsCancellation(t *testing.T) {
 		t.Fatal("WaitUntilReady did not return after cancellation")
 	}
 }
+
+// A Docker port proxy completes the host handshake before the container
+// process listens, so the exec-based container-side check must not run on
+// every host poll. The cached closed result keeps the wait semantics while
+// bounding subprocess launches.
+func TestForListeningPortThrottlesContainerProbe(t *testing.T) {
+	restore := containerPortProbeInterval
+	containerPortProbeInterval = 40 * time.Millisecond
+	t.Cleanup(func() { containerPortProbeInterval = restore })
+
+	ln := startProxyOnlyListener(t)
+	target := &portListenTarget{
+		fakeTarget: newFakeTarget(),
+		statuses:   []PortListenStatus{PortListenClosed},
+	}
+	target.endpoint = ln.Addr().String()
+
+	err := ForListeningPort("6379/tcp").
+		WithStartupTimeout(155*time.Millisecond).
+		WithPollInterval(5*time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("wait reported readiness for a closed container port")
+	}
+	// About four probes fit in 155ms at a 40ms floor; unthrottled polling
+	// would execute one per 5ms poll.
+	if target.calls < 2 || target.calls > 5 {
+		t.Fatalf("container checks = %d, want throttled to about 4", target.calls)
+	}
+}

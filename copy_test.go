@@ -19,7 +19,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
-const defaultTestDockerVersion = `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`
+const defaultTestDockerVersion = `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0","Os":"linux"}}`
 
 // cpRunner materializes files for container-to-host copies.
 type cpRunner struct {

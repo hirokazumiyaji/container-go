@@ -6,30 +6,62 @@ package strictjson
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrNull reports a JSON null where a required value must decode.
+var ErrNull = errors.New("must not be null")
+
+// NonNull decodes a T and rejects an explicit JSON null. A field declared
+// with NonNull is required: an omitted field keeps the zero value, while a
+// present-but-null field fails the decode.
+//
+// Encoding/json matches struct tags case-insensitively and applies duplicate
+// keys in document order before calling UnmarshalJSON, so a null cannot
+// bypass the check through another spelling or a later duplicate key. The
+// check runs in the same decode that fills the surrounding struct, so no
+// second pass over the entry is needed to find nulls.
+type NonNull[T any] struct {
+	Value T
+}
+
+func (n *NonNull[T]) UnmarshalJSON(data []byte) error {
+	if IsNull(data) {
+		return ErrNull
+	}
+	return json.Unmarshal(data, &n.Value)
+}
+
+// MarshalJSON keeps a NonNull field's encoded shape identical to T.
+func (n NonNull[T]) MarshalJSON() ([]byte, error) {
+	return json.Marshal(n.Value)
+}
 
 // Array decodes data as a JSON array of T and reports an error, not a
 // zero value, for output that is unusable:
 //
 //   - a top-level null instead of an array,
 //   - a null element,
-//   - an explicit null in one of required, a dotted path into a nested
-//     object. Field names are matched the way encoding/json matches struct
-//     tags: an exact match or a case-insensitive one, and a later duplicate
-//     key wins, as it does during decoding.
+//   - an explicit null in a required field, or on the dotted path to one.
+//     The diagnostic matches field names the way encoding/json matches
+//     struct tags: an exact match or a case-insensitive one, and a later
+//     duplicate key wins, as it does during decoding.
 //
-// encoding/json decodes a JSON null into a zero value, which erases the
-// difference between a field the CLI omitted and one that leaves the
+// T rejects nulls in the fields it requires during the typed decode, using
+// NonNull. encoding/json decodes a JSON null into a zero value, which erases
+// the difference between a field the CLI omitted and one that leaves the
 // entry unreadable. A caller that cannot read an entry must not treat the
 // entry as absent: a delete that verified nothing would then pass as a
 // removal that happened.
 //
+// required names those fields for the error message. It is consulted only
+// after the decode fails, because NonNull.UnmarshalJSON sees only its own
+// value and cannot name the field; a successful entry is never re-decoded.
 // An absent field is not a violation, so a non-container inspect object —
 // one that carries no container state — still decodes, and so do the
-// nullable maps and arrays real output uses for empty collections. Only
-// list the fields a caller reads to identify and interpret an entry.
+// nullable maps and arrays real output uses for empty collections.
 func Array[T any](data []byte, required []string) ([]T, error) {
 	var entries []json.RawMessage
 	if err := json.Unmarshal(data, &entries); err != nil {
@@ -43,16 +75,23 @@ func Array[T any](data []byte, required []string) ([]T, error) {
 		if IsNull(entry) {
 			return nil, fmt.Errorf("entry %d: expected an object, got null", i)
 		}
-		// nullField decodes the entry into a field map. A required field can
-		// only be null when the entry bytes contain the null literal, so skip
-		// that second decode for the normal case that has none.
+		// A required path can name a field the target type does not spell
+		// with NonNull, such as a plain pointer or a dotted path into one.
+		// Only an entry that actually contains the null literal can be
+		// affected, so the ordered walk runs on that minority of entries and
+		// never repeats the map decode normal output used to pay for.
 		if bytes.Contains(entry, jsonNullLiteral) {
 			if field, bad := nullField(entry, required); bad {
-				return nil, fmt.Errorf("entry %d: field %q must not be null", i, field)
+				return nil, fmt.Errorf("entry %d: field %q %w", i, field, ErrNull)
 			}
 		}
 		var v T
 		if err := json.Unmarshal(entry, &v); err != nil {
+			if errors.Is(err, ErrNull) {
+				if field, bad := nullField(entry, required); bad {
+					return nil, fmt.Errorf("entry %d: field %q %w", i, field, ErrNull)
+				}
+			}
 			return nil, fmt.Errorf("entry %d: %w", i, err)
 		}
 		values = append(values, v)
@@ -123,7 +162,9 @@ func memberValue(members []jsonMember, key string) (json.RawMessage, bool) {
 }
 
 // nullField reports the first required field present with a JSON null
-// value, named by its dotted path.
+// value, named by its dotted path. It runs only on the error path of Array,
+// so the ordered walk it needs for a precise diagnostic costs nothing on the
+// success path.
 func nullField(entry json.RawMessage, required []string) (string, bool) {
 	members, ok := objectMembers(entry)
 	if !ok {

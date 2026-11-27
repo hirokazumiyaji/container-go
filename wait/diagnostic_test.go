@@ -356,3 +356,24 @@ func TestDiagnosticHelpersIgnoreTypedNilStrategy(t *testing.T) {
 		t.Errorf("safeStrategyError = %v, want the original cause", err)
 	}
 }
+
+// panicDiagnosticStrategy fails the test if diagnostics are collected on a
+// successful wait.
+type panicDiagnosticStrategy struct{}
+
+func (panicDiagnosticStrategy) WaitUntilReady(context.Context, Target) error { return nil }
+func (panicDiagnosticStrategy) DiagnosticValues() []string {
+	panic("diagnostics collected on the success path")
+}
+
+// Every successful WaitUntilReady call, and every successful child of a
+// composite strategy, used to collect diagnostic values and build a redactor
+// only to wrap a nil error.
+func TestSafeErrorsSkipDiagnosticsOnSuccess(t *testing.T) {
+	if err := safeStrategyError(nil, panicDiagnosticStrategy{}); err != nil {
+		t.Fatalf("safeStrategyError(nil) = %v, want nil", err)
+	}
+	if err := safeDiagnosticError(nil, "secret"); err != nil {
+		t.Fatalf("safeDiagnosticError(nil) = %v, want nil", err)
+	}
+}

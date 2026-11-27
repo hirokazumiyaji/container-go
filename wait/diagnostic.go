@@ -104,6 +104,9 @@ func DiagnosticBoundaryValues(strategy Strategy) []string {
 }
 
 func safeStrategyError(err error, strategy Strategy) error {
+	if err == nil {
+		return nil
+	}
 	if isNilStrategy(strategy) {
 		return err
 	}
@@ -112,6 +115,9 @@ func safeStrategyError(err error, strategy Strategy) error {
 }
 
 func safeDiagnosticError(err error, values ...string) error {
+	if err == nil {
+		return nil
+	}
 	return cli.WithRedactor(err, cli.NewHashedContextRedactor(values...))
 }
 

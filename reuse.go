@@ -1516,8 +1516,8 @@ func pruneReuseGroupWithConfig(ctx context.Context, r cli.Runner, eng engine, gr
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, safePublicError(err, group)
 	}
-	return pruneListedWithGroupConfig(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
-		return eng.parseReuseGroupIDs(data, group)
+	return pruneListedWithGroupConfig(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, map[string]pruneCandidate, error) {
+		return eng.parsePruneListed(data, group)
 	}, "prune reuse group "+group, group, cfg)
 }
 

@@ -139,7 +139,7 @@ func WithClientDockerHost(host string) ClientOption {
 // WithClientDockerContext sets the target DOCKER_CONTEXT for Docker.
 func WithClientDockerContext(context string) ClientOption {
 	return func(c *clientConfig) error {
-		if err := validateDockerTargetValue("WithClientDockerContext", context); err != nil {
+		if err := validateDockerContextValue("WithClientDockerContext", context); err != nil {
 			return err
 		}
 		c.dockerContext = &context

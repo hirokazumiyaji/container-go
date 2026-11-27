@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -181,14 +182,26 @@ func (c *config) validateDockerTarget() error {
 	if c.clientPinned && (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
 		return validationErrorf(c.daemonTargetOption(), nil, "cannot override Docker target options on Client.Run")
 	}
-	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.target() == nil {
-		return validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
+	if err := c.validateDockerTargetBackend(); err != nil {
+		return err
 	}
 	if c.reuseAttachTimeout > 0 && !c.reuse {
 		return validationErrorf("WithReuseAttachTimeout", c.reuseAttachTimeout, "WithReuseAttachTimeout requires WithReuse")
 	}
 	if c.reusePollInterval > 0 && !c.reuse {
 		return validationErrorf("WithReusePollInterval", c.reusePollInterval, "WithReusePollInterval requires WithReuse")
+	}
+	return nil
+}
+
+// validateDockerTargetBackend rejects Docker target overrides on a backend
+// that has no Docker target, naming the option the caller set. Run calls it
+// again after engine detection because a plain Run resolves its engine after
+// validate has already run with a nil engine.
+func (c *config) validateDockerTargetBackend() error {
+	if c.eng != nil && c.eng.target() == nil &&
+		(c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
+		return validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
 	return nil
 }
@@ -1325,7 +1338,7 @@ func WithDockerHost(host string) Option {
 // Docker target resolution.
 func WithDockerContext(context string) Option {
 	return func(c *config) error {
-		if err := validateDockerTargetValue("WithDockerContext", context); err != nil {
+		if err := validateDockerContextValue("WithDockerContext", context); err != nil {
 			return err
 		}
 		c.dockerContext = &context
@@ -1356,6 +1369,20 @@ func validateDockerTargetValue(option, value string) error {
 	}
 	if len(value) > cli.MaxStreamOverlap || !cli.StreamValueFits(value) {
 		return invalidOption(option, "value is too large to redact safely from streamed diagnostics")
+	}
+	return nil
+}
+
+// validateDockerContextValue additionally enforces Docker's context-name
+// grammar so an unvalidated name cannot be read as a `docker context inspect`
+// flag. An empty value is accepted on purpose: it pins the context as
+// explicitly unset.
+func validateDockerContextValue(option, value string) error {
+	if err := validateDockerTargetValue(option, value); err != nil {
+		return err
+	}
+	if value != "" && !validDockerContextName(value) {
+		return newValidationErrorWithField(option, "value", nil, errors.New("invalid Docker context name"))
 	}
 	return nil
 }

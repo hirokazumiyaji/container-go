@@ -230,6 +230,43 @@ func TestImageCacheWaitersPopulateOwnCaches(t *testing.T) {
 	}
 }
 
+// TestImageCacheDoesNotServeUnpinnedIdentityToFailClosedCaller covers the
+// shared-Option case: one Run that opted into WithAllowMutableImageTag must
+// not let a later default Run adopt the mutable tag from the cache. The
+// default Run has to fail closed instead.
+func TestImageCacheDoesNotServeUnpinnedIdentityToFailClosedCaller(t *testing.T) {
+	r := &identityLessRunner{}
+	opt := WithImagePresenceCache(time.Minute)
+	ctx := context.Background()
+
+	mutable := newConfig()
+	mutable.runner = r
+	mutable.eng = appleEngine{}
+	if err := opt(mutable); err != nil {
+		t.Fatal(err)
+	}
+	if err := WithAllowMutableImageTag()(mutable); err != nil {
+		t.Fatal(err)
+	}
+	id, err := mutable.ensureImageRef(ctx, "redis:7-alpine")
+	if err != nil {
+		t.Fatalf("allow-mutable ensureImageRef: %v", err)
+	}
+	if id.pinned {
+		t.Fatalf("identity = %+v, want an unpinned mutable fallback", id)
+	}
+
+	failClosed := newConfig()
+	failClosed.runner = r
+	failClosed.eng = appleEngine{}
+	if err := opt(failClosed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failClosed.ensureImageRef(ctx, "redis:7-alpine"); !errors.Is(err, ErrImageIdentityUnavailable) {
+		t.Fatalf("fail-closed ensureImageRef = %v, want ErrImageIdentityUnavailable", err)
+	}
+}
+
 // TestImageCacheDoesNotCacheAbsence is the safety property: a missing
 // image is pulled, and the cache records the presence the pull created
 // rather than the absence that triggered it. Caching the absence would

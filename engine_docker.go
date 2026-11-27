@@ -29,11 +29,15 @@ type dockerEngine struct {
 	explicitContext         bool
 	explicitConfigDir       bool
 	explicitDefaultPlatform bool
-	host                    string
-	context                 string
-	configDir               string
-	defaultPlatform         string
-	resolvedTarget          *dockerTargetEndpoint
+	// frozenEnv marks a target created for a Client: the effective
+	// accessors read only the snapshotted values and never the process
+	// environment again.
+	frozenEnv       bool
+	host            string
+	context         string
+	configDir       string
+	defaultPlatform string
+	resolvedTarget  *dockerTargetEndpoint
 }
 
 func newDockerEngine(host, context, configDir, defaultPlatform string) dockerEngine {

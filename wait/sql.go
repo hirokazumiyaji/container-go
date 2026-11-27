@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // sqlAttemptTimeout bounds one database/sql probe attempt so a stalled
@@ -58,11 +60,12 @@ type SQLStrategy struct {
 // configuration errors that fail immediately.
 //
 // The DSN is registered for redaction of the wait error produced here,
-// together with the password-derived forms recoverable with the standard
-// library (URL userinfo/password, URL query password parameters, and key=value
-// password fields). A log tail attached by a higher-level helper after the
-// wait fails is outside that redaction because the DSN is not known before the
-// wait starts.
+// together with the password-derived forms the common driver DSN dialects
+// expose (URL userinfo and secret-named query parameters, MySQL
+// user:password@protocol(address)/dbname, and key=value fields including
+// quoted libpq and semicolon-separated ADO/ODBC values). A log tail attached
+// by a higher-level helper after the wait fails is outside that redaction
+// because the DSN is not known before the wait starts.
 func ForSQL(port, driver string, dsn func(host string, port int) string) *SQLStrategy {
 	return &SQLStrategy{port: port, driver: driver, dsn: dsn}
 }
@@ -98,9 +101,11 @@ func (s *SQLStrategy) WithPollInterval(d time.Duration) *SQLStrategy {
 }
 
 // DiagnosticValues returns only the strategy's static values. A DSN is built
-// during a wait and therefore stays with that wait's error.
+// during a wait and therefore stays with that wait's error. The port and
+// driver are connection metadata, not secrets: registering them would turn
+// ordinary diagnostics such as "invalid driver \"...\"" into redacted noise.
 func (s *SQLStrategy) DiagnosticValues() []string {
-	return []string{s.port, s.driver, s.query}
+	return []string{s.query}
 }
 
 func (s *SQLStrategy) validate() error {
@@ -198,10 +203,17 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		if err != nil {
 			return err
 		}
-		if err := rows.Close(); err != nil {
+		// Advance once so a driver that defers a failure until the first
+		// row fetch reports it through rows.Err; database/sql only exposes
+		// such an error after Next has moved the cursor. One advance is
+		// enough for readiness, and it keeps a large or unbounded result from
+		// extending the probe.
+		rows.Next()
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
 			return err
 		}
-		return rows.Err()
+		return rows.Close()
 	})
 }
 
@@ -223,10 +235,12 @@ func splitSQLEndpoint(endpoint string) (string, int, error) {
 }
 
 // sqlDSNDiagnosticValues returns the DSN and the password-derived forms a
-// driver may echo in a connection error. Only forms recoverable with the
-// standard library are covered: URL userinfo and password, URL query password
-// parameters, and key=value password fields. Key=value fields whose value
-// contains whitespace are recovered only on a best-effort basis.
+// driver may echo in a connection error. Drivers do not share one DSN grammar,
+// so every dialect is scanned independently: URL DSNs, MySQL's
+// user:password@protocol(address)/dbname form, semicolon-separated ADO/ODBC
+// key=value pairs, and libpq key=value pairs whose values may be quoted and
+// contain whitespace. Scanning the raw text keeps a malformed URL from hiding
+// the password forms it still contains.
 func sqlDSNDiagnosticValues(dsn string) []string {
 	if dsn == "" {
 		return nil
@@ -244,27 +258,208 @@ func sqlDSNDiagnosticValues(dsn string) []string {
 		values = append(values, value)
 	}
 	add(dsn)
-	if parsed, err := url.Parse(dsn); err == nil {
-		if parsed.User != nil {
-			add(parsed.User.String())
-			if password, ok := parsed.User.Password(); ok {
-				add(password)
-			}
-		}
-		query := parsed.Query()
-		for _, key := range []string{"password", "passwd", "pwd"} {
-			add(query.Get(key))
-		}
+	addURLDSNSecrets(dsn, add)
+	addMySQLDSNSecrets(dsn, add)
+	addDSNFieldSecrets(dsn, add)
+	return values
+}
+
+// addURLDSNSecrets registers userinfo and secret-named query values from a
+// scheme://... DSN.
+func addURLDSNSecrets(dsn string, add func(string)) {
+	_, rest, ok := strings.Cut(dsn, "://")
+	if !ok {
+		return
 	}
-	for _, field := range strings.Fields(dsn) {
-		key, value, ok := strings.Cut(field, "=")
-		if !ok {
+	authority, query, hasQuery := strings.Cut(rest, "?")
+	if i := strings.IndexAny(authority, "/#"); i >= 0 {
+		authority = authority[:i]
+	}
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		addUserInfoSecrets(authority[:at], add)
+	}
+	if hasQuery {
+		addQueryDSNSecrets(query, add)
+	}
+}
+
+// addMySQLDSNSecrets registers the password of MySQL's
+// [user[:password]@][protocol[(address)]]/dbname form, which has no scheme and
+// would otherwise parse as a URL with the user name as its scheme.
+func addMySQLDSNSecrets(dsn string, add func(string)) {
+	if strings.Contains(dsn, "://") {
+		return
+	}
+	base, query, hasQuery := strings.Cut(dsn, "?")
+	slash := strings.LastIndexByte(base, '/')
+	if slash <= 0 {
+		return
+	}
+	prefix := base[:slash]
+	at := strings.LastIndexByte(prefix, '@')
+	if at <= 0 {
+		return
+	}
+	userinfo := prefix[:at]
+	// A key=value or semicolon pair before the separator is another dialect,
+	// not MySQL userinfo. Spaces are allowed because a MySQL password may
+	// contain them.
+	if strings.ContainsAny(userinfo, "=;") {
+		return
+	}
+	addUserInfoSecrets(userinfo, add)
+	if hasQuery {
+		addQueryDSNSecrets(query, add)
+	}
+}
+
+// addQueryDSNSecrets registers values of secret-named query parameters. Query
+// keys are case-insensitive, so matching goes through cli.IsSecretName rather
+// than a fixed lower-case list.
+func addQueryDSNSecrets(rawQuery string, add func(string)) {
+	rawQuery, _, _ = strings.Cut(rawQuery, "#")
+	for _, pair := range strings.FieldsFunc(rawQuery, func(r rune) bool { return r == '&' || r == ';' }) {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok || value == "" {
 			continue
 		}
-		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "password", "passwd", "pwd":
-			add(strings.Trim(strings.TrimSpace(value), `"'`))
+		decodedKey, err := url.QueryUnescape(key)
+		if err != nil {
+			decodedKey = key
+		}
+		if !secretDSNKey(decodedKey) {
+			continue
+		}
+		add(value)
+		if decoded, err := url.QueryUnescape(value); err == nil && decoded != value {
+			add(decoded)
 		}
 	}
-	return values
+}
+
+// addDSNFieldSecrets registers values of secret-named key=value fields. The
+// field scanner keeps quoted and braced values intact, so a password such as
+// 'my secret' is registered whole rather than split into harmless words.
+func addDSNFieldSecrets(dsn string, add func(string)) {
+	for _, field := range splitDSNFields(dsn) {
+		key, rawValue, ok := strings.Cut(field, "=")
+		if !ok || !secretDSNKey(key) {
+			continue
+		}
+		if value := dsnFieldValue(rawValue); value != "" {
+			add(value)
+		}
+	}
+}
+
+// splitDSNFields splits a key=value DSN at unquoted whitespace and semicolons.
+// Single- and double-quoted values and ODBC {braced} values keep their
+// separators, and a backslash escapes the next byte inside a quoted value.
+func splitDSNFields(dsn string) []string {
+	var fields []string
+	start := -1
+	var quote byte
+	braces := 0
+	for i := 0; i < len(dsn); i++ {
+		c := dsn[i]
+		if quote != 0 {
+			if c == '\\' && i+1 < len(dsn) {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if braces > 0 {
+			if c == '}' {
+				if i+1 < len(dsn) && dsn[i+1] == '}' {
+					i++
+					continue
+				}
+				braces--
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '{':
+			braces++
+		case ' ', '\t', '\r', '\n', ';':
+			if start >= 0 {
+				fields = append(fields, dsn[start:i])
+				start = -1
+			}
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		fields = append(fields, dsn[start:])
+	}
+	return fields
+}
+
+// dsnFieldValue strips the optional quoting an ADO/ODBC or libpq value may
+// carry and resolves its escapes.
+func dsnFieldValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 {
+		return value
+	}
+	switch {
+	case value[0] == '\'' && value[len(value)-1] == '\'':
+		return unescapeDSNQuoted(value[1 : len(value)-1])
+	case value[0] == '"' && value[len(value)-1] == '"':
+		return unescapeDSNQuoted(value[1 : len(value)-1])
+	case value[0] == '{' && value[len(value)-1] == '}':
+		return strings.ReplaceAll(value[1:len(value)-1], "}}", "}")
+	}
+	return value
+}
+
+// unescapeDSNQuoted removes the backslash escapes libpq permits inside a
+// quoted value.
+func unescapeDSNQuoted(value string) string {
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' && i+1 < len(value) {
+			i++
+		}
+		b.WriteByte(value[i])
+	}
+	return b.String()
+}
+
+// addUserInfoSecrets registers a user:password prefix in both its escaped and
+// unescaped spellings.
+func addUserInfoSecrets(userinfo string, add func(string)) {
+	add(userinfo)
+	if unescaped, err := url.PathUnescape(userinfo); err == nil {
+		add(unescaped)
+	}
+	_, password, ok := strings.Cut(userinfo, ":")
+	if !ok {
+		return
+	}
+	add(password)
+	if unescaped, err := url.PathUnescape(password); err == nil && unescaped != password {
+		add(unescaped)
+	}
+}
+
+// secretDSNKey reports whether a DSN field name marks its value as a secret.
+// A bare pwd is included explicitly because cli.IsSecretName treats it as the
+// working directory unless it is qualified.
+func secretDSNKey(key string) bool {
+	key = strings.TrimSpace(key)
+	if strings.EqualFold(key, "pwd") {
+		return true
+	}
+	return cli.IsSecretName(key)
 }

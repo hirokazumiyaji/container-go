@@ -2638,3 +2638,220 @@ func argvValues(args []string, flag string) []string {
 	}
 	return values
 }
+
+func TestFrozenDockerTargetIgnoresLateEnvironment(t *testing.T) {
+	t.Run("unset components stay unset", func(t *testing.T) {
+		for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_DEFAULT_PLATFORM"} {
+			t.Setenv(key, "")
+		}
+		frozen, ok := frozenTarget(dockerEngine{}).(dockerEngine)
+		if !ok {
+			t.Fatal("frozenTarget did not return dockerEngine")
+		}
+		if !frozen.frozenEnv {
+			t.Fatal("frozen target did not record the frozen environment")
+		}
+
+		t.Setenv("DOCKER_HOST", "tcp://late-host:2375")
+		t.Setenv("DOCKER_CONTEXT", "late-context")
+		t.Setenv("DOCKER_CONFIG", "/late/config")
+		t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/arm64")
+
+		if got := frozen.effectiveHost(); got != "" {
+			t.Errorf("effectiveHost() = %q, want empty after freeze", got)
+		}
+		if got := frozen.effectiveContext(); got != "" {
+			t.Errorf("effectiveContext() = %q, want empty after freeze", got)
+		}
+		if got := frozen.effectiveConfigDir(); got != "" {
+			t.Errorf("effectiveConfigDir() = %q, want empty after freeze", got)
+		}
+		if got := frozen.effectiveDefaultPlatform(); got != "" {
+			t.Errorf("effectiveDefaultPlatform() = %q, want empty after freeze", got)
+		}
+		want := []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_DEFAULT_PLATFORM"}
+		if env := frozen.pinnedTargetEnv(); !slices.Equal(env, want) {
+			t.Errorf("pinnedTargetEnv() = %v, want %v", env, want)
+		}
+	})
+
+	t.Run("snapshot is not replaced by a later value", func(t *testing.T) {
+		t.Setenv("DOCKER_HOST", "tcp://first-host:2375")
+		t.Setenv("DOCKER_CONTEXT", "first-context")
+		t.Setenv("DOCKER_CONFIG", "/first/config")
+		t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/amd64")
+		frozen, ok := frozenTarget(dockerEngine{}).(dockerEngine)
+		if !ok {
+			t.Fatal("frozenTarget did not return dockerEngine")
+		}
+
+		t.Setenv("DOCKER_HOST", "tcp://late-host:2375")
+		t.Setenv("DOCKER_CONTEXT", "late-context")
+		t.Setenv("DOCKER_CONFIG", "/late/config")
+		t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/arm64")
+
+		if got := frozen.effectiveHost(); got != "tcp://first-host:2375" {
+			t.Errorf("effectiveHost() = %q, want first-host", got)
+		}
+		if got := frozen.effectiveContext(); got != "first-context" {
+			t.Errorf("effectiveContext() = %q, want first-context", got)
+		}
+		if got := frozen.effectiveConfigDir(); got != "/first/config" {
+			t.Errorf("effectiveConfigDir() = %q, want /first/config", got)
+		}
+		if got := frozen.effectiveDefaultPlatform(); got != "linux/amd64" {
+			t.Errorf("effectiveDefaultPlatform() = %q, want linux/amd64", got)
+		}
+	})
+}
+
+func TestDockerInspectResolvesAliasesAfterNetworkModeFallback(t *testing.T) {
+	data := []byte(`[{
+		"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"},
+		"NetworkSettings":{"Networks":{"test-net":{
+			"Aliases":["myctr","db"],"DNSNames":["myctr","db","abc123"]
+		}}}
+	}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.networkMode != "test-net" {
+		t.Fatalf("networkMode = %q, want test-net from the network map", info.networkMode)
+	}
+	want := []string{"abc123", "db", "myctr"}
+	if !slices.Equal(info.networkAliases, want) {
+		t.Errorf("networkAliases = %v, want sorted and deduplicated %v", info.networkAliases, want)
+	}
+	if got := info.networkAliasMap["test-net"]; !slices.Equal(got, want) {
+		t.Errorf("networkAliasMap[test-net] = %v, want %v", got, want)
+	}
+}
+
+func TestDockerInspectPortOrderIsDeterministic(t *testing.T) {
+	data := []byte(`[{
+		"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"},
+		"NetworkSettings":{"Ports":{
+			"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18080"}],
+			"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"16379"}],
+			"53/udp":[{"HostIp":"127.0.0.1","HostPort":"1053"}]
+		}}
+	}]`)
+	var first []int
+	for i := 0; i < 20; i++ {
+		info, err := (dockerEngine{}).parseInspect(data, "myctr")
+		if err != nil {
+			t.Fatalf("parseInspect: %v", err)
+		}
+		ports := make([]int, 0, len(info.bound))
+		for _, b := range info.bound {
+			ports = append(ports, b.containerPort)
+		}
+		if i == 0 {
+			first = ports
+			if want := []int{53, 6379, 8080}; !slices.Equal(ports, want) {
+				t.Fatalf("port order = %v, want %v", ports, want)
+			}
+			continue
+		}
+		if !slices.Equal(ports, first) {
+			t.Fatalf("port order changed between parses: %v then %v", first, ports)
+		}
+	}
+}
+
+func TestDockerInspectRejectsOutOfRangeHostPort(t *testing.T) {
+	data := []byte(`[{
+		"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"},
+		"NetworkSettings":{"Ports":{"6379/tcp":[
+			{"HostIp":"127.0.0.1","HostPort":"49153"},
+			{"HostIp":"127.0.0.1","HostPort":"70000"},
+			{"HostIp":"127.0.0.1","HostPort":"0"},
+			{"HostIp":"127.0.0.1","HostPort":"-1"},
+			{"HostIp":"127.0.0.1","HostPort":"abc"},
+			{"HostIp":"127.0.0.1","HostPort":""}
+		]}}
+	}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if len(info.bound) != 1 {
+		t.Fatalf("bound = %+v, want only the valid host-port binding", info.bound)
+	}
+	if info.bound[0].hostPort != 49153 {
+		t.Errorf("hostPort = %d, want 49153", info.bound[0].hostPort)
+	}
+}
+
+func TestDockerInspectRejectsNegativeShmSize(t *testing.T) {
+	data := []byte(`[{
+		"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"},
+		"HostConfig":{"ShmSize":-1}
+	}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.runOptions.shmSizeReported || info.runOptions.shmSizeBytes != 0 {
+		t.Errorf("shm size = %d reported=%t, want unreported for a negative value",
+			info.runOptions.shmSizeBytes, info.runOptions.shmSizeReported)
+	}
+}
+
+func TestDockerParseImageIdentityRejectsNullInspectEntry(t *testing.T) {
+	for _, data := range []string{`null`, `[null]`} {
+		lookup := (dockerEngine{}).parseImageIdentity([]byte(data), "redis:7-alpine", "")
+		if lookup.availability != imageUnreadable {
+			t.Errorf("parseImageIdentity(%q) availability = %v, want unreadable", data, lookup.availability)
+		}
+	}
+}
+
+func TestDockerImageIdentityNormalizesRegistryCase(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("b", 64)
+	data := []byte(`[{"Id":"sha256:` + strings.Repeat("a", 64) + `","RepoDigests":["ghcr.io/owner/repo@` + digest + `"]}]`)
+	lookup := (dockerEngine{}).parseImageIdentity(data, "GHCR.IO/owner/repo:v1", "")
+	if !lookup.found() {
+		t.Fatal("image record was reported absent")
+	}
+	if !lookup.identity.pinned {
+		t.Fatalf("identity = %+v, want a digest-pinned identity", lookup.identity)
+	}
+	if !strings.EqualFold(lookup.identity.digest, digest) {
+		t.Errorf("digest = %q, want %q", lookup.identity.digest, digest)
+	}
+	if lookup.identity.repository != "ghcr.io/owner/repo" {
+		t.Errorf("repository = %q, want ghcr.io/owner/repo", lookup.identity.repository)
+	}
+}
+
+type networkInspectBlockingRunner struct {
+	calls []string
+}
+
+func (r *networkInspectBlockingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	r.calls = append(r.calls, strings.Join(args, " "))
+	if len(args) > 0 && args[0] == "network" {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	}
+	return []byte("ok"), nil, nil
+}
+
+func TestInspectDockerNetworkHonorsQueryTimeout(t *testing.T) {
+	runner := &networkInspectBlockingRunner{}
+	cfg := &config{
+		network:      "test-net",
+		queryTimeout: 10 * time.Millisecond,
+		runner:       runner,
+		eng:          dockerEngine{},
+	}
+	_, err := inspectDockerNetwork(context.Background(), cfg)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("inspectDockerNetwork error = %v, want a deadline error", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %v, want only the timed-out network inspect", runner.calls)
+	}
+}

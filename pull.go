@@ -104,7 +104,9 @@ func WithAllowMutableImageTag() Option {
 //
 // Only "present" answers are cached. A missing image is pulled, and the
 // successful pull is recorded, so the next Run of the same image skips
-// the inspect too.
+// the inspect too. A cached identity that is not pinned is returned only to
+// a Run that opted into WithAllowMutableImageTag; a default Run still fails
+// closed instead of inheriting another caller's mutable-tag fallback.
 //
 // The cache is owned by the returned Option, not process-global: call
 // WithImagePresenceCache once and reuse that Option across Runs so
@@ -236,7 +238,7 @@ func WithPullDockerHost(host string) PullOption {
 // for this pull.
 func WithPullDockerContext(context string) PullOption {
 	return func(c *pullConfig) error {
-		if err := validateDockerTargetValue("WithPullDockerContext", context); err != nil {
+		if err := validateDockerContextValue("WithPullDockerContext", context); err != nil {
 			return err
 		}
 		c.dockerContext = &context
@@ -414,7 +416,13 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 	platform := c.platform
 	if c.pullPolicy == PullMissing {
 		if id, ok := c.imageCache.get(c.eng, image, platform); ok {
-			return id, nil
+			// An unpinned identity is a mutable tag that only an explicit
+			// WithAllowMutableImageTag caller may run. The cache is shared by
+			// every Run using one WithImagePresenceCache Option, so a single
+			// opt-in Run must not hand that identity to a fail-closed Run.
+			if id.pinned || c.allowMutableImageTag {
+				return id, nil
+			}
 		}
 	}
 	switch c.pullPolicy {

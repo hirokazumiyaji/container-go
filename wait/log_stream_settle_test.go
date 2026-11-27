@@ -44,12 +44,21 @@ func TestForLogSucceedsAfterRealStreamSettleClose(t *testing.T) {
 	}
 }
 
-func TestForLogMatchesCleanUnterminatedFinalLine(t *testing.T) {
+// An unterminated final line may still be extended by the next follow
+// stream, so a running container cannot make it readiness evidence yet.
+func TestForLogDefersCleanUnterminatedFinalLineWhileRunning(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.logStreams = []io.ReadCloser{io.NopCloser(strings.NewReader("ready"))}
 
-	if err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target); err != nil {
-		t.Fatalf("clean final log line was not matched: %v", err)
+	err := ForLog("ready").
+		WithStartupTimeout(60*time.Millisecond).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want timeout: an unterminated line may still grow", err)
+	}
+	if target.logCalls < 2 {
+		t.Fatalf("FollowLogs calls = %d, want a reconnect before deciding", target.logCalls)
 	}
 }
 

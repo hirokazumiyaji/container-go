@@ -135,7 +135,7 @@ func TestAppleDescriptorReferenceIsLocallyCheckedForAllPullPolicies(t *testing.T
 			r := &appleAddressRunner{
 				fixture:      appleImageFixture(t),
 				localMissing: true,
-				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: pinned"},
+				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"},
 			}
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithPullPolicy(policy), withRunner(r), withEngine(appleEngine{}))
@@ -194,7 +194,7 @@ func TestAppleDescriptorReferenceUsesExplicitMutableFallback(t *testing.T) {
 			r := &appleAddressRunner{
 				fixture:      appleImageFixture(t),
 				localMissing: true,
-				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: pinned"},
+				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"},
 			}
 			ctr, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithPullPolicy(policy), WithAllowMutableImageTag(),

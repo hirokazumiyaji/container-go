@@ -286,3 +286,60 @@ func TestHTTPHeaderValueErrorKeepsNameInField(t *testing.T) {
 		t.Errorf("err = %q, must not echo the header value", err)
 	}
 }
+
+// hostileValidationStrategy returns a ConfigError that quotes a secret and a
+// terminal escape. Validation must render both through the redacting,
+// sanitizing diagnostic boundary.
+type hostileValidationStrategy struct{ secret string }
+
+func (hostileValidationStrategy) WaitUntilReady(context.Context, Target) error { return nil }
+
+func (s hostileValidationStrategy) DiagnosticValues() []string { return []string{s.secret} }
+
+func (s hostileValidationStrategy) validate() error {
+	return &ConfigError{
+		Strategy: "ForTest",
+		Field:    "field",
+		Value:    s.secret,
+		Reason:   "rejected \x1b[31m" + s.secret + "\x1b[0m",
+	}
+}
+
+func TestValidateRedactsAndSanitizesConfigError(t *testing.T) {
+	const secret = "validate-secret-value"
+	err := Validate(hostileValidationStrategy{secret: secret})
+	if err == nil {
+		t.Fatal("want a configuration error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("err = %q, must not echo the rejected value", err)
+	}
+	if strings.ContainsAny(err.Error(), "\x1b\r\n") {
+		t.Fatalf("err = %q, contains terminal controls", err)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("err = %T, want *ConfigError", err)
+	}
+	if strings.Contains(configErr.Value, secret) || strings.Contains(configErr.Reason, secret) {
+		t.Fatalf("ConfigError = %+v, must not expose the rejected value", configErr)
+	}
+}
+
+func TestValidateRedactsRealConfigErrorValues(t *testing.T) {
+	const secret = "token=validate-regexp-secret["
+	err := Validate(ForLog(secret).AsRegexp())
+	if err == nil {
+		t.Fatal("want a configuration error")
+	}
+	if strings.Contains(err.Error(), "validate-regexp-secret") {
+		t.Fatalf("err = %q, must not echo the rejected pattern", err)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("err = %T, want *ConfigError", err)
+	}
+	if strings.Contains(configErr.Value, "validate-regexp-secret") {
+		t.Fatalf("ConfigError.Value = %q, must not echo the rejected pattern", configErr.Value)
+	}
+}

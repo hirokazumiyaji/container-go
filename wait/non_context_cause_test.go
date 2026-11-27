@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,8 +142,13 @@ func TestPollRetainsCheckErrorWhenContextCompletes(t *testing.T) {
 	if !errors.As(err, &typed) || typed != cause {
 		t.Fatalf("error = %v, want typed check cause", err)
 	}
-	if got := errors.Unwrap(err); got != context.Canceled {
-		t.Fatalf("errors.Unwrap = %v, want context.Canceled", got)
+	unwrapped, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("error = %T, want an error exposing all children", err)
+	}
+	children := unwrapped.Unwrap()
+	if !slices.Contains(children, context.Canceled) || !slices.Contains(children, error(cause)) {
+		t.Fatalf("Unwrap() = %v, want the context and the check cause", children)
 	}
 	if !strings.Contains(err.Error(), cause.Error()) {
 		t.Fatalf("error = %q, want retained cause text", err)

@@ -62,7 +62,12 @@ func (c *config) diagnosticValues() []string {
 
 func (c *config) waitDiagnosticValues() []string {
 	values := append([]string(nil), c.waitDiagnosticSecrets...)
-	return append(values, wait.DiagnosticValues(c.waitStrategy)...)
+	values = append(values, wait.DiagnosticValues(c.waitStrategy)...)
+	// Strategy values are caller-owned and have no size validation, so drop
+	// any value the bounded stream window cannot redact. Otherwise one large
+	// header, query, log pattern, or exec argument would make every log-tail
+	// redaction on the handle fail.
+	return streamFittingValues(values)
 }
 
 func (c *config) rememberDiagnosticValues() {
@@ -237,10 +242,6 @@ func (c *config) diagnosticBoundaryValues() []string {
 		}
 	}
 	return streamFittingValues(values)
-}
-
-func (c *config) waitBoundaryValues() []string {
-	return streamFittingValues(wait.DiagnosticBoundaryValues(c.waitStrategy))
 }
 
 // streamFittingValues drops values the bounded streaming window cannot

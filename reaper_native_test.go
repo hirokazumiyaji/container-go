@@ -1049,3 +1049,73 @@ func TestParseNativeReaperInspect(t *testing.T) {
 		t.Errorf("unreadable inspect parsed as creation %q", gotCreation)
 	}
 }
+
+// TestNativeReaperBudgetBoundsStartedWorkers pins that the budget context
+// reaches work that started before the deadline: a backend delete command and
+// a pending-create retry loop must not run to their own limits after the reap
+// budget expires.
+func TestNativeReaperBudgetBoundsStartedWorkers(t *testing.T) {
+	if raceDetectorEnabled {
+		t.Skip("subprocess timing; no shared state under test")
+	}
+
+	t.Run("delete command", func(t *testing.T) {
+		cfg, logPath := nativeReaperBackend(t, "rm")
+		cfg.timeout = 30 * time.Second
+		t.Setenv(testNativeReaperDeleteSleepMS, "6000")
+		t.Setenv("REAPER_BUDGET_SECONDS", "1")
+		t.Setenv("REAPER_PARALLEL", "1")
+
+		entries := "+\t" + nativeReaperID('a') + "\n+\t" + nativeReaperID('b') + "\n"
+		start := time.Now()
+		var stderr strings.Builder
+		if code := runNativeReaper(cfg, strings.NewReader(entries), &stderr); code != 0 {
+			t.Fatalf("runNativeReaper = %d; stderr: %s", code, stderr.String())
+		}
+		elapsed := time.Since(start)
+		if elapsed > 5*time.Second {
+			t.Fatalf("reap took %v; a started delete ignored the overall budget", elapsed)
+		}
+		if got := readNativeReaperLog(t, logPath); len(got) != 1 {
+			t.Fatalf("deleted %v, want only the entry started before the budget expired", got)
+		}
+	})
+
+	t.Run("pending retry", func(t *testing.T) {
+		cfg, logPath := nativeReaperBackend(t, "rm")
+		cfg.pendingAttempts = 8
+		t.Setenv(testNativeReaperInspectCounter, filepath.Join(t.TempDir(), "inspect-count"))
+		t.Setenv(testNativeReaperInspectFailCount, "10000")
+		t.Setenv("REAPER_BUDGET_SECONDS", "1")
+		t.Setenv("REAPER_PARALLEL", "1")
+
+		entry := "P\t" + nativeReaperID('c') + "\t" + strings.Repeat("b", 16) + "\n"
+		start := time.Now()
+		var stderr strings.Builder
+		if code := runNativeReaper(cfg, strings.NewReader(entry), &stderr); code != 0 {
+			t.Fatalf("runNativeReaper = %d; stderr: %s", code, stderr.String())
+		}
+		elapsed := time.Since(start)
+		if elapsed > 5*time.Second {
+			t.Fatalf("reap took %v; the pending retry loop ignored the overall budget", elapsed)
+		}
+		if got := readNativeReaperLog(t, logPath); len(got) != 0 {
+			t.Fatalf("deleted %v, want no delete when the generation never matched", got)
+		}
+	})
+}
+
+// TestRunNativeReaperMainUsesProvidedStderr pins that the self-exec entry
+// point writes diagnostics to the writer it was given instead of bypassing it
+// with os.Stderr.
+func TestRunNativeReaperMainUsesProvidedStderr(t *testing.T) {
+	var stderr strings.Builder
+	// An empty backend binary makes runNativeReaper reject the configuration
+	// without reading stdin.
+	if code := runNativeReaperMain([]string{"", "rm", "key", "5", "1"}, &stderr); code != 2 {
+		t.Fatalf("runNativeReaperMain = %d, want 2", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, "invalid configuration") {
+		t.Fatalf("stderr = %q, want the configuration diagnostic", got)
+	}
+}

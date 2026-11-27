@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -876,6 +877,33 @@ func TestForAnyWithStartupTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("took %v, want <= 2s", elapsed)
+	}
+}
+
+// TestWaitErrorUnwrapExposesEveryRetainedChild pins that a diagnostic
+// boundary can reach every cause even when a context error terminated the
+// wait. Returning only the termination reason hid a backend CLIError from the
+// leaf-by-leaf redaction path.
+func TestWaitErrorUnwrapExposesEveryRetainedChild(t *testing.T) {
+	checkErr := errors.New("check failed")
+	probeErr := errors.New("probe failed")
+	causeErr := errors.New("terminal cause")
+	extraErr := errors.New("extra cause")
+	err := &waitError{
+		reason:     waitReasonTimeout,
+		what:       "wait for test",
+		timeout:    time.Second,
+		contextErr: context.DeadlineExceeded,
+		checkErr:   checkErr,
+		probeErr:   probeErr,
+		cause:      causeErr,
+		causes:     []error{extraErr},
+	}
+	children := err.Unwrap()
+	for _, want := range []error{context.DeadlineExceeded, checkErr, probeErr, causeErr, extraErr} {
+		if !slices.Contains(children, want) {
+			t.Errorf("Unwrap() = %v, missing %v", children, want)
+		}
 	}
 }
 

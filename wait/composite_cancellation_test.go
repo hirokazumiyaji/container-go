@@ -185,3 +185,66 @@ func TestCompositeFinalLifecycleCheckIsBounded(t *testing.T) {
 		t.Fatalf("State calls = %d, want initial and final checks", got)
 	}
 }
+
+// blockingChildStrategy reports both when it started and when its wait
+// context was canceled. A composite that returns without canceling its
+// derived context leaves this goroutine running for the caller's lifetime.
+type blockingChildStrategy struct {
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func newBlockingChildStrategy() *blockingChildStrategy {
+	return &blockingChildStrategy{started: make(chan struct{}), canceled: make(chan struct{})}
+}
+
+func (s *blockingChildStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
+	close(s.started)
+	<-ctx.Done()
+	close(s.canceled)
+	return ctx.Err()
+}
+
+func TestForAllCancelsChildOnLifecycleFailure(t *testing.T) {
+	target := newLifecycleTarget(StateStopped)
+	child := newBlockingChildStrategy()
+
+	err := ForAll(child).WaitUntilReady(context.Background(), target)
+	if err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("error = %v, want stopped lifecycle failure", err)
+	}
+	select {
+	case <-child.started:
+	case <-time.After(time.Second):
+		t.Fatal("child strategy did not start")
+	}
+	select {
+	case <-child.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("child wait context was not canceled when the lifecycle monitor failed")
+	}
+}
+
+func TestForAllStopsLifecycleMonitorAfterSuccess(t *testing.T) {
+	target := newLifecycleTarget(StateRunning)
+	if err := ForAll(&countingSuccessStrategy{}).WaitUntilReady(context.Background(), target); err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+
+	target.mu.Lock()
+	afterReturn := target.stateCalls
+	target.mu.Unlock()
+	if afterReturn == 0 {
+		t.Fatal("lifecycle monitor never probed state")
+	}
+
+	// The monitor polls at 1 Hz. Without canceling and joining it on return,
+	// the caller's Background context would keep a probe running forever.
+	time.Sleep(stateCheckInterval + 200*time.Millisecond)
+	target.mu.Lock()
+	afterIdle := target.stateCalls
+	target.mu.Unlock()
+	if afterIdle != afterReturn {
+		t.Fatalf("State calls after return = %d, want %d (monitor still running)", afterIdle, afterReturn)
+	}
+}

@@ -549,9 +549,24 @@ func TestPruneMalformedExplicitContextEndpointIsRedacted(t *testing.T) {
 	}
 }
 
+// TestPruneDiagnosticRedactorIncludesLabelValues covers a backend echoing the
+// WithPruneLabel filter value in a list or verification error.
+func TestPruneDiagnosticRedactorIncludesLabelValues(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	const value = "private-team-label-value"
+	redactor := pruneDiagnosticRedactor(dockerEngine{}, nil, "", map[string]string{"team": value})
+	got := redactor.Text("team budgets echoed " + value + " for review")
+	if strings.Contains(got, value) {
+		t.Fatalf("prune redactor Text() = %q, kept the filter value", got)
+	}
+	if !strings.Contains(got, "team budgets") {
+		t.Fatalf("prune redactor Text() = %q, want ordinary context kept", got)
+	}
+}
+
 func TestDockerBinaryHostnameRemainsReadable(t *testing.T) {
 	de := newDockerEngine("tcp://docker:2375", "", "", "")
-	err := cli.WithRedactor(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, Stderr: "daemon docker tcp://docker:2375 failed"}, pruneDiagnosticRedactor(de, nil, ""))
+	err := cli.WithRedactor(&cli.CLIError{Binary: "docker", Args: []string{"ps"}, Stderr: "daemon docker tcp://docker:2375 failed"}, pruneDiagnosticRedactor(de, nil, "", nil))
 	var commandErr *cli.CLIError
 	if !errors.As(err, &commandErr) || commandErr.Binary != "docker" || !strings.Contains(err.Error(), "docker ps") || strings.Contains(err.Error(), "tcp://docker:2375") || strings.Contains(commandErr.Error(), "tcp://docker:2375") {
 		t.Fatalf("binary diagnostic=%v (%+v)", err, commandErr)
@@ -565,11 +580,11 @@ func TestPruneDiagnosticRedactorSkipsMissingTargetScope(t *testing.T) {
 
 	// Apple Container has no target scope, so a runner's DOCKER_* values are
 	// not target diagnostics and must stay readable.
-	if got := pruneDiagnosticRedactor(appleEngine{}, runner, "").Text(secret); got != secret {
+	if got := pruneDiagnosticRedactor(appleEngine{}, runner, "", nil).Text(secret); got != secret {
 		t.Fatalf("apple prune redactor changed %q to %q", secret, got)
 	}
 	// Docker does own the target, so the same value must be redacted.
-	if got := pruneDiagnosticRedactor(dockerEngine{}, runner, "").Text(secret); strings.Contains(got, "runner-target.internal") {
+	if got := pruneDiagnosticRedactor(dockerEngine{}, runner, "", nil).Text(secret); strings.Contains(got, "runner-target.internal") {
 		t.Fatalf("docker prune redactor did not redact the runner target: %q", got)
 	}
 }
@@ -671,6 +686,18 @@ func TestPackagePruneAmbientContextCommandUnavailableIsBestEffort(t *testing.T) 
 				t.Fatalf("listed=%v, err=%v", listed, err)
 			}
 		})
+	}
+}
+
+func TestContainerDiagnosticsIncludeDockerTargetBoundaryValues(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	host := "tcp://private-wait-daemon:2375"
+	cfg := &config{eng: dockerEngine{}, dockerHost: &host}
+	ctr := &Container{}
+	ctr.applyConfigDiagnostics(cfg)
+	const text = "dial tcp private-wait-daemon:2375 failed"
+	if got := ctr.diagnosticRedactor().Text(text); strings.Contains(got, "private-wait-daemon") {
+		t.Fatalf("container redactor Text() = %q, kept the Docker target host", got)
 	}
 }
 

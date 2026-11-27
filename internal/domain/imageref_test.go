@@ -163,3 +163,57 @@ func TestIsBareImageReferenceRejectsUnprovenancedValues(t *testing.T) {
 		t.Error("malformed digest-shaped references compare compatible")
 	}
 }
+
+func TestImagesCompatibleDoesNotDefaultDigestOnlyTag(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	if ImagesCompatible("redis:latest", "redis@"+digest) {
+		t.Error("a digest-only reference was treated as implicitly tagged latest")
+	}
+	if ImagesCompatible("redis", "redis@"+digest) {
+		t.Error("an untagged request matched a digest-only reference through the latest default")
+	}
+	if !ImagesCompatible("redis:latest", "redis:latest@"+digest) {
+		t.Error("an explicit tag on a digest reference was not compared")
+	}
+	if !ImagesCompatible("redis:7-alpine", "redis:7-alpine@"+digest) {
+		t.Error("a matching explicit tag on a digest reference is compatible")
+	}
+}
+
+func TestParseImageRefRejectsDanglingSeparator(t *testing.T) {
+	for _, input := range []string{"redis:", "redis@", "redis:7@"} {
+		if _, err := ParseImageRef(input); err == nil {
+			t.Errorf("ParseImageRef(%q) = nil error, want a malformed-separator error", input)
+		}
+	}
+	if got, err := ParseImageRef("localhost:5000/myimg"); err != nil || got.Name != "localhost:5000/myimg" {
+		t.Errorf("ParseImageRef(localhost:5000/myimg) = %+v, %v", got, err)
+	}
+}
+
+func TestImageRepositoryPartsDoNotTreatSingleSegmentAsRegistry(t *testing.T) {
+	name, tag, explicit := ImageRepositoryParts("my.image")
+	if name != "my.image" || tag != "" || explicit {
+		t.Fatalf("ImageRepositoryParts(my.image) = %q, %q, %t; want a Docker Hub repository", name, tag, explicit)
+	}
+	if got := ImageRegistryOf("my.image"); got != "" {
+		t.Errorf("ImageRegistryOf(my.image) = %q, want no explicit registry", got)
+	}
+
+	name, tag, explicit = ImageRepositoryParts("GHCR.IO/Owner/Repo:v1")
+	if name != "Owner/Repo" || tag != "v1" || !explicit {
+		t.Fatalf("ImageRepositoryParts(GHCR.IO/Owner/Repo:v1) = %q, %q, %t", name, tag, explicit)
+	}
+	if got := ImageRegistryOf("GHCR.IO/Owner/Repo:v1"); got != "ghcr.io" {
+		t.Errorf("ImageRegistryOf(GHCR.IO/Owner/Repo:v1) = %q, want ghcr.io", got)
+	}
+}
+
+func TestNormalizeImageRefLowercasesRegistryHost(t *testing.T) {
+	if got := NormalizeImageRef("GHCR.IO/Owner/Repo:v1"); got != "ghcr.io/Owner/Repo:v1" {
+		t.Errorf("NormalizeImageRef(GHCR.IO/Owner/Repo:v1) = %q, want the registry host lowercased", got)
+	}
+	if !ImagesCompatible("GHCR.IO/owner/repo:v1", "ghcr.io/owner/repo:v1") {
+		t.Error("registry host case made otherwise identical references incompatible")
+	}
+}

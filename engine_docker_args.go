@@ -119,13 +119,33 @@ func (dockerEngine) logsFollowArgs(id string) []string {
 	return logsFollowArgsFor(id)
 }
 
+// logsFollowArgsWithOptions builds the follow argv for caller options. Docker
+// accepts --tail, --since, and --timestamps together with --follow.
+func (dockerEngine) logsFollowArgsWithOptions(id string, opts FollowLogsOptions) ([]string, error) {
+	return dockerLogsFollowArgs(id, opts), nil
+}
+
+func dockerLogsFollowArgs(id string, opts FollowLogsOptions) []string {
+	args := []string{"logs", "--follow"}
+	if opts.Tail > 0 {
+		args = append(args, "--tail", strconv.Itoa(opts.Tail))
+	}
+	if !opts.Since.IsZero() {
+		args = append(args, "--since", opts.Since.UTC().Format(time.RFC3339Nano))
+	}
+	if opts.Timestamps {
+		args = append(args, "--timestamps")
+	}
+	return append(args, id)
+}
+
 // logsFollowResumeArgs starts the replacement stream at since. Docker keeps
 // the full log across restarts, so following without --since would replay
 // every line the previous stream already wrote to the output. since is a
 // client-clock instant; a remote daemon must be time-synchronized with the
 // client or the boundary can drop/replay output.
 func (dockerEngine) logsFollowResumeArgs(id string, since time.Time) []string {
-	return []string{"logs", "--follow", "--since", since.UTC().Format(time.RFC3339Nano), id}
+	return dockerLogsFollowArgs(id, FollowLogsOptions{Since: since})
 }
 
 // logsArgsWithOptions builds the snapshot argv. --since uses the same UTC
@@ -139,6 +159,9 @@ func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, 
 	}
 	if !opts.Since.IsZero() {
 		args = append(args, "--since", opts.Since.UTC().Format(time.RFC3339Nano))
+	}
+	if opts.Timestamps {
+		args = append(args, "--timestamps")
 	}
 	return append(args, id), nil
 }

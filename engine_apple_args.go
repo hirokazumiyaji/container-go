@@ -66,6 +66,23 @@ func (appleEngine) logsFollowArgs(id string) []string {
 	return logsFollowArgsFor(id)
 }
 
+// logsFollowArgsWithOptions builds the follow argv for caller options. Apple
+// Container maps Tail to -n and has no --since or --timestamps equivalent, so
+// those options are rejected rather than silently ignored.
+func (appleEngine) logsFollowArgsWithOptions(id string, opts FollowLogsOptions) ([]string, error) {
+	if !opts.Since.IsZero() {
+		return nil, fmt.Errorf("%w: apple backend does not support logs since", ErrUnsupportedCapability)
+	}
+	if opts.Timestamps {
+		return nil, fmt.Errorf("%w: apple backend does not support log timestamps", ErrUnsupportedCapability)
+	}
+	args := []string{"logs", "--follow"}
+	if opts.Tail > 0 {
+		args = append(args, "-n", strconv.Itoa(opts.Tail))
+	}
+	return append(args, id), nil
+}
+
 // logsFollowResumeArgs ignores since: Apple Container truncates stdio.log
 // when a container starts, so following from the beginning of the current
 // log replays only the replacement process's output. Apple has no --since.
@@ -76,6 +93,9 @@ func (e appleEngine) logsFollowResumeArgs(id string, _ time.Time) []string {
 func (appleEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
 	if !opts.Since.IsZero() {
 		return nil, fmt.Errorf("%w: apple backend does not support logs since", ErrUnsupportedCapability)
+	}
+	if opts.Timestamps {
+		return nil, fmt.Errorf("%w: apple backend does not support log timestamps", ErrUnsupportedCapability)
 	}
 	args := []string{"logs"}
 	if opts.Tail > 0 {

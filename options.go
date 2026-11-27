@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 	"unicode/utf8"
 
@@ -109,8 +108,9 @@ type config struct {
 	// caller leaves the shared generation in place.
 	postReadyHooks []func(context.Context, *Container) error
 	// testLogger receives the container's log output while its test runs.
-	// It is nil unless WithTestLogger was applied.
-	testLogger            testing.TB
+	// It is nil unless WithTestLogger or WithTestLogOnFailure was applied.
+	testLogger            testLogSink
+	testLogOnFailure      bool
 	diagnosticSecrets     []string
 	waitDiagnosticSecrets []string
 	dockerHost            *string
@@ -1164,7 +1164,21 @@ func nilWriter(w io.Writer) bool {
 	if w == nil {
 		return true
 	}
-	value := reflect.ValueOf(w)
+	return nilInterface(reflect.ValueOf(w))
+}
+
+// nilReader reports whether r is nil, including a typed-nil value stored in
+// the interface. A typed-nil reader passes an interface comparison and panics
+// on its first Read.
+func nilReader(r io.Reader) bool {
+	if r == nil {
+		return true
+	}
+	return nilInterface(reflect.ValueOf(r))
+}
+
+// nilInterface reports whether a nil-capable dynamic value is nil.
+func nilInterface(value reflect.Value) bool {
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()

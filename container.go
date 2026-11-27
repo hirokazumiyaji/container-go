@@ -1805,7 +1805,7 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 		select {
 		case gate <- struct{}{}:
 			defer func() { <-gate }()
-			err := c.followLogsTo(attachCtx, output, resumeSince)
+			err := c.followLogsTo(attachCtx, output, FollowLogsOptions{}, resumeSince)
 			// A teardown cancellation is not a stream failure, but losing
 			// output to a failing sink is always reportable.
 			if attachCtx.Err() == nil || errors.Is(err, ErrOutputDelivery) {

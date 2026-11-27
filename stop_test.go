@@ -2,9 +2,11 @@ package container
 
 import (
 	"context"
+	"errors"
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,4 +158,58 @@ func newStopTestContainer(t *testing.T, eng engine) (*Container, *fakeRunner) {
 	}
 	runner := newTestRunner()
 	return runTestContainer(t, runner), runner
+}
+
+// A caller-supplied Duration can be large enough that adding the operation's
+// query budget overflows. The backend's range validation must report the
+// invalid timeout instead of an already-expired context.
+func TestStopOverflowingTimeoutUsesBackendValidation(t *testing.T) {
+	backends := []struct {
+		name   string
+		engine engine
+	}{
+		{name: "Apple", engine: appleEngine{}},
+		{name: "Docker", engine: dockerEngine{}},
+	}
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			ctr, runner := newStopTestContainer(t, backend.engine)
+			runner.calls = nil
+
+			timeout := maxStopTestDuration
+			err := ctr.Stop(context.Background(), &timeout)
+			if err == nil {
+				t.Fatal("Stop accepted an out-of-range timeout")
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Stop error = %v, want the backend timeout validation", err)
+			}
+			if !strings.Contains(err.Error(), "exceeds backend limit") {
+				t.Fatalf("Stop error = %v, want the backend timeout limit", err)
+			}
+			if stop := runner.callWith("stop"); stop != nil {
+				t.Fatalf("out-of-range timeout reached the backend: %v", stop)
+			}
+		})
+	}
+}
+
+func TestRestartOverflowingTimeoutUsesBackendValidation(t *testing.T) {
+	ctr, runner := newStopTestContainer(t, dockerEngine{})
+	runner.calls = nil
+
+	timeout := maxStopTestDuration
+	err := ctr.Restart(context.Background(), &timeout)
+	if err == nil {
+		t.Fatal("Restart accepted an out-of-range timeout")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Restart error = %v, want the backend timeout validation", err)
+	}
+	if !strings.Contains(err.Error(), "exceeds backend limit") {
+		t.Fatalf("Restart error = %v, want the backend timeout limit", err)
+	}
+	if restart := runner.callWith("restart"); restart != nil {
+		t.Fatalf("out-of-range timeout reached the backend: %v", restart)
+	}
 }

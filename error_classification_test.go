@@ -1270,3 +1270,67 @@ func TestImageMissingClassifierRejectsPullOperation(t *testing.T) {
 		t.Fatal("pull output was classified as image-missing")
 	}
 }
+
+func TestDockerNameConflictRejectsUnrelatedStderrTargets(t *testing.T) {
+	// Each of these names appears in the fixed wording of the conflict line,
+	// so a substring fallback would classify the conflict for the wrong
+	// container.
+	for _, target := range []string{"use", "container", "already", "conflict"} {
+		err := &cli.CLIError{
+			Binary: "docker", Args: []string{"run", "--name", target}, ExitCode: 1,
+			Stderr: `Conflict. The container name "/other" is already in use by container abc`,
+		}
+		if (dockerEngine{}).nameConflict(err) {
+			t.Errorf("nameConflict(target=%q) classified a conflict for another container", target)
+		}
+	}
+}
+
+func TestAppleImagePullMissingRequiresExactTarget(t *testing.T) {
+	args := []string{"image", "pull", "redis:7-alpine"}
+	other := &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: "image not found: other:tag"}
+	if (appleEngine{}).imageMissing(other) {
+		t.Fatal("image pull classified a not-found line for another image")
+	}
+	exact := &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: "image not found: redis:7-alpine"}
+	if !(appleEngine{}).imageMissing(exact) {
+		t.Fatal("image pull did not classify a not-found line for its own target")
+	}
+}
+
+func TestAppleContainerMissingIsBranchIsolated(t *testing.T) {
+	appleBranch := &cli.CLIError{
+		Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1,
+		Stderr: "permission denied",
+	}
+	foreignBranch := &cli.CLIError{
+		Binary: "docker", Args: []string{"exec", "myctr"}, ExitCode: 1,
+		Stderr: "container not found: myctr",
+	}
+	if (appleEngine{}).containerMissing(errors.Join(foreignBranch, appleBranch)) {
+		t.Fatal("another backend branch's stderr satisfied the Apple absence classifier")
+	}
+
+	// The matching Apple branch must be evaluated even when an earlier Apple
+	// branch carries unrelated diagnostics.
+	matching := &cli.CLIError{
+		Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1,
+		Stderr: "Error: container not found: myctr",
+	}
+	if !(appleEngine{}).containerMissing(errors.Join(appleBranch, foreignBranch, matching)) {
+		t.Fatal("the matching Apple branch was not evaluated")
+	}
+}
+
+func TestAppleUnescapedEnvelopeRejectsTrailingGarbage(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1,
+		Stderr: `Error: notFound: "container not found: myctr""`,
+	}
+	if (appleEngine{}).containerMissing(err) {
+		t.Fatal("trailing garbage after an unescaped envelope was accepted")
+	}
+	if _, ok := parseAppleContainerizationError(`notFound: "container not found: myctr""`); ok {
+		t.Fatal("envelope parser accepted a message with an unescaped interior quote")
+	}
+}

@@ -219,7 +219,7 @@ func (r *fakeSQLRows) Close() error { return nil }
 func (r *fakeSQLRows) Next(dest []driver.Value) error {
 	if r.state != nil {
 		// A test that injects a deferred row error drives Next directly.
-		if err := r.state.countRowNext(context.Background()); err != nil && err != io.EOF {
+		if err := r.state.countRowNext(context.Background()); err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
 	}

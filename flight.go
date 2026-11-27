@@ -71,6 +71,12 @@ func (g *flightGroup[T]) wait(ctx context.Context, f *flight[T]) (T, error) {
 	var zero T
 	select {
 	case <-f.done:
+		// A caller whose context ended must observe its own cancellation
+		// even when the flight finished in the same instant, so the outcome
+		// does not depend on which select arm wins.
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
 		return f.val, f.err
 	case <-ctx.Done():
 		return zero, ctx.Err()

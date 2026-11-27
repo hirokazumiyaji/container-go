@@ -32,6 +32,7 @@ const (
 	sessionLabel     = domain.LabelSession
 	reuseLabel       = domain.LabelReuse
 	reuseGroupLabel  = domain.LabelReuseGroup
+	reuseEnvLabel    = domain.LabelReuseEnvFingerprint
 	creationLabel    = domain.LabelCreation
 
 	queryTimeout = 30 * time.Second

@@ -955,18 +955,37 @@ rejected), and `WithHostname` (`--hostname`, an RFC 1123 hostname of at
 most 63 bytes). String values that start with `-` or contain control characters
 are rejected.
 
+The remaining options map to security- and process-related run flags.
+`WithReadOnlyRootFS()` passes `--read-only` to mount the container's root
+filesystem read-only. `WithInit()` passes `--init` to run a lightweight
+init process that forwards signals and reaps orphaned children.
+`WithDNS(servers ...string)` passes one `--dns` flag per server; every
+server must be a literal IPv4 or IPv6 address, and empty, malformed, or
+flag-shaped values are rejected while the option is evaluated.
+`WithStopSignal(signal string)` passes `--stop-signal` and accepts a
+Linux signal number from 1 to 64, a standard uppercase signal name such
+as `SIGTERM` or `TERM`, or a realtime spelling such as `SIGRTMIN+3` or
+`SIGRTMAX-1`; lowercase, unknown, out-of-range, and flag-shaped values
+are rejected. Docker supports all four options.
+
 Apple Container supports `--shm-size`, `--cap-add`, `--cap-drop`, and
-`--ulimit` and receives the same flags. It has no equivalent for
-privileged containers, extra hosts, or `--hostname`, so `WithPrivileged`,
-`WithExtraHost`, and `WithHostname` return `ErrUnsupportedCapability`
-before any image or container command.
+`--ulimit` and receives the same flags. It also supports `--read-only`,
+`--init`, and repeatable `--dns`, so `WithReadOnlyRootFS`, `WithInit`, and
+`WithDNS` pass through. It has no equivalent for privileged containers,
+extra hosts, `--hostname`, or a run-time stop signal, so `WithPrivileged`,
+`WithExtraHost`, `WithHostname`, and `WithStopSignal` return
+`ErrUnsupportedCapability` before any image or container command.
 
 These options are part of the `WithReuse` compatibility identity: a
 reused container must report matching CPU, shm, privilege, ulimit,
 extra-host, and hostname settings. Capabilities use a requested-subset
 rule: every capability the caller asked to add or drop must be present,
 while a caller that requests no capability changes accepts any inspected
-set. `Run` refuses to attach when these checks fail.
+set. The read-only root filesystem, init process, DNS server list, and
+stop signal are recorded in the creation fingerprint, so an existing
+container created with a different value, or without the option, returns
+`ErrReuseMismatch`. Environment values are handled separately by
+`WithReuseEnvFingerprint`. `Run` refuses to attach when these checks fail.
 
 ### Apple capability validation
 
@@ -999,12 +1018,13 @@ ports must be 2–65535, and Apple accepts at most 64 published-port descriptors
 `WithExposedPorts` remains a library-side declaration and is not turned into an
 Apple `--publish` flag.
 
-Apple supports `--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`, and
-integer `--cpus`, so `WithShmSize`, `WithCapAdd`, `WithCapDrop`,
-`WithUlimit`, and whole-number `WithCPUs` values are passed through.
-`WithPrivileged`, `WithExtraHost`, `WithHostname`, and a fractional
-`WithCPUs` value are rejected with `ErrUnsupportedCapability` before the
-CLI runs.
+Apple supports `--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`,
+`--read-only`, `--init`, repeatable `--dns`, and integer `--cpus`, so
+`WithShmSize`, `WithCapAdd`, `WithCapDrop`, `WithUlimit`,
+`WithReadOnlyRootFS`, `WithInit`, `WithDNS`, and whole-number `WithCPUs`
+values are passed through. `WithPrivileged`, `WithExtraHost`,
+`WithHostname`, `WithStopSignal`, and a fractional `WithCPUs` value are
+rejected with `ErrUnsupportedCapability` before the CLI runs.
 
 ## Image resolution and pinning
 
@@ -1347,14 +1367,25 @@ Contract:
   container IP, so use distinct names when those declarations must be
   isolated.
 - `WithMemory`, `WithUser`, `WithWorkingDir`, `WithEntrypoint`,
-  `WithCmd`, `WithMounts`, and custom labels must match the creation
+  `WithCmd`, `WithMounts`, custom labels, `WithReadOnlyRootFS`,
+  `WithInit`, `WithDNS`, and `WithStopSignal` must match the creation
   fingerprint stored on the container, or Run returns `ErrReuseMismatch`.
   Omitted options must also match, and the reuse group must match exactly.
-  Existing containers without a fingerprint must be recreated before attaching. Environment differences still attach; use distinct names when
-  they matter. `WithFiles` is copied for every reuse
+  Existing containers without a fingerprint must be recreated before
+  attaching. Environment differences still attach unless
+  `WithReuseEnvFingerprint` is set; use distinct names when they matter.
+  `WithFiles` is copied for every reuse
   caller, including attach callers; a failed attach copy returns an error
   without deleting the shared container. `PullAlways` fetches the image for
   every caller before attach.
+- `WithReuseEnvFingerprint()` opts into environment matching for a
+  `WithReuse` caller. The library stores a SHA-256 digest of the sorted
+  environment key/value pairs in a reserved label and never writes raw
+  values to labels or argv. An attach caller that sets the option must
+  find the same digest and otherwise returns `ErrReuseMismatch`; an
+  existing container without the label must be recreated. Without the
+  option, environment differences are ignored on attach, as before.
+  The option requires `WithReuse`.
 - `Container.Created()` reports whether the `Run` call created the container;
   `Container.Reused()` is its inverse. A `WithReuse` caller that attaches to
   an existing generation reports `Reused`, while the creating caller reports

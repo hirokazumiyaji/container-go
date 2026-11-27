@@ -32,6 +32,7 @@ const (
 	sessionLabel     = domain.LabelSession
 	reuseLabel       = domain.LabelReuse
 	reuseGroupLabel  = domain.LabelReuseGroup
+	reuseEnvLabel    = domain.LabelReuseEnvFingerprint
 	creationLabel    = domain.LabelCreation
 
 	queryTimeout = 30 * time.Second
@@ -1808,7 +1809,7 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 		select {
 		case gate <- struct{}{}:
 			defer func() { <-gate }()
-			err := c.followLogsTo(attachCtx, output, resumeSince)
+			err := c.followLogsTo(attachCtx, output, FollowLogsOptions{}, resumeSince)
 			// A teardown cancellation is not a stream failure, but losing
 			// output to a failing sink is always reportable.
 			if attachCtx.Err() == nil || errors.Is(err, ErrOutputDelivery) {
@@ -2300,15 +2301,19 @@ func (c *Container) cachedDynamic() *engineInfo {
 	return info
 }
 
-// cachedInspectSnapshot returns the most recent lifecycle/network snapshot
-// even when it carries no endpoint data. Health waits reuse the 1 Hz
-// lifecycle probe's inspect through it instead of spawning another CLI
-// process for every check.
-func (c *Container) cachedInspectSnapshot() *engineInfo {
+// cachedHealthSnapshot reads the health fields of the most recent
+// lifecycle/network snapshot under the lock. Health waits reuse the 1 Hz
+// lifecycle probe's inspect; copying the whole snapshot for the two fields
+// this poll reads allocated a clone of every label, port, and capability
+// array on each check.
+func (c *Container) cachedHealthSnapshot() (health string, observedAt time.Time, ok bool) {
 	p := c.pack()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return cloneEngineInfo(p.dynamic)
+	if p.dynamic == nil {
+		return "", time.Time{}, false
+	}
+	return p.dynamic.health, p.dynamic.observedAt, true
 }
 
 // healthStatus reports the Docker HEALTHCHECK status from a lifecycle
@@ -2318,9 +2323,9 @@ func (c *Container) cachedInspectSnapshot() *engineInfo {
 func (c *Container) healthStatus(ctx context.Context) (string, error) {
 	p := c.pack()
 	now := p.currentTime()
-	if info := c.cachedInspectSnapshot(); info != nil {
-		if !info.observedAt.IsZero() && now.Sub(info.observedAt) <= dynamicInspectTTL {
-			return info.health, nil
+	if health, observedAt, ok := c.cachedHealthSnapshot(); ok {
+		if !observedAt.IsZero() && now.Sub(observedAt) <= dynamicInspectTTL {
+			return health, nil
 		}
 	}
 	// Re-observe through the normal identity-checked inspect, bounded by

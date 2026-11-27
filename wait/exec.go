@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
 	"slices"
 	"strings"
@@ -34,6 +35,27 @@ type ExecOutputTarget interface {
 	ExecCommandOutput(ctx context.Context, cmd []string) (code int, output []byte, err error)
 }
 
+// ExecOptions describes the execution context ForExec passes to a target
+// implementing ExecOptionsTarget. Empty fields leave the corresponding
+// container default unchanged.
+type ExecOptions struct {
+	// User is the container user that runs the readiness command.
+	User string
+	// WorkDir is the absolute working directory for the readiness command.
+	WorkDir string
+	// Env is added to the readiness command's environment.
+	Env map[string]string
+}
+
+// ExecOptionsTarget is an optional extension to Target for targets that can
+// run a readiness command with a user, working directory, and environment.
+// ForExec requires it only when WithUser, WithWorkDir, or WithEnv is
+// configured; a target without it fails immediately with a *ConfigError.
+type ExecOptionsTarget interface {
+	ExecCommandWithOptions(ctx context.Context, cmd []string, options ExecOptions) (code int, err error)
+	ExecCommandOutputWithOptions(ctx context.Context, cmd []string, options ExecOptions) (code int, output []byte, err error)
+}
+
 // ExecStrategy waits until a command run inside the container exits
 // with an accepted code (0 by default) and, when configured, produces
 // acceptable output.
@@ -45,6 +67,9 @@ type ExecStrategy struct {
 	outputContains    string
 	outputContainsSet bool
 	execTimeout       time.Duration
+	user              string
+	workDir           string
+	env               map[string]string
 }
 
 // ForExec waits for cmd to succeed inside the container.
@@ -61,7 +86,51 @@ func ForExec(cmd []string) *ExecStrategy {
 func (s *ExecStrategy) clone() *ExecStrategy {
 	cloned := *s
 	cloned.cmd = slices.Clone(s.cmd)
+	cloned.env = maps.Clone(s.env)
 	return &cloned
+}
+
+// WithUser sets the container user that runs the readiness command. It needs
+// a target implementing ExecOptionsTarget; the container adapter does.
+func (s *ExecStrategy) WithUser(user string) *ExecStrategy {
+	cloned := s.clone()
+	cloned.user = user
+	return cloned
+}
+
+// WithWorkDir sets the absolute working directory for the readiness command.
+// It needs a target implementing ExecOptionsTarget; the container adapter
+// does.
+func (s *ExecStrategy) WithWorkDir(dir string) *ExecStrategy {
+	cloned := s.clone()
+	cloned.workDir = dir
+	return cloned
+}
+
+// WithEnv adds environment variables to the readiness command. Values are
+// registered as diagnostic secrets so a failure cannot echo them. It needs a
+// target implementing ExecOptionsTarget; the container adapter does.
+func (s *ExecStrategy) WithEnv(env map[string]string) *ExecStrategy {
+	cloned := s.clone()
+	if len(env) > 0 && cloned.env == nil {
+		cloned.env = make(map[string]string, len(env))
+	}
+	for key, value := range env {
+		cloned.env[key] = value
+	}
+	return cloned
+}
+
+func (s *ExecStrategy) execOptions() ExecOptions {
+	options := ExecOptions{User: s.user, WorkDir: s.workDir}
+	if len(s.env) > 0 {
+		options.Env = maps.Clone(s.env)
+	}
+	return options
+}
+
+func (s *ExecStrategy) hasExecOptions() bool {
+	return s.user != "" || s.workDir != "" || len(s.env) > 0
 }
 
 // WithExitCodeMatcher replaces the default exit-code-zero check.
@@ -139,7 +208,11 @@ func (s *ExecStrategy) attemptTimeout() time.Duration {
 
 func (s *ExecStrategy) DiagnosticValues() []string {
 	values := append([]string(nil), s.cmd...)
-	return append(values, strings.Join(s.cmd, " "))
+	values = append(values, strings.Join(s.cmd, " "))
+	for _, value := range s.env {
+		values = append(values, value)
+	}
+	return values
 }
 
 func (s *ExecStrategy) validate() error {
@@ -200,6 +273,19 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 			}
 		}
 	}
+	var optionsTarget ExecOptionsTarget
+	if s.hasExecOptions() {
+		var ok bool
+		optionsTarget, ok = target.(ExecOptionsTarget)
+		if !ok {
+			return &ConfigError{
+				Strategy: "ForExec",
+				Field:    "target",
+				Value:    fmt.Sprintf("%T", target),
+				Reason:   "target does not support exec user, working directory, or environment options",
+			}
+		}
+	}
 	pollOptions := s.options
 	if pollOptions.pollInterval == 0 {
 		pollOptions.pollInterval = defaultExecPollInterval
@@ -210,9 +296,14 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 		var code int
 		var output []byte
 		var err error
-		if outputTarget != nil {
+		switch {
+		case optionsTarget != nil && outputTarget != nil:
+			code, output, err = optionsTarget.ExecCommandOutputWithOptions(attemptCtx, s.cmd, s.execOptions())
+		case optionsTarget != nil:
+			code, err = optionsTarget.ExecCommandWithOptions(attemptCtx, s.cmd, s.execOptions())
+		case outputTarget != nil:
 			code, output, err = outputTarget.ExecCommandOutput(attemptCtx, s.cmd)
-		} else {
+		default:
 			code, err = target.ExecCommand(attemptCtx, s.cmd)
 		}
 		attemptErr := attemptCtx.Err()

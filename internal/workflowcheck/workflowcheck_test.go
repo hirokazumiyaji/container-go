@@ -5,6 +5,7 @@
 package workflowcheck
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -633,10 +634,15 @@ func checkoutWithHas(lines []string, usesIdx int) bool {
 }
 
 var (
-	makeGovulncheckVersion = regexp.MustCompile(`(?m)^GOVULNCHECK_VERSION\s*:=\s*(\S+)`)
-	makeActionlintVersion  = regexp.MustCompile(`(?m)^ACTIONLINT_VERSION\s*:=\s*(\S+)`)
-	workflowGovulncheckPin = regexp.MustCompile(`golang\.org/x/vuln/cmd/govulncheck@(v\S+)`)
-	workflowActionlintPin  = regexp.MustCompile(`github\.com/rhysd/actionlint/cmd/actionlint@(v\S+)`)
+	// toolVersionPin matches a `go run`-style pin to a released tool version.
+	// Versions belong in tools/go.mod, where go.sum verifies the module tree;
+	// a copy here or in a workflow is what the test below rejects.
+	toolVersionPin = regexp.MustCompile(`(?:govulncheck|actionlint)@v\S+`)
+	// integrationImageLine matches the exported image constants in
+	// internal/integrationtest/images.go.
+	integrationImageLine = regexp.MustCompile(`^\s*([A-Z][A-Za-z0-9]*Image)\s*=\s*"([^"]+)"`)
+	// deadcodeAllowedLine matches one allowlist assignment in the Makefile.
+	deadcodeAllowedLine = regexp.MustCompile(`^DEADCODE_ALLOWED(_BENCH)?\s*:=\s*(.+)$`)
 )
 
 func parseModRequires(t *testing.T, path string) map[string]string {
@@ -652,62 +658,371 @@ func parseModRequires(t *testing.T, path string) map[string]string {
 	return requires
 }
 
+func makefileText(t *testing.T) string {
+	t.Helper()
+	return strings.Join(readLines(t, filepath.Join("..", "..", "Makefile")), "\n")
+}
+
 // Dependabot tracks developer tool dependencies declared in tools/go.mod.
-// Tool version pins across Makefile and CI workflows must match tools/go.mod
-// so that Dependabot updates produce an immediate CI failure if the pins drift.
-func TestToolPinsMatchToolsGoMod(t *testing.T) {
+// govulncheck and actionlint have to be built from that module: `go run
+// pkg@version` runs outside the current module, so the downloaded tree is
+// never checked against tools/go.sum and the version Dependabot bumps can
+// differ from the one CI executes.
+func TestToolsAreBuiltFromToolsModule(t *testing.T) {
 	toolsModPath := filepath.Join("..", "..", "tools", "go.mod")
 	requires := parseModRequires(t, toolsModPath)
-
-	vulnVersion, ok := requires["golang.org/x/vuln"]
-	if !ok || vulnVersion == "" {
-		t.Fatalf("%s: missing require for golang.org/x/vuln", toolsModPath)
-	}
-
-	actionlintVersion, ok := requires["github.com/rhysd/actionlint"]
-	if !ok || actionlintVersion == "" {
-		t.Fatalf("%s: missing require for github.com/rhysd/actionlint", toolsModPath)
-	}
-
-	// 1. Check Makefile
-	makefilePath := filepath.Join("..", "..", "Makefile")
-	makeContent, err := os.ReadFile(makefilePath)
-	if err != nil {
-		t.Fatalf("read Makefile: %v", err)
-	}
-
-	if m := makeGovulncheckVersion.FindSubmatch(makeContent); m == nil || string(m[1]) != vulnVersion {
-		got := ""
-		if m != nil {
-			got = string(m[1])
+	for _, module := range []string{"golang.org/x/vuln", "github.com/rhysd/actionlint"} {
+		if requires[module] == "" {
+			t.Errorf("%s: missing require for %s", toolsModPath, module)
 		}
-		t.Errorf("Makefile GOVULNCHECK_VERSION = %q, want %q from %s", got, vulnVersion, toolsModPath)
 	}
 
-	if m := makeActionlintVersion.FindSubmatch(makeContent); m == nil || string(m[1]) != actionlintVersion {
-		got := ""
-		if m != nil {
-			got = string(m[1])
+	makefile := makefileText(t)
+	for _, pin := range toolVersionPin.FindAllString(makefile, -1) {
+		t.Errorf("Makefile pins %q; build the tool from tools/go.mod instead", pin)
+	}
+	for _, want := range []string{
+		"GOVULNCHECK_TOOL := golang.org/x/vuln/cmd/govulncheck",
+		"ACTIONLINT_TOOL := github.com/rhysd/actionlint/cmd/actionlint",
+		"$(GOVULNCHECK_TOOL)",
+		"$(ACTIONLINT_TOOL)",
+	} {
+		if !strings.Contains(makefile, want) {
+			t.Errorf("Makefile does not use the tools/go.mod tool build (%q)", want)
 		}
-		t.Errorf("Makefile ACTIONLINT_VERSION = %q, want %q from %s", got, actionlintVersion, toolsModPath)
 	}
 
-	// 2. Check workflow files
 	for _, wf := range workflowFiles(t) {
-		lines := readLines(t, wf)
-		for i, line := range lines {
-			if m := workflowGovulncheckPin.FindStringSubmatch(line); m != nil {
-				if m[1] != vulnVersion {
-					t.Errorf("%s:%d: govulncheck pin = %q, want %q from %s", wf, i+1, m[1], vulnVersion, toolsModPath)
-				}
+		body := strings.Join(readLines(t, wf), "\n")
+		for _, pin := range toolVersionPin.FindAllString(body, -1) {
+			t.Errorf("%s pins %q; build the tool from tools/go.mod instead", wf, pin)
+		}
+	}
+	ci := strings.Join(readLines(t, filepath.Join(workflowDir, "ci.yml")), "\n")
+	for _, tool := range []string{
+		"golang.org/x/vuln/cmd/govulncheck",
+		"github.com/rhysd/actionlint/cmd/actionlint",
+	} {
+		if !strings.Contains(ci, tool) {
+			t.Errorf("ci.yml no longer checks with %s", tool)
+		}
+	}
+}
+
+// actionlint's shellcheck integration is what checks the run: blocks as shell
+// scripts. `-shellcheck=` turns it off, leaving only Actions-expression
+// validation.
+func TestActionlintDoesNotDisableShellcheck(t *testing.T) {
+	paths := append(workflowFiles(t), filepath.Join("..", "..", "Makefile"))
+	for _, path := range paths {
+		if strings.Contains(strings.Join(readLines(t, path), "\n"), "-shellcheck=") {
+			t.Errorf("%s disables actionlint's shellcheck integration", path)
+		}
+	}
+}
+
+// The integration suites import their image refs from
+// internal/integrationtest/images.go, and ci.yml's Docker-image cache lists
+// the same refs. Before this test the list existed three times with nothing
+// checking the copies agreed, so a mirror or tag change could leave CI
+// pre-pulling an image the tests no longer use.
+func TestIntegrationDockerImageListIsSingleSource(t *testing.T) {
+	images := integrationImageConstants(t)
+	want := make([]string, 0, len(images))
+	for _, ref := range images {
+		if !strings.HasPrefix(ref, "public.ecr.aws/docker/library/") {
+			t.Errorf("image %q is not a public ECR library mirror", ref)
+		}
+		want = append(want, ref)
+	}
+	slices.Sort(want)
+
+	ci := strings.Join(readLines(t, filepath.Join(workflowDir, "ci.yml")), "\n")
+	got := integrationWorkflowImages(t)
+	if len(got) != len(want) {
+		t.Fatalf("ci.yml target_images = %v, want %v", got, want)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("ci.yml target_images = %v, want %v from internal/integrationtest/images.go", got, want)
+	}
+	for _, ref := range want {
+		if n := strings.Count(ci, ref); n != 1 {
+			t.Errorf("ci.yml mentions %q %d times; the image list must be defined once", ref, n)
+		}
+	}
+
+	// The Docker Hub fallback is the mirror path without its prefix, so the
+	// two lists cannot drift.
+	if !strings.Contains(ci, `dockerhub_prefix="public.ecr.aws/docker/library/"`) {
+		t.Error("ci.yml does not define the Docker Hub mirror prefix")
+	}
+	if !strings.Contains(ci, "fallback_images+=(") {
+		t.Error("ci.yml does not derive the fallback image list from target_images")
+	}
+
+	for _, rel := range []string{"integration_image_test.go", "integration_image_ext_test.go"} {
+		body := strings.Join(readLines(t, filepath.Join("..", "..", rel)), "\n")
+		for _, ref := range want {
+			if strings.Contains(body, ref) {
+				t.Errorf("%s restates %q; alias internal/integrationtest instead", rel, ref)
 			}
-			if m := workflowActionlintPin.FindStringSubmatch(line); m != nil {
-				if m[1] != actionlintVersion {
-					t.Errorf("%s:%d: actionlint pin = %q, want %q from %s", wf, i+1, m[1], actionlintVersion, toolsModPath)
-				}
+		}
+		for _, name := range []string{"RedisImage", "NginxImage", "AlpineImage"} {
+			if !strings.Contains(body, "integrationtest."+name) {
+				t.Errorf("%s does not alias integrationtest.%s", rel, name)
 			}
 		}
 	}
+
+	// The cache key must follow the image list, or a ref change reuses the
+	// previous tarball.
+	if !strings.Contains(ci, "hashFiles('internal/integrationtest/images.go')") {
+		t.Error("ci.yml cache key does not hash internal/integrationtest/images.go")
+	}
+}
+
+// actions/cache skips its post-job upload only on an exact key hit. A
+// restore-keys partial hit restores an older tarball, and unless the script
+// rewrites it after pulling what was missing, the job uploads the stale set
+// under the new key and the cache never catches up.
+func TestIntegrationDockerCacheRebuildsOnPartialHit(t *testing.T) {
+	lines := readLines(t, filepath.Join(workflowDir, "ci.yml"))
+	body := strings.Join(jobBodyLines(lines, "integration-docker"), "\n")
+	for _, want := range []string{
+		"id: cache-images",
+		"CACHE_EXACT_HIT: ${{ steps.cache-images.outputs.cache-hit }}",
+		`if [ "$CACHE_EXACT_HIT" != "true" ] || [ "$loaded" -ne 1 ]; then`,
+		`docker save -o /tmp/docker-images.tar "${target_images[@]}"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("integration-docker job is missing %q", want)
+		}
+	}
+	if strings.Contains(body, "if [ ! -f /tmp/docker-images.tar ]; then") {
+		t.Error("integration-docker job only saves when the tarball is missing; a partial hit keeps the stale file")
+	}
+	// Primary and fallback pulls both need retries against a throttled
+	// registry.
+	for _, want := range []string{
+		`pull_with_retry "$target"`,
+		`pull_with_retry "$fallback"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("integration-docker job does not retry %s", want)
+		}
+	}
+}
+
+// The release gate runs `make release-check`, so its pull_request filter has
+// to list every input that can flip a gate result. A missing entry means a PR
+// touching that input runs no release check at all.
+func TestReleaseCheckPathsCoverGateInputs(t *testing.T) {
+	paths := releaseCheckPaths(t)
+	for _, want := range []string{
+		"CHANGELOG.md",
+		"README.md",
+		"README.ja.md",
+		"SECURITY.md",
+		"docs/**",
+		"testdata/**",
+		"internal/**/testdata/**",
+		"go.mod",
+		"go.sum",
+		"bench/go.mod",
+		"bench/go.sum",
+		"**/*.go",
+		"bench/**",
+		"tools/**",
+		"Makefile",
+		".golangci.yml",
+		".github/workflows/**",
+		".github/dependabot.yml",
+		"internal/releasecheck/**",
+	} {
+		if !slices.Contains(paths, want) {
+			t.Errorf("release-check.yml pull_request.paths is missing %q", want)
+		}
+	}
+}
+
+// DEADCODE_ALLOWED documents functions that only an external caller can
+// reach. An entry for a deleted function hides nothing, and an entry for a
+// function in-repo tests reach would mask a regression. bench/ is a separate
+// module, so its exported result-schema API needs its own checked list and the
+// target has to run deadcode inside that module.
+func TestDeadcodeAllowlistIsAnchoredAndCoversBench(t *testing.T) {
+	makefile := makefileText(t)
+	allowed := deadcodeAllowlist(t, makefile, "DEADCODE_ALLOWED")
+	benchAllowed := deadcodeAllowlist(t, makefile, "DEADCODE_ALLOWED_BENCH")
+	if len(allowed) == 0 || len(benchAllowed) == 0 {
+		t.Fatalf("DEADCODE_ALLOWED = %v, DEADCODE_ALLOWED_BENCH = %v; both must be non-empty", allowed, benchAllowed)
+	}
+
+	for _, stale := range []string{"DiagnosticSecrets", "SecretValues"} {
+		if slices.Contains(allowed, stale) {
+			t.Errorf("DEADCODE_ALLOWED still names %q, which no longer exists", stale)
+		}
+	}
+	// Unit tests reach these, so deadcode reports them as reachable; listing
+	// them would suppress a future regression instead of documenting API.
+	for _, reachable := range []string{"WithClientDockerConfig", "WithClientPlatform"} {
+		if slices.Contains(allowed, reachable) {
+			t.Errorf("DEADCODE_ALLOWED names %q, which in-repo code reaches", reachable)
+		}
+	}
+
+	for _, name := range allowed {
+		if !declaredFunction(t, filepath.Join("..", ".."), name) {
+			t.Errorf("DEADCODE_ALLOWED names %q, which is not declared", name)
+		}
+	}
+	for _, name := range benchAllowed {
+		if !declaredFunction(t, filepath.Join("..", "..", "bench"), name) {
+			t.Errorf("DEADCODE_ALLOWED_BENCH names %q, which is not declared in bench/", name)
+		}
+	}
+
+	// The report is reduced to its symbol and compared as a whole token; a
+	// substring match would let a longer name hide behind an allowed prefix.
+	if !strings.Contains(makefile, "grep -Evx") {
+		t.Error("deadcode target does not match allowlisted symbols as whole tokens")
+	}
+	if !strings.Contains(makefile, `(cd bench && "$$tmp/deadcode" -test -tags integration ./...`) {
+		t.Error("deadcode target does not run the bench module")
+	}
+}
+
+// integrationImageConstants returns name to ref for the exported constants in
+// internal/integrationtest/images.go.
+func integrationImageConstants(t *testing.T) map[string]string {
+	t.Helper()
+	lines := readLines(t, filepath.Join("..", "..", "internal", "integrationtest", "images.go"))
+	out := make(map[string]string)
+	for _, line := range lines {
+		if m := integrationImageLine.FindStringSubmatch(line); m != nil {
+			out[m[1]] = m[2]
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("internal/integrationtest/images.go declares no image constants")
+	}
+	return out
+}
+
+// integrationWorkflowImages returns the refs in ci.yml's target_images array.
+func integrationWorkflowImages(t *testing.T) []string {
+	t.Helper()
+	lines := readLines(t, filepath.Join(workflowDir, "ci.yml"))
+	start := -1
+	for i, line := range lines {
+		if strings.Contains(line, "target_images=(") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatal("ci.yml: no target_images array")
+	}
+	var out []string
+	for _, line := range lines[start+1:] {
+		trim := strings.TrimSpace(line)
+		if trim == ")" {
+			return out
+		}
+		if trim == "" || strings.HasPrefix(trim, "#") {
+			continue
+		}
+		out = append(out, strings.Trim(trim, `"'`))
+	}
+	t.Fatal("ci.yml: unterminated target_images array")
+	return nil
+}
+
+// releaseCheckPaths returns the pull_request.paths entries of release-check.yml.
+func releaseCheckPaths(t *testing.T) []string {
+	t.Helper()
+	lines := readLines(t, filepath.Join(workflowDir, "release-check.yml"))
+	inPullRequest := false
+	for i, line := range lines {
+		if strings.TrimSuffix(line, " ") == "  pull_request:" {
+			inPullRequest = true
+			continue
+		}
+		if !inPullRequest || strings.TrimSpace(line) != "paths:" {
+			continue
+		}
+		keyIndent := leadingSpaces(line)
+		var out []string
+		for _, next := range lines[i+1:] {
+			trim := strings.TrimSpace(next)
+			if trim == "" || strings.HasPrefix(trim, "#") {
+				continue
+			}
+			if leadingSpaces(next) <= keyIndent || !strings.HasPrefix(trim, "- ") {
+				break
+			}
+			out = append(out, strings.Trim(strings.TrimPrefix(trim, "- "), `"'`))
+		}
+		return out
+	}
+	t.Fatal("release-check.yml: no pull_request.paths list")
+	return nil
+}
+
+// deadcodeAllowlist splits one Makefile allowlist assignment into its names.
+func deadcodeAllowlist(t *testing.T, makefile, name string) []string {
+	t.Helper()
+	for _, line := range strings.Split(makefile, "\n") {
+		m := deadcodeAllowedLine.FindStringSubmatch(line)
+		if m == nil || "DEADCODE_ALLOWED"+m[1] != name {
+			continue
+		}
+		var out []string
+		for _, entry := range strings.Split(m[2], "|") {
+			if entry = strings.TrimSpace(entry); entry != "" {
+				out = append(out, entry)
+			}
+		}
+		return out
+	}
+	t.Fatalf("Makefile: no %s assignment", name)
+	return nil
+}
+
+// declaredFunction reports whether dir declares a top-level func with name.
+func declaredFunction(t *testing.T, dir, name string) bool {
+	t.Helper()
+	pattern := regexp.MustCompile(`(?m)^func ` + regexp.QuoteMeta(name) + `\(`)
+	found := false
+	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", "testdata", "vendor":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if pattern.Match(data) {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan %s for func %s: %v", dir, name, err)
+	}
+	return found
 }
 
 // Dependabot configuration must track the /tools directory.

@@ -12,6 +12,7 @@ func TestWithLabelsRejectsReserved(t *testing.T) {
 		"com.github.hirokazumiyaji.container-go.session",
 		"com.github.hirokazumiyaji.container-go.reuse",
 		"com.github.hirokazumiyaji.container-go.reuse-group",
+		"com.github.hirokazumiyaji.container-go.reuse-env-fingerprint",
 		"com.github.hirokazumiyaji.container-go.creation",
 	} {
 		_, err := Run(context.Background(), "redis:7-alpine",

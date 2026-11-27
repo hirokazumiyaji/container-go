@@ -63,6 +63,11 @@ func (r *inspectSequenceRunner) Run(_ context.Context, args ...string) ([]byte, 
 		step := r.steps[len(r.steps)-1]
 		return []byte(r.withAppleOwnership(step.data)), nil, step.err
 	case "version":
+		for _, arg := range args {
+			if strings.Contains(arg, "json .") {
+				return []byte(defaultTestDockerVersion), nil, nil
+			}
+		}
 		return []byte("linux"), nil, nil
 	default:
 		return nil, nil, nil

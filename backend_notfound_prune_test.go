@@ -201,7 +201,7 @@ func TestDockerPruneRequestsFullIDsWithoutQuiet(t *testing.T) {
 	if !containsArg(args, "--no-trunc") || containsArg(args, "--quiet") {
 		t.Fatalf("listArgs = %v, want --no-trunc and no --quiet", args)
 	}
-	if _, err := (dockerEngine{}).parseStoppedManaged([]byte("short-name\n")); err == nil {
+	if _, _, err := (dockerEngine{}).parsePruneListed([]byte("short-name\n"), ""); err == nil {
 		t.Fatal("Docker prune accepted a non-full container ID")
 	}
 }

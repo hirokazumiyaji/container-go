@@ -19,7 +19,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
-const defaultTestDockerVersion = `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`
+const defaultTestDockerVersion = `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0","Os":"linux"}}`
 
 // cpRunner materializes files for container-to-host copies.
 type cpRunner struct {
@@ -78,7 +78,7 @@ func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 	return c.fakeRunner.Run(ctx, args...)
 }
 
-func (c *cpRunner) setBinary(b string) {
+func (c *cpRunner) setBinary(b string) { //nolint:unparam // satisfies the runner capability; the test always pins docker
 	if c != nil && c.fakeRunner != nil {
 		c.binary = b
 	}

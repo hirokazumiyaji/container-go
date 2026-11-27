@@ -29,9 +29,10 @@ func TestReuseConfigurationCompatibility(t *testing.T) {
 	options := map[string]Option{
 		"memory": WithMemory("512M"), "user": WithUser("1000"),
 		"workdir": WithWorkingDir("/app"), "entrypoint": WithEntrypoint("/bin/app"),
-		"cmd":    WithCmd("serve", "--quiet"),
-		"mount":  WithMounts(Mount{Type: MountVolume, Source: "data", Target: "/data"}),
-		"labels": WithLabels(map[string]string{"team": "backend"}),
+		"cmd":       WithCmd("serve", "--quiet"),
+		"mount":     WithMounts(Mount{Type: MountVolume, Source: "data", Target: "/data"}),
+		"labels":    WithLabels(map[string]string{"team": "backend"}),
+		"read-only": WithReadOnlyRootFS(), "init": WithInit(), "dns": WithDNS("1.1.1.1"),
 	}
 	for _, backend := range reuseBackendFixtures() {
 		t.Run(backend.name, func(t *testing.T) {
@@ -90,6 +91,41 @@ func TestReuseConfigurationCompatibility(t *testing.T) {
 	}
 }
 
+// Apple rejects WithStopSignal before reuse, so its creation-fingerprint
+// compatibility is exercised through the Docker fixture only.
+func TestReuseStopSignalCompatibility(t *testing.T) {
+	backend := reuseBackendFixtures()[0]
+	if backend.name != "docker" {
+		t.Fatalf("fixture order changed: got %q, want docker", backend.name)
+	}
+	cfg := newConfig()
+	cfg.reuse = true
+	if err := WithStopSignal("SIGTERM")(cfg); err != nil {
+		t.Fatal(err)
+	}
+	data := reuseInspectWithLabels(backend.inspect(backend.runningSpec()), cfg.allLabels())
+	for _, matching := range []bool{true, false} {
+		runner := newReuseTransitionRunner(data, data, backend.eng)
+		opts := []Option{WithName("shared"), WithReuse(), withRunner(runner), withEngine(backend.eng)}
+		if matching {
+			opts = append(opts, WithStopSignal("SIGTERM"))
+		}
+		ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
+		if matching {
+			if err != nil {
+				t.Fatalf("matching stop signal: %v", err)
+			}
+			if ctr == nil {
+				t.Fatal("missing reused handle")
+			}
+			continue
+		}
+		if !errors.Is(err, ErrReuseMismatch) {
+			t.Fatalf("removed stop signal: got %v, want ErrReuseMismatch", err)
+		}
+	}
+}
+
 func TestReuseFlightKeyIncludesConfiguration(t *testing.T) {
 	base := newConfig()
 	base.eng = dockerEngine{}
@@ -101,7 +137,9 @@ func TestReuseFlightKeyIncludesConfiguration(t *testing.T) {
 		"mount":    WithMounts(Mount{Type: MountVolume, Source: "data", Target: "/data"}),
 		"platform": WithPlatform("linux/arm64"), "network": WithNetwork("test"),
 		"exposed": WithExposedPorts("80"), "published": WithPublishedPort("8080:80"),
-		"group": WithReuseGroup("tests"),
+		"group":     WithReuseGroup("tests"),
+		"read-only": WithReadOnlyRootFS(), "init": WithInit(),
+		"dns": WithDNS("1.1.1.1"), "stop-signal": WithStopSignal("SIGTERM"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := newConfig()

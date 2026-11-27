@@ -127,7 +127,7 @@ func writeEnvFileAtContext(ctx context.Context, base string, env map[string]stri
 	ctx, cancel := boundedEnvContext(ctx)
 	defer cancel()
 	err = withEnvFileRootContext(ctx, base, func(rootCtx context.Context, root string) error {
-		if err := cleanupWindowsEnvDirsContext(rootCtx, root); err != nil {
+		if err := cleanupWindowsEnvDirsIfDueContext(rootCtx, root); err != nil {
 			return err
 		}
 		path, dir, err = createWindowsEnvFileContext(rootCtx, root, env)
@@ -512,8 +512,29 @@ func cleanupStaleEnvFilesAtContext(ctx context.Context, base string) error {
 	ctx, cancel := boundedEnvContext(ctx)
 	defer cancel()
 	return withEnvFileRootContext(ctx, base, func(rootCtx context.Context, root string) error {
-		return cleanupWindowsEnvDirsContext(rootCtx, root)
+		if err := cleanupWindowsEnvDirsContext(rootCtx, root); err != nil {
+			return err
+		}
+		markEnvDirGC(root, time.Now())
+		return nil
 	})
+}
+
+// cleanupWindowsEnvDirsIfDueContext reclaims abandoned directories at most
+// once per envDirGCInterval for root, matching the Unix write path. Run's
+// explicit security preflight calls cleanupWindowsEnvDirsContext directly and
+// stays unconditional. A failed scan is not recorded, so the entry that made
+// it fail is retried by the next write.
+func cleanupWindowsEnvDirsIfDueContext(ctx context.Context, root string) error {
+	now := time.Now()
+	if !envDirGCDue(root, now) {
+		return nil
+	}
+	if err := cleanupWindowsEnvDirsContext(ctx, root); err != nil {
+		return err
+	}
+	markEnvDirGC(root, now)
+	return nil
 }
 
 func cleanupWindowsEnvDirsContext(ctx context.Context, root string) error {

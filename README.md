@@ -228,6 +228,21 @@ container cannot make the host allocate an unbounded response:
   mode. Supplying the same comparable writer value for both streams (typically
   the same pointer) is allowed and writes are serialized; distinct wrappers or
   non-comparable dynamic types are not detected.
+- `WithExecStdin(r)` attaches `r` to the exec'd process's stdin and adds
+  `exec -i`, so a dump can be piped into `psql`, `mysql`, or
+  `redis-cli --pipe` without a temporary file. A nil or typed-nil reader is
+  rejected as a `*ValidationError`. The runner must provide the optional
+  stdin capability that `ExecRunner` (and any wrapper embedding it)
+  implements; otherwise `Exec`/`ExecTo` return `ErrUnsupportedCapability`
+  before invoking the backend. When the command exits or the context is
+  cancelled the child's stdin pipe is closed and a reader that implements
+  `io.Closer` is closed too and its copy is awaited for a short grace.
+  A non-EOF read failure from `r` is returned with the command result, even
+  when the command exits successfully, because the command received truncated
+  input. Go cannot interrupt a read on a non-closable reader, so pass input
+  that reaches EOF or whose `Close` unblocks a pending read. A reader that
+  stays blocked leaves only its copy goroutine until the read returns; the
+  child is still terminated and reaped.
 - A bounded reader returns `ErrOutputTruncated` as its terminal read
   error, while still returning all retained bytes. Check
   `errors.Is(readErr, container.ErrOutputTruncated)` or the
@@ -252,12 +267,13 @@ new code should select a positive limit or use a streaming method.
 The legacy path will be reconsidered in a future minor release, but
 this change does not silently discard existing output.
 
-`LogsOptions` now has a `MaxBytes` field. Go cannot add a field to a
-struct without breaking old unkeyed literals, so this release
-intentionally requires keyed `LogsOptions` literals; update existing
-`LogsOptions{tail, since}` calls to `LogsOptions{Tail: tail, Since:
-since}`. The repository is pre-1.0 and documents this narrow source
-compatibility tradeoff rather than hiding it behind a second option
+`LogsOptions` now has `Tail`, `Since`, `Timestamps`, and `MaxBytes`
+fields. Go cannot add a field to a struct without breaking old unkeyed
+literals, so this release intentionally requires keyed `LogsOptions`
+literals; update existing `LogsOptions{tail, since}` calls to
+`LogsOptions{Tail: tail, Since: since}` (leaving `Timestamps` false keeps
+the previous output). The repository is pre-1.0 and documents this narrow
+source compatibility tradeoff rather than hiding it behind a second option
 representation. The large-output integration check verifies bounded
 forwarding and draining; it does not measure peak host memory, which
 would require an external RSS sampler.
@@ -462,15 +478,26 @@ probe attempt runs under a deadline so a stalled handshake is retried.
 `WithResponseMatcher` / `WithOutputContains` for command output. An output
 matcher needs a target implementing the optional `wait.ExecOutputTarget`
 interface; the container adapter retains at most 64 KiB of command output for
-it. The healthcheck strategy is Docker-only; the Apple backend rejects it
-before creating a container.
+it. The same strategy gains `WithUser`, `WithWorkDir`, and `WithEnv` for the
+readiness command's execution context; those need the optional
+`wait.ExecOptionsTarget` interface, and environment values are registered for
+diagnostic redaction. `wait.ForExit()` waits for a one-shot container to stop
+and accepts exit code 0 by default, failing immediately for any other result;
+`WithExitCode` and `WithExitCodeMatcher` change acceptance. It uses the
+optional `wait.ExitCodeTarget` interface and is meant for job-like containers
+(migrations, seeders, generated configuration) rather than long-lived
+services. The healthcheck strategy is Docker-only; the Apple backend rejects
+it before creating a container.
 
 Waiting fails fast when the container is stopping, stopped, or paused.
 Created, restarting, unknown, and transient inspect states retry under the
 timeout; transient log stream open/EOF failures are reopened, while a
 terminal log-stream error is returned. A successful marker is accepted only
 after a bounded final lifecycle observation reports `Running`; `ForLog` is for
-long-lived services, not one-shot job completion. A marker observed on a
+long-lived services, not one-shot job completion. `ForExit` is the exception:
+its success condition is a stopped container, so use it directly rather than
+inside `ForAll` or `ForAny`, whose final check requires the container to stay
+running. A marker observed on a
 still-running follow stream is accepted without an extra settle delay; a
 stream whose CLI has already exited is drained first so its terminal error is
 not hidden. `ForLog` counts occurrences across reconnects after de-duplicating
@@ -484,7 +511,10 @@ and fall back to `Running` for compatibility. Docker healthcheck waits also
 use the optional `wait.HealthTarget` interface; `ForHealthcheck` returns a
 `*wait.ConfigError` for targets that do not implement it. `ForExec` output
 matchers use the optional `wait.ExecOutputTarget` interface the same way and
-fail with a `*wait.ConfigError` when it is missing.
+fail with a `*wait.ConfigError` when it is missing. `ForExit` uses the optional
+`wait.ExitCodeTarget` interface, and `ForExec` execution options use the
+optional `wait.ExecOptionsTarget` interface; both fail with a
+`*wait.ConfigError` when the target lacks the interface the strategy needs.
 
 On Docker, a successful TCP connection to a published port does not prove
 that the container process listens: `docker-proxy` or Docker Desktop's port
@@ -572,7 +602,11 @@ func DevelopmentWaitOptions() {
         WithBody([]byte(`{"probe":true}`)).
         WithStartupTimeout(time.Second)
     _ = wait.ForExec([]string{"pg_isready"}).
-        WithOutputContains("accepting connections")
+        WithOutputContains("accepting connections").
+        WithUser("app").
+        WithWorkDir("/srv/app").
+        WithEnv(map[string]string{"PGPASSWORD": "secret"})
+    _ = wait.ForExit().WithExitCode(0)
     _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
     _ = wait.ForSQL("5432/tcp", "postgres", func(host string, port int) string {
         return fmt.Sprintf(
@@ -596,18 +630,24 @@ imposes no byte limit. `LogsWithOptions` imposes a byte limit only when
 `LogsOptions.MaxBytes` is positive: it then retains at most that many bytes
 of the combined output as a prefix, following the output contract above.
 `LogsOptions` is
-backend-specific: Docker supports both `Tail` and `Since`. The checked
-Apple Container CLI versions use `-n` for a tail and have no `--since`
-option, so the Apple backend maps `Tail` to `-n` and rejects `Since` with
-`ErrUnsupportedCapability`. A requested window can still produce output
-whose size depends on the container, so pass a positive `MaxBytes` when the
-output is large or untrusted. `FollowLogs` returns a streaming `io.ReadCloser`; close it or
-cancel its context to stop the backend CLI. `ForLog` uses `FollowLogs`,
+backend-specific: Docker supports `Tail`, `Since`, and `Timestamps`. The
+checked Apple Container CLI versions use `-n` for a tail and have no
+`--since` or `--timestamps` option, so the Apple backend maps `Tail` to `-n`
+and rejects `Since` and `Timestamps` with `ErrUnsupportedCapability`. A
+requested window can still produce output whose size depends on the
+container, so pass a positive `MaxBytes` when the output is large or
+untrusted. `FollowLogs` returns a streaming `io.ReadCloser`; close it or
+cancel its context to stop the backend CLI. `FollowLogsWithOptions` and
+`FollowLogsToWithOptions` apply `FollowLogsOptions{Tail, Since,
+Timestamps}` to that stream, with the same backend rules: a zero `Tail`
+replays all available history. `ForLog` uses `FollowLogs`,
 while `Logs` does not follow new output. `LogsOptions` and
 `LogsWithOptions` are recorded in the `0.3.0` section of
-[CHANGELOG.md](CHANGELOG.md).
-`LogsOptions.Tail` and `MaxBytes` are validated as non-negative, and
-`PruneReuseGroup` uses the same reuse-group grammar as `WithReuseGroup`.
+[CHANGELOG.md](CHANGELOG.md); the `FollowLogsOptions` variants are newer.
+`LogsOptions.Tail`/`MaxBytes` and `FollowLogsOptions.Tail` are validated as
+non-negative, and `PruneReuseGroup` uses the same reuse-group grammar as
+`WithReuseGroup`.
+
 
 The example below is Docker-specific. It also shows the log stream, exec
 options, and public error symbols added after `v0.2.0`; it is not an
@@ -619,6 +659,7 @@ package docexample
 import (
     "context"
     "errors"
+    "strings"
     "time"
 
     container "github.com/hirokazumiyaji/container-go"
@@ -626,21 +667,26 @@ import (
 
 func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
     logs, err := ctr.LogsWithOptions(ctx, container.LogsOptions{
-        Tail:  10,
-        Since: time.Now(),
+        Tail:       10,
+        Since:      time.Now(),
+        Timestamps: true,
     })
     if err != nil {
         return err
     }
     defer logs.Close()
 
-    stream, err := ctr.FollowLogs(ctx)
+    stream, err := ctr.FollowLogsWithOptions(ctx, container.FollowLogsOptions{
+        Tail:       10,
+        Timestamps: true,
+    })
     if err != nil {
         return err
     }
     defer stream.Close()
 
     _, _, err = ctr.Exec(ctx, []string{"true"},
+        container.WithExecStdin(strings.NewReader("SELECT 1;")),
         container.WithExecEnv(map[string]string{"MODE": "test"}),
         container.WithExecUser("test"),
         container.WithExecWorkDir("/tmp"),
@@ -909,18 +955,37 @@ rejected), and `WithHostname` (`--hostname`, an RFC 1123 hostname of at
 most 63 bytes). String values that start with `-` or contain control characters
 are rejected.
 
+The remaining options map to security- and process-related run flags.
+`WithReadOnlyRootFS()` passes `--read-only` to mount the container's root
+filesystem read-only. `WithInit()` passes `--init` to run a lightweight
+init process that forwards signals and reaps orphaned children.
+`WithDNS(servers ...string)` passes one `--dns` flag per server; every
+server must be a literal IPv4 or IPv6 address, and empty, malformed, or
+flag-shaped values are rejected while the option is evaluated.
+`WithStopSignal(signal string)` passes `--stop-signal` and accepts a
+Linux signal number from 1 to 64, a standard uppercase signal name such
+as `SIGTERM` or `TERM`, or a realtime spelling such as `SIGRTMIN+3` or
+`SIGRTMAX-1`; lowercase, unknown, out-of-range, and flag-shaped values
+are rejected. Docker supports all four options.
+
 Apple Container supports `--shm-size`, `--cap-add`, `--cap-drop`, and
-`--ulimit` and receives the same flags. It has no equivalent for
-privileged containers, extra hosts, or `--hostname`, so `WithPrivileged`,
-`WithExtraHost`, and `WithHostname` return `ErrUnsupportedCapability`
-before any image or container command.
+`--ulimit` and receives the same flags. It also supports `--read-only`,
+`--init`, and repeatable `--dns`, so `WithReadOnlyRootFS`, `WithInit`, and
+`WithDNS` pass through. It has no equivalent for privileged containers,
+extra hosts, `--hostname`, or a run-time stop signal, so `WithPrivileged`,
+`WithExtraHost`, `WithHostname`, and `WithStopSignal` return
+`ErrUnsupportedCapability` before any image or container command.
 
 These options are part of the `WithReuse` compatibility identity: a
 reused container must report matching CPU, shm, privilege, ulimit,
 extra-host, and hostname settings. Capabilities use a requested-subset
 rule: every capability the caller asked to add or drop must be present,
 while a caller that requests no capability changes accepts any inspected
-set. `Run` refuses to attach when these checks fail.
+set. The read-only root filesystem, init process, DNS server list, and
+stop signal are recorded in the creation fingerprint, so an existing
+container created with a different value, or without the option, returns
+`ErrReuseMismatch`. Environment values are handled separately by
+`WithReuseEnvFingerprint`. `Run` refuses to attach when these checks fail.
 
 ### Apple capability validation
 
@@ -953,12 +1018,13 @@ ports must be 2–65535, and Apple accepts at most 64 published-port descriptors
 `WithExposedPorts` remains a library-side declaration and is not turned into an
 Apple `--publish` flag.
 
-Apple supports `--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`, and
-integer `--cpus`, so `WithShmSize`, `WithCapAdd`, `WithCapDrop`,
-`WithUlimit`, and whole-number `WithCPUs` values are passed through.
-`WithPrivileged`, `WithExtraHost`, `WithHostname`, and a fractional
-`WithCPUs` value are rejected with `ErrUnsupportedCapability` before the
-CLI runs.
+Apple supports `--shm-size`, `--cap-add`, `--cap-drop`, `--ulimit`,
+`--read-only`, `--init`, repeatable `--dns`, and integer `--cpus`, so
+`WithShmSize`, `WithCapAdd`, `WithCapDrop`, `WithUlimit`,
+`WithReadOnlyRootFS`, `WithInit`, `WithDNS`, and whole-number `WithCPUs`
+values are passed through. `WithPrivileged`, `WithExtraHost`,
+`WithHostname`, `WithStopSignal`, and a fractional `WithCPUs` value are
+rejected with `ErrUnsupportedCapability` before the CLI runs.
 
 ## Image resolution and pinning
 
@@ -1301,14 +1367,25 @@ Contract:
   container IP, so use distinct names when those declarations must be
   isolated.
 - `WithMemory`, `WithUser`, `WithWorkingDir`, `WithEntrypoint`,
-  `WithCmd`, `WithMounts`, and custom labels must match the creation
+  `WithCmd`, `WithMounts`, custom labels, `WithReadOnlyRootFS`,
+  `WithInit`, `WithDNS`, and `WithStopSignal` must match the creation
   fingerprint stored on the container, or Run returns `ErrReuseMismatch`.
   Omitted options must also match, and the reuse group must match exactly.
-  Existing containers without a fingerprint must be recreated before attaching. Environment differences still attach; use distinct names when
-  they matter. `WithFiles` is copied for every reuse
+  Existing containers without a fingerprint must be recreated before
+  attaching. Environment differences still attach unless
+  `WithReuseEnvFingerprint` is set; use distinct names when they matter.
+  `WithFiles` is copied for every reuse
   caller, including attach callers; a failed attach copy returns an error
   without deleting the shared container. `PullAlways` fetches the image for
   every caller before attach.
+- `WithReuseEnvFingerprint()` opts into environment matching for a
+  `WithReuse` caller. The library stores a SHA-256 digest of the sorted
+  environment key/value pairs in a reserved label and never writes raw
+  values to labels or argv. An attach caller that sets the option must
+  find the same digest and otherwise returns `ErrReuseMismatch`; an
+  existing container without the label must be recreated. Without the
+  option, environment differences are ignored on attach, as before.
+  The option requires `WithReuse`.
 - `Container.Created()` reports whether the `Run` call created the container;
   `Container.Reused()` is its inverse. A `WithReuse` caller that attaches to
   an existing generation reports `Reused`, while the creating caller reports
@@ -1326,7 +1403,11 @@ Contract:
   verified only on hosts where that test ran. `WithTestLogger(t)` forwards a
   container's logs to `t.Logf` for the test's lifetime; new containers replay
   history and Docker reuse attaches resume just before attach time to tolerate
-  clock skew (Apple has no `--since` and replays history).
+  clock skew (Apple has no `--since` and replays history). Both test loggers
+  normalize CR/CRLF to line breaks and escape terminal control characters.
+  `WithTestLogOnFailure(t)` is the bounded alternative: it keeps the most
+  recent 64 KiB in a ring buffer and emits sanitized lines at `t.Cleanup`
+  only when `t.Failed()` is true.
 - Each creation carries a generation label; `Terminate`, the
   stopped-recreate path, and the watchdog reaper refuse to delete a replaced
   generation. Docker handles delete by the immutable ID printed by

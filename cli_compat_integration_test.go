@@ -394,7 +394,7 @@ func appleCapabilityOwned(r *cli.ExecRunner, name, token string) (bool, error) {
 		return false, err
 	}
 	for _, ctr := range containers {
-		if ctr.ID == name && ctr.Configuration.Labels[appleCapabilityLabel] == token {
+		if ctr.ID.Value == name && ctr.Configuration.Value.Labels[appleCapabilityLabel] == token {
 			return true, nil
 		}
 	}

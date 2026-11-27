@@ -189,6 +189,11 @@ func newReuseTransitionRunner(before, after []byte, eng engine) *reuseTransition
 
 func (r *reuseTransitionRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "version" {
+		for _, arg := range args {
+			if strings.Contains(arg, "json .") {
+				return []byte(defaultTestDockerVersion), nil, nil
+			}
+		}
 		return []byte("linux"), nil, nil
 	}
 	if len(args) == 0 || args[0] != "inspect" {

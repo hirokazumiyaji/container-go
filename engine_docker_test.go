@@ -1263,8 +1263,8 @@ func TestDockerReuseGroupListsFullIDs(t *testing.T) {
 	if !slices.Contains(got, "--no-trunc") || !slices.Contains(got, "{{.ID}}") || slices.Contains(got, "--quiet") {
 		t.Errorf("listReuseGroupArgs = %v, want non-truncated {{.ID}} output", got)
 	}
-	if _, err := e.parseReuseGroupIDs([]byte("group-member\n"), "group"); err == nil {
-		t.Error("parseReuseGroupIDs accepted a container name")
+	if _, _, err := e.parsePruneListed([]byte("group-member\n"), "group"); err == nil {
+		t.Error("parsePruneListed accepted a container name")
 	}
 }
 
@@ -1275,15 +1275,15 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 	}
 	one := strings.Repeat("1", 64)
 	two := strings.Repeat("2", 64)
-	ids, err := e.parseStoppedManaged([]byte(one + "\n" + two + "\n\n"))
+	ids, _, err := e.parsePruneListed([]byte(one+"\n"+two+"\n\n"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(ids, []string{one, two}) {
 		t.Errorf("ids = %v", ids)
 	}
-	if _, err := e.parseStoppedManaged([]byte("short\n")); err == nil {
-		t.Fatal("parseStoppedManaged accepted a short ID")
+	if _, _, err := e.parsePruneListed([]byte("short\n"), ""); err == nil {
+		t.Fatal("parsePruneListed accepted a short ID")
 	}
 }
 
@@ -1428,7 +1428,11 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	case "version":
 		for _, a := range args {
 			if strings.Contains(a, "json .") {
-				return []byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`), nil, nil
+				serverOS := d.serverOS
+				if serverOS == "" {
+					serverOS = "linux"
+				}
+				return []byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0","Os":"` + serverOS + `"}}`), nil, nil
 			}
 		}
 		if d.serverOS != "" {

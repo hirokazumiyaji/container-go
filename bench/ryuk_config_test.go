@@ -41,6 +41,12 @@ func TestValidateTestcontainersEnvironmentOverrides(t *testing.T) {
 	if err := validateTestcontainersEnvironmentOverride("TESTCONTAINERS_RYUK_DISABLED", "false"); err != nil {
 		t.Fatalf("explicit false disabled flag should be forceable: %v", err)
 	}
+	if err := validateTestcontainersEnvironmentOverride("TESTCONTAINERS_PROVIDER", "docker"); err != nil {
+		t.Fatalf("docker provider should be forceable: %v", err)
+	}
+	if err := validateTestcontainersEnvironmentOverride("TESTCONTAINERS_PROVIDER", "podman"); err == nil {
+		t.Fatal("podman provider override was accepted")
+	}
 }
 
 // Every setting the preflight must refuse has to appear in the policy table.
@@ -62,6 +68,7 @@ func TestBenchmarkOverridesCoverBehaviorChangingSettings(t *testing.T) {
 		"TESTCONTAINERS_RYUK_PORT",
 		"TESTCONTAINERS_ALWAYS_PULL_IMAGE",
 		"TESTCONTAINERS_CHECKS_DISABLE",
+		"TESTCONTAINERS_PROVIDER",
 		"TESTCONTAINERS_DOCKER_SOCKET_PATH",
 		"TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE",
 		"TESTCONTAINERS_HOST_OVERRIDE",
@@ -100,6 +107,10 @@ func TestValidateTestcontainersEnvironmentOverridesRejectBehaviorChanges(t *test
 		{"TESTCONTAINERS_RYUK_CONNECTION_TIMEOUT", "5m"},
 		{"RYUK_VERBOSE", "true"},
 		{"TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED", "true"},
+		// Testcontainers resolves this before DOCKER_HOST, so a Podman or
+		// sandbox provider would bypass the Docker provenance capture.
+		{"TESTCONTAINERS_PROVIDER", "podman"},
+		{"TESTCONTAINERS_PROVIDER", "sandbox"},
 	} {
 		if err := validateTestcontainersEnvironmentOverride(override.name, override.value); err == nil {
 			t.Errorf("%s=%q was accepted", override.name, override.value)
@@ -114,6 +125,7 @@ func TestValidateTestcontainersEnvironmentOverridesRejectBehaviorChanges(t *test
 		// canonical duration.
 		{"RYUK_RECONNECTION_TIMEOUT", "10000ms"},
 		{"RYUK_CONNECTION_TIMEOUT", "60s"},
+		{"TESTCONTAINERS_PROVIDER", "docker"},
 	} {
 		if err := validateTestcontainersEnvironmentOverride(override.name, override.value); err != nil {
 			t.Errorf("%s=%q rejected: %v", override.name, override.value, err)
@@ -144,6 +156,7 @@ func TestValidateTestcontainersPropertiesUsesJavaGrammar(t *testing.T) {
 		"always.pull.image=false\n",
 		"checks.disable=false\n",
 		"docker.socket.path=\n",
+		"provider=docker\n",
 	} {
 		if err := validateTestcontainersProperties(data); err != nil {
 			t.Errorf("canonical properties %q rejected: %v", data, err)
@@ -166,6 +179,7 @@ func TestValidateTestcontainersPropertiesUsesJavaGrammar(t *testing.T) {
 		"docker socket path":        "docker.socket.path=/tmp/other-docker.sock\n",
 		"escaped pull key":          `always\.pull.image=true` + "\n",
 		"unicode escaped pull flag": `always.pull.image=tr\u0075e` + "\n",
+		"podman provider":           "provider=podman\n",
 	} {
 		if err := validateTestcontainersProperties(data); err == nil {
 			t.Errorf("%s override was accepted", name)

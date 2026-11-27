@@ -2,6 +2,7 @@ package diagnostic
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -226,6 +227,28 @@ func TestRedactorArgsCoversAttachedAndAliasFlags(t *testing.T) {
 	}
 	if !strings.Contains(got, Redacted) {
 		t.Errorf("Args() = %q, want marker", got)
+	}
+}
+
+// A value-taking flag missing from commandPayloadStart makes its value look
+// like the image positional, so the real image and every later argument are
+// redacted as command payload. --network-alias was such a miss.
+func TestRedactorArgsKeepsImageAfterNetworkAlias(t *testing.T) {
+	const image = "registry.example/team/app:1.2.3"
+	args := []string{
+		"docker", "run", "--name", "myctr", "--network", "test-net",
+		"--network-alias", "db", image, "sh", "-c", "echo command-secret",
+	}
+	got := NewRedactor().Args(args)
+	imageIndex := slices.Index(args, image)
+	if imageIndex < 0 {
+		t.Fatalf("test image missing from args %v", args)
+	}
+	if got[imageIndex] != image {
+		t.Fatalf("Args() = %v, redacted the image at index %d", got, imageIndex)
+	}
+	if joined := strings.Join(got, " "); strings.Contains(joined, "command-secret") {
+		t.Fatalf("Args() = %q, kept the command payload", joined)
 	}
 }
 

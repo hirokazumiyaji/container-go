@@ -465,3 +465,12 @@ func TestImageExistsReportsAvailabilityStates(t *testing.T) {
 		})
 	}
 }
+
+func TestAppleParseImageIdentityRejectsNullInspectEntry(t *testing.T) {
+	for _, data := range []string{`null`, `[null]`} {
+		lookup := (appleEngine{}).parseImageIdentity([]byte(data), "redis:7-alpine", "")
+		if lookup.availability != imageUnreadable {
+			t.Errorf("parseImageIdentity(%q) availability = %v, want unreadable", data, lookup.availability)
+		}
+	}
+}

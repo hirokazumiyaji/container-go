@@ -452,6 +452,49 @@ func TestDockerReuseDoesNotAttachWithDifferentNetworkAliases(t *testing.T) {
 	}
 }
 
+// TestCommonRunArgsFlagsKeepImageVisibleToRedaction exercises every
+// value-taking flag commonRunArgs can emit. If one is missing from
+// commandPayloadStart's consumes-next set, its value is mistaken for the
+// image positional and the real image is redacted as command payload.
+func TestCommonRunArgsFlagsKeepImageVisibleToRedaction(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	cfg := dockerTestConfig(t,
+		WithLabels(map[string]string{"team": "alpha"}),
+		WithEnv(map[string]string{"MODE": "test"}),
+		WithPublishedPort("127.0.0.1:18080:80"),
+		WithMounts(Mount{Type: MountVolume, Source: "data", Target: "/data"}),
+		WithCPUs(0.5),
+		WithMemory("64M"),
+		WithShmSize("64M"),
+		WithPrivileged(),
+		WithCapAdd("NET_ADMIN"),
+		WithCapDrop("MKNOD"),
+		WithUlimit("nofile", 1024, 2048),
+		WithExtraHost("db.internal", "10.0.0.1"),
+		WithHostname("app"),
+		WithUser("1000:1000"),
+		WithWorkingDir("/srv"),
+		WithNetwork("test-net"),
+		WithNetworkAliases("db", "postgres"),
+		WithPlatform("linux/amd64"),
+		WithEntrypoint("/entry.sh"),
+		WithCmd("sh", "-c", "echo command-secret"),
+	)
+	const image = "registry.example/team/app:1.2.3"
+	args := append([]string{"docker"}, (dockerEngine{}).runArgs(cfg, image, "/tmp/container-go.env")...)
+	got := cli.NewRedactor().Args(args)
+	imageIndex := slices.Index(args, image)
+	if imageIndex < 0 {
+		t.Fatalf("test image missing from args %v", args)
+	}
+	if got[imageIndex] != image {
+		t.Fatalf("Args() = %v, redacted the image at index %d", got, imageIndex)
+	}
+	if joined := strings.Join(got, " "); strings.Contains(joined, "command-secret") {
+		t.Fatalf("Args() = %q, kept the command payload", joined)
+	}
+}
+
 func TestDockerReuseRejectsAliasOnAnotherNetwork(t *testing.T) {
 	data := fmt.Sprintf(`[{
 		"Id": %q, "Name": "/myctr", "State": {"Status": "running"},

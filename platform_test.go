@@ -2,6 +2,7 @@ package container
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -94,6 +95,65 @@ func TestPlatformSelectorUnverifiableOnlyForUnreadableMetadata(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := platformSelectorUnverifiable(tc.selector, tc.actual); got != tc.want {
 				t.Fatalf("platformSelectorUnverifiable(%q, %q) = %v, want %v", tc.selector, tc.actual, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAppleReusePlatformAliasesRoundTrip covers a container created with an
+// Apple platform alias: container inspect reports the normalized parts, so a
+// WithReuse call with the same selector must not report a mismatch.
+func TestAppleReusePlatformAliasesRoundTrip(t *testing.T) {
+	tests := []struct {
+		name         string
+		selector     string
+		platformJSON string
+		wantPlatform string
+		want         bool
+	}{
+		{name: "aarch64 alias", selector: "linux/aarch64", platformJSON: `{"os":"linux","architecture":"arm64"}`, wantPlatform: "linux/arm64/v8", want: true},
+		{name: "explicit arm64 default variant", selector: "linux/arm64/v8", platformJSON: `{"os":"linux","architecture":"arm64"}`, wantPlatform: "linux/arm64/v8", want: true},
+		{name: "bare armel selector", selector: "linux/armel", platformJSON: `{"os":"linux","architecture":"arm","variant":"v6"}`, wantPlatform: "linux/arm/v6", want: true},
+		{name: "armel with default variant", selector: "linux/armel/v6", platformJSON: `{"os":"linux","architecture":"arm","variant":"v6"}`, wantPlatform: "linux/arm/v6", want: true},
+		{name: "x86_64 alias", selector: "linux/x86_64", platformJSON: `{"os":"linux","architecture":"amd64"}`, wantPlatform: "linux/amd64", want: true},
+		{name: "amd64 v1 default", selector: "linux/amd64/v1", platformJSON: `{"os":"linux","architecture":"amd64"}`, wantPlatform: "linux/amd64", want: true},
+		{name: "armhf default variant", selector: "linux/armhf", platformJSON: `{"os":"linux","architecture":"arm","variant":"v7"}`, wantPlatform: "linux/arm/v7", want: true},
+		{name: "variant mismatch", selector: "linux/arm/v7", platformJSON: `{"os":"linux","architecture":"arm","variant":"v6"}`, wantPlatform: "linux/arm/v6"},
+		{name: "architecture mismatch", selector: "linux/amd64", platformJSON: `{"os":"linux","architecture":"arm64"}`, wantPlatform: "linux/arm64/v8"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(fmt.Sprintf(`[{"id":"myctr","configuration":{"platform":%s},"status":{"state":"running"}}]`, tc.platformJSON))
+			info, err := (appleEngine{}).parseInspect(data, "myctr")
+			if err != nil {
+				t.Fatalf("parseInspect: %v", err)
+			}
+			if info.platform != tc.wantPlatform {
+				t.Errorf("platform = %q, want %q", info.platform, tc.wantPlatform)
+			}
+			if platformSelectorUnverifiable(tc.selector, info.platform) {
+				t.Errorf("selector %q was reported as unverifiable against %q", tc.selector, info.platform)
+			}
+			if got := enginePlatformCompatible(appleEngine{}, tc.selector, info); got != tc.want {
+				t.Errorf("enginePlatformCompatible(%q) = %v, want %v", tc.selector, got, tc.want)
+			}
+
+			cfg := newConfig()
+			cfg.eng = appleEngine{}
+			cfg.name = "myctr"
+			if err := WithPlatform(tc.selector)(cfg); err != nil {
+				t.Fatalf("WithPlatform(%q): %v", tc.selector, err)
+			}
+			info.labels = map[string]string{domain.LabelReuseConfig: cfg.reuseConfigHash()}
+			err = checkReuseConfigCompat(info, cfg)
+			if tc.want {
+				if err != nil {
+					t.Errorf("WithReuse rejected the same platform selector: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrReuseMismatch) || !strings.Contains(err.Error(), "does not match existing") {
+				t.Errorf("WithReuse platform mismatch = %v, want a verified mismatch", err)
 			}
 		})
 	}

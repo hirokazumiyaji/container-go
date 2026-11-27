@@ -376,19 +376,50 @@ func TestKill(t *testing.T) {
 		}
 	})
 
-	t.Run("Single signal is forwarded unchanged", func(t *testing.T) {
-		f := newTestRunner()
-		ctr := runTestContainer(t, f)
-
-		const signal = "NOT-A-SIGNAL"
-		if err := ctr.Kill(context.Background(), signal); err != nil {
-			t.Fatalf("Kill: %v", err)
+	t.Run("Rejects option-shaped signals before the backend", func(t *testing.T) {
+		invalid := []string{
+			"--all", "-9", "-s", "--",
+			"9\n", "SIGTERM\r\n", "SIGTERM\x00", "SIG KILL", "SIGTERM;rm", "9 ",
+			"sigterm", "0", "09", "-",
 		}
+		for i, signal := range invalid {
+			t.Run(strconv.Itoa(i), func(t *testing.T) {
+				f := newTestRunner()
+				ctr := runTestContainer(t, f)
+				before := len(f.calls)
 
-		kill := f.callWith("kill")
-		joined := strings.Join(kill, " ")
-		if !strings.Contains(joined, "--signal "+signal) {
-			t.Errorf("kill call = %v, want the caller's signal forwarded", kill)
+				err := ctr.Kill(context.Background(), signal)
+				if !errors.Is(err, ErrInvalidOption) {
+					t.Fatalf("Kill(%q) error = %v, want ErrInvalidOption", signal, err)
+				}
+				var validationErr *ValidationError
+				if !errors.As(err, &validationErr) {
+					t.Fatalf("Kill(%q) error = %T, want *ValidationError", signal, err)
+				}
+				if validationErr.Option != "Kill" || validationErr.Field != "signal" {
+					t.Errorf("validation option/field = %q/%q, want Kill/signal", validationErr.Option, validationErr.Field)
+				}
+				if len(f.calls) != before {
+					t.Fatalf("backend was called for invalid signal %q: %v", signal, f.calls[before:])
+				}
+			})
+		}
+	})
+
+	t.Run("Accepts numeric and named signals", func(t *testing.T) {
+		for _, signal := range []string{"KILL", "SIGTERM", "9", "SIGRTMIN+3", "SIGRTMAX-1"} {
+			t.Run(signal, func(t *testing.T) {
+				f := newTestRunner()
+				ctr := runTestContainer(t, f)
+
+				if err := ctr.Kill(context.Background(), signal); err != nil {
+					t.Fatalf("Kill(%q): %v", signal, err)
+				}
+				kill := f.callWith("kill")
+				if !slices.Contains(kill, "--signal") || !slices.Contains(kill, signal) {
+					t.Errorf("kill call = %v, want --signal %s", kill, signal)
+				}
+			})
 		}
 	})
 

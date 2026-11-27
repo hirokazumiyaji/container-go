@@ -12,7 +12,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const darwinWaitIDProcess = 0 // idtype_t.P_PID
+// darwinWaitIDProcess is idtype_t.P_PID. Darwin's idtype_t is P_ALL=0,
+// P_PID=1, P_PGID=2; P_ALL would let an unrelated stopped child satisfy the
+// query for process.Pid.
+const darwinWaitIDProcess = 1
 
 func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
 	if process == nil {
@@ -54,9 +57,15 @@ func observeProcessStopped(process *os.Process) (bool, error) {
 			return false, errno
 		}
 		// Darwin's siginfo_t starts with signo, errno, and code as
-		// 32-bit fields. CLD_TRAPPED and CLD_STOPPED are 4 and 5.
+		// 32-bit fields. CLD_TRAPPED and CLD_STOPPED are 4 and 5. si_pid
+		// follows at offset 12; verify it so a status for any other child
+		// can never be reported as this process stopping.
 		code := int32(*(*uint32)(unsafe.Pointer(&info[8])))
 		if code == 4 || code == 5 {
+			pid := int32(*(*uint32)(unsafe.Pointer(&info[12])))
+			if pid != int32(process.Pid) {
+				return false, nil
+			}
 			return true, nil
 		}
 		if time.Now().After(deadline) {

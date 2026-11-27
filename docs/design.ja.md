@@ -143,8 +143,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 オプションは functional options で提供する。
 以下は現在の開発チェックアウトの API 一覧である。
 ここで列挙した基本 option は `v0.2.0` にもあった。
-後述する `LogsOptions` / `LogsWithOptions`、追加 HTTP setter、
-合成 wait の setter は `v0.2.0` にはなかった。
+`LogsOptions` / `LogsWithOptions`、追加 HTTP setter、公開型
+`AllStrategy` / `AnyStrategy` の合成 `WithStartupTimeout` は
+`CHANGELOG.md` の `0.3.0` 節に記載されている。本文が現在の開発版追加と
+記すものはその節より後の追加である。
 
 - `WithExposedPorts(ports ...string)`：接続対象のコンテナポート（`"6379/tcp"` 形式）を宣言する。`MappedPort` と `Endpoint` はこの宣言を解決に使える。Docker は宣言したポートを自動公開し、Apple Container は既定でコンテナ IP から解決する。Apple ではこれは handle 側の endpoint 宣言であり、backend に別の `--expose` flag を渡さない。
 - `WithEnv(env map[string]string)`：環境変数を設定する。値はコマンドライン引数ではなく一時ファイル経由で渡す。
@@ -219,7 +221,8 @@ Windows 固有の lifecycle test は build constraint 付きで、exit-259 の a
 backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用できる場合に `*ExecTerminationError`（`errors.Is(err, ErrExecTerminationUnsupported)`）を返します。保守的な direct-handle fallback では remote process の終了を主張せず context error だけを返すことがあります。process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。したがって error が non-nil でも reader を読む必要があります。Linux の stable identity は pidfd が process を参照する。pidfd 非対応 kernel では、他の Unix target と同じく保守的な direct-handle fallback を使う。
 
 `WithExecEnv`、`WithExecUser`、`WithExecWorkDir` は個別の exec 呼び出しを設定する。環境変数の値は `WithEnv` と同じ一時ファイル方式を使う。
-`Logs` と、成功する `LogsWithOptions` 呼び出しは backend command が終了するため有限のスナップショットを返すが、単体で byte 上限は課さない。`Logs` は全出力を要求する。`LogsOptions` は backend 固有で、Docker は `Tail` と `Since` の両方を受け付ける。確認した Apple Container CLI の各 version は tail に `-n` を使い、`--since` option を持たないため、Apple backend は `Tail` を `-n` に対応させ、`Since` を `ErrUnsupportedCapability` で拒否する。範囲を指定しても大きさはコンテナ出力に依存する。`FollowLogs` は意図的に上限のない stream で、リーダーを閉じるか context をキャンセルするまで続く。`LogsOptions` と `LogsWithOptions` は `v0.2.0` にはない現在の開発 API である。`Terminate` は世代ガードを持ち、Apple の名前ベース削除は有効な creation generation を、Docker の削除は immutable UID を要求する。reuse と failed-create の経路も同じ ownership 情報を削除前に要求する。
+`Logs` と、成功する `LogsWithOptions` 呼び出しは backend command が終了するため有限のスナップショットを返す。`LogsWithOptions` は `LogsOptions.MaxBytes` が正のときだけ結合出力の先頭 byte を上限まで保持する。`Logs` は全出力を要求する。`LogsOptions` は backend 固有で、Docker は `Tail` と `Since` の両方を受け付ける。確認した Apple Container CLI の各 version は tail に `-n` を使い、`--since` option を持たないため、Apple backend は `Tail` を `-n` に対応させ、`Since` を `ErrUnsupportedCapability` で拒否する。範囲を指定しても大きさはコンテナ出力に依存する。`FollowLogs` は意図的に上限のない stream で、リーダーを閉じるか context をキャンセルするまで続く。`LogsOptions` と `LogsWithOptions` は `CHANGELOG.md` の `0.3.0` 節に
+記載されている。`Terminate` は世代ガードを持ち、Apple の名前ベース削除は有効な creation generation を、Docker の削除は immutable UID を要求する。reuse と failed-create の経路も同じ ownership 情報を削除前に要求する。
 
 `LogsOptions.Tail` と `MaxBytes` は非負として検証され、`WithMemory` と `WithShmSize` は zero と overflow を拒否し、`WithMounts` は unknown な `MountType` を拒否する。`PruneReuseGroup` は `WithReuseGroup` と同じ group grammar を使う。
 
@@ -356,13 +359,13 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForLog(pattern)`：`FollowLogs` のストリームを読み、部分文字列（`AsRegexp` による正規表現も可）が現れるまで待つ。照合は行単位で行い、`WithOccurrence(n)` で出現回数を指定できる。ストリーム方式なので poll 方式ではない。
 - `wait.ForListeningPort(port)`：解決したエンドポイントへの TCP 接続と、対応する target ではコンテナ側の LISTEN 状態を確認する。`WithHostOnly` でコンテナ側の確認を省略できる。
 - `wait.ForExposedPort()`：最初の exposed TCP port を使い、TCP の exposed 宣言がなければ最初の published TCP port を選ぶ。
-- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` または単一コードの `WithStatusCode` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定し、`WithBody` で各 poll のリクエストボディを送る。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。受理したレスポンスボディは `WithResponseMatcher` で最大 64KiB まで判定でき、false なら再試行する。
+- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` または単一コードの `WithStatusCode` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定し、`WithBody` で各 poll のリクエストボディを送る。`CHANGELOG.md` の `0.3.0` 節には `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も記載されている。これらは `v0.2.0` にはなかった。受理したレスポンスボディは `WithResponseMatcher` で最大 64KiB まで判定でき、false なら再試行する。
 - `wait.ForHealthcheck()`：Docker の `HEALTHCHECK` が healthy になるまで待つ。`starting` の間は poll を続け、`unhealthy` は終端エラーになる。`HEALTHCHECK` を持たないイメージは `*wait.ConfigError` で即座に失敗し、Apple バックエンドはコンテナ作成前にこの戦略を拒否する。
 - `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。各試行の timeout は poll interval から 1〜5 秒の範囲で導出し、`WithExecTimeout` で上書きできる。`WithResponseMatcher(func([]byte) bool)` と `WithOutputContains` を指定すると、終了コードの受理後にコマンド出力も判定する。これらは任意の `wait.ExecOutputTarget` インターフェースを使い、実装しない target には `*wait.ConfigError` を即座に返す。container adapter は最大 64KiB の出力を保持する。matcher を指定しない場合、出力は従来どおり破棄される。`WithUser`、`WithWorkDir`、`WithEnv` は readiness コマンドの実行コンテキストを設定し、任意の `wait.ExecOptionsTarget` インターフェースを使う。実装しない target には `*wait.ConfigError` を即座に返し、環境変数の値は診断時の redaction 対象として登録される。
 - `wait.ForExit()`：ワンショットコンテナの停止を待つ。既定では終了コード 0 を受理し、それ以外は即座に失敗する。`WithExitCode` は単一のコードを受理し、`WithExitCodeMatcher` は判定自体を置き換える。任意の `wait.ExitCodeTarget` インターフェースを poll するため、カスタム target はこれを実装する必要がある（container adapter は 1 回の新しい inspect から状態と終了コードを返す）。停止しているがバックエンドが終了コードを報告しない場合は、0 とみなさず即座に失敗する。`ForExit` はマイグレーションや seed 投入などのジョブ向けで、長時間稼働するサービス向けではない。`ForAll` と `ForAny` は各子戦略の成功後にコンテナが Running であることを要求するため、`ForExit` は合成せず単独で使うこと。
 - `wait.ForFunc(fn)`：poll ごとに `fn(ctx, target)` を呼び、nil で準備完了とする。非 nil エラーは再試行し、timeout 時には最後のエラーを報告する。`context.Canceled` を包むエラーや、`ErrInvalidConfiguration` など恒久エラーとして分類されるエラーは即座に待機を終える。試行ごとの deadline エラーは再試行する。コンテナの終了そのものをコールバックで観測したい場合は `WithExitCheck(false)` で stopped コンテナのガードを無効化できるが、これは ForFunc 自身の poll に限られる。`ForAll` / `ForAny` は実 target に対して独自の lifecycle monitor と最終チェックを実行するため、合成戦略の中ではコンテナ終了時に失敗する。終了を観測する ForFunc は合成せず単独で使うこと。
 - `wait.ForSQL(port, driver, dsn)`：解決した host と port に対して `database/sql` の `db.PingContext`（または `WithQuery` の readiness 文）を poll する。各試行には 3 秒の deadline を渡すため、応答しない handshake は startup budget を消費せず再試行される。パッケージは driver を import せず、呼び出し側が driver を登録して名前を渡す。未登録の driver は `Validate`（したがってコンテナ作成前の `WithWaitStrategy`）と待機開始時の両方で `*wait.ConfigError` になる。`dsn(host, port)` が試行ごとに接続文字列を作り、host に IPv6 の角括弧は付かないため URL 形式では `net.JoinHostPort` を使う。戦略は待機ごとの状態を持たないので、同じ値を並行 wait で再利用できる。DSN とパスワード由来の派生値は、その wait のエラーの redaction にだけ登録され、後から上位ヘルパーが付ける log tail は対象外である。
-- `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。合成 timeout が 0 または負の場合は合成全体を無制限とし、各子の timeout を適用する。
+- `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。`CHANGELOG.md` の `0.3.0` 節に記載された公開型 `AllStrategy` と `AnyStrategy` は `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。合成 timeout が 0 または負の場合は合成全体を無制限とし、各子の timeout を適用する。
 
 すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を持つ。`ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間である。コンテナが stopping、stopped、paused の状態のいずれかになると、残りのタイムアウトを待たずに失敗する。created、restarting、unknown と一時的な inspect エラーは再試行し、一時的なログストリームの open と EOF は再-open する。終了コードを伴うログストリームエラーは返却する。成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理される。`ForLog` はワンショットジョブではなく長時間稼働するサービス向けである。`ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計する。再利用でない `Run` の待機が失敗した場合はコンテナをロールバックし、上限付き log の取得が成功した場合だけ 1MiB 上限の末尾をエラーに付ける。再利用の待機失敗では共有コンテナを残す。
 
@@ -418,8 +421,9 @@ caller の context を使い、`Cleanup` と `StrictCleanup` は完全な teardo
 エラーを呼び出し元へ返す。
 
 `Container.Kill(ctx, signal string)` は signal を 1 つだけ取る。空文字列は
-既定の SIGKILL で、空でない signal は backend へそのまま渡す。そのため
-不正な綴りは可変長引数の検査ではなく backend が拒否する。
+既定の SIGKILL で、空でない signal は正の番号または大文字の signal 名でなけれ
+ばならない。フラグ形・小文字・制御文字を含む綴りは backend 実行前に検証エラー
+として拒否する。
 
 **作成後の rollback**：再利用でない `Run` が file copy または readiness 待ちの
 途中で失敗すると、作成した handle の `Terminate` を呼ぶ。削除にも失敗した場合、
@@ -665,8 +669,8 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる。
 - `ErrReuseMismatch`：再利用時の設定、image、platform、network、port、reuse group の不一致。Docker の一時的な port binding の未反映は再試行し、attach 予算の終了時は `context.DeadlineExceeded` にも一致する。Apple の明示的な publication の欠落は即座に不一致とする。呼び出し元の取消や所有権・世代の検証失敗は構成不一致に分類しない。
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。reuse は readiness 後の再 inspect で置き換えを検出し、handle を返さない。
-- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、分類用の有界な末尾 stderr ウィンドウを保持する（描画時の診断は秘匿化され 64KiB 上限）。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
-- `ErrContainerNotFound` と `ErrGenerationReplaced` も現在の開発版追加である。
+- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、分類用の有界な末尾 stderr ウィンドウを保持する（描画時の診断は秘匿化され 64KiB 上限）。root の `CLIError` alias は `CHANGELOG.md` の `0.3.0` 節に記載され、`v0.2.0` にはない。
+- `ErrContainerNotFound` と `ErrGenerationReplaced` も同節に記載されている。
 - `ErrEnvFileUnsupported`：API 互換のために残している。安全な env ファイルはすべての対応プラットフォームで利用できるため、現在は返さない
 - `ErrCopyFileNotRegular`：Docker の copy-out 結果が regular file でない
 - `ErrCopyFileFromContainerUnsupported`：選択した backend または host が型安全な copy-out を実装していない(Apple Container、Docker client/server が 29.7.0 未満、必要な open flag がない host、または Windows Go 1.23 から 1.25)

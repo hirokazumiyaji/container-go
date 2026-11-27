@@ -44,7 +44,7 @@ func DiagnosticValues(strategy Strategy) []string {
 	}
 	var collect func(Strategy)
 	collect = func(s Strategy) {
-		if s == nil {
+		if isNilStrategy(s) {
 			return
 		}
 		if provider, ok := s.(DiagnosticProvider); ok {
@@ -84,6 +84,9 @@ type diagnosticBoundaryProvider interface {
 // that are redacted only at token boundaries. Composite strategies recurse
 // into their children.
 func DiagnosticBoundaryValues(strategy Strategy) []string {
+	if isNilStrategy(strategy) {
+		return nil
+	}
 	var values []string
 	switch s := strategy.(type) {
 	case diagnosticBoundaryProvider:
@@ -116,6 +119,41 @@ func basicAuthValues(username, password string) []string {
 		base64.StdEncoding.EncodeToString([]byte(joined)),
 		base64.RawStdEncoding.EncodeToString([]byte(joined)),
 	}
+}
+
+// authorizationDiagnosticValues registers the credential forms carried by a
+// Bearer or Basic Authorization header. The complete header value is
+// registered separately; this adds the bare Bearer token and, for Basic, the
+// decoded user:password form so a backend that echoes only the token or the
+// decoded credentials is still covered.
+func authorizationDiagnosticValues(value string) []string {
+	scheme, credential, ok := strings.Cut(strings.TrimSpace(value), " ")
+	if !ok {
+		return nil
+	}
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return nil
+	}
+	if strings.EqualFold(scheme, "bearer") {
+		return []string{credential}
+	}
+	if !strings.EqualFold(scheme, "basic") {
+		return nil
+	}
+	values := []string{credential}
+	decoded, err := base64.StdEncoding.DecodeString(credential)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(credential)
+	}
+	if err != nil {
+		return values
+	}
+	values = append(values, string(decoded))
+	if _, password, ok := strings.Cut(string(decoded), ":"); ok && password != "" {
+		values = append(values, password)
+	}
+	return values
 }
 
 // cookieDiagnosticValues registers each cookie component as well as common

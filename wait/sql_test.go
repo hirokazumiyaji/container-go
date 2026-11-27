@@ -75,12 +75,14 @@ type fakeSQLState struct {
 	opens      int
 	pings      int
 	queries    int
-	rowNexts   int
 	lastDSN    string
 	lastQuery  string
+	columns    []string
+	rows       [][]driver.Value
 	pingFn     func(ctx context.Context, attempt int) error
 	queryFn    func(ctx context.Context, attempt int) error
-	rowsNextFn func(context.Context) error
+	rowNexts   int
+	rowsNextFn func(ctx context.Context) error
 }
 
 func (s *fakeSQLState) open(dsn string) (driver.Conn, error) {
@@ -134,10 +136,22 @@ func (s *fakeSQLState) setPingFunc(fn func(ctx context.Context, attempt int) err
 	s.mu.Unlock()
 }
 
-func (s *fakeSQLState) probeCounts() (opens, pings, queries int) {
+func (s *fakeSQLState) setQueryFunc(fn func(ctx context.Context, attempt int) error) {
+	s.mu.Lock()
+	s.queryFn = fn
+	s.mu.Unlock()
+}
+
+func (s *fakeSQLState) setRows(columns []string, rows [][]driver.Value) {
+	s.mu.Lock()
+	s.columns, s.rows = columns, rows
+	s.mu.Unlock()
+}
+
+func (s *fakeSQLState) resultRows() *fakeSQLRows {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.opens, s.pings, s.queries
+	return &fakeSQLRows{columns: s.columns, rows: s.rows, state: s}
 }
 
 func (s *fakeSQLState) countRowNext(ctx context.Context) error {
@@ -155,6 +169,12 @@ func (s *fakeSQLState) rowNextCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.rowNexts
+}
+
+func (s *fakeSQLState) probeCounts() (opens, pings, queries int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.opens, s.pings, s.queries
 }
 
 type fakeSQLConn struct{ state *fakeSQLState }
@@ -175,18 +195,41 @@ func (c fakeSQLConn) QueryContext(ctx context.Context, query string, _ []driver.
 	if err := c.state.countQuery(ctx, query); err != nil {
 		return nil, err
 	}
-	return &fakeSQLRows{state: c.state}, nil
+	return c.state.resultRows(), nil
 }
 
+// fakeSQLRows serves one result set per query. A nil rows list yields no rows,
+// which is enough for tests that only need the query to succeed.
 type fakeSQLRows struct {
-	state *fakeSQLState
+	columns []string
+	rows    [][]driver.Value
+	index   int
+	state   *fakeSQLState
 }
 
-func (fakeSQLRows) Columns() []string { return []string{"ready"} }
+func (r *fakeSQLRows) Columns() []string {
+	if len(r.columns) == 0 {
+		return []string{"ready"}
+	}
+	return r.columns
+}
 
-func (fakeSQLRows) Close() error { return nil }
+func (r *fakeSQLRows) Close() error { return nil }
 
-func (r *fakeSQLRows) Next([]driver.Value) error { return r.state.countRowNext(context.Background()) }
+func (r *fakeSQLRows) Next(dest []driver.Value) error {
+	if r.state != nil {
+		// A test that injects a deferred row error drives Next directly.
+		if err := r.state.countRowNext(context.Background()); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+	}
+	if r.index >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.index])
+	r.index++
+	return nil
+}
 
 func withFakeSQLState(t *testing.T, state *fakeSQLState) *fakeSQLState {
 	t.Helper()
@@ -315,6 +358,166 @@ func TestForSQLQueryRetriesRejectedQuery(t *testing.T) {
 	_, _, queries := state.probeCounts()
 	if queries < 2 {
 		t.Errorf("queries = %d, want a retry after the rejected query", queries)
+	}
+}
+
+func TestForSQLQueryMatcherValidatesRowsAndRetries(t *testing.T) {
+	state := withFakeSQLState(t, &fakeSQLState{})
+	state.setRows([]string{"count"}, [][]driver.Value{{int64(2)}})
+	var calls atomic.Int32
+	err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithQuery("SELECT count(*) FROM migrations").
+		WithQueryMatcher(func(rows *sql.Rows) (bool, error) {
+			if calls.Add(1) == 1 {
+				return false, nil
+			}
+			if !rows.Next() {
+				return false, rows.Err()
+			}
+			var count int
+			if err := rows.Scan(&count); err != nil {
+				return false, err
+			}
+			return count > 0, nil
+		}).
+		WithStartupTimeout(time.Second).
+		WithPollInterval(2*time.Millisecond).
+		WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if calls.Load() < 2 {
+		t.Errorf("matcher calls = %d, want a retry after the rejected result", calls.Load())
+	}
+	_, _, queries := state.probeCounts()
+	if queries < 2 {
+		t.Errorf("queries = %d, want the matcher to trigger another attempt", queries)
+	}
+}
+
+func TestForSQLQueryMatcherErrorIsRetryable(t *testing.T) {
+	withFakeSQLState(t, &fakeSQLState{})
+	cause := errors.New("result is not populated yet")
+	var calls atomic.Int32
+	err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithQuery("SELECT count(*) FROM migrations").
+		WithQueryMatcher(func(*sql.Rows) (bool, error) {
+			if calls.Add(1) < 3 {
+				return false, cause
+			}
+			return true, nil
+		}).
+		WithStartupTimeout(time.Second).
+		WithPollInterval(2*time.Millisecond).
+		WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if calls.Load() < 3 {
+		t.Errorf("matcher calls = %d, want retries after matcher errors", calls.Load())
+	}
+}
+
+func TestForSQLQueryMatcherPermanentErrorFailsFast(t *testing.T) {
+	withFakeSQLState(t, &fakeSQLState{})
+	start := time.Now()
+	err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithQuery("SELECT 1").
+		WithQueryMatcher(func(*sql.Rows) (bool, error) {
+			return false, fmt.Errorf("matcher is misconfigured: %w", ErrInvalidConfiguration)
+		}).
+		WithStartupTimeout(5*time.Second).
+		WithPollInterval(5*time.Millisecond).
+		WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if err == nil || !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("error = %v, want ErrInvalidConfiguration", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("wait took %v, want a fail-fast permanent matcher error", elapsed)
+	}
+}
+
+func TestForSQLQueryMatcherRequiresQuery(t *testing.T) {
+	err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithQueryMatcher(func(*sql.Rows) (bool, error) { return true, nil }).
+		WaitUntilReady(context.Background(), newFakeTarget())
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("error = %T %v, want *ConfigError", err, err)
+	}
+	if configErr.Strategy != "ForSQL" || configErr.Field != "query matcher" {
+		t.Errorf("ConfigError = %+v, want strategy ForSQL and field query matcher", configErr)
+	}
+}
+
+func TestForSQLWithAttemptTimeoutRetriesHungProbe(t *testing.T) {
+	blockedPing := func(ctx context.Context, _ int) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	blockedQuery := func(ctx context.Context, _ int) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	for _, tc := range []struct {
+		name  string
+		build func(*fakeSQLState) *SQLStrategy
+	}{
+		{
+			name: "ping",
+			build: func(state *fakeSQLState) *SQLStrategy {
+				state.setPingFunc(blockedPing)
+				return ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN)
+			},
+		},
+		{
+			name: "query",
+			build: func(state *fakeSQLState) *SQLStrategy {
+				state.setQueryFunc(blockedQuery)
+				return ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).WithQuery("SELECT 1")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := withFakeSQLState(t, &fakeSQLState{})
+			err := tc.build(state).
+				WithAttemptTimeout(20*time.Millisecond).
+				WithStartupTimeout(150*time.Millisecond).
+				WithPollInterval(2*time.Millisecond).
+				WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+			if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v, want the startup deadline", err)
+			}
+			_, pings, queries := state.probeCounts()
+			if pings+queries < 2 {
+				t.Errorf("attempts = %d, want a retry after the per-attempt timeout", pings+queries)
+			}
+		})
+	}
+}
+
+func TestForSQLAttemptTimeoutRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Millisecond} {
+		t.Run(d.String(), func(t *testing.T) {
+			err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+				WithAttemptTimeout(d).
+				WaitUntilReady(context.Background(), newFakeTarget())
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("error = %T %v, want *ConfigError", err, err)
+			}
+			if configErr.Strategy != "ForSQL" || configErr.Field != "attempt timeout" {
+				t.Errorf("ConfigError = %+v, want strategy ForSQL and field attempt timeout", configErr)
+			}
+		})
+	}
+}
+
+func TestForSQLDiagnosticValuesOmitRequestMetadata(t *testing.T) {
+	strategy := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithQuery("SELECT count(*) FROM migrations")
+	if values := strategy.DiagnosticValues(); len(values) != 0 {
+		t.Fatalf("DiagnosticValues() = %v, want no static request metadata", values)
 	}
 }
 

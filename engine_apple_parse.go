@@ -1,13 +1,13 @@
 package container
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/internal/inspect"
+	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
 func (appleEngine) parseRunID([]byte) string { return "" }
@@ -40,6 +40,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			image = stripImageDigest(image) + "@" + imageDigest
 		}
 		platform := ""
+		platformMeta := emptyPlatformMetadata()
 		if p := c.Configuration.Platform; p.OS != "" || p.Architecture != "" || p.Variant != "" {
 			candidate := p.OS + "/" + p.Architecture
 			if p.Variant != "" {
@@ -49,7 +50,18 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			if !ok {
 				return nil, fmt.Errorf("container %s has invalid platform %q", id, candidate)
 			}
+			// Store the normalized components: Apple reports architecture
+			// aliases and may omit the default variant, while a later
+			// WithReuse selector uses the caller's spelling.
 			platform = formatApplePlatform(parsed)
+			platformMeta = platformMetadataFromParts(
+				parsed.os,
+				parsed.architecture,
+				parsed.variant,
+				true,
+				true,
+				parsed.variant != "",
+			)
 		}
 		cpus := 0.0
 		cpusReported := false
@@ -82,20 +94,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 				hard: int64(limit.Hard),
 			})
 		}
-		pConfig := c.Configuration.Platform
-		platformMeta := platformMetadataFromParts(
-			pConfig.OS,
-			pConfig.Architecture,
-			pConfig.Variant,
-			pConfig.OSPresent || pConfig.OS != "",
-			pConfig.ArchPresent || pConfig.Architecture != "",
-			pConfig.VariantPresent || pConfig.Variant != "",
-		)
-		if platform != "" {
-			info.platform = platform
-		} else {
-			info.platform = platformMeta.normalized()
-		}
+		info.platform = platform
 		info.platformMeta = platformMeta
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -223,8 +222,8 @@ type appleImageInspectRecord struct {
 // validated separately while the root descriptor remains the run and
 // reuse identity.
 func (appleEngine) parseImageIdentity(data []byte, image, platform string) imageLookupResult {
-	var records []appleImageInspectRecord
-	if err := json.Unmarshal(data, &records); err != nil {
+	records, err := strictjson.Array[appleImageInspectRecord](data, nil)
+	if err != nil {
 		// A successful CLI invocation with malformed JSON is not proof
 		// that the image is absent. Treat it as an identity-unavailable
 		// result so PullMissing cannot turn a parser failure into a fetch,

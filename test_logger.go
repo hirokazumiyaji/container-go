@@ -263,6 +263,7 @@ func (b *testLogBuffer) String() string {
 		return data[i+1:]
 	}
 	return ""
+
 }
 
 // readTestLogLine reads one newline-terminated line, bounding the retained

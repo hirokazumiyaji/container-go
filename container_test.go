@@ -124,11 +124,15 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return []byte(f.contextJSON), nil, nil
 		}
 		name := "default"
-		if len(args) > 2 && args[2] != "" {
-			name = args[2]
-			if name == "nonexistent" {
-				return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: fmt.Sprintf("context %q: context not found", name)}
+		if len(args) > 2 {
+			// `context inspect [--] <context>`: the name is the last
+			// positional argument; a separator or option is not a name.
+			if last := args[len(args)-1]; last != "--" && !strings.HasPrefix(last, "-") {
+				name = last
 			}
+		}
+		if name == "nonexistent" {
+			return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: fmt.Sprintf("context %q: context not found", name)}
 		}
 		return []byte(fmt.Sprintf(`[{"Name":%q,"Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`, name)), nil, nil
 	}

@@ -32,6 +32,36 @@ func (s *blockingTestLogStream) Close() error {
 	return nil
 }
 
+// recordingTestLogTB embeds a real testing.TB so it satisfies the interface,
+// and captures Logf output instead of writing it to the test log.
+type recordingTestLogTB struct {
+	testing.TB
+	mu    sync.Mutex
+	lines []string
+}
+
+func (r *recordingTestLogTB) Logf(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lines = append(r.lines, fmt.Sprintf(format, args...))
+}
+
+func TestForwardTestLogsSanitizesControlCharacters(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	recorder := &recordingTestLogTB{TB: t}
+	forwardTestLogs(recorder, ctr, strings.NewReader("ready\x1b[31m\r\nnext\rline\n"))
+	joined := strings.Join(recorder.lines, "\n")
+	if strings.Contains(joined, "\x1b") || strings.Contains(joined, "\r") {
+		t.Fatalf("forwarded logs = %q, contain terminal controls", joined)
+	}
+	for _, want := range []string{"ready", "next", `\x1b`, `\r`} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("forwarded logs = %q, missing %q", joined, want)
+		}
+	}
+}
+
 func TestWithTestLoggerClosesStreamWhenTestEnds(t *testing.T) {
 	stream := newBlockingTestLogStream()
 	f := &singleStreamRunner{fakeRunner: newTestRunner(), stream: stream}

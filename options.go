@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1353,7 +1354,7 @@ func WithDockerHost(host string) Option {
 // Docker target resolution.
 func WithDockerContext(context string) Option {
 	return func(c *config) error {
-		if err := validateDockerTargetValue("WithDockerContext", context); err != nil {
+		if err := validateDockerContextValue("WithDockerContext", context); err != nil {
 			return err
 		}
 		c.dockerContext = &context
@@ -1384,6 +1385,20 @@ func validateDockerTargetValue(option, value string) error {
 	}
 	if len(value) > cli.MaxStreamOverlap || !cli.StreamValueFits(value) {
 		return invalidOption(option, "value is too large to redact safely from streamed diagnostics")
+	}
+	return nil
+}
+
+// validateDockerContextValue additionally enforces Docker's context-name
+// grammar so an unvalidated name cannot be read as a `docker context inspect`
+// flag. An empty value is accepted on purpose: it pins the context as
+// explicitly unset.
+func validateDockerContextValue(option, value string) error {
+	if err := validateDockerTargetValue(option, value); err != nil {
+		return err
+	}
+	if value != "" && !validDockerContextName(value) {
+		return newValidationErrorWithField(option, "value", nil, errors.New("invalid Docker context name"))
 	}
 	return nil
 }

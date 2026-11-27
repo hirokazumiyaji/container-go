@@ -114,9 +114,14 @@ type strategyValidator interface {
 
 // Validate checks a strategy before a container is pulled or created.
 // Composite strategies are checked recursively, including typed-nil
-// strategy values held in a non-nil interface.
+// strategy values held in a non-nil interface. A configuration error is
+// rendered with the strategy's own redactor and control-character
+// sanitization, because its fields can quote caller-provided values.
 func Validate(strategy Strategy) error {
-	return validateStrategy(strategy)
+	if err := validateStrategy(strategy); err != nil {
+		return safeStrategyError(err, strategy)
+	}
+	return nil
 }
 
 // ValidateWithPorts additionally checks the built-in port strategies
@@ -131,11 +136,14 @@ func ValidateWithPorts(strategy Strategy, ports []string) error {
 	for _, port := range ports {
 		canonical, err := canonicalPortSpec("", port)
 		if err != nil {
-			return err
+			return safeStrategyError(err, strategy)
 		}
 		allowed[canonical] = struct{}{}
 	}
-	return validateStrategyPorts(strategy, allowed)
+	if err := validateStrategyPorts(strategy, allowed); err != nil {
+		return safeStrategyError(err, strategy)
+	}
+	return nil
 }
 
 func validateStrategy(strategy Strategy) error {

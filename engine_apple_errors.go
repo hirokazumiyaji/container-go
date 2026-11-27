@@ -60,8 +60,10 @@ func (appleEngine) imageMissingForTarget(err error, target string) bool {
 			if appleImagePullManifestMissing(branch.ctx.err) {
 				return true
 			}
-			if hasBranchImageLine(branch, appleStderrImageNotFound, branch.ctx.target, true) ||
-				hasBranchImageLine(branch, appleStderrImageNotFound, "", false) {
+			// The error line must name the same image as the pull argv.
+			// A wildcard match would accept a not-found line for any other
+			// image that happens to share the stderr stream.
+			if hasBranchImageLine(branch, appleStderrImageNotFound, branch.ctx.target, true) {
 				return true
 			}
 		}
@@ -244,19 +246,29 @@ func appleServerConflictLine(message, target string) bool {
 // required so application output containing "not found" is not treated
 // as a backend result. Typed envelopes are accepted through the escape-
 // aware notFound unwrapper, then validated with operation-specific leaves.
+// Each backend branch contributes only its own stderr: in a joined error,
+// another branch's diagnostics must not satisfy this one's classifier.
 func (appleEngine) containerMissing(err error) bool {
-	ctx, ok := backendCLIError(err, "container")
-	if !ok || !hasParsedCLITarget(ctx) {
+	if isContextError(err) {
 		return false
 	}
-	switch ctx.operation {
-	case "inspect", "exec", "stop", "delete", "rm", "logs", "start", "kill", "cp":
-		return hasCLIErrorLine(err, func(line string) bool {
+	for _, branch := range backendCLIErrorBranches(err, "container") {
+		ctx := branch.ctx
+		if !hasParsedCLITarget(ctx) {
+			continue
+		}
+		switch ctx.operation {
+		case "inspect", "exec", "stop", "delete", "rm", "logs", "start", "kill", "cp":
+		default:
+			continue
+		}
+		if hasBranchLine(branch, func(line string) bool {
 			return appleContainerMissingLine(line, ctx.target, ctx.operation)
-		})
-	default:
-		return false
+		}) {
+			return true
+		}
 	}
+	return false
 }
 
 func appleContainerMissingLine(line, target, command string) bool {

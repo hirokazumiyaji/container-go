@@ -14,11 +14,15 @@ import (
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
+	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
 func (e dockerEngine) effectiveHost() string {
 	if e.explicitHost || e.host != "" {
 		return e.host
+	}
+	if e.frozenEnv {
+		return ""
 	}
 	return os.Getenv("DOCKER_HOST")
 }
@@ -27,8 +31,10 @@ func (e dockerEngine) effectiveContext() string {
 	if e.explicitContext || e.context != "" {
 		return e.context
 	}
-	if env := os.Getenv("DOCKER_CONTEXT"); env != "" {
-		return env
+	if !e.frozenEnv {
+		if env := os.Getenv("DOCKER_CONTEXT"); env != "" {
+			return env
+		}
 	}
 	if e.resolvedTarget != nil && e.resolvedTarget.context != "" {
 		return e.resolvedTarget.context
@@ -40,12 +46,18 @@ func (e dockerEngine) effectiveConfigDir() string {
 	if e.explicitConfigDir || e.configDir != "" {
 		return e.configDir
 	}
+	if e.frozenEnv {
+		return ""
+	}
 	return os.Getenv("DOCKER_CONFIG")
 }
 
 func (e dockerEngine) effectiveDefaultPlatform() string {
 	if e.explicitDefaultPlatform || e.defaultPlatform != "" {
 		return e.defaultPlatform
+	}
+	if e.frozenEnv {
+		return ""
 	}
 	return os.Getenv("DOCKER_DEFAULT_PLATFORM")
 }
@@ -58,7 +70,9 @@ func (e dockerEngine) effectiveDefaultPlatform() string {
 func pinRunnerEnv(runnerEnv, pinned []string) []string {
 	// Collapse duplicate keys first (last occurrence wins, matching
 	// MergeEnv) so replacing a pinned key in place cannot leave an earlier
-	// stale duplicate that first-match env lookup would prefer.
+	// stale duplicate that first-match env lookup would prefer. Keys are
+	// folded with envKeyFold because MergeEnv compares case-insensitively
+	// on Windows.
 	env := make([]string, 0, len(runnerEnv)+len(pinned))
 	index := make(map[string]int, len(runnerEnv))
 	for _, entry := range runnerEnv {
@@ -67,6 +81,7 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 			// Index a bare removal marker too, so re-applying the pinned
 			// environment cannot append the same marker twice.
 			if key != "" {
+				key = envKeyFold(key)
 				if at, seen := index[key]; seen {
 					env[at] = entry
 					continue
@@ -76,6 +91,7 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 			env = append(env, entry)
 			continue
 		}
+		key = envKeyFold(key)
 		if at, duplicate := index[key]; duplicate {
 			env[at] = entry
 			continue
@@ -88,6 +104,7 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 		if key == "" {
 			continue
 		}
+		key = envKeyFold(key)
 		if at, exists := index[key]; exists {
 			if hasValue {
 				env[at] = entry
@@ -207,6 +224,12 @@ func inspectDockerNetwork(ctx context.Context, cfg *config) (dockerNetworkInfo, 
 	defer cancel()
 	stdout, _, err := cfg.runner.Run(queryCtx, "network", "inspect", cfg.network)
 	if err != nil {
+		// A query that exhausted its own budget is a timeout, not evidence
+		// that the daemon is unreachable: probing again would repeat the
+		// failed round trip with the unbounded operation context.
+		if contextErr := commandContextError(queryCtx, err); contextErr != nil {
+			return dockerNetworkInfo{}, fmt.Errorf("inspect Docker network %q before starting container: %w", cfg.network, contextErr)
+		}
 		classified := classifyErrorWithProbe(ctx, cfg.runner, err, cfg.eng, cfg.effectiveProbeTimeout())
 		return dockerNetworkInfo{}, fmt.Errorf("inspect Docker network %q before starting container: %w", cfg.network, classified)
 	}
@@ -309,13 +332,24 @@ func runnerEnvEntry(runner cli.Runner, key string) (string, bool) {
 		return "", false
 	}
 	env := eenv.ExternalEnv()
-	prefix := key + "="
+	foldedKey := envKeyFold(key)
 	for i := len(env) - 1; i >= 0; i-- {
-		if env[i] == key || strings.HasPrefix(env[i], prefix) {
+		entryKey, _, _ := strings.Cut(env[i], "=")
+		if envKeyFold(entryKey) == foldedKey {
 			return env[i], true
 		}
 	}
 	return "", false
+}
+
+// dockerContextNameRE is the context-name grammar Docker itself accepts: an
+// ASCII alphanumeric first character followed by alphanumerics, dots,
+// underscores, or hyphens. The leading character may not be a hyphen, so a
+// name can never be parsed as a CLI flag.
+var dockerContextNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+func validDockerContextName(name string) bool {
+	return dockerContextNameRE.MatchString(name)
 }
 
 // resolveDockerContextEndpoint is deliberately not cached process-wide. A
@@ -325,12 +359,20 @@ func runnerEnvEntry(runner cli.Runner, key string) (string, bool) {
 // could answer a changed DOCKER_CONTEXT or DOCKER_CONFIG with an earlier
 // target's endpoint.
 func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contextName string) (string, string, error) {
+	if contextName != "" && !validDockerContextName(contextName) {
+		return "", "", &ConfigError{
+			Backend: "docker",
+			Option:  "WithContext",
+			Detail:  "invalid Docker context name",
+		}
+	}
+
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	var args []string
 	if contextName != "" {
-		args = []string{"context", "inspect", contextName}
+		args = []string{"context", "inspect", "--", contextName}
 	} else {
 		args = []string{"context", "inspect"}
 	}
@@ -373,8 +415,8 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 		}
 	}
 
-	var contexts []dockerContextInspect
-	if err := json.Unmarshal(stdout, &contexts); err != nil {
+	contexts, err := strictjson.Array[dockerContextInspect](stdout, nil)
+	if err != nil {
 		return "", "", fmt.Errorf("decode Docker context inspect output: %w", err)
 	}
 	if len(contexts) == 0 {
@@ -386,6 +428,17 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 			Backend: "docker",
 			Option:  "WithContext",
 			Detail:  detail,
+		}
+	}
+	// A named lookup must report the context that was requested. Without
+	// this check a `--format` argument smuggled through an unvalidated name
+	// could make `context inspect` return an endpoint for a different
+	// context, flipping a remote daemon back to local.
+	if contextName != "" && contexts[0].Name != contextName {
+		return "", "", &ConfigError{
+			Backend: "docker",
+			Option:  "WithContext",
+			Detail:  fmt.Sprintf("Docker context %q reported context %q", contextName, contexts[0].Name),
 		}
 	}
 	endpointHost := contexts[0].Endpoints["docker"].Host
@@ -431,10 +484,17 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 
 	effectiveHost, effectiveCtx, runnerHasHost, runnerSelectedContext := e.targetSelection(runner)
 
+	// An explicit empty host clears the inherited DOCKER_HOST and leaves the
+	// active Docker context in charge, so the context still has to be
+	// inspected: the child CLI resolves a missing DOCKER_HOST from
+	// ~/.docker/config.json. Treating that form as a local default would let a
+	// remote active context bypass the remote-target checks.
+	clearedHost := e.explicitHost && !e.explicitContext && strings.TrimSpace(effectiveHost) == ""
+
 	resolvedCtx := effectiveCtx
 	var targetHost string
 
-	if e.explicitHost && !e.explicitContext {
+	if e.explicitHost && !e.explicitContext && !clearedHost {
 		// Explicit host requested by caller takes precedence over ambient context.
 		targetHost = effectiveHost
 	} else if effectiveCtx != "" {
@@ -458,7 +518,8 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		// No context set, explicit or ambient host is target.
 		targetHost = effectiveHost
 	} else if runner != nil {
-		// Neither context nor host is set: inspect active context.
+		// Neither context nor host is set (or the host was explicitly
+		// cleared): inspect the active context.
 		ctxName, ctxEndpoint, err := resolveDockerContextEndpoint(ctx, runner, "")
 		if err != nil {
 			var unavail *dockerContextUnavailableError
@@ -500,16 +561,22 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		ep.context = resolvedCtx
 	}
 	clone.resolvedTarget = &ep
-	if e.explicitHost && !e.explicitContext {
+	switch {
+	case e.explicitHost && !e.explicitContext && !clearedHost:
 		clone.host = effectiveHost
 		clone.explicitHost = true
 		clone.explicitTarget = true
-	} else if e.explicitContext || runnerSelectedContext {
+	case e.explicitContext || runnerSelectedContext || clearedHost:
 		clone.context = resolvedCtx
 		clone.host = ""
 		clone.explicitContext = true
 		clone.explicitTarget = true
-	} else if runnerHasHost && targetHost == effectiveHost {
+		if clearedHost {
+			// The cleared host must stay in effect even if a runner's own
+			// environment exports DOCKER_HOST.
+			clone.explicitHost = true
+		}
+	case runnerHasHost && targetHost == effectiveHost:
 		clone.host = effectiveHost
 		clone.explicitHost = true
 		clone.explicitTarget = true

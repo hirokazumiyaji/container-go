@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redact sensitive argv in `internal/cli` stream setup, cancellation, and terminal
   wait diagnostics instead of embedding the raw command line.
 - Bound the watchdog reaper's `flock` acquisition with a 30-second timeout and
-  confirm the reaper shell has stopped before signaling its process group, so a
+  confirm the reaper process has stopped before signaling its process group, so a
   wedged lock holder cannot stall later cleanup and an in-flight backend child
   cannot race the group teardown (#332). An entry skipped by a lock timeout is
   reported on stderr. Where stop observation is unavailable (BSD, Solaris, or
@@ -271,7 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned diagnostics stay redacted.
 - `Run` and `Exec` no longer return `ErrEnvFileUnsupported` on Windows for a
   non-empty environment map; `ErrEnvFileUnsupported` remains exported for
-  compatibility. The external watchdog reaper is still unavailable on Windows.
+  compatibility. Secret environment files are protected by a
+  current-logon-only DACL.
 
 - Publish backend behaviour through an engine capability contract instead of
   asserting `dockerEngine` or comparing backend names in the shared lifecycle,

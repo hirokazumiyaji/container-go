@@ -7,8 +7,11 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
 
 // maxTestLogLine bounds one forwarded log line so a workload that never emits
@@ -105,6 +108,7 @@ func forwardTestLogs(tb testing.TB, c *Container, stream io.Reader) {
 	for {
 		line, truncated, err := readTestLogLine(reader)
 		if line != "" || truncated {
+			line = sanitizeTestLogLine(line)
 			if truncated {
 				line += " [truncated]"
 			}
@@ -114,6 +118,13 @@ func forwardTestLogs(tb testing.TB, c *Container, stream io.Reader) {
 			return
 		}
 	}
+}
+
+// sanitizeTestLogLine removes the CR of a CRLF line ending and escapes any
+// remaining control or format character, so container output cannot inject
+// terminal sequences or rewrite earlier lines in the test log.
+func sanitizeTestLogLine(line string) string {
+	return diagnostic.Sanitize(strings.TrimSuffix(line, "\r"))
 }
 
 // readTestLogLine reads one newline-terminated line, bounding the retained

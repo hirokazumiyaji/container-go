@@ -120,6 +120,9 @@ func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.
 	scanner := newProcNetScanner(spec.Port)
 	code, _, err := t.c.ExecTo(ctx, procNetCommand(), scanner,
 		WithExecTimeout(procNetExecTimeout),
+		// An image without /proc/net/tcp6 writes cat's diagnostics to
+		// stderr. Keep them out of the table the scanner parses.
+		WithExecStderr(io.Discard),
 	)
 	if err != nil {
 		if portCheckUnavailable(err) {
@@ -141,7 +144,28 @@ func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.
 	if scanner.listening {
 		return wait.PortListenOpen, nil
 	}
+	if scanner.loopbackListening && t.hostNetwork() {
+		// A host-network container shares the host loopback namespace, so a
+		// loopback-only listener is reachable through the resolved endpoint.
+		return wait.PortListenOpen, nil
+	}
 	return wait.PortListenClosed, nil
+}
+
+// hostNetwork reports whether the container shares the host's network
+// namespace. Only there is a listener bound to 127.0.0.0/8 or ::1 reachable
+// from the host endpoint; across a bridge network it is not published.
+func (t waitTarget) hostNetwork() bool {
+	if t.c.networkExplicit && t.c.network == dockerNetworkHost {
+		return true
+	}
+	// Reuse and daemon-default containers describe their mode only through
+	// inspect. Endpoint resolution runs before this check and populates the
+	// short-TTL snapshot, so reading it does not add a backend call.
+	if info := t.c.cachedDynamic(); info != nil {
+		return info.networkMode == dockerNetworkHost
+	}
+	return false
 }
 
 // portCheckUnavailable reports whether an exec failure means the
@@ -164,11 +188,15 @@ func portCheckUnavailable(err error) bool {
 // table neither needs a full-output buffer nor allocates a string and a
 // field slice per line.
 type procNetScanner struct {
-	port      int
-	line      []byte
-	listening bool
-	supported bool
-	skipLine  bool
+	port int
+	line []byte
+	// listening reports an externally reachable LISTEN socket. A listener
+	// confined to 127.0.0.0/8 or ::1 only counts on a host-network
+	// container, so it is tracked separately.
+	listening         bool
+	loopbackListening bool
+	supported         bool
+	skipLine          bool
 }
 
 func newProcNetScanner(port int) *procNetScanner {
@@ -209,9 +237,12 @@ func (s *procNetScanner) appendLine(fragment []byte) {
 
 func (s *procNetScanner) classifyLine() {
 	if !s.skipLine {
-		listening, socketLine, headerLine := scanProcNetLine(s.line, s.port)
+		listening, loopback, socketLine, headerLine := scanProcNetLine(s.line, s.port)
 		if listening {
 			s.listening = true
+		}
+		if loopback {
+			s.loopbackListening = true
 		}
 		if socketLine || headerLine {
 			s.supported = true
@@ -229,8 +260,10 @@ var (
 
 // scanProcNetLine classifies one table line without allocating. socketLine
 // reports a parseable socket row, headerLine reports the table header, and
-// listening requires a socket row for port in LISTEN state.
-func scanProcNetLine(line []byte, port int) (listening, socketLine, headerLine bool) {
+// listening requires a socket row for port in LISTEN state bound to an
+// address reachable from outside the container. loopback reports the same
+// LISTEN row bound only to the container's loopback interface.
+func scanProcNetLine(line []byte, port int) (listening, loopback, socketLine, headerLine bool) {
 	var fields [4][]byte
 	count := 0
 	for index := 0; index < len(line) && count < len(fields); {
@@ -248,16 +281,97 @@ func scanProcNetLine(line []byte, port int) (listening, socketLine, headerLine b
 		count++
 	}
 	if count < len(fields) {
-		return false, false, false
+		return false, false, false, false
 	}
 	if bytes.Equal(fields[0], procNetHeaderFirstField) && bytes.Equal(fields[1], procNetHeaderSecondField) {
-		return false, false, true
+		return false, false, false, true
 	}
 	localPort, ok := procNetLocalPort(fields[1])
 	if !ok {
-		return false, false, false
+		return false, false, false, false
 	}
-	return localPort == port && bytes.Equal(fields[3], procNetListenStateField), true, false
+	if localPort != port || !bytes.Equal(fields[3], procNetListenStateField) {
+		return false, false, true, false
+	}
+	isLoopback, ok := procNetLoopbackAddress(fields[1])
+	if ok && isLoopback {
+		return false, true, true, false
+	}
+	return true, false, true, false
+}
+
+// procNetLoopbackAddress decodes the local_address field and reports whether
+// it is a loopback address. The kernel prints each 32-bit word in host byte
+// order, so the bytes within each word are reversed for both address
+// families.
+func procNetLoopbackAddress(field []byte) (bool, bool) {
+	colon := bytes.LastIndexByte(field, ':')
+	if colon < 0 {
+		return false, false
+	}
+	address := field[:colon]
+	switch len(address) {
+	case 8:
+		var octets [4]byte
+		for i := range octets {
+			value, ok := procNetHexByte(address[i*2 : i*2+2])
+			if !ok {
+				return false, false
+			}
+			octets[len(octets)-1-i] = value
+		}
+		return octets[0] == 127, true
+	case 32:
+		var parsed [16]byte
+		for word := 0; word < 4; word++ {
+			for i := 0; i < 4; i++ {
+				value, ok := procNetHexByte(address[word*8+i*2 : word*8+i*2+2])
+				if !ok {
+					return false, false
+				}
+				parsed[word*4+(3-i)] = value
+			}
+		}
+		return procNetIPv6Loopback(parsed), true
+	default:
+		return false, false
+	}
+}
+
+func procNetHexByte(pair []byte) (byte, bool) {
+	high, ok := procNetHexDigit(pair[0])
+	if !ok {
+		return 0, false
+	}
+	low, ok := procNetHexDigit(pair[1])
+	if !ok {
+		return 0, false
+	}
+	return byte(high<<4 | low), true
+}
+
+func procNetIPv6Loopback(address [16]byte) bool {
+	// ::1
+	if procNetZeroBytes(address[:15]) && address[15] == 1 {
+		return true
+	}
+	if address[12] != 127 {
+		return false
+	}
+	// IPv4-compatible ::127.0.0.0/8 and IPv4-mapped ::ffff:127.0.0.0/8.
+	if procNetZeroBytes(address[:12]) {
+		return true
+	}
+	return procNetZeroBytes(address[:10]) && address[10] == 0xff && address[11] == 0xff
+}
+
+func procNetZeroBytes(values []byte) bool {
+	for _, value := range values {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func procNetLocalPort(field []byte) (int, bool) {

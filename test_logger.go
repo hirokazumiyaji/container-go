@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -34,12 +35,27 @@ const maxTestLogLine = 16 << 10
 // the stream.
 func WithTestLogger(t testing.TB) Option {
 	return func(c *config) error {
-		if t == nil {
+		if nilTestLogger(t) {
 			return validationErrorf("WithTestLogger", nil, "testing.TB must not be nil")
 		}
 		c.testLogger = t
 		return nil
 	}
+}
+
+// nilTestLogger reports whether t is nil, including a typed-nil *testing.T or
+// *testing.B stored in the interface. A plain comparison misses that case and
+// the first Logf or Cleanup call would panic.
+func nilTestLogger(t testing.TB) bool {
+	if t == nil {
+		return true
+	}
+	value := reflect.ValueOf(t)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	}
+	return false
 }
 
 // startTestLogger begins forwarding the container's logs to the configured

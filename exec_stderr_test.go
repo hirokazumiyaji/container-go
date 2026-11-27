@@ -199,3 +199,25 @@ func TestExecToSameWriterForStdoutAndStderrIsSerialized(t *testing.T) {
 		t.Errorf("shared writer output = %q", got)
 	}
 }
+
+func TestExecToRejectsNilWriter(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output io.Writer
+	}{
+		{name: "nil", output: nil},
+		{name: "typed nil", output: (*bytes.Buffer)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestRunner()
+			ctr := runTestContainer(t, f)
+			f.calls = nil
+			_, _, err := ctr.ExecTo(context.Background(), []string{"true"}, tc.output)
+			assertPublicValidationError(t, err, "ExecTo", "ExecTo", tc.output,
+				"output writer cannot be nil")
+			if len(f.calls) != 0 {
+				t.Fatalf("backend was called for a nil writer: %v", f.calls)
+			}
+		})
+	}
+}

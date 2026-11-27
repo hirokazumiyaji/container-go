@@ -459,3 +459,67 @@ func TestNilCleanupError(t *testing.T) {
 		t.Fatalf("nil CleanupError.Unwrap() = %v, want nil", errors.Unwrap(err))
 	}
 }
+
+// reuseDeleteFailRunner fails only the reuse-generation teardown delete, so a
+// post-ready failure reaches cleanupReuseCreate.
+type reuseDeleteFailRunner struct {
+	*reuseCreateRunner
+	deleteErr error
+}
+
+func (r *reuseDeleteFailRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "delete" {
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return nil, nil, r.deleteErr
+	}
+	return r.reuseCreateRunner.Run(ctx, args...)
+}
+
+// A reuse generation whose creation could not be completed must follow the
+// rollback contract: CONTAINERGO_KEEP=1 leaves it in place, and a failed
+// removal is a *CleanupError instead of flattened text.
+func TestReuseCreateCleanupHonorsKeepAndCleanupError(t *testing.T) {
+	deleteErr := &cli.CLIError{Binary: "container", Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: "daemon down"}
+	tests := []struct {
+		name        string
+		keep        string
+		wantDelete  bool
+		wantCleanup bool
+	}{
+		{name: "default reports a cleanup failure", keep: "", wantDelete: true, wantCleanup: true},
+		{name: "keep leaves the generation", keep: "1", wantDelete: false, wantCleanup: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CONTAINERGO_KEEP", tc.keep)
+			base := newReuseCreateRunner()
+			r := &reuseDeleteFailRunner{reuseCreateRunner: base, deleteErr: deleteErr}
+			sentinel := errors.New("initialization failed")
+
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"), WithReuse(), withRunner(r), withEngine(appleEngine{}),
+				WithPostReadyHook(func(context.Context, *Container) error { return sentinel }))
+			if ctr != nil {
+				t.Fatalf("Run returned handle %v after hook failure", ctr)
+			}
+			if err == nil {
+				t.Fatal("Run returned nil after hook failure")
+			}
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("error = %v, want the hook error", err)
+			}
+			if got := r.callWith("delete") != nil; got != tc.wantDelete {
+				t.Fatalf("delete issued = %v, want %v", got, tc.wantDelete)
+			}
+			var cleanupErr *CleanupError
+			if got := errors.As(err, &cleanupErr); got != tc.wantCleanup {
+				t.Fatalf("errors.As(*CleanupError) = %v, want %v (err = %v)", got, tc.wantCleanup, err)
+			}
+			if tc.wantCleanup && !errors.Is(err, ErrCleanupFailed) {
+				t.Fatalf("errors.Is(ErrCleanupFailed) = false for %v", err)
+			}
+		})
+	}
+}

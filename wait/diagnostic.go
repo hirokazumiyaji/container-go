@@ -104,6 +104,9 @@ func DiagnosticBoundaryValues(strategy Strategy) []string {
 }
 
 func safeStrategyError(err error, strategy Strategy) error {
+	if isNilStrategy(strategy) {
+		return err
+	}
 	r := cli.NewHashedContextRedactor(DiagnosticValues(strategy)...).WithBoundaryValues(DiagnosticBoundaryValues(strategy)...)
 	return cli.WithRedactor(err, r)
 }

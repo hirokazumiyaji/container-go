@@ -40,7 +40,7 @@ type execConfig struct {
 func WithExecTimeout(d time.Duration) ExecOption {
 	return func(c *execConfig) error {
 		if d < 0 {
-			return fmt.Errorf("exec timeout must not be negative, got %v", d)
+			return validationErrorf("WithExecTimeout", d, "exec timeout must not be negative, got %v", d)
 		}
 		c.timeout = d
 		c.timeoutSet = true
@@ -209,6 +209,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 // and classification behave as they do for Exec. WithExecStderr sends
 // stderr to its writer instead; the stats still count both streams.
 func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error) {
+	if nilWriter(output) {
+		return 0, OutputStats{}, validationErrorf("ExecTo", output, "output writer cannot be nil")
+	}
 	code, _, stats, err := c.execute(ctx, cmd, opts, output, true)
 	return code, stats, err
 }

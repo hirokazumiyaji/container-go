@@ -189,6 +189,14 @@ func TestTestLoggerKeepsHistoryForCreatedHandle(t *testing.T) {
 	}
 }
 
+func TestWithTestLoggerRejectsTypedNilTB(t *testing.T) {
+	var typedNil *testing.T
+	var tb testing.TB = typedNil
+	err := WithTestLogger(tb)(newConfig())
+	assertPublicValidationError(t, err, "WithTestLogger", "WithTestLogger", nil,
+		"testing.TB must not be nil")
+}
+
 // recordingTestLogSink implements testLogSink so buffering and flush behavior
 // can be observed without depending on a real testing.T's output.
 type recordingTestLogSink struct {

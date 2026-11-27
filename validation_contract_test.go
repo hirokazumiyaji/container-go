@@ -405,3 +405,21 @@ func TestValidationErrorMessageTracksErr(t *testing.T) {
 		t.Fatalf("Error() after Err mutation = %q, want replacement cause", got)
 	}
 }
+
+// WithExecTimeout validates its own input, so the returned error names the
+// option instead of being rewrapped as a generic Run validation failure.
+func TestWithExecTimeoutNegativeIsOptionValidationError(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	err := (WithExecTimeout(-time.Second))(&execConfig{env: map[string]string{}})
+	assertPublicValidationError(t, err, "WithExecTimeout", "WithExecTimeout", -time.Second,
+		"exec timeout must not be negative, got -1s")
+
+	f.calls = nil
+	_, _, execErr := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(-time.Second))
+	assertPublicValidationError(t, execErr, "WithExecTimeout", "WithExecTimeout", -time.Second,
+		"exec timeout must not be negative, got -1s")
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called for an invalid exec timeout: %v", f.calls)
+	}
+}

@@ -319,7 +319,7 @@ func (c *Container) setImmutableID(uid string) {
 // target host. Every construction site must use it so a new handle cannot
 // silently omit either field.
 func (c *Container) applyConfigDiagnostics(cfg *config) {
-	c.diagnosticRedactorValue = newDiagnosticMatcher(cfg.diagnosticValues()).WithBoundaryValues(cfg.waitBoundaryValues()...)
+	c.diagnosticRedactorValue = newDiagnosticMatcher(cfg.diagnosticValues()).WithBoundaryValues(cfg.diagnosticBoundaryValues()...)
 	c.targetHost = cfg.eng.defaultHost()
 }
 

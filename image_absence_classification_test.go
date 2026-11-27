@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 func TestAppleManifestUnknownAllowsExplicitMutableFallback(t *testing.T) {
@@ -214,15 +215,15 @@ func TestDockerHubAliasesAreCanonicalForRepositoryComparisons(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		if !imagesCompatible(tc.requested, tc.actual) {
-			t.Errorf("imagesCompatible(%q, %q) = false", tc.requested, tc.actual)
+		if !domain.ImagesCompatible(tc.requested, tc.actual) {
+			t.Errorf("domain.ImagesCompatible(%q, %q) = false", tc.requested, tc.actual)
 		}
-		if !imageRepositoryPathsCompatible(tc.requested, tc.actual) {
-			t.Errorf("imageRepositoryPathsCompatible(%q, %q) = false", tc.requested, tc.actual)
+		if !domain.ImageRepositoryPathsCompatible(tc.requested, tc.actual) {
+			t.Errorf("domain.ImageRepositoryPathsCompatible(%q, %q) = false", tc.requested, tc.actual)
 		}
 	}
-	if got := imageRepository("registry-1.docker.io/redis"); got != "docker.io/library/redis" {
-		t.Fatalf("imageRepository(alias) = %q, want canonical implicit-library path", got)
+	if got := domain.ImageRepository("registry-1.docker.io/redis"); got != "docker.io/library/redis" {
+		t.Fatalf("domain.ImageRepository(alias) = %q, want canonical implicit-library path", got)
 	}
 	if imageRepositoriesCompatible("docker.io/library/redis", "registry.example/team/redis") {
 		t.Fatal("custom registry was treated as a Docker Hub alias")

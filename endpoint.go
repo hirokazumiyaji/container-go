@@ -94,7 +94,7 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 
 // resolve maps a container port to the (host, port) pair to dial.
 func (c *Container) resolve(ctx context.Context, port, operation string) (string, int, error) {
-	spec, err := parsePortSpec(port)
+	spec, err := domain.ParsePortSpec(port)
 	if err != nil {
 		return "", 0, newValidationErrorWithField(operation, "port", port, err)
 	}

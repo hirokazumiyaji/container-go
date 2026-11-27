@@ -1,11 +1,15 @@
 package container
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
+)
 
 // imageReferencesCompatible compares a requested reference with the reference
 // inspect reported using Docker's repository and tag rules.
 func (dockerEngine) imageReferencesCompatible(requested, actual string) bool {
-	return imagesCompatible(requested, actual)
+	return domain.ImagesCompatible(requested, actual)
 }
 
 // parsePruneListed returns no list metadata: Docker prunes by immutable ID
@@ -29,7 +33,7 @@ func (e dockerEngine) checkReuseNetworkCompat(info *engineInfo, cfg *config) err
 		return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
 	}
 	if len(cfg.exposed) > 0 || len(cfg.published) > 0 {
-		if err := dockerNetworkEndpointError(info.networkMode); err != nil {
+		if err := domain.NetworkEndpointError(info.networkMode); err != nil {
 			return fmt.Errorf("%w: reuse %s: %w", ErrReuseMismatch, cfg.name, err)
 		}
 	}

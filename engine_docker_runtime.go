@@ -611,10 +611,10 @@ func parseDockerEndpoint(raw string) (dockerTargetEndpoint, error) {
 				clientHost: "127.0.0.1",
 			}, nil
 		}
-		canonical := canonicalIP(host)
-		if isLoopbackOrUnspecified(host) {
+		canonical := domain.CanonicalIP(host)
+		if domain.IsLoopbackOrUnspecified(host) {
 			clientHost := "127.0.0.1"
-			if ipIsUnspecified(canonical) && !ipIs4(canonical) {
+			if domain.IPIsUnspecified(canonical) && !domain.IPIs4(canonical) {
 				clientHost = "::1"
 			}
 			return dockerTargetEndpoint{
@@ -641,10 +641,10 @@ func parseDockerEndpoint(raw string) (dockerTargetEndpoint, error) {
 		if host == "" {
 			return dockerTargetEndpoint{}, fmt.Errorf("docker ssh endpoint %q missing host", raw)
 		}
-		canonical := canonicalIP(host)
-		if isLoopbackOrUnspecified(host) {
+		canonical := domain.CanonicalIP(host)
+		if domain.IsLoopbackOrUnspecified(host) {
 			clientHost := "127.0.0.1"
-			if ipIsUnspecified(canonical) && !ipIs4(canonical) {
+			if domain.IPIsUnspecified(canonical) && !domain.IPIs4(canonical) {
 				clientHost = "::1"
 			}
 			return dockerTargetEndpoint{
@@ -705,12 +705,6 @@ func isRemoteDockerHostValue(rawHost string) bool {
 // is outside what DOCKER_HOST can express.
 func isRemoteDockerHost() bool {
 	return isRemoteDockerHostValue(os.Getenv("DOCKER_HOST"))
-}
-
-// isLoopbackOrUnspecified reports addresses that mean "this host" and
-// must be rewritten to defaultHost() on a remote daemon.
-func isLoopbackOrUnspecified(addr string) bool {
-	return domain.IsLoopbackOrUnspecified(addr)
 }
 
 // dockerConnectHost is the Docker backend's spelling of the shared connect

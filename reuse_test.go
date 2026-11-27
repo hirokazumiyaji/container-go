@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // reuseCreateRunner answers inspect with not-found until a successful
@@ -628,8 +629,8 @@ func TestImagesCompatible(t *testing.T) {
 		{"myorg/app:v1", "otherorg/app:v1", false},
 	}
 	for _, tc := range cases {
-		if got := imagesCompatible(tc.req, tc.act); got != tc.ok {
-			t.Errorf("imagesCompatible(%q,%q) = %v, want %v", tc.req, tc.act, got, tc.ok)
+		if got := domain.ImagesCompatible(tc.req, tc.act); got != tc.ok {
+			t.Errorf("domain.ImagesCompatible(%q,%q) = %v, want %v", tc.req, tc.act, got, tc.ok)
 		}
 	}
 }

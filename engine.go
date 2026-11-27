@@ -587,9 +587,9 @@ func imageReferenceWithDigest(requested, reported, digest, id string) imageIdent
 		id = canonicalID
 	}
 	if digest != "" {
-		base := imageReferenceBase(requested)
+		base := domain.ImageReferenceBase(requested)
 		if base == "" {
-			base = imageReferenceBase(reported)
+			base = domain.ImageReferenceBase(reported)
 		}
 		if base == "" {
 			// A verified backend ID may stand alone. This is the only
@@ -604,8 +604,8 @@ func imageReferenceWithDigest(requested, reported, digest, id string) imageIdent
 		}
 		return imageIdentity{reference: base + "@" + digest, digest: digest, rootDigest: digest, id: id, pinned: true}
 	}
-	if requestedDigest := imageDigest(requested); validImageDigest(requestedDigest) {
-		if imageReferenceBase(requested) == "" {
+	if requestedDigest := domain.ImageDigest(requested); validImageDigest(requestedDigest) {
+		if domain.ImageReferenceBase(requested) == "" {
 			return imageIdentity{}
 		}
 		return imageIdentity{reference: requested, digest: requestedDigest, rootDigest: requestedDigest, id: id, pinned: true}
@@ -664,8 +664,8 @@ func imageIdentitiesCompatible(a, b imageIdentity) bool {
 	// repository from which that content was resolved. Do not accept a
 	// same-digest identity from a different registry or namespace, and do
 	// not accept a bare digest with no repository provenance.
-	abase := imageReferenceBase(a.reference)
-	bbase := imageReferenceBase(b.reference)
+	abase := domain.ImageReferenceBase(a.reference)
+	bbase := domain.ImageReferenceBase(b.reference)
 	if abase == "" || bbase == "" {
 		return false
 	}
@@ -676,9 +676,9 @@ func imageIdentitiesCompatible(a, b imageIdentity) bool {
 		// One side may be a caller spelling while the other carries the
 		// backend's canonical registry. Compare the repository paths and
 		// tags without accepting a bare digest as a wildcard.
-		return imageRepositoryPathsCompatible(abase, bbase)
+		return domain.ImageRepositoryPathsCompatible(abase, bbase)
 	}
-	return imageRepositoriesCompatible(imageRepository(abase), imageRepository(bbase))
+	return imageRepositoriesCompatible(domain.ImageRepository(abase), domain.ImageRepository(bbase))
 }
 
 // requestedImageIdentitiesCompatible compares a resolved request with an
@@ -722,22 +722,8 @@ func isImageID(ref string) bool {
 	return strings.HasPrefix(ref, prefix) && len(ref) == len(prefix)+64 &&
 		domain.IsHex(strings.TrimPrefix(ref, prefix)) && imageRE.MatchString(ref)
 }
-
-// imageReferenceBase returns a repository-bearing base for an image
-// reference. A bare Docker-style ID or digest is deliberately rejected:
-// without a repository it cannot be compared with another named image.
-func imageReferenceBase(ref string) string {
-	return domain.ImageReferenceBase(ref)
-}
-
 func isRepositoryDigestReference(ref string) bool {
-	return imageReferenceBase(ref) != "" && validImageDigest(imageDigest(ref))
-}
-
-// isBareImageID recognizes the unprefixed 64-hex image-ID spelling. It
-// is a local identifier, not a repository name.
-func isBareImageID(ref string) bool {
-	return domain.IsBareImageID(ref)
+	return domain.ImageReferenceBase(ref) != "" && validImageDigest(domain.ImageDigest(ref))
 }
 
 // canonicalDockerImageID normalizes Docker's accepted 64-hex and
@@ -748,18 +734,11 @@ func canonicalDockerImageID(ref string) (string, bool) {
 	if isImageID(ref) {
 		return ref, true
 	}
-	if isBareImageID(ref) {
+	if domain.IsBareImageID(ref) {
 		return "sha256:" + ref, true
 	}
 	return "", false
 }
-
-// isBareImageReference identifies either spelling of an ID-shaped or
-// digest-shaped value that has no repository provenance.
-func isBareImageReference(ref string) bool {
-	return domain.IsBareImageReference(ref)
-}
-
 func validImageDigest(digest string) bool {
 	i := strings.IndexByte(digest, ':')
 	if i <= 0 || i == len(digest)-1 {

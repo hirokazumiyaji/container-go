@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 const (
@@ -85,7 +87,7 @@ func (r *platformPinningRunner) Run(_ context.Context, args ...string) ([]byte, 
 		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
-		image := stripImageDigest(r.runImage)
+		image := domain.StripImageDigest(r.runImage)
 		if image == "" {
 			image = "redis:7-alpine"
 		}

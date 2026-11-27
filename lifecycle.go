@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"io"
 	"regexp"
 	"strings"
@@ -758,7 +759,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 		if uid != "" {
 			return identityError(fmt.Sprintf("%s inspect unexpectedly returned a container ID", c.eng.name()))
 		}
-		if !validCreationID(creation) {
+		if !domain.IsCreationID(creation) {
 			return identityError(fmt.Sprintf("%s handle has no valid creation generation", c.eng.name()))
 		}
 		unlock, err := lockName(ctx, c.id)

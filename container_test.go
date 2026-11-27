@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 )
 
@@ -151,10 +152,10 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		if f.imagePresent {
 			target := args[len(args)-1]
 			digest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-			if d := imageDigest(target); d != "" {
+			if d := domain.ImageDigest(target); d != "" {
 				digest = d
 			}
-			repo := stripImageDigest(target)
+			repo := domain.StripImageDigest(target)
 			return []byte(fmt.Sprintf(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":[%q],"reference":%q,"descriptor":{"digest":%q},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`, repo+"@"+digest, repo, digest)), nil, nil
 		}
 		// The message carries both backends' verified not-found lines

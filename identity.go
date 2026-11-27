@@ -14,11 +14,6 @@ func requiresImmutableID(eng engine) bool {
 	}
 	return eng.capabilities().immutableID
 }
-
-func validCreationID(generation string) bool {
-	return domain.IsCreationID(generation)
-}
-
 func validImmutableID(eng engine, id string) bool {
 	if requiresImmutableID(eng) {
 		return domain.IsImmutableContainerID(id)
@@ -69,7 +64,7 @@ func sameContainerIdentity(eng engine, expected, fresh *engineInfo) error {
 	// specific value, so an empty expected fact would otherwise match any
 	// well-formed observation.
 	expectedGeneration := expected.labels[creationLabel]
-	if !validCreationID(expectedGeneration) {
+	if !domain.IsCreationID(expectedGeneration) {
 		return identityError("creation generation is missing or invalid")
 	}
 	if requiresImmutableID(eng) {
@@ -93,7 +88,7 @@ func sameContainerIdentity(eng engine, expected, fresh *engineInfo) error {
 	case domain.OwnershipFailureNone:
 		return nil
 	case domain.OwnershipFailureCreation:
-		if !validCreationID(fresh.labels[creationLabel]) {
+		if !domain.IsCreationID(fresh.labels[creationLabel]) {
 			return identityError("creation generation is missing or invalid")
 		}
 		return identityError("creation generation changed")

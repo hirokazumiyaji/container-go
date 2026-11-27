@@ -75,12 +75,6 @@ func assertIntegrationCopyOutRejectsSpecialFiles(t *testing.T, ctx context.Conte
 				if got.err == nil {
 					t.Fatalf("CopyFileFromContainer accepted %s", tc.name)
 				}
-				if copyOutUnsupportedOnThisToolchain {
-					if !errors.Is(got.err, container.ErrCopyFileFromContainerUnsupported) {
-						t.Fatalf("%s error = %v, want documented unsupported error", tc.name, got.err)
-					}
-					t.Skipf("%s is intentionally unsupported on this Windows toolchain: %v", tc.name, got.err)
-				}
 				// Docker's Windows archive extractor can omit a Unix
 				// link/FIFO instead of materializing it. This is the only
 				// copy-stage platform skip; all other errors must be typed.

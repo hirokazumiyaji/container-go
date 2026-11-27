@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 const (
@@ -112,7 +113,7 @@ func finalContainerJSON(image, root, variant, platform, creation string) []byte 
 		platformValue["variant"] = parts[2]
 	}
 	imageValue := map[string]any{
-		"reference":  stripImageDigest(image),
+		"reference":  domain.StripImageDigest(image),
 		"descriptor": map[string]string{"digest": root},
 	}
 	if variant != "" {

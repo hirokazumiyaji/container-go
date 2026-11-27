@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 const appleImageID = "3333333333333333333333333333333333333333333333333333333333333333"
@@ -85,7 +86,7 @@ func (r *appleAddressRunner) Run(_ context.Context, args ...string) ([]byte, []b
 		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
-		image := stripImageDigest(r.runImage)
+		image := domain.StripImageDigest(r.runImage)
 		if image == "" {
 			image = "redis:7-alpine"
 		}
@@ -388,10 +389,10 @@ func TestBareDigestIdentityRequiresProvenanceOrVerifiedID(t *testing.T) {
 	if imageIdentitiesCompatible(bare, repository) {
 		t.Fatal("bare digest matched a repository identity without provenance")
 	}
-	if imagesCompatible(digest, repository.reference) {
+	if domain.ImagesCompatible(digest, repository.reference) {
 		t.Fatal("bare digest compatibility accepted a repository-backed identity")
 	}
-	if imagesCompatible("sha256:not-a-valid-digest", "sha256:not-a-valid-digest") {
+	if domain.ImagesCompatible("sha256:not-a-valid-digest", "sha256:not-a-valid-digest") {
 		t.Fatal("malformed bare digest compatibility must fail closed")
 	}
 	verifiedA := bare

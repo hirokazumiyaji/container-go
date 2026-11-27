@@ -1,4 +1,4 @@
-//go:build windows && go1.26
+//go:build windows
 
 package container
 
@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func TestWindowsCopyFileOpenIsAvailableFromGo126(t *testing.T) {
+func TestWindowsCopyFileOpenIsAvailable(t *testing.T) {
 	if err := checkCopyFileOpenCapability(); err != nil {
 		t.Fatalf("checkCopyFileOpenCapability: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestWindowsCopyFileOpenIsAvailableFromGo126(t *testing.T) {
 	}
 }
 
-func TestWindowsCopyFileFromContainerRejectsBackslashPathsFromGo126(t *testing.T) {
+func TestWindowsCopyFileFromContainerRejectsBackslashPaths(t *testing.T) {
 	runner := &cpRunner{fakeRunner: newTestRunner(), fileContent: "must not be copied"}
 	ctr := runCopyDockerTestContainer(t, runner)
 
@@ -54,7 +54,7 @@ func TestWindowsCopyFileFromContainerRejectsBackslashPathsFromGo126(t *testing.T
 	}
 }
 
-func TestWindowsCopyFileOpenDoesNotFollowSymlinkFromGo126(t *testing.T) {
+func TestWindowsCopyFileOpenDoesNotFollowSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "host-secret")
 	payload := filepath.Join(dir, "payload")

@@ -24,27 +24,36 @@ import (
 // misbehaving endpoint from turning the drain into a memory cost.
 const maxDrainBytes = 64 * 1024
 
+// defaultHTTPRequestTimeout bounds one request made by the built-in client.
+// WithRequestTimeout overrides it.
+const defaultHTTPRequestTimeout = 3 * time.Second
+
 // HTTPStrategy waits until an HTTP request against the container
 // returns an acceptable status code.
 type HTTPStrategy struct {
 	options
-	path            string
-	port            string
-	portSet         bool
-	method          string
-	statusMatcher   func(int) bool
-	statusCode      int
-	statusCodeSet   bool
-	responseMatcher func(io.Reader) bool
-	headers         map[string]string
-	body            []byte
-	bodySet         bool
-	username        string
-	password        string
-	basicAuth       bool
-	useTLS          bool
-	tlsConfig       *tls.Config
-	httpClient      *http.Client
+	path               string
+	port               string
+	portSet            bool
+	method             string
+	statusMatcher      func(int) bool
+	statusCode         int
+	statusCodeSet      bool
+	responseMatcher    func(io.Reader) bool
+	headers            map[string]string
+	body               []byte
+	bodySet            bool
+	username           string
+	password           string
+	basicAuth          bool
+	useTLS             bool
+	tlsConfig          *tls.Config
+	insecureTLS        bool
+	httpClient         *http.Client
+	followRedirects    bool
+	followRedirectsSet bool
+	requestTimeout     time.Duration
+	requestTimeoutSet  bool
 }
 
 // ForHTTP waits for a plain-HTTP endpoint at path (on the first declared
@@ -154,9 +163,11 @@ func (s *HTTPStrategy) WithTLS() *HTTPStrategy {
 	return cloned
 }
 
-// WithTLSConfig probes via https with a custom TLS config (e.g.,
-// InsecureSkipVerify for self-signed test certs). The config is cloned so a
-// caller mutation after the builder call cannot race with the wait.
+// WithTLSConfig probes via https with a custom TLS config (for example a
+// pinned RootCAs). The config is cloned before use, so the caller's value is
+// never mutated and a mutation after the builder call cannot race with the
+// wait. A self-signed test certificate is better handled with
+// WithAllowInsecureTLS.
 func (s *HTTPStrategy) WithTLSConfig(cfg *tls.Config) *HTTPStrategy {
 	cloned := s.clone()
 	cloned.useTLS = true
@@ -167,10 +178,53 @@ func (s *HTTPStrategy) WithTLSConfig(cfg *tls.Config) *HTTPStrategy {
 	return cloned
 }
 
+// WithAllowInsecureTLS probes via https without verifying the server
+// certificate. It is for tests only: it sets TLSClientConfig.InsecureSkipVerify,
+// which disables certificate verification and leaves the probe open to a
+// man-in-the-middle. The caller's WithTLSConfig value is never mutated; the
+// built-in client clones it before applying the override.
+//
+// A caller-supplied WithHTTPClient supplies its own transport and TLS
+// config, so this option only selects the https scheme for that client.
+func (s *HTTPStrategy) WithAllowInsecureTLS() *HTTPStrategy {
+	cloned := s.clone()
+	cloned.useTLS = true
+	cloned.insecureTLS = true
+	return cloned
+}
+
+// WithFollowRedirects controls whether the readiness request follows HTTP
+// redirects. false installs a CheckRedirect that returns
+// http.ErrUseLastResponse, so the redirect response itself is validated by the
+// status and body matchers. true restores the default policy: the built-in
+// client follows same-origin redirects up to 10, while a caller-supplied
+// WithHTTPClient keeps its own policy.
+//
+// When this option is unset, a caller-supplied client's redirect policy is
+// left untouched.
+func (s *HTTPStrategy) WithFollowRedirects(follow bool) *HTTPStrategy {
+	cloned := s.clone()
+	cloned.followRedirects, cloned.followRedirectsSet = follow, true
+	return cloned
+}
+
+// WithRequestTimeout bounds one HTTP request independently of
+// WithStartupTimeout, so a hung request cannot consume the whole startup
+// budget. A non-positive duration is rejected as a *ConfigError before
+// probing. When unset, the built-in client keeps its 3s per-request timeout
+// and a caller-supplied WithHTTPClient keeps its own Timeout.
+func (s *HTTPStrategy) WithRequestTimeout(d time.Duration) *HTTPStrategy {
+	cloned := s.clone()
+	cloned.requestTimeout, cloned.requestTimeoutSet = d, true
+	return cloned
+}
+
 // WithHTTPClient delegates transport, proxy, redirect, and timeout
 // policy to the caller. WithTLS/WithTLSConfig still select the https
 // scheme; the custom client supplies the TLS config (for example
-// httptest.NewTLSServer).
+// httptest.NewTLSServer). WithRequestTimeout and WithFollowRedirects(false)
+// clone the client before overriding its Timeout or CheckRedirect, so the
+// caller's value is never mutated.
 func (s *HTTPStrategy) WithHTTPClient(c *http.Client) *HTTPStrategy {
 	cloned := s.clone()
 	cloned.httpClient = c
@@ -293,6 +347,9 @@ func (s *HTTPStrategy) validate() error {
 	if s.method == "" {
 		return invalidConfigf("ForHTTP", "method", "", "must not be empty")
 	}
+	if s.requestTimeoutSet && s.requestTimeout <= 0 {
+		return invalidConfigf("ForHTTP", "request timeout", s.requestTimeout.String(), "must be positive")
+	}
 	if s.path != "" &&
 		!strings.HasPrefix(s.path, "/") &&
 		!strings.HasPrefix(s.path, "@") &&
@@ -338,8 +395,19 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 	}
 	client := s.httpClient
 	if client == nil {
-		client = newDefaultHTTPClient(s.tlsConfig)
+		client = newDefaultHTTPClient(s)
 		defer client.CloseIdleConnections()
+	} else if s.requestTimeoutSet || (s.followRedirectsSet && !s.followRedirects) {
+		// Override on a shallow copy so the caller's client and its
+		// transport stay untouched.
+		overridden := *client
+		if s.requestTimeoutSet {
+			overridden.Timeout = s.requestTimeout
+		}
+		if s.followRedirectsSet && !s.followRedirects {
+			overridden.CheckRedirect = stopHTTPProbeRedirect
+		}
+		client = &overridden
 	}
 	scheme := "http"
 	if s.useTLS {
@@ -447,20 +515,45 @@ func buildHTTPProbeURL(scheme, endpoint, callerPath string) (string, error) {
 	}).String(), nil
 }
 
-func newDefaultHTTPClient(tlsConfig *tls.Config) *http.Client {
+func newDefaultHTTPClient(s *HTTPStrategy) *http.Client {
 	transport := &http.Transport{}
 	if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok && defaultTransport != nil {
 		transport = defaultTransport.Clone()
 	}
 	transport.Proxy = nil
-	if tlsConfig != nil {
-		transport.TLSClientConfig = tlsConfig.Clone()
+	if tlsConfig := s.probeTLSConfig(); tlsConfig != nil {
+		transport.TLSClientConfig = tlsConfig
+	}
+	requestTimeout := defaultHTTPRequestTimeout
+	if s.requestTimeoutSet {
+		requestTimeout = s.requestTimeout
+	}
+	checkRedirect := checkHTTPProbeRedirect
+	if s.followRedirectsSet && !s.followRedirects {
+		checkRedirect = stopHTTPProbeRedirect
 	}
 	return &http.Client{
 		Transport:     transport,
-		CheckRedirect: checkHTTPProbeRedirect,
-		Timeout:       3 * time.Second,
+		CheckRedirect: checkRedirect,
+		Timeout:       requestTimeout,
 	}
+}
+
+// probeTLSConfig returns the TLS config for the built-in transport. The
+// caller's WithTLSConfig value is cloned before the test-only
+// InsecureSkipVerify override is applied.
+func (s *HTTPStrategy) probeTLSConfig() *tls.Config {
+	if s.tlsConfig == nil {
+		if !s.insecureTLS {
+			return nil
+		}
+		return &tls.Config{InsecureSkipVerify: true}
+	}
+	tlsConfig := s.tlsConfig.Clone()
+	if s.insecureTLS {
+		tlsConfig.InsecureSkipVerify = true
+	}
+	return tlsConfig
 }
 
 func checkHTTPProbeRedirect(req *http.Request, via []*http.Request) error {
@@ -476,6 +569,12 @@ func checkHTTPProbeRedirect(req *http.Request, via []*http.Request) error {
 		req.Host = host
 	}
 	return nil
+}
+
+// stopHTTPProbeRedirect makes net/http return the redirect response instead of
+// following it, so the status and body matchers validate that response.
+func stopHTTPProbeRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func sameOrigin(a, b *url.URL) bool {

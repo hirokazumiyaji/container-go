@@ -688,7 +688,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
 		return nil
 	}
-	if !validCreationID(cfg.creation) {
+	if !domain.IsCreationID(cfg.creation) {
 		return identityError("failed create has no valid creation generation")
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.effectiveQueryTimeout())

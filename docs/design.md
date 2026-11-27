@@ -760,6 +760,12 @@ provides:
   `v0.2.0`.
   `WithResponseMatcher(func(io.Reader) bool)` checks up to 64KiB of an
   accepted response body, and a false verdict is retried.
+  `WithAllowInsecureTLS` is for tests only: it sets
+  `TLSClientConfig.InsecureSkipVerify` and therefore disables certificate
+  verification. `WithFollowRedirects(false)` installs a `CheckRedirect`
+  returning `http.ErrUseLastResponse`, so the redirect response itself is
+  validated; `WithRequestTimeout` bounds one request independently of the
+  startup timeout.
 - `wait.ForHealthcheck()`: wait until Docker reports the image's
   `HEALTHCHECK` as healthy. `starting` keeps polling and `unhealthy` is
   terminal; an image without a HEALTHCHECK fails immediately with a
@@ -802,7 +808,11 @@ provides:
 - `wait.ForSQL(port, driver, dsn)`: poll `database/sql` with
   `db.PingContext` (or a `WithQuery` readiness statement) against the
   resolved host and port. Each attempt runs under a 3s deadline, so a
-  stalled handshake is retried instead of consuming the startup budget.
+  stalled handshake is retried instead of consuming the startup budget;
+  `WithAttemptTimeout` overrides that per-attempt deadline. `WithQueryMatcher`
+  validates the rows returned by `WithQuery`: a false result or a retryable
+  matcher error starts another poll, while a permanent error such as one
+  wrapping `ErrInvalidConfiguration` ends the wait immediately.
   The package imports no driver; the caller registers one and passes its
   name, and an unregistered driver is rejected by `Validate` (and so by
   `WithWaitStrategy` before container work) as well as at the start of

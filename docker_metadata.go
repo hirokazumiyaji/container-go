@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -26,52 +25,28 @@ const (
 	dockerMetadataLimit = 64
 )
 
-type dockerMetadataEntry struct {
-	value  string
-	expiry time.Time
-}
-
 // dockerMetadataCache collapses concurrent Docker metadata lookups with the
 // same key and briefly reuses their successful results. It caches the daemon
 // default network and the copy-out version capability. It is owned by a
 // Client (and carried by the handles that Client creates) rather than shared
 // process-wide, so unrelated targets cannot observe each other's answers.
 //
+// The bounded TTL map is the shared ttlCache; this type adds only the flight
+// group that collapses a concurrent miss onto one CLI invocation.
+//
 // Only successful lookups are stored. A failed or canceled lookup removes
 // nothing because nothing was stored, and the next caller retries. A joined
 // caller's context still bounds its wait; the leader's context bounds the CLI
 // invocation itself.
 type dockerMetadataCache struct {
-	mu      sync.Mutex
-	entries map[string]dockerMetadataEntry
-	// nextExpiry is the earliest expiry among entries, or the zero time when
-	// no entry is known to expire. It lets store skip a full sweep until an
-	// entry can actually be stale.
-	nextExpiry time.Time
-	flights    flightGroup[string]
-
-	// now and ttl are injectable so expiry is testable without sleeping.
-	now func() time.Time
-	ttl time.Duration
-	// limit is the maximum number of live entries; a non-positive limit
-	// disables eviction.
-	limit int
+	*ttlCache[string, string]
+	flights flightGroup[string]
 }
 
 func newDockerMetadataCache(ttl time.Duration) *dockerMetadataCache {
 	return &dockerMetadataCache{
-		entries: map[string]dockerMetadataEntry{},
-		now:     time.Now,
-		ttl:     ttl,
-		limit:   dockerMetadataLimit,
+		ttlCache: newTTLCache[string, string](ttl, dockerMetadataLimit),
 	}
-}
-
-func (c *dockerMetadataCache) currentTime() time.Time {
-	if c.now != nil {
-		return c.now()
-	}
-	return time.Now()
 }
 
 // lookup returns a cached successful value for key, or runs fn once for all
@@ -126,101 +101,19 @@ func (c *dockerMetadataCache) delete(key string) {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.entries[key]; !ok {
-		return
-	}
-	delete(c.entries, key)
-	c.recomputeNextExpiryLocked()
+	c.forget(key)
 }
 
-func (c *dockerMetadataCache) get(key string) (string, bool) {
-	if c.ttl <= 0 {
-		return "", false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.entries[key]
-	if !ok {
-		return "", false
-	}
-	if !c.currentTime().Before(entry.expiry) {
-		delete(c.entries, key)
-		return "", false
-	}
-	return entry.value, true
-}
-
-func (c *dockerMetadataCache) store(key, value string) {
-	if c.ttl <= 0 {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := c.currentTime()
-	if !c.nextExpiry.IsZero() && !now.Before(c.nextExpiry) {
-		c.purgeExpiredLocked(now)
-	}
-	if _, exists := c.entries[key]; !exists && c.limit > 0 && len(c.entries) >= c.limit {
-		c.evictEarliestExpiryLocked()
-	}
-	expiry := now.Add(c.ttl)
-	c.entries[key] = dockerMetadataEntry{value: value, expiry: expiry}
-	if c.nextExpiry.IsZero() || expiry.Before(c.nextExpiry) {
-		c.nextExpiry = expiry
-	}
-}
-
-// purgeExpiredLocked drops entries whose expiry has passed and restores the
-// earliest-expiry hint. It runs only when the hint says at least one entry may
-// be stale.
-func (c *dockerMetadataCache) purgeExpiredLocked(now time.Time) {
-	for existing, entry := range c.entries {
-		if !now.Before(entry.expiry) {
-			delete(c.entries, existing)
-		}
-	}
-	c.recomputeNextExpiryLocked()
-}
-
-// evictEarliestExpiryLocked keeps a just-stored hot answer from being evicted
-// at capacity: with one TTL per cache, the earliest expiry is the oldest
-// insertion, which is the least likely answer a caller needs next.
-func (c *dockerMetadataCache) evictEarliestExpiryLocked() {
-	var oldestKey string
-	var oldestExpiry time.Time
-	for existing, entry := range c.entries {
-		if oldestKey == "" || entry.expiry.Before(oldestExpiry) {
-			oldestKey, oldestExpiry = existing, entry.expiry
-		}
-	}
-	if oldestKey == "" {
-		return
-	}
-	delete(c.entries, oldestKey)
-	c.recomputeNextExpiryLocked()
-}
-
-func (c *dockerMetadataCache) recomputeNextExpiryLocked() {
-	c.nextExpiry = time.Time{}
-	for _, entry := range c.entries {
-		if c.nextExpiry.IsZero() || entry.expiry.Before(c.nextExpiry) {
-			c.nextExpiry = entry.expiry
-		}
-	}
-}
-
-// dockerTargetKey identifies one daemon: the backend, the resolved target and
-// client settings, and the executable that issued the query. The effective
-// query timeout changes how long a lookup may take, not what a successful
-// answer means, so cache entries omit it; flights append the timeout
-// separately to isolate callers with different budgets.
+// dockerTargetKey identifies one Docker target: the backend, the resolved
+// image-store identity, and the client settings the answer belongs to.
 func dockerTargetKey(eng engine, runner cli.Runner) string {
 	return eng.name() + "\x00" + eng.imageStoreID() + "\x00" + dockerRunnerKey(runner)
 }
 
-// dockerDefaultNetworkKey identifies one daemon default-network answer.
+// dockerDefaultNetworkKey identifies one daemon default-network answer. The
+// effective query timeout changes how long a lookup may take, not what a
+// successful answer means, so cache entries omit it; flights append the
+// timeout separately to isolate callers with different budgets.
 func dockerDefaultNetworkKey(eng engine, runner cli.Runner) string {
 	return dockerTargetKey(eng, runner)
 }

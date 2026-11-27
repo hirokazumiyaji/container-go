@@ -42,8 +42,8 @@ func DiagnosticValues(strategy Strategy) []string {
 		seen[value] = struct{}{}
 		values = append(values, value)
 	}
-	var collect func(Strategy)
-	collect = func(s Strategy) { //nolint:staticcheck // recursive closure needs the declaration first
+	var collect func(Strategy) //nolint:staticcheck // recursive closure needs the declaration first
+	collect = func(s Strategy) {
 		if isNilStrategy(s) {
 			return
 		}

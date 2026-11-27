@@ -98,6 +98,9 @@ func (s *HealthcheckStrategy) WaitUntilReady(ctx context.Context, target Target)
 // status, including through composite strategies. Backends without
 // healthchecks use it to reject a strategy before creating a container.
 func RequiresHealthcheck(strategy Strategy) bool {
+	if isNilStrategy(strategy) {
+		return false
+	}
 	switch s := strategy.(type) {
 	case *HealthcheckStrategy:
 		return true

@@ -724,17 +724,21 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		return ctr, &reuseCleanupWarning{err: envCleanupErr}
 	}
 	if contextErr := commandContextError(runCtx, nil); contextErr != nil {
-		if cleanupErr := ctr.Terminate(context.WithoutCancel(ctx)); cleanupErr != nil {
-			return nil, errors.Join(contextErr, fmt.Errorf("cleanup reused failed create: %w", cleanupErr))
-		}
-		return nil, contextErr
+		return nil, cleanupReuseCreate(ctx, ctr, contextErr)
 	}
 	return ctr, nil
 }
 
+// cleanupReuseCreate discards a reuse generation whose creation could not be
+// completed. Like rollback, CONTAINERGO_KEEP=1 leaves it for debugging, and a
+// failed removal is joined as a *CleanupError so callers can detect the
+// leftover with errors.Is(err, ErrCleanupFailed).
 func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error {
+	if keepContainers() {
+		return cause
+	}
 	if err := ctr.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, ctr.id, err)
+		return withCleanupError(cause, &CleanupError{Container: ctr.id, Err: err})
 	}
 	return cause
 }

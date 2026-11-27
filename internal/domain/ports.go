@@ -129,7 +129,10 @@ func FieldOf(err error) (string, bool) {
 }
 
 // ParsePublishSpec parses a publish specification string
-// "[hostAddr:]hostPort:containerPort[/proto]".
+// "[hostAddr:]hostPort:containerPort[/proto]". A bracketed host address must
+// be a literal IPv6 address, and an explicitly empty host address is
+// malformed: it would render an empty bind address rather than asking for the
+// default one.
 func ParsePublishSpec(s string) (PublishSpec, error) {
 	spec := PublishSpec{Raw: s, Proto: protocolTCP}
 	rest := s
@@ -142,21 +145,32 @@ func ParsePublishSpec(s string) (PublishSpec, error) {
 	}
 
 	hostAddr := ""
+	hostExplicit := false
+	bracketed := false
 	if strings.HasPrefix(rest, "[") {
 		end := strings.Index(rest, "]:")
 		if end < 0 {
 			return PublishSpec{}, newFieldError("published port", "bracketed IPv6 form is malformed")
 		}
 		hostAddr = rest[1:end]
+		hostExplicit = true
+		bracketed = true
 		rest = rest[end+2:]
 	} else if parts := strings.Split(rest, ":"); len(parts) == 3 {
 		hostAddr = parts[0]
+		hostExplicit = true
 		rest = parts[1] + ":" + parts[2]
 	}
-	if hostAddr != "" {
+	if hostExplicit {
+		if hostAddr == "" {
+			return PublishSpec{}, newFieldError("published port", "host address must not be empty")
+		}
 		addr, err := netip.ParseAddr(hostAddr)
 		if err != nil {
 			return PublishSpec{}, fmt.Errorf("invalid publish spec %q: host address must be an IP: %w", s, err)
+		}
+		if bracketed && (!addr.Is6() || addr.Zone() != "") {
+			return PublishSpec{}, fmt.Errorf("invalid publish spec %q: bracketed host address must be an IPv6 address", s)
 		}
 		spec.HostAddr = addr.Unmap()
 	}
@@ -175,8 +189,13 @@ func ParsePublishSpec(s string) (PublishSpec, error) {
 	return spec, nil
 }
 
-// parsePortNumber parses a port number and ensures it is in 1-65535.
+// parsePortNumber parses a decimal port number and ensures it is in 1-65535.
+// Only ASCII digits are accepted: strconv.Atoi would also take a leading
+// "+", which is not part of the port grammar.
 func parsePortNumber(s string) (int, error) {
+	if s == "" || strings.IndexFunc(s, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		return 0, fmt.Errorf("invalid port %q: must be 1-65535", s)
+	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 1 || n > 65535 {
 		return 0, fmt.Errorf("invalid port %q: must be 1-65535", s)

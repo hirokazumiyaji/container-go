@@ -6,8 +6,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
 
 // maxTestLogLine bounds one forwarded log line so a workload that never emits
@@ -31,12 +35,27 @@ const maxTestLogLine = 16 << 10
 // the stream.
 func WithTestLogger(t testing.TB) Option {
 	return func(c *config) error {
-		if t == nil {
+		if nilTestLogger(t) {
 			return validationErrorf("WithTestLogger", nil, "testing.TB must not be nil")
 		}
 		c.testLogger = t
 		return nil
 	}
+}
+
+// nilTestLogger reports whether t is nil, including a typed-nil *testing.T or
+// *testing.B stored in the interface. A plain comparison misses that case and
+// the first Logf or Cleanup call would panic.
+func nilTestLogger(t testing.TB) bool {
+	if t == nil {
+		return true
+	}
+	value := reflect.ValueOf(t)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	}
+	return false
 }
 
 // startTestLogger begins forwarding the container's logs to the configured
@@ -89,6 +108,7 @@ func forwardTestLogs(tb testing.TB, c *Container, stream io.Reader) {
 	for {
 		line, truncated, err := readTestLogLine(reader)
 		if line != "" || truncated {
+			line = sanitizeTestLogLine(line)
 			if truncated {
 				line += " [truncated]"
 			}
@@ -98,6 +118,13 @@ func forwardTestLogs(tb testing.TB, c *Container, stream io.Reader) {
 			return
 		}
 	}
+}
+
+// sanitizeTestLogLine removes the CR of a CRLF line ending and escapes any
+// remaining control or format character, so container output cannot inject
+// terminal sequences or rewrite earlier lines in the test log.
+func sanitizeTestLogLine(line string) string {
+	return diagnostic.Sanitize(strings.TrimSuffix(line, "\r"))
 }
 
 // readTestLogLine reads one newline-terminated line, bounding the retained

@@ -359,3 +359,15 @@ func (appleEngine) defaultHost() string { return "127.0.0.1" }
 func (appleEngine) platformCompatible(selector, actual string) bool {
 	return platformSelectorMatches(selector, actual)
 }
+
+// normalizePlatformSelector rewrites an Apple selector to the canonical
+// os/arch/variant spelling Apple reports from container inspect, so
+// architecture aliases (aarch64, x86_64) and default variants compare
+// equal after a round trip through WithReuse.
+func (appleEngine) normalizePlatformSelector(selector string) string {
+	parsed, ok := parseApplePlatformSelector(selector)
+	if !ok {
+		return selector
+	}
+	return formatApplePlatform(parsed)
+}

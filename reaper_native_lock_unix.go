@@ -3,6 +3,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"os"
 	"time"
@@ -11,8 +12,9 @@ import (
 // lockReaperName takes the same per-name flock the Go name lock uses. The
 // lock file is validated as private before it is opened, so a substituted
 // symlink, FIFO, or foreign file is skipped instead of followed. Acquisition
-// is bounded: a wedged lock holder must not stall every entry behind it.
-func lockReaperName(path string, timeout time.Duration) (func(), error) {
+// is bounded by timeout and by ctx: a wedged lock holder and an expired reap
+// budget must not stall every entry behind them.
+func lockReaperName(ctx context.Context, path string, timeout time.Duration) (func(), error) {
 	info, err := os.Lstat(path)
 	switch {
 	case err == nil:
@@ -43,6 +45,9 @@ func lockReaperName(path string, timeout time.Duration) (func(), error) {
 			_ = f.Close()
 			return nil, errReaperLockTimeout
 		}
-		time.Sleep(nameLockPoll)
+		if err := sleepWithContext(ctx, nameLockPoll); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 	}
 }

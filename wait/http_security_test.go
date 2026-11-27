@@ -610,7 +610,7 @@ func TestForHTTPHostHeaderReachesRequest(t *testing.T) {
 	err := ForHTTP("/health").
 		WithHeader("Host", "virtual.example.com").
 		WithStartupTimeout(time.Second).
-		WithPollInterval(20 * time.Millisecond).
+		WithPollInterval(20*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err != nil {
 		t.Fatalf("WaitUntilReady: %v", err)

@@ -1240,7 +1240,7 @@ func TestCleanupDeleteClassifierIsOperationAndBackendAware(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &pruneDeleteRunner{list: listJSON, inspectJSON: listJSON, deleteErr: tc.err}
 			ids, err := pruneListed(context.Background(), r, appleEngine{}, []string{"ls"}, func(data []byte) ([]string, error) {
-				candidates, err := applePruneCandidates(data)
+				_, candidates, err := applePruneList(data)
 				if err != nil {
 					return nil, err
 				}

@@ -128,6 +128,7 @@ func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) (r
 	// per-connection state, so rebuilding it per iteration only
 	// wasted an allocation.
 	d := net.Dialer{Timeout: time.Second}
+	confirm := s.listenConfirmer(target)
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for listening port %q", s.port), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)
 		if err != nil {
@@ -140,32 +141,75 @@ func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) (r
 		if err := conn.Close(); err != nil {
 			return err
 		}
-		return s.confirmContainerListening(ctx, target)
+		return confirm.confirm(ctx)
 	})
 }
 
-// confirmContainerListening rejects a host connection that precedes the
-// container process. The check is best-effort: an absent optional interface
-// or an unsupported target keeps the historical host-only behavior.
-func (s *HostPortStrategy) confirmContainerListening(ctx context.Context, target Target) error {
-	if s.hostOnly {
+// containerPortProbeInterval bounds how often one wait runs the exec-based
+// container-side listen check. A Docker port proxy completes the host
+// handshake before the container process listens, so without a floor the
+// strategy would spawn a `docker exec` on every poll (10 Hz by default).
+// Reusing a recent closed result keeps the poll cadence, lifecycle probes,
+// and diagnostics unchanged while cutting those subprocesses to 4 Hz.
+// Overridable in tests.
+var containerPortProbeInterval = 250 * time.Millisecond
+
+// containerListenConfirmer rejects a host connection that precedes the
+// container process. It caches the most recent container-side result so the
+// poll loop cannot launch the same exec repeatedly within
+// containerPortProbeInterval. Instances are created per wait, so a strategy
+// reused by concurrent waits shares no state.
+type containerListenConfirmer struct {
+	hostOnly bool
+	port     string
+	target   PortListenTarget
+	interval time.Duration
+	last     time.Time
+	lastErr  error
+	probed   bool
+}
+
+// listenConfirmer builds the per-wait container-side checker. The floor never
+// shortens a caller's own poll interval, so a slower poll keeps its cadence.
+func (s *HostPortStrategy) listenConfirmer(target Target) *containerListenConfirmer {
+	c := &containerListenConfirmer{hostOnly: s.hostOnly, port: s.port, interval: containerPortProbeInterval}
+	c.target, _ = target.(PortListenTarget)
+	_, pollInterval := s.effective()
+	if pollInterval > c.interval {
+		c.interval = pollInterval
+	}
+	return c
+}
+
+func (c *containerListenConfirmer) confirm(ctx context.Context) error {
+	if c.hostOnly || c.target == nil {
 		return nil
 	}
-	listenTarget, ok := target.(PortListenTarget)
-	if !ok {
-		return nil
+	now := time.Now()
+	if c.probed && now.Sub(c.last) < c.interval {
+		return c.lastErr
 	}
-	status, err := listenTarget.ContainerPortStatus(ctx, s.port)
+	c.probed = true
+	c.last = now
+	status, err := c.target.ContainerPortStatus(ctx, c.port)
 	if err != nil {
+		c.lastErr = err
 		return err
 	}
-	if status == PortListenOpen || status == PortListenUnsupported {
-		return nil
+	switch status {
+	case PortListenOpen, PortListenUnsupported:
+		c.lastErr = nil
+	default:
+		c.lastErr = containerPortNotListeningError(c.port)
 	}
-	if s.port == "" {
+	return c.lastErr
+}
+
+func containerPortNotListeningError(port string) error {
+	if port == "" {
 		return errors.New("selected container port is not listening yet")
 	}
-	return fmt.Errorf("container port %q is not listening yet", s.port)
+	return fmt.Errorf("container port %q is not listening yet", port)
 }
 
 func validateTCPPortSpec(strategy, spec string) error {

@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1554,5 +1555,205 @@ func TestExecNonCLIErrorReturnsError(t *testing.T) {
 	}
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
+	}
+}
+
+// stdinExecRunner adds the optional cli.StdinRunner capability to the fake
+// runner. It echoes the received reader back through stdout so a test can
+// verify that the public option reached the runner and was actually consumed.
+type stdinExecRunner struct {
+	*fakeRunner
+	stdin     []byte
+	stdinArgs []string
+	runErr    error
+}
+
+func (r *stdinExecRunner) RunWithStdin(_ context.Context, stdin io.Reader, stdout, _ io.Writer, args ...string) (cli.OutputStats, error) {
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return cli.OutputStats{}, err
+	}
+	r.mu.Lock()
+	r.stdin = data
+	r.stdinArgs = append([]string(nil), args...)
+	r.calls = append(r.calls, args)
+	r.mu.Unlock()
+	n, writeErr := stdout.Write(data)
+	if r.runErr != nil {
+		return cli.OutputStats{StdoutBytes: int64(n)}, r.runErr
+	}
+	return cli.OutputStats{StdoutBytes: int64(n)}, writeErr
+}
+
+func (r *stdinExecRunner) capturedStdin() ([]byte, []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]byte(nil), r.stdin...), append([]string(nil), r.stdinArgs...)
+}
+
+func TestExecWithStdinWiresReaderAndAddsInteractiveFlag(t *testing.T) {
+	f := &stdinExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"psql", "-f", "-"},
+		WithExecStdin(strings.NewReader("SELECT 1;\n")))
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	data, _ := io.ReadAll(out)
+	if got, want := string(data), "SELECT 1;\n"; got != want {
+		t.Errorf("output = %q, want the stdin payload", got)
+	}
+	stdin, args := f.capturedStdin()
+	if got, want := string(stdin), "SELECT 1;\n"; got != want {
+		t.Errorf("stdin = %q, want %q", got, want)
+	}
+	interactive := slices.Index(args, "-i")
+	target := slices.Index(args, "myctr")
+	if interactive < 0 || target < 0 || interactive > target {
+		t.Errorf("exec args = %v, want -i before the container target", args)
+	}
+	if !slices.Equal(args[target+1:], []string{"psql", "-f", "-"}) {
+		t.Errorf("exec command suffix = %v", args[target+1:])
+	}
+}
+
+func TestExecToWithStdinWiresReader(t *testing.T) {
+	f := &stdinExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	var output strings.Builder
+	code, stats, err := ctr.ExecTo(context.Background(), []string{"mysql"}, &output,
+		WithExecStdin(strings.NewReader("INSERT 1;\n")))
+	if err != nil {
+		t.Fatalf("ExecTo: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if got, want := output.String(), "INSERT 1;\n"; got != want {
+		t.Errorf("streamed output = %q, want the stdin payload", got)
+	}
+	if got, want := stats.Bytes, int64(len("INSERT 1;\n")); got != want {
+		t.Errorf("stats.Bytes = %d, want %d", got, want)
+	}
+	_, args := f.capturedStdin()
+	if !slices.Contains(args, "-i") {
+		t.Errorf("exec args = %v, want -i", args)
+	}
+}
+
+func TestExecWithStdinHonorsMaxBytes(t *testing.T) {
+	f := &stdinExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+	payload := strings.Repeat("x", 64)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"cat"},
+		WithExecStdin(strings.NewReader(payload)), WithExecMaxBytes(8))
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	data, readErr := io.ReadAll(out)
+	if len(data) != 8 {
+		t.Errorf("retained output = %q, want the 8-byte prefix", data)
+	}
+	if !errors.Is(readErr, ErrOutputTruncated) {
+		t.Errorf("read error = %v, want ErrOutputTruncated", readErr)
+	}
+	stdin, _ := f.capturedStdin()
+	if len(stdin) != len(payload) {
+		t.Errorf("stdin length = %d, want the full %d-byte dump", len(stdin), len(payload))
+	}
+}
+
+func TestExecWithStdinRejectsTypedNilReader(t *testing.T) {
+	f := &stdinExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+	var reader *bytes.Reader
+
+	code, out, err := ctr.Exec(context.Background(), []string{"cat"}, WithExecStdin(reader))
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithExecStdin" {
+		t.Fatalf("error = %v, want *ValidationError for WithExecStdin", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	// Option validation returns before output capture starts.
+	if out != nil {
+		data, _ := io.ReadAll(out)
+		if len(data) != 0 {
+			t.Errorf("output = %q, want none", data)
+		}
+	}
+	if call := f.callWith("exec"); call != nil {
+		t.Errorf("typed-nil stdin still invoked the CLI: %v", call)
+	}
+}
+
+func TestExecWithStdinReturnsReaderError(t *testing.T) {
+	readErr := errors.New("stdin source failed")
+	f := &stdinExecRunner{
+		fakeRunner: newTestRunner(),
+		runErr:     &cli.StdinReadError{Err: readErr},
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"cat"},
+		WithExecStdin(strings.NewReader("partial")))
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+	if !errors.Is(err, readErr) || !errors.Is(err, cli.ErrStdinRead) {
+		t.Fatalf("error = %v, want the reader failure and ErrStdinRead", err)
+	}
+	data, _ := io.ReadAll(out)
+	if string(data) != "partial" {
+		t.Errorf("output = %q, want the data read before the failure", data)
+	}
+}
+
+func TestExecWithStdinPreservesReaderErrorWithCommandExit(t *testing.T) {
+	readErr := errors.New("stdin source failed")
+	cliErr := &cli.CLIError{Binary: "container", Args: []string{"exec", "myctr", "cat"}, ExitCode: 7, Stderr: "command failed"}
+	f := &stdinExecRunner{
+		fakeRunner: newTestRunner(),
+		runErr:     errors.Join(cliErr, &cli.StdinReadError{Err: readErr}),
+	}
+	ctr := runTestContainer(t, f)
+
+	code, _, err := ctr.Exec(context.Background(), []string{"cat"},
+		WithExecStdin(strings.NewReader("partial")))
+	if code != 7 {
+		t.Errorf("exit code = %d, want the command status 7", code)
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("error = %v, want the reader failure alongside the command exit", err)
+	}
+	if !errors.Is(err, cli.ErrStdinRead) {
+		t.Fatalf("error = %v, want ErrStdinRead alongside the command exit", err)
+	}
+}
+
+func TestExecWithStdinRequiresStdinCapableRunner(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	before := len(f.calls)
+
+	_, _, err := ctr.Exec(context.Background(), []string{"cat"}, WithExecStdin(strings.NewReader("x")))
+	if !errors.Is(err, ErrUnsupportedCapability) {
+		t.Fatalf("error = %v, want ErrUnsupportedCapability", err)
+	}
+	if got := len(f.calls); got != before {
+		t.Errorf("CLI calls grew from %d to %d; unsupported stdin must not invoke the backend", before, got)
 	}
 }

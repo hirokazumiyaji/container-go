@@ -411,13 +411,13 @@ func parseNativeReaperInspect(data []byte, subcommand, key string) (uid, creatio
 		if err != nil || len(containers) == 0 {
 			return "", ""
 		}
-		return "", containers[0].Configuration.Labels[key]
+		return "", containers[0].Configuration.Value.Labels[key]
 	case "rm":
 		containers, err := strictjson.Array[dockerInspect](data, reaperDockerInspectFields)
 		if err != nil || len(containers) == 0 {
 			return "", ""
 		}
-		uid = containers[0].ID
+		uid = containers[0].ID.Value
 		if !domain.IsImmutableContainerID(uid) {
 			uid = ""
 		}

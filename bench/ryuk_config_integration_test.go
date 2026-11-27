@@ -16,6 +16,7 @@ func TestCanonicalTestcontainersConfigErrorCoversResolvedFields(t *testing.T) {
 	canonical := tc.TestcontainersConfig{}
 	canonical.Config.RyukReconnectionTimeout = 10 * time.Second
 	canonical.Config.RyukConnectionTimeout = time.Minute
+	canonical.Config.Provider = "docker"
 	if err := canonicalTestcontainersConfigError(canonical); err != nil {
 		t.Fatalf("canonical resolved configuration rejected: %v", err)
 	}
@@ -31,6 +32,7 @@ func TestCanonicalTestcontainersConfigErrorCoversResolvedFields(t *testing.T) {
 		"docker socket override": func(c *tc.TestcontainersConfig) { c.Config.TestcontainersHost = "/var/run/docker.sock" },
 		"tls verification":       func(c *tc.TestcontainersConfig) { c.Config.TLSVerify = 1 },
 		"certificate path":       func(c *tc.TestcontainersConfig) { c.Config.CertPath = "/tmp/certs" },
+		"podman provider":        func(c *tc.TestcontainersConfig) { c.Config.Provider = "podman" },
 		// The deprecated mirrors are checked too, so a release that stops
 		// mirroring them cannot let a non-canonical value through.
 		"deprecated host mirror":  func(c *tc.TestcontainersConfig) { c.Host = "tcp://127.0.0.1:2375" },

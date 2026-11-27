@@ -942,3 +942,40 @@ func TestForSQLDiagnosticValuesKeepConnectionMetadata(t *testing.T) {
 		t.Fatalf("error = %q, must not redact connection metadata", err)
 	}
 }
+
+// The whole wait shares one database handle. Rebuilding the pool per attempt
+// also rebuilt connectionOpener and its cleanup goroutine; the shared handle
+// still opens one connection per attempt because the idle pool is disabled.
+func TestForSQLReusesOneDatabaseHandle(t *testing.T) {
+	restore := sqlOpen
+	var handles atomic.Int32
+	sqlOpen = func(driverName, dsn string) (*sql.DB, error) {
+		handles.Add(1)
+		return sql.Open(driverName, dsn)
+	}
+	t.Cleanup(func() { sqlOpen = restore })
+
+	state := withFakeSQLState(t, &fakeSQLState{pingFn: func(_ context.Context, attempt int) error {
+		if attempt < 3 {
+			return errors.New("connection refused")
+		}
+		return nil
+	}})
+	err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithStartupTimeout(2*time.Second).
+		WithPollInterval(2*time.Millisecond).
+		WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := handles.Load(); got != 1 {
+		t.Fatalf("database handles = %d, want one per wait", got)
+	}
+	opens, pings, _ := state.probeCounts()
+	if pings < 3 {
+		t.Errorf("pings = %d, want repeated attempts", pings)
+	}
+	if opens != pings {
+		t.Errorf("driver opens = %d, pings = %d; want one connection per attempt", opens, pings)
+	}
+}

@@ -14,19 +14,21 @@ import (
 
 // LogsOptions bounds a Logs snapshot. Tail keeps the last N lines
 // (it must be non-negative; 0 means all); Since drops entries older than
-// the timestamp. Each backend maps those options to its supported CLI
-// arguments. A positive MaxBytes caps the combined stdout+stderr response;
-// zero preserves the historical unbounded snapshot behavior.
+// the timestamp; Timestamps prefixes each line with its backend timestamp.
+// Each backend maps those options to its supported CLI arguments. A positive
+// MaxBytes caps the combined stdout+stderr response; zero preserves the
+// historical unbounded snapshot behavior.
 //
 // Tail is a backend line-based tail. MaxBytes is applied while the CLI
 // runs: it retains the prefix of the combined output, not the trailing
-// bytes. The added field intentionally makes keyed literals the required
-// form; old two-field unkeyed literals no longer compile, which is the
-// explicit pre-1.0 compatibility tradeoff.
+// bytes. The added fields intentionally make keyed literals the required
+// form; old unkeyed literals no longer compile, which is the explicit
+// pre-1.0 compatibility tradeoff.
 type LogsOptions struct {
-	Tail     int
-	Since    time.Time
-	MaxBytes int64
+	Tail       int
+	Since      time.Time
+	Timestamps bool
+	MaxBytes   int64
 }
 
 func (o LogsOptions) validate() error {
@@ -35,6 +37,28 @@ func (o LogsOptions) validate() error {
 	}
 	if o.MaxBytes < 0 {
 		return validationErrorf("LogsOptions.MaxBytes", o.MaxBytes, "log MaxBytes must be >= 0, got %d", o.MaxBytes)
+	}
+	return nil
+}
+
+// FollowLogsOptions bounds a FollowLogs or FollowLogsTo stream. Tail keeps the
+// last N lines before following (it must be non-negative; 0 means all
+// available history). Since starts the stream at the timestamp. Timestamps
+// prefixes each line with its backend timestamp.
+//
+// Docker supports all three options. The checked Apple Container CLI maps Tail
+// to -n and has no --since or --timestamps equivalent, so the Apple backend
+// returns ErrUnsupportedCapability for those fields instead of silently
+// ignoring them.
+type FollowLogsOptions struct {
+	Tail       int
+	Since      time.Time
+	Timestamps bool
+}
+
+func (o FollowLogsOptions) validate() error {
+	if o.Tail < 0 {
+		return validationErrorf("FollowLogsOptions.Tail", o.Tail, "follow log tail must be >= 0, got %d", o.Tail)
 	}
 	return nil
 }
@@ -146,15 +170,26 @@ func (c *Container) logsError(ctx, qCtx context.Context, err error) error {
 // descendants are not terminated. Once the child is reaped, Close does
 // not signal its former process group.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
-	return c.followLogs(ctx, time.Time{})
+	return c.followLogs(ctx, FollowLogsOptions{}, time.Time{})
 }
 
-// followLogs starts a follow stream. A zero resumeSince asks for the
-// backend's ordinary follow argv, which replays the available history. A
-// non-zero resumeSince asks for a replacement stream that starts at that
-// instant instead, so a re-attached writer does not receive the history a
-// previous stream already delivered.
-func (c *Container) followLogs(ctx context.Context, resumeSince time.Time) (io.ReadCloser, error) {
+// FollowLogsWithOptions is FollowLogs with a bounded replay window and optional
+// timestamp prefixes. It returns ErrUnsupportedCapability without starting a
+// stream when the backend cannot honor opts.
+func (c *Container) FollowLogsWithOptions(ctx context.Context, opts FollowLogsOptions) (io.ReadCloser, error) {
+	return c.followLogs(ctx, opts, time.Time{})
+}
+
+// followLogs starts a follow stream. A zero resumeSince asks for the backend
+// argv built from opts, which replays the available history. A non-zero
+// resumeSince asks for a replacement stream that starts at that instant
+// instead, so a re-attached writer does not receive the history a previous
+// stream already delivered; the test logger uses that internal form with zero
+// opts.
+func (c *Container) followLogs(ctx context.Context, opts FollowLogsOptions, resumeSince time.Time) (io.ReadCloser, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
 	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return nil, c.redactError(err)
@@ -163,8 +198,13 @@ func (c *Container) followLogs(ctx context.Context, resumeSince time.Time) (io.R
 	if !ok {
 		return nil, c.redactError(fmt.Errorf("logs: %w: runner does not support streaming", cli.ErrStreamSetup))
 	}
-	args := c.eng.logsFollowArgs(target)
-	if !resumeSince.IsZero() {
+	var args []string
+	if resumeSince.IsZero() {
+		args, err = c.eng.logsFollowArgsWithOptions(target, opts)
+		if err != nil {
+			return nil, c.redactError(err)
+		}
+	} else {
 		args = c.eng.logsFollowResumeArgs(target, resumeSince)
 	}
 	stream, err := s.Stream(ctx, args...)
@@ -317,14 +357,21 @@ func (s *classifyingStream) wrap(err error) error {
 // A failed sink write is reported as ErrOutputDelivery rather than being
 // hidden behind a terminal stream error, and neither is reported as success.
 func (c *Container) FollowLogsTo(ctx context.Context, output io.Writer) error {
-	return c.followLogsTo(ctx, output, time.Time{})
+	return c.followLogsTo(ctx, output, FollowLogsOptions{}, time.Time{})
 }
 
-func (c *Container) followLogsTo(ctx context.Context, output io.Writer, resumeSince time.Time) error {
+// FollowLogsToWithOptions is FollowLogsTo with a bounded replay window and
+// optional timestamp prefixes. It returns ErrUnsupportedCapability without
+// starting a stream when the backend cannot honor opts.
+func (c *Container) FollowLogsToWithOptions(ctx context.Context, output io.Writer, opts FollowLogsOptions) error {
+	return c.followLogsTo(ctx, output, opts, time.Time{})
+}
+
+func (c *Container) followLogsTo(ctx context.Context, output io.Writer, opts FollowLogsOptions, resumeSince time.Time) error {
 	if nilWriter(output) {
 		return validationErrorf("FollowLogsTo", output, "output writer cannot be nil")
 	}
-	stream, err := c.followLogs(ctx, resumeSince)
+	stream, err := c.followLogs(ctx, opts, resumeSince)
 	if err != nil {
 		return err
 	}

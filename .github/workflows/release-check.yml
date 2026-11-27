@@ -20,7 +20,13 @@ on:
       - 'README.md'
       - 'README.ja.md'
       - 'SECURITY.md'
+      # docs/ is read by internal/docscheck and describes behavior the gate
+      # verifies, and the fixture trees feed parser and benchmark tests.
+      - 'docs/**'
+      - 'testdata/**'
+      - 'internal/**/testdata/**'
       - 'go.mod'
+      - 'go.sum'
       - 'bench/go.mod'
       - 'bench/go.sum'
       # `go mod tidy -diff` reads the root import graph, so a PR that drops a
@@ -42,6 +48,9 @@ on:
       # otherwise pass ci.yml's lint, and a broken ci.yml would not run at all.
       - '.golangci.yml'
       - '.github/workflows/**'
+      # workflowcheck asserts the Dependabot layout and the tool pins, so a PR
+      # touching this config must run the gate that checks those invariants.
+      - '.github/dependabot.yml'
       - 'internal/releasecheck/**'
   workflow_dispatch:
 

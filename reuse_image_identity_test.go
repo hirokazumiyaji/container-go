@@ -121,6 +121,11 @@ func (r *reuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, er
 		r.deleted = true
 		return nil, nil, nil
 	case args[0] == "version":
+		for _, arg := range args {
+			if strings.Contains(arg, "json .") {
+				return []byte(defaultTestDockerVersion), nil, nil
+			}
+		}
 		return []byte("linux\n"), nil, nil
 	default:
 		return nil, nil, nil

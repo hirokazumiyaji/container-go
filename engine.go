@@ -273,9 +273,63 @@ type engineTarget interface {
 	runnerDiagnosticValues(runner cli.Runner) (values, boundary []string)
 }
 
+// engineLifecycleExtensions is the optional role for lifecycle commands a
+// backend supports beyond start, stop, and kill. A backend without it has no
+// native restart and cannot pause or unpause; shared code expresses that
+// absence with a type assertion instead of calling no-op implementations.
+// Docker implements it; Apple Container does not.
+type engineLifecycleExtensions interface {
+	// restartArgs builds the backend's native restart argv.
+	restartArgs(id string, timeout *time.Duration) ([]string, error)
+	// pauseArgs builds the backend's pause argv.
+	pauseArgs(id string) ([]string, error)
+	// unpauseArgs builds the backend's unpause argv.
+	unpauseArgs(id string) ([]string, error)
+}
+
+// engineCopyOut is the optional role for copying one file out of a container
+// with its type preserved. The presence of the interface is the support
+// decision: a backend without it fails copy-out with
+// ErrCopyFileFromContainerUnsupported before any CLI call, so no no-op
+// capability check method is needed.
+type engineCopyOut interface {
+	// copyFromArgs builds the backend's copy-out argv.
+	copyFromArgs(id, containerPath, hostPath string) []string
+	// checkCopyFileFromContainerVersion verifies backend-specific
+	// minimum versions before a copy-out creates a private temp directory.
+	checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error
+}
+
+// engineImageVerifier is the optional role for proving a pinned image
+// identity before run. A backend without it accepts the identity shared code
+// parsed and compared without an additional backend-specific check.
+type engineImageVerifier interface {
+	// imageIdentityComplete reports whether a parsed identity carries every
+	// metadata field this backend requires for a pinned reference.
+	imageIdentityComplete(identity imageIdentity, platform string) bool
+	// verifyPinnedImageIdentity rejects a re-inspected pinned identity the
+	// backend cannot prove complete and platform-correct.
+	verifyPinnedImageIdentity(pinned, checked imageIdentity, platform string) error
+	// reconcileImageIdentity merges the authoritative re-inspected identity
+	// back into the caller's pinned spelling.
+	reconcileImageIdentity(pinned, checked imageIdentity) imageIdentity
+}
+
+// engineNetworkCompat is the optional role for validating that an existing
+// container's network configuration can satisfy a reuse request, including
+// network mode, aliases, and published endpoints. A backend without a
+// configurable network model omits it instead of returning nil from a no-op
+// check.
+type engineNetworkCompat interface {
+	// checkReuseNetworkCompat rejects an existing container whose network
+	// configuration cannot satisfy the requested reuse options.
+	checkReuseNetworkCompat(info *engineInfo, cfg *config) error
+}
+
 // engine encapsulates what differs between container backends: how CLI
 // argv vectors are built and how inspect output is read. Process
-// execution, waiting, validation, and cleanup are shared.
+// execution, waiting, validation, and cleanup are shared. A backend may
+// additionally implement the optional role interfaces declared above.
 type engine interface {
 	name() string
 	binary() string
@@ -290,20 +344,10 @@ type engine interface {
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
 	startArgs(id string) []string
-	restartArgs(id string, timeout *time.Duration) ([]string, error)
 	killArgs(id string, signal string) []string
-	pauseArgs(id string) ([]string, error)
-	unpauseArgs(id string) ([]string, error)
 	stopArgs(id string, timeout *time.Duration) ([]string, error)
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
-	copyFromArgs(id, containerPath, hostPath string) []string
-	// checkCopyFileFromContainer rejects backends whose copy-out cannot
-	// preserve file types and reject links/special files before host open.
-	checkCopyFileFromContainer() error
-	// checkCopyFileFromContainerVersion verifies backend-specific
-	// minimum versions before a copy-out creates a private temp directory.
-	checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	// logsFollowArgs builds the streaming follow argv. It replays the
 	// backend's available history before following new output.
@@ -394,15 +438,6 @@ type engine interface {
 	// parseImageIdentity extracts the image lookup result from image inspect
 	// output.
 	parseImageIdentity(data []byte, image, platform string) imageLookupResult
-	// imageIdentityComplete reports whether a parsed identity carries every
-	// metadata field this backend requires for a pinned reference.
-	imageIdentityComplete(identity imageIdentity, platform string) bool
-	// verifyPinnedImageIdentity rejects a re-inspected pinned identity the
-	// backend cannot prove complete and platform-correct.
-	verifyPinnedImageIdentity(pinned, checked imageIdentity, platform string) error
-	// reconcileImageIdentity merges the authoritative re-inspected identity
-	// back into the caller's pinned spelling.
-	reconcileImageIdentity(pinned, checked imageIdentity) imageIdentity
 	// imageReferencesCompatible compares a requested reference with the
 	// reference inspect reported.
 	imageReferencesCompatible(requested, actual string) bool
@@ -416,9 +451,20 @@ type engine interface {
 	// container IDs, and Docker returns full IDs from --no-trunc --format
 	// {{.ID}}. A backend without candidate metadata returns a nil map.
 	parsePruneListed(data []byte, reuseGroup string) ([]string, map[string]pruneCandidate, error)
-	// checkReuseNetworkCompat rejects an existing container whose network
-	// configuration cannot satisfy the requested reuse options.
-	checkReuseNetworkCompat(info *engineInfo, cfg *config) error
+}
+
+// unsupportedLifecycle reports that eng lacks the optional lifecycle
+// extension for operation, preserving the error the backend's former method
+// returned.
+func unsupportedLifecycle(eng engine, operation string) error {
+	return fmt.Errorf("%w: %s backend does not support %s", ErrUnsupportedCapability, eng.name(), operation)
+}
+
+// unsupportedCopyOut reports that eng lacks the optional copy-out role,
+// preserving the sentinel the backend's former capability check returned.
+func unsupportedCopyOut(eng engine) error {
+	return fmt.Errorf("%w: %s backend does not support type-preserving copy-out", ErrCopyFileFromContainerUnsupported, eng.name())
+
 }
 
 // startArgsFor builds the shared start argv. Both backends start by name or

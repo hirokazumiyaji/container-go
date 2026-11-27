@@ -33,6 +33,43 @@ func TestEngineCapabilitiesDeclareBackendContract(t *testing.T) {
 	}
 }
 
+// TestOptionalEngineRolesAreDeclaredByType pins which backend supplies each
+// optional role. Shared code asserts these interfaces instead of calling no-op
+// methods, so dropping or adding a role must change this contract
+// deliberately.
+func TestOptionalEngineRolesAreDeclaredByType(t *testing.T) {
+	tests := []struct {
+		name      string
+		eng       engine
+		lifecycle bool
+		copyOut   bool
+		verifier  bool
+		network   bool
+	}{
+		// Apple has no native restart, pause, copy-out, or network model.
+		{name: "apple", eng: appleEngine{}, verifier: true},
+		// Docker supplies every optional role; its identity verification is
+		// the shared default, so it has no verifier.
+		{name: "docker", eng: dockerEngine{}, lifecycle: true, copyOut: true, network: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := tc.eng.(engineLifecycleExtensions); ok != tc.lifecycle {
+				t.Errorf("engineLifecycleExtensions = %v, want %v", ok, tc.lifecycle)
+			}
+			if _, ok := tc.eng.(engineCopyOut); ok != tc.copyOut {
+				t.Errorf("engineCopyOut = %v, want %v", ok, tc.copyOut)
+			}
+			if _, ok := tc.eng.(engineImageVerifier); ok != tc.verifier {
+				t.Errorf("engineImageVerifier = %v, want %v", ok, tc.verifier)
+			}
+			if _, ok := tc.eng.(engineNetworkCompat); ok != tc.network {
+				t.Errorf("engineNetworkCompat = %v, want %v", ok, tc.network)
+			}
+		})
+	}
+}
+
 // TestTargetScopeIsExpressedByType pins that a backend without an externally
 // addressable target reports none: shared code branches on a nil engineTarget
 // instead of every backend supplying no-op implementations.
@@ -84,7 +121,6 @@ func TestSharedCommandBuildersBuildBackendArgv(t *testing.T) {
 		{"docker copy in", (dockerEngine{}).copyToArgs("ctr", "/host", "/ctr"), []string{"cp", "/host", "ctr:/ctr"}},
 		{"apple copy in", (appleEngine{}).copyToArgs("ctr", "/host", "/ctr"), []string{"cp", "/host", "ctr:/ctr"}},
 		{"docker copy out", (dockerEngine{}).copyFromArgs("ctr", "/ctr", "/host"), []string{"cp", "ctr:/ctr", "/host"}},
-		{"apple copy out", (appleEngine{}).copyFromArgs("ctr", "/ctr", "/host"), []string{"cp", "ctr:/ctr", "/host"}},
 		{"docker exec", (dockerEngine{}).execArgs("ctr", execCfg, "/env", []string{"true"}), []string{"exec", "--env-file", "/env", "--user", "1000", "--workdir", "/work", "ctr", "true"}},
 		{"apple exec", (appleEngine{}).execArgs("ctr", execCfg, "/env", []string{"true"}), []string{"exec", "--env-file", "/env", "--user", "1000", "--workdir", "/work", "ctr", "true"}},
 		{"docker logs follow", (dockerEngine{}).logsFollowArgs("ctr"), []string{"logs", "--follow", "ctr"}},

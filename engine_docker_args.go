@@ -68,7 +68,7 @@ func (dockerEngine) startArgs(id string) []string {
 	return startArgsFor(id)
 }
 
-func (dockerEngine) restartArgs(id string, timeout *time.Duration) ([]string, error) {
+func (dockerEngine) restartArgs(id string, timeout *time.Duration) ([]string, error) { //nolint:unparam // part of the lifecycle role signature
 	if timeout == nil {
 		return []string{"restart", id}, nil
 	}

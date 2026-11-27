@@ -1403,7 +1403,11 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.restartArgs(target, timeout)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return c.restartAttached(ctx, timeout)
+	}
+	args, err := lifecycle.restartArgs(target, timeout)
 	if errors.Is(err, ErrUnsupportedCapability) {
 		return c.restartAttached(ctx, timeout)
 	}
@@ -1530,7 +1534,11 @@ func (c *Container) Pause(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.pauseArgs(target)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return unsupportedLifecycle(c.eng, "pause")
+	}
+	args, err := lifecycle.pauseArgs(target)
 	if err != nil {
 		return err
 	}
@@ -1554,7 +1562,11 @@ func (c *Container) Unpause(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.unpauseArgs(target)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return unsupportedLifecycle(c.eng, "unpause")
+	}
+	args, err := lifecycle.unpauseArgs(target)
 	if err != nil {
 		return err
 	}

@@ -365,6 +365,7 @@ func dockerCopyFileFromContainerVersionCached(ctx context.Context, cache *docker
 	raw, err := dockerVersionJSONCached(ctx, cache, runner, eng, timeouts)
 	if err != nil {
 		return dockerCopyVersionError(ctx, err)
+
 	}
 	if err := ctx.Err(); err != nil {
 		return err

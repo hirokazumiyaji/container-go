@@ -1155,8 +1155,10 @@ func checkReuseConfigCompat(info *engineInfo, cfg *config) error {
 	if err := checkReuseCreationConfig(info, cfg); err != nil {
 		return err
 	}
-	if err := cfg.eng.checkReuseNetworkCompat(info, cfg); err != nil {
-		return err
+	if compat, ok := cfg.eng.(engineNetworkCompat); ok {
+		if err := compat.checkReuseNetworkCompat(info, cfg); err != nil {
+			return err
+		}
 	}
 	if cfg.platform != "" {
 		if info.platform == "" || platformSelectorUnverifiable(cfg.platform, info.platform) {

@@ -104,16 +104,6 @@ func (c *dockerMetadataCache) delete(key string) {
 	c.ttlCache.forget(key)
 }
 
-// forget drops a cached answer that a consumer found unusable, so the next
-// caller retries the lookup instead of reusing the failure until the TTL. The
-// mechanics live in ttlCache; this is the name the Docker metadata paths use.
-func (c *dockerMetadataCache) forget(key string) {
-	if c == nil {
-		return
-	}
-	c.ttlCache.forget(key)
-}
-
 // dockerTargetKey identifies one Docker target: the backend, the resolved
 // image-store identity, and the client settings the answer belongs to.
 func dockerTargetKey(eng engine, runner cli.Runner) string {

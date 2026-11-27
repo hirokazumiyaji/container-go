@@ -47,4 +47,3 @@ func (appleEngine) reconcileImageIdentity(pinned, checked imageIdentity) imageId
 func (appleEngine) imageReferencesCompatible(requested, actual string) bool {
 	return appleImageReferencesCompatible(requested, actual)
 }
-

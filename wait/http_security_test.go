@@ -244,7 +244,7 @@ func TestForHTTPDefaultClientIgnoresAmbientProxy(t *testing.T) {
 	}
 
 	var originHits atomic.Int32
-	listener, err := net.Listen("tcp4", "0.0.0.0:0")
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp4", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestForHTTPDefaultClientIgnoresAmbientProxy(t *testing.T) {
 
 	targetEndpoint := net.JoinHostPort(nonLoopbackIPv4(t), strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
 	t.Setenv("no_proxy", "*")
-	cmd := exec.Command(os.Args[0], "-test.run", "^TestForHTTPDefaultClientIgnoresAmbientProxy$", "-test.count=1")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run", "^TestForHTTPDefaultClientIgnoresAmbientProxy$", "-test.count=1")
 	cmd.Env = environmentWithOverrides(map[string]string{
 		childEnv:         "1",
 		targetEnv:        targetEndpoint,
@@ -397,7 +397,7 @@ func TestForHTTPRedirectRejectsDistinctDialingAuthorities(t *testing.T) {
 				CheckRedirect: checkHTTPProbeRedirect,
 			}
 
-			req, err := http.NewRequest(http.MethodGet, test.initial, nil)
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, test.initial, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

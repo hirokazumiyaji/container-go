@@ -571,7 +571,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 
 	if err := c.copyFiles(ctx, cfg.files); err != nil {
-		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
+		return nil, c.rollback(ctx, err)
 	}
 	if cfg.waitStrategy != nil {
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
@@ -584,12 +584,12 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			} else if tail != "" {
 				err = c.publicError(fmt.Errorf("%w; container logs: %s", err, tail), waitValues...)
 			}
-			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
+			return nil, c.rollback(ctx, err)
 		}
 	}
 	startTestLogger(cfg, c)
 	if err := runPostReadyHooks(ctx, c, cfg.postReadyHooks); err != nil {
-		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
+		return nil, c.rollback(ctx, err)
 	}
 	return c, envCleanupErr
 }
@@ -697,6 +697,7 @@ func protectReuseReaper(cfg *config) {
 // generation-checked prune/delete paths. attempted is false when the
 // lock could not be acquired, so callers must not run failed-create
 // cleanup for a command that was never issued.
+//nolint:unparam // stderr is part of the runner result shape even when callers ignore it
 func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, stderr []byte, attempted bool, err error) {
 	if !cfg.eng.capabilities().nameAddressed {
 		stdout, stderr, err = cfg.runner.Run(ctx, args...)
@@ -1253,7 +1254,9 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 func (c *Container) ExitCode(ctx context.Context) (int, error) {
 	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
-		if err == context.Canceled || err == context.DeadlineExceeded {
+		// A bare sentinel is returned as-is; a wrapped deadline takes the
+		// redacted path below so its diagnostic values stay protected.
+		if err == context.Canceled || err == context.DeadlineExceeded { //nolint:errorlint // exact identity selects the unredacted path
 			return 0, err
 		}
 		redacted := c.redactError(err)
@@ -1400,7 +1403,11 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.restartArgs(target, timeout)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return c.restartAttached(ctx, timeout)
+	}
+	args, err := lifecycle.restartArgs(target, timeout)
 	if errors.Is(err, ErrUnsupportedCapability) {
 		return c.restartAttached(ctx, timeout)
 	}
@@ -1527,7 +1534,11 @@ func (c *Container) Pause(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.pauseArgs(target)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return unsupportedLifecycle(c.eng, "pause")
+	}
+	args, err := lifecycle.pauseArgs(target)
 	if err != nil {
 		return err
 	}
@@ -1551,7 +1562,11 @@ func (c *Container) Unpause(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.unpauseArgs(target)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return unsupportedLifecycle(c.eng, "unpause")
+	}
+	args, err := lifecycle.unpauseArgs(target)
 	if err != nil {
 		return err
 	}

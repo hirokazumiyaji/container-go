@@ -95,8 +95,9 @@ func nilTestLogger(t testing.TB) bool {
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
+	default:
+		return false
 	}
-	return false
 }
 
 // startTestLogger begins forwarding the container's logs to the configured

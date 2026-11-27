@@ -41,7 +41,7 @@ func TestWindowsExit259IsNotActive(t *testing.T) {
 	dir := t.TempDir()
 	ready := filepath.Join(dir, "ready")
 	release := filepath.Join(dir, "release")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsExit259Helper$")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestWindowsExit259Helper$")
 	cmd.Env = append(os.Environ(),
 		windowsExit259HelperEnv+"=1",
 		windowsExit259ReadyEnv+"="+ready,
@@ -101,7 +101,7 @@ func TestWindowsExit259IsNotActive(t *testing.T) {
 }
 
 func TestWindowsEmptyJobTerminationDoesNotClaimActiveChild(t *testing.T) {
-	cmd := exec.Command("cmd.exe", "/D", "/C", "exit 0")
+	cmd := exec.CommandContext(context.Background(), "cmd.exe", "/D", "/C", "exit 0")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cmd.exe is unavailable: %v", err)
 	}

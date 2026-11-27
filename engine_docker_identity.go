@@ -2,24 +2,6 @@ package container
 
 import "fmt"
 
-// imageIdentityComplete reports that Docker's identity metadata is complete
-// whenever inspect returned it: a pinned Docker reference is proven by its
-// repo digest or verified local image ID alone.
-func (dockerEngine) imageIdentityComplete(imageIdentity, string) bool { return true }
-
-// verifyPinnedImageIdentity has no additional Docker completeness rule to
-// enforce.
-func (dockerEngine) verifyPinnedImageIdentity(imageIdentity, imageIdentity, string) error {
-	return nil
-}
-
-// reconcileImageIdentity keeps the pinned identity unchanged: Docker's inspect
-// is the authoritative observation and the pinned spelling is already the run
-// argument.
-func (dockerEngine) reconcileImageIdentity(pinned imageIdentity, _ imageIdentity) imageIdentity {
-	return pinned
-}
-
 // imageReferencesCompatible compares a requested reference with the reference
 // inspect reported using Docker's repository and tag rules.
 func (dockerEngine) imageReferencesCompatible(requested, actual string) bool {

@@ -48,5 +48,3 @@ func (appleEngine) imageReferencesCompatible(requested, actual string) bool {
 	return appleImageReferencesCompatible(requested, actual)
 }
 
-// checkReuseNetworkCompat has no Docker network model to verify.
-func (appleEngine) checkReuseNetworkCompat(*engineInfo, *config) error { return nil }

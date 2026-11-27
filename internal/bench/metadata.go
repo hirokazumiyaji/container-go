@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -167,7 +168,7 @@ func validLowerHex(value string) bool {
 }
 
 func gitOutput(args ...string) (string, error) {
-	out, err := exec.Command("git", args...).Output()
+	out, err := exec.CommandContext(context.Background(), "git", args...).Output()
 	if err == nil {
 		return string(out), nil
 	}

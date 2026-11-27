@@ -17,7 +17,7 @@ import (
 )
 
 func TestTerminateProcessTreeDoesNotClaimExitedChild(t *testing.T) {
-	cmd := exec.Command(writeStub(t, `exit 0`))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, `exit 0`))
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func waitForProcessExitNoReap(cmd *exec.Cmd) bool {
 }
 
 func TestTerminateProcessTreeAfterWaitUsesHandleDoneState(t *testing.T) {
-	cmd := exec.Command(writeStub(t, `exit 0`))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, `exit 0`))
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +129,6 @@ func waitForPIDFile(t *testing.T, path string) int {
 }
 
 func processState(pid int) (string, error) {
-	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+	out, err := exec.CommandContext(context.Background(), "ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
 	return strings.TrimSpace(string(out)), err
 }

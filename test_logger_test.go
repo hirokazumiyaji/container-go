@@ -243,7 +243,7 @@ func (s *recordingTestLogSink) logged() []string {
 	return append([]string(nil), s.logs...)
 }
 
-func newBufferedLogContainer(t *testing.T, data string) (*Container, *streamRunner) {
+func newBufferedLogContainer(t *testing.T, data string) *Container {
 	t.Helper()
 	f := &streamRunner{fakeRunner: newTestRunner(), streamData: data}
 	c := &Container{
@@ -252,7 +252,7 @@ func newBufferedLogContainer(t *testing.T, data string) (*Container, *streamRunn
 		eng:    dockerEngine{},
 		sync:   &lockPack{uid: dockerFixtureID},
 	}
-	return c, f
+	return c
 }
 
 func TestTestLogOnFailureOnlyFlushesFailedTests(t *testing.T) {
@@ -262,7 +262,7 @@ func TestTestLogOnFailureOnlyFlushesFailedTests(t *testing.T) {
 			name = "failing"
 		}
 		t.Run(name, func(t *testing.T) {
-			ctr, _ := newBufferedLogContainer(t, "ready\r\n")
+			ctr := newBufferedLogContainer(t, "ready\r\n")
 			sink := &recordingTestLogSink{failed: failed}
 
 			startTestLogger(&config{testLogger: sink, testLogOnFailure: true}, ctr)
@@ -287,7 +287,7 @@ func TestTestLogOnFailureBufferIsBounded(t *testing.T) {
 	for i := 0; i < 3000; i++ {
 		fmt.Fprintf(&data, "line-%04d-%s\n", i, strings.Repeat("x", 60))
 	}
-	ctr, _ := newBufferedLogContainer(t, data.String())
+	ctr := newBufferedLogContainer(t, data.String())
 	sink := &recordingTestLogSink{failed: true}
 
 	startTestLogger(&config{testLogger: sink, testLogOnFailure: true}, ctr)
@@ -314,7 +314,7 @@ func TestTestLogOnFailureBufferIsBounded(t *testing.T) {
 }
 
 func TestTestLogOnFailureSanitizesControlCharacters(t *testing.T) {
-	ctr, _ := newBufferedLogContainer(t, "before\x1b[31mred\x1b[0m\rprogress\n")
+	ctr := newBufferedLogContainer(t, "before\x1b[31mred\x1b[0m\rprogress\n")
 	sink := &recordingTestLogSink{failed: true}
 
 	startTestLogger(&config{testLogger: sink, testLogOnFailure: true}, ctr)
@@ -332,7 +332,7 @@ func TestTestLogOnFailureSanitizesControlCharacters(t *testing.T) {
 }
 
 func TestTestLogOnFailureRecordsStreamError(t *testing.T) {
-	ctr, _ := newBufferedLogContainer(t, "")
+	ctr := newBufferedLogContainer(t, "")
 	sink := &recordingTestLogSink{failed: true}
 	_, cancel := context.WithCancel(context.Background())
 
@@ -354,7 +354,7 @@ func TestTestLogOnFailureRecordsStreamError(t *testing.T) {
 }
 
 func TestWithTestLoggerSanitizesForwardedLines(t *testing.T) {
-	ctr, _ := newBufferedLogContainer(t, "")
+	ctr := newBufferedLogContainer(t, "")
 	sink := &recordingTestLogSink{}
 
 	forwardTestLogs(sink, ctr, strings.NewReader("before\x1b[31mred\x1b[0m\rprogress\n"))

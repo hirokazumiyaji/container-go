@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -609,7 +610,7 @@ func (r *reaper) respawnAndReplayLocked() error {
 	if lastErr == nil {
 		lastErr = errReaperSpawnFailed
 	}
-	return fmt.Errorf("%w: %v", errReaperSpawnFailed, lastErr)
+	return fmt.Errorf("%w: %w", errReaperSpawnFailed, lastErr)
 }
 
 func (r *reaper) spawnFailuresValue() int {
@@ -674,7 +675,9 @@ func (r *reaper) spawnLocked() error {
 		}
 		args := []string{reaperInternalCommand, r.binary, r.subcommand, creationLabel, strconv.Itoa(timeout), strconv.Itoa(attempts)}
 		args = append(args, r.deleteFlags...)
-		cmd = exec.Command(exe, args...)
+		// The reaper daemon must outlive the request that spawned it, so it
+		// deliberately carries no caller context.
+		cmd = exec.CommandContext(context.Background(), exe, args...)
 		env := append(append([]string(nil), r.env...), reaperInternalEnv+"=1")
 		cmd.Env = cli.MergeEnv(os.Environ(), env)
 	}

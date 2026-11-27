@@ -3,6 +3,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -20,7 +21,7 @@ import (
 func startReaperGroup(t *testing.T) (*exec.Cmd, int, <-chan error) {
 	t.Helper()
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
-	cmd := exec.Command("sh", "-c", `sleep 60 & echo $! > "$1"; wait`, "sh", pidFile)
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", `sleep 60 & echo $! > "$1"; wait`, "sh", pidFile)
 	configureReaperProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start reaper: %v", err)

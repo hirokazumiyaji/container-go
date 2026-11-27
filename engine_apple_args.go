@@ -22,20 +22,8 @@ func (appleEngine) startArgs(id string) []string {
 	return startArgsFor(id)
 }
 
-func (appleEngine) restartArgs(id string, timeout *time.Duration) ([]string, error) {
-	return nil, fmt.Errorf("%w: apple backend does not support restart CLI subcommand", ErrUnsupportedCapability)
-}
-
 func (appleEngine) killArgs(id string, signal string) []string {
 	return killArgsFor(id, signal)
-}
-
-func (appleEngine) pauseArgs(id string) ([]string, error) {
-	return nil, fmt.Errorf("%w: apple backend does not support pause", ErrUnsupportedCapability)
-}
-
-func (appleEngine) unpauseArgs(id string) ([]string, error) {
-	return nil, fmt.Errorf("%w: apple backend does not support unpause", ErrUnsupportedCapability)
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
@@ -48,10 +36,6 @@ func (appleEngine) deleteArgs(id string) []string {
 
 func (appleEngine) copyToArgs(id, hostPath, containerPath string) []string {
 	return copyToArgsFor(id, hostPath, containerPath)
-}
-
-func (appleEngine) copyFromArgs(id, containerPath, hostPath string) []string {
-	return copyFromArgsFor(id, containerPath, hostPath)
 }
 
 func (appleEngine) reaperSubcommand() string { return "delete" }

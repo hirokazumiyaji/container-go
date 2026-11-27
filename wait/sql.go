@@ -288,12 +288,9 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			// only exposes such an error after Next has moved the cursor.
 			// One advance is enough for readiness, and it keeps a large or
 			// unbounded result from extending the probe.
+			defer func() { _ = rows.Close() }()
 			rows.Next()
-			if err := rows.Err(); err != nil {
-				_ = rows.Close()
-				return err
-			}
-			return rows.Close()
+			return rows.Err()
 		}
 		matched, matchErr := s.queryMatcher(rows)
 		closeErr := rows.Close()
@@ -307,6 +304,7 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			return errors.New("query result was rejected by the matcher")
 		}
 		return nil
+
 	})
 }
 

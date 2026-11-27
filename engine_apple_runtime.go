@@ -1,8 +1,6 @@
 package container
 
 import (
-	"context"
-	"fmt"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -39,17 +37,4 @@ func appleProbeLivenessText(line string) bool {
 		}
 	}
 	return false
-}
-
-// Apple Container's public cp command has no mode that preserves source
-// types or prevents it from dereferencing special files, so fail closed.
-func (appleEngine) checkCopyFileFromContainer() error {
-	return fmt.Errorf(
-		"%w: Apple Container cp has no type-preserving/no-follow copy-out mode",
-		ErrCopyFileFromContainerUnsupported,
-	)
-}
-
-func (appleEngine) checkCopyFileFromContainerVersion(context.Context, cli.Runner, opTimeouts) error {
-	return appleEngine{}.checkCopyFileFromContainer()
 }

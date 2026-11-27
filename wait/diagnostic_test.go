@@ -352,7 +352,7 @@ func TestDiagnosticHelpersIgnoreTypedNilStrategy(t *testing.T) {
 		t.Error("typed-nil strategy must not require a healthcheck")
 	}
 	cause := errors.New("wait failed")
-	if err := safeStrategyError(cause, httpTypedNil); err != cause {
+	if err := safeStrategyError(cause, httpTypedNil); err != cause { //nolint:errorlint // identity of the original cause
 		t.Errorf("safeStrategyError = %v, want the original cause", err)
 	}
 }

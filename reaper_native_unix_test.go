@@ -250,3 +250,50 @@ func TestNativeReaperKillsTimedOutBackend(t *testing.T) {
 	}
 	t.Fatalf("timed-out backend process %d survived the reap", pid)
 }
+
+// TestNativeReaperBudgetBoundsNameLockWait pins that a worker blocked on a
+// name lock stops when the overall reap budget expires instead of waiting for
+// its full lock timeout.
+func TestNativeReaperBudgetBoundsNameLockWait(t *testing.T) {
+	if raceDetectorEnabled {
+		t.Skip("subprocess timing; the lock path is not shared memory")
+	}
+	cfg, logPath := nativeReaperBackend(t, "delete")
+	cfg.lockTimeout = 6 * time.Second
+	t.Setenv("REAPER_BUDGET_SECONDS", "1")
+
+	name := nativeReaperName("budget-locked")
+	creation := strings.Repeat("b", 16)
+	lockPath, err := reaperNameLockPath(name)
+	if err != nil {
+		t.Fatalf("reaperNameLockPath: %v", err)
+	}
+	held, err := openVerifiedLockFile(lockPath)
+	if err != nil {
+		t.Fatalf("openVerifiedLockFile: %v", err)
+	}
+	if err := flockFile(int(held.Fd()), lockExclusiveNonBlocking); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = flockFile(int(held.Fd()), lockUnlock)
+		_ = held.Close()
+	})
+
+	entry := "+\t" + name + "\t" + creation + "\t" + lockPath + "\n"
+	start := time.Now()
+	var stderr strings.Builder
+	if code := runNativeReaper(cfg, strings.NewReader(entry), &stderr); code != 0 {
+		t.Fatalf("runNativeReaper = %d; stderr: %s", code, stderr.String())
+	}
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		t.Fatalf("reap took %v; a blocked name lock ignored the overall budget", elapsed)
+	}
+	if got := readNativeReaperLog(t, logPath); len(got) != 0 {
+		t.Fatalf("deleted %v, want no delete while the name lock is held", got)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want the budget skip to stay silent", stderr.String())
+	}
+}

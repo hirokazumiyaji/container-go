@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -17,7 +18,7 @@ func BenchmarkScanLogStream(b *testing.B) {
 	}
 	payload.WriteString("level=info msg=\"server ready\"\n")
 	data := payload.Bytes()
-	match := func(line []byte) int { return bytes.Count(line, []byte("server ready")) }
+	match := func(line string) int { return strings.Count(line, "server ready") }
 	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()

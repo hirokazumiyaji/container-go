@@ -49,5 +49,5 @@ func runNativeReaperMain(args []string, stderr io.Writer) int {
 		pendingAttempts: pendingAttempts,
 		deleteFlags:     append([]string(nil), args[5:]...),
 	}
-	return runNativeReaper(cfg, os.Stdin, os.Stderr)
+	return runNativeReaper(cfg, os.Stdin, stderr)
 }

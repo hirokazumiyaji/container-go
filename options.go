@@ -182,14 +182,26 @@ func (c *config) validateDockerTarget() error {
 	if c.clientPinned && (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
 		return validationErrorf(c.daemonTargetOption(), nil, "cannot override Docker target options on Client.Run")
 	}
-	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.target() == nil {
-		return validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
+	if err := c.validateDockerTargetBackend(); err != nil {
+		return err
 	}
 	if c.reuseAttachTimeout > 0 && !c.reuse {
 		return validationErrorf("WithReuseAttachTimeout", c.reuseAttachTimeout, "WithReuseAttachTimeout requires WithReuse")
 	}
 	if c.reusePollInterval > 0 && !c.reuse {
 		return validationErrorf("WithReusePollInterval", c.reusePollInterval, "WithReusePollInterval requires WithReuse")
+	}
+	return nil
+}
+
+// validateDockerTargetBackend rejects Docker target overrides on a backend
+// that has no Docker target, naming the option the caller set. Run calls it
+// again after engine detection because a plain Run resolves its engine after
+// validate has already run with a nil engine.
+func (c *config) validateDockerTargetBackend() error {
+	if c.eng != nil && c.eng.target() == nil &&
+		(c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
+		return validationErrorf(c.daemonTargetOption(), nil, "Docker target options require Docker backend")
 	}
 	return nil
 }

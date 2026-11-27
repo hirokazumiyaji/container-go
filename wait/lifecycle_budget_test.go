@@ -249,7 +249,7 @@ func TestScanLogStreamJoinsContextWithSettledTerminalExit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	result := scanLogStream(ctx, stream, func([]byte) int { return 0 }, 1, logReplay{})
+	result := scanLogStream(ctx, stream, func(string) int { return 0 }, 1, logReplay{})
 	if !errors.Is(result.err, context.Canceled) {
 		t.Fatalf("scan error = %v, want context.Canceled", result.err)
 	}

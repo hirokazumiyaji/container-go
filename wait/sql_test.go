@@ -71,14 +71,16 @@ func (fakeSQLConnector) Connect(context.Context) (driver.Conn, error) {
 func (fakeSQLConnector) Driver() driver.Driver { return fakeConnectorDriver{} }
 
 type fakeSQLState struct {
-	mu        sync.Mutex
-	opens     int
-	pings     int
-	queries   int
-	lastDSN   string
-	lastQuery string
-	pingFn    func(ctx context.Context, attempt int) error
-	queryFn   func(ctx context.Context, attempt int) error
+	mu         sync.Mutex
+	opens      int
+	pings      int
+	queries    int
+	rowNexts   int
+	lastDSN    string
+	lastQuery  string
+	pingFn     func(ctx context.Context, attempt int) error
+	queryFn    func(ctx context.Context, attempt int) error
+	rowsNextFn func(context.Context) error
 }
 
 func (s *fakeSQLState) open(dsn string) (driver.Conn, error) {
@@ -138,6 +140,23 @@ func (s *fakeSQLState) probeCounts() (opens, pings, queries int) {
 	return s.opens, s.pings, s.queries
 }
 
+func (s *fakeSQLState) countRowNext(ctx context.Context) error {
+	s.mu.Lock()
+	s.rowNexts++
+	fn := s.rowsNextFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return io.EOF
+}
+
+func (s *fakeSQLState) rowNextCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rowNexts
+}
+
 type fakeSQLConn struct{ state *fakeSQLState }
 
 func (fakeSQLConn) Prepare(string) (driver.Stmt, error) {
@@ -156,16 +175,18 @@ func (c fakeSQLConn) QueryContext(ctx context.Context, query string, _ []driver.
 	if err := c.state.countQuery(ctx, query); err != nil {
 		return nil, err
 	}
-	return fakeSQLRows{}, nil
+	return &fakeSQLRows{state: c.state}, nil
 }
 
-type fakeSQLRows struct{}
+type fakeSQLRows struct {
+	state *fakeSQLState
+}
 
 func (fakeSQLRows) Columns() []string { return []string{"ready"} }
 
 func (fakeSQLRows) Close() error { return nil }
 
-func (fakeSQLRows) Next([]driver.Value) error { return io.EOF }
+func (r *fakeSQLRows) Next([]driver.Value) error { return r.state.countRowNext(context.Background()) }
 
 func withFakeSQLState(t *testing.T, state *fakeSQLState) *fakeSQLState {
 	t.Helper()
@@ -664,6 +685,59 @@ func TestForSQLDiagnosticValuesOmitDSN(t *testing.T) {
 		t.Fatalf("WaitUntilReady: %v", err)
 	}
 	assertNoDSN()
+}
+
+func TestForSQLWithQueryIteratesRows(t *testing.T) {
+	state := withFakeSQLState(t, &fakeSQLState{})
+	err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithQuery("SELECT 1").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(2*time.Millisecond).
+		WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := state.rowNextCount(); got == 0 {
+		t.Fatal("query probe never called rows.Next")
+	}
+}
+
+func TestForSQLWithQueryRetriesDeferredRowError(t *testing.T) {
+	state := withFakeSQLState(t, &fakeSQLState{
+		rowsNextFn: func(context.Context) error { return errors.New("relation is not ready") },
+	})
+	err := ForSQL("5432/tcp", fakeSQLDriverName, sqlDSN).
+		WithQuery("SELECT 1").
+		WithStartupTimeout(60*time.Millisecond).
+		WithPollInterval(2*time.Millisecond).
+		WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want the startup deadline after retrying the row error", err)
+	}
+	if _, _, queries := state.probeCounts(); queries < 2 {
+		t.Errorf("queries = %d, want a retry after the deferred row error", queries)
+	}
+	if got := state.rowNextCount(); got < 2 {
+		t.Errorf("rows.Next calls = %d, want repeated probes to iterate rows", got)
+	}
+}
+
+func TestForSQLDiagnosticValuesKeepConnectionMetadata(t *testing.T) {
+	const driver = "wait-test-diagnostic-driver"
+	strategy := ForSQL("5432/tcp", driver, func(string, int) string { return "" })
+	for _, value := range strategy.DiagnosticValues() {
+		if value == "5432/tcp" || value == driver {
+			t.Fatalf("DiagnosticValues = %v, must not register non-secret connection metadata", strategy.DiagnosticValues())
+		}
+	}
+
+	err := strategy.WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if err == nil || !strings.Contains(err.Error(), driver) {
+		t.Fatalf("error = %v, want the unregistered driver name in the diagnostic", err)
+	}
+	if strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("error = %q, must not redact connection metadata", err)
+	}
 }
 
 // The whole wait shares one database handle. Rebuilding the pool per attempt

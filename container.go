@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"regexp"
@@ -380,10 +381,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 	// cfg.validate cannot see this combination before the engine is selected:
 	// with no explicit engine it runs while cfg.eng is still nil.
-	if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil {
-		if cfg.eng.target() == nil {
-			return nil, validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
-		}
+	if err := cfg.validateDockerTargetBackend(); err != nil {
+		return nil, err
 	}
 	cfg.eng = configuredTarget(cfg.eng, engineTargetOverride{
 		host:      cfg.dockerHost,
@@ -1025,7 +1024,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
 	}
-	stopCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
+	stopCtx, cancel := withDefaultTimeout(ctx, addTimeout(c.effectiveQueryTimeout(), durationOrZero(timeout)))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(stopCtx)
 	if err != nil {
@@ -1048,6 +1047,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 
 // Image returns the image reference the container was created with.
 func (c *Container) Image() string {
+	c.pack().mu.Lock()
+	defer c.pack().mu.Unlock()
 	return c.image.reference
 }
 
@@ -1392,7 +1393,7 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("restart %s: %w", c.id, ErrSharedContainer)
 	}
-	restartCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
+	restartCtx, cancel := withDefaultTimeout(ctx, addTimeout(c.effectiveQueryTimeout(), durationOrZero(timeout)))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(restartCtx)
 	if err != nil {
@@ -1574,13 +1575,18 @@ func (c *Container) Shared() *Container {
 	c.secretsMu.RLock()
 	diagnosticRedactor := c.diagnosticRedactorValue
 	c.secretsMu.RUnlock()
+	// rememberIdentity may promote the image identity of a name-addressed
+	// handle after construction, so read it under the same lock.
+	c.pack().mu.Lock()
+	image := c.image
+	c.pack().mu.Unlock()
 	return &Container{
 		id: c.id, runner: c.runner, eng: c.eng,
 		queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout,
 		exposed: c.exposed, published: c.published,
 		network: c.network, networkExplicit: c.networkExplicit,
 		reused: c.reused, created: c.created, allowDestructive: true, creation: c.creation,
-		image: c.image, nameInspect: c.nameInspect,
+		image: image, nameInspect: c.nameInspect,
 		sync: c.sync, dockerMeta: c.dockerMeta,
 		diagnosticRedactorValue: diagnosticRedactor,
 		targetHost:              c.targetHost,
@@ -2429,6 +2435,12 @@ func cloneEngineInfo(info *engineInfo) *engineInfo {
 	if info.networkAliases != nil {
 		out.networkAliases = append([]string(nil), info.networkAliases...)
 	}
+	if info.networkAliasMap != nil {
+		out.networkAliasMap = make(map[string][]string, len(info.networkAliasMap))
+		for network, aliases := range info.networkAliasMap {
+			out.networkAliasMap[network] = append([]string(nil), aliases...)
+		}
+	}
 	if info.bound != nil {
 		out.bound = append([]boundPort(nil), info.bound...)
 	}
@@ -2809,6 +2821,17 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	// caller must first validate managed/reuse/session ownership.
 	info.observedAt = c.pack().currentTime()
 	return info, nil
+}
+
+// addTimeout combines the operation's query budget with a caller-supplied
+// timeout, saturating at the maximum Duration instead of overflowing. A
+// caller can pass any non-negative Duration; an overflowing sum would make
+// the context expire immediately and hide the backend's range validation.
+func addTimeout(base, extra time.Duration) time.Duration {
+	if extra > 0 && base > time.Duration(math.MaxInt64)-extra {
+		return time.Duration(math.MaxInt64)
+	}
+	return base + extra
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

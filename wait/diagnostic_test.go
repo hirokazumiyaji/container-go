@@ -316,6 +316,47 @@ func TestHTTPWaitErrorUsesHeaderAndBasicAuthContext(t *testing.T) {
 	}
 }
 
+func TestCompositeWaitRejectsTypedNilStrategyWithoutPanic(t *testing.T) {
+	var typedNil *LogStrategy
+	for name, strategy := range map[string]Strategy{
+		"all": ForAll(typedNil),
+		"any": ForAny(typedNil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := strategy.WaitUntilReady(context.Background(), newFakeTarget())
+			if err == nil || !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("error = %v, want ErrInvalidConfiguration", err)
+			}
+		})
+	}
+}
+
+func TestDiagnosticHelpersIgnoreTypedNilStrategy(t *testing.T) {
+	var (
+		httpTypedNil        *HTTPStrategy
+		healthcheckTypedNil *HealthcheckStrategy
+	)
+	if values := DiagnosticValues(httpTypedNil); len(values) != 0 {
+		t.Errorf("DiagnosticValues = %v, want none for a typed-nil strategy", values)
+	}
+	if values := DiagnosticValues(ForAll(ForAny(httpTypedNil))); len(values) != 0 {
+		t.Errorf("nested DiagnosticValues = %v, want none for a typed-nil strategy", values)
+	}
+	if values := DiagnosticBoundaryValues(httpTypedNil); len(values) != 0 {
+		t.Errorf("DiagnosticBoundaryValues = %v, want none for a typed-nil strategy", values)
+	}
+	if values := DiagnosticBoundaryValues(ForAny(httpTypedNil)); len(values) != 0 {
+		t.Errorf("nested DiagnosticBoundaryValues = %v, want none for a typed-nil strategy", values)
+	}
+	if RequiresHealthcheck(httpTypedNil) || RequiresHealthcheck(healthcheckTypedNil) {
+		t.Error("typed-nil strategy must not require a healthcheck")
+	}
+	cause := errors.New("wait failed")
+	if err := safeStrategyError(cause, httpTypedNil); err != cause {
+		t.Errorf("safeStrategyError = %v, want the original cause", err)
+	}
+}
+
 // panicDiagnosticStrategy fails the test if diagnostics are collected on a
 // successful wait.
 type panicDiagnosticStrategy struct{}

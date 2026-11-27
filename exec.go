@@ -29,6 +29,7 @@ type execConfig struct {
 	timeoutSet bool
 	maxBytes   int64
 	stderr     io.Writer
+	stdin      io.Reader
 }
 
 // WithExecTimeout sets an upper bound for one Exec invocation. A
@@ -83,6 +84,40 @@ func WithExecStderr(w io.Writer) ExecOption {
 			return validationErrorf("WithExecStderr", nil, "stderr writer cannot be nil")
 		}
 		c.stderr = w
+		return nil
+	}
+}
+
+// WithExecStdin attaches r to the exec'd process's standard input and adds the
+// backend's interactive flag to the exec argv, so commands such as psql,
+// mysql, and redis-cli --pipe can read a dump from the caller instead of a
+// temporary file. The reader is consumed until EOF or until the command
+// exits. A nil or typed-nil reader is rejected as a validation error.
+//
+// Exec and ExecTo need a runner with the optional stdin capability; ExecRunner
+// provides it, and wrappers that embed ExecRunner inherit it. A runner without
+// that capability is rejected with ErrUnsupportedCapability before the backend
+// is invoked. The child process is always terminated and reaped when the
+// command exits or the context is cancelled.
+//
+// A non-EOF failure from r is returned with the command result, even when the
+// command still exits successfully, because the command received truncated
+// input.
+//
+// The caller owns the input contract: r must either reach EOF or implement
+// io.Closer with a Close that unblocks a pending Read. On completion or
+// cancellation the child's stdin pipe and a closable r are closed, and a
+// closable reader's copy is awaited for a short grace period. Go cannot
+// interrupt a Read
+// on a non-closable reader, so a reader that stays blocked leaves its copy
+// goroutine until the Read returns; that pending read does not delay Exec's
+// result or keep the child alive.
+func WithExecStdin(r io.Reader) ExecOption {
+	return func(c *execConfig) error {
+		if nilReader(r) {
+			return validationErrorf("WithExecStdin", nil, "stdin reader cannot be nil")
+		}
+		c.stdin = r
 		return nil
 	}
 }
@@ -213,6 +248,14 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 			return 0, nil, OutputStats{}, optionBoundaryError(err)
 		}
 	}
+	// Stdin is an optional runner capability. Reject it before any backend
+	// operation so an unsupported custom runner costs no inspect or exec.
+	if cfg.stdin != nil {
+		if _, ok := c.runner.(cli.StdinRunner); !ok {
+			return 0, emptyExecOutput(), OutputStats{}, fmt.Errorf(
+				"%w: exec stdin requires a runner that supports stdin", ErrUnsupportedCapability)
+		}
+	}
 
 	// Exec is a buffered, bounded operation by default. An explicit zero
 	// timeout opts out of the library default. A positive custom timeout
@@ -264,6 +307,12 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 	}
 
 	args := c.eng.execArgs(target, cfg, envFile, cmd)
+	runTo := func(stdout, stderr io.Writer) (cli.OutputStats, error) {
+		if cfg.stdin != nil {
+			return cli.RunWithStdin(c.runner, execCtx, cfg.stdin, stdout, stderr, args...)
+		}
+		return cli.RunTo(c.runner, execCtx, stdout, stderr, args...)
+	}
 	switch {
 	case streaming:
 		var limited *limitedWriter
@@ -287,7 +336,7 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 			stderrSink = stderrTracked
 		}
 		var runStats cli.OutputStats
-		runStats, err = cli.RunTo(c.runner, execCtx, sink, stderrSink, args...)
+		runStats, err = runTo(sink, stderrSink)
 		err = preserveOutputDeliveryError(err, tracked)
 		err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
 		stats = newOutputStats(runStats, limited)
@@ -295,14 +344,28 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 	case cfg.maxBytes > 0:
 		capture := newBoundedBuffer(cfg.maxBytes)
 		if cfg.stderr == nil {
-			_, err = cli.RunTo(c.runner, execCtx, capture, capture, args...)
+			_, err = runTo(capture, capture)
 		} else {
 			stderrTracked := newOutputTrackingWriter(cfg.stderr)
-			_, err = cli.RunTo(c.runner, execCtx, capture, stderrTracked, args...)
+			_, err = runTo(capture, stderrTracked)
 			err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
 		}
 		output = capture.reader()
 	default:
+		if cfg.stdin != nil {
+			// A stdin-capable runner reports output through writers. Keep
+			// the historical stdout-then-stderr concatenation.
+			var stdout, stderr bytes.Buffer
+			if cfg.stderr == nil {
+				_, err = cli.RunWithStdin(c.runner, execCtx, cfg.stdin, &stdout, &stderr, args...)
+			} else {
+				stderrTracked := newOutputTrackingWriter(cfg.stderr)
+				_, err = cli.RunWithStdin(c.runner, execCtx, cfg.stdin, &stdout, stderrTracked, args...)
+				err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
+			}
+			output = io.MultiReader(bytes.NewReader(stdout.Bytes()), bytes.NewReader(stderr.Bytes()))
+			break
+		}
 		if cfg.stderr == nil {
 			var stdout, stderr []byte
 			stdout, stderr, err = c.runner.Run(execCtx, args...)
@@ -315,6 +378,11 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 		err = preserveNamedOutputDeliveryError(err, stderrTracked, "stderr")
 		output = bytes.NewReader(stdout.Bytes())
 	}
+	// A stdin read failure is local evidence that must survive the
+	// application-result classification below; a successful command may
+	// still have received truncated input.
+	stdinErr := cli.StdinError(err)
+
 	// The CLI has finished reading the env file. Remove it before any
 	// result classification or caller-visible output processing. Retain
 	// envDir for a deferred retry if removal fails, and preserve the error.
@@ -364,6 +432,13 @@ func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption
 				classified = err
 			} else if !errors.Is(classified, cli.ErrOutputDelivery) {
 				classified = errors.Join(classified, deliveryErr)
+			}
+		}
+		if stdinErr != nil && !errors.Is(classified, stdinErr) {
+			if classified == nil {
+				classified = stdinErr
+			} else {
+				classified = errors.Join(classified, stdinErr)
 			}
 		}
 		if contextErr, ok := execContextualError(ctx, execCtx, classified, terminationUnknown); ok {
@@ -493,7 +568,7 @@ func isExecOperationTimeout(err error, cliErr *cli.CLIError) bool {
 // represented by structured evidence rather than workload output. Exec
 // forwards the workload's stderr through CLIError, so diagnostic phrases
 // alone cannot establish that the backend or the CLI invocation failed.
-func isDefinitiveExecError(err error, cliErr *cli.CLIError) bool {
+func isDefinitiveExecError(err error, _ *cli.CLIError) bool {
 	if err == nil {
 		return false
 	}

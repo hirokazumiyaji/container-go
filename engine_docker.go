@@ -40,6 +40,10 @@ type dockerEngine struct {
 	resolvedTarget  *dockerTargetEndpoint
 }
 
+// newDockerEngine builds the target. configDir and defaultPlatform belong to
+// the target identity even when a test passes "".
+//
+//nolint:unparam // target identity fields, not constants
 func newDockerEngine(host, context, configDir, defaultPlatform string) dockerEngine {
 	return dockerEngine{
 		explicitTarget:          true,

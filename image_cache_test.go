@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -13,7 +14,7 @@ import (
 // countInspects reports how many recorded CLI invocations are
 // `<subcommand> inspect`. It takes the recorded calls rather than a
 // runner so the wrapper runners below can be counted too.
-func countInspects(calls [][]string, subcommand string) int {
+func countInspects(calls [][]string, subcommand string) int { //nolint:unparam // the subcommand stays explicit at call sites
 	n := 0
 	for _, c := range calls {
 		if len(c) >= 2 && c[0] == subcommand && c[1] == "inspect" {
@@ -149,6 +150,48 @@ func TestImageCacheExpires(t *testing.T) {
 	}
 	if got := countInspects(r.calls, "image"); got != 2 {
 		t.Errorf("ran %d inspects after the entry expired, want 2", got)
+	}
+}
+
+// TestImageCacheForgetsExpiredEntries keeps the map from growing without
+// bound when an image is looked up repeatedly past its TTL.
+func TestImageCacheForgetsExpiredEntries(t *testing.T) {
+	c := newImageCache(time.Minute)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	c.remember("redis:7-alpine", "")
+	if got := c.size(); got != 1 {
+		t.Fatalf("size = %d after remember, want 1", got)
+	}
+	now = now.Add(2 * time.Minute)
+	if c.seen("redis:7-alpine", "") {
+		t.Error("seen() reported a fresh entry for an expired one")
+	}
+	if got := c.size(); got != 0 {
+		t.Errorf("size = %d after an expired entry was observed, want 0 (it should be dropped)", got)
+	}
+}
+
+// TestImageCacheRememberPurgesExpiredEntries covers keys that expire
+// without ever being looked up again: remember of a different image must
+// still drop them so a long-lived Option does not retain dead entries.
+func TestImageCacheRememberPurgesExpiredEntries(t *testing.T) {
+	c := newImageCache(time.Minute)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	c.remember("old:1", "")
+	now = now.Add(2 * time.Minute)
+	c.remember("new:1", "")
+	if got := c.size(); got != 1 {
+		t.Errorf("size = %d after remember purged expired, want 1", got)
+	}
+	if c.seen("old:1", "") {
+		t.Error("expired entry survived a remember of a different key")
+	}
+	if !c.seen("new:1", "") {
+		t.Error("fresh entry missing after remember")
 	}
 }
 
@@ -601,8 +644,8 @@ func TestWithImagePresenceCacheZeroIsDisabled(t *testing.T) {
 	if cfg.imageCache.enabled() {
 		t.Error("a zero ttl produced an enabled cache")
 	}
-	cfg.imageCache.remember(dockerEngine{}, "redis:7-alpine", "")
-	if cfg.imageCache.seen(dockerEngine{}, "redis:7-alpine", "") {
+	cfg.imageCache.remember("redis:7-alpine", "")
+	if cfg.imageCache.seen("redis:7-alpine", "") {
 		t.Error("a disabled cache reported a hit")
 	}
 }
@@ -614,11 +657,11 @@ func TestNilImageCacheIsInert(t *testing.T) {
 	if c.enabled() {
 		t.Error("nil cache reported enabled")
 	}
-	if c.seen(dockerEngine{}, "redis:7-alpine", "") {
+	if c.seen("redis:7-alpine", "") {
 		t.Error("nil cache reported a hit")
 	}
 	// These must not panic on a nil receiver.
-	c.remember(dockerEngine{}, "redis:7-alpine", "")
+	c.remember("redis:7-alpine", "")
 	c.forget(dockerEngine{}, "redis:7-alpine", "")
 }
 
@@ -631,13 +674,40 @@ func TestImageCacheSurvivesConcurrentRuns(t *testing.T) {
 	for range workers {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			c.remember(dockerEngine{}, "redis:7-alpine", "")
-			c.seen(dockerEngine{}, "redis:7-alpine", "")
+			c.remember("redis:7-alpine", "")
+			c.seen("redis:7-alpine", "")
 			c.forget(dockerEngine{}, "redis:7-alpine", "")
 			c.size()
 		}()
 	}
 	for range workers {
 		<-done
+	}
+}
+
+func TestImageCacheEvictsEarliestExpiry(t *testing.T) {
+	c := newImageCache(time.Hour)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	for i := range imageCacheLimit {
+		c.remember(fmt.Sprintf("image:%d", i), "")
+		now = now.Add(time.Second)
+	}
+	c.remember("image:0", "")
+	if c.size() != imageCacheLimit || !c.seen("image:1", "") {
+		t.Fatal("refreshing an existing entry evicted another image")
+	}
+	now = now.Add(time.Second)
+	c.remember("new:1", "")
+	if got := c.size(); got != imageCacheLimit {
+		t.Fatalf("size = %d, want %d", got, imageCacheLimit)
+	}
+	if c.seen("image:1", "") {
+		t.Error("earliest-expiring image survived eviction")
+	}
+	for _, image := range []string{"image:0", "image:2", "new:1"} {
+		if !c.seen(image, "") {
+			t.Errorf("fresh image %q missing", image)
+		}
 	}
 }

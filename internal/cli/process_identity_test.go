@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -10,7 +11,7 @@ import (
 )
 
 func TestRetainedUnixProcessTreeAfterWaitUsesReleasedHandle(t *testing.T) {
-	cmd := exec.Command(writeStub(t, "exit 0"))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, "exit 0"))
 	configureProcessTree(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

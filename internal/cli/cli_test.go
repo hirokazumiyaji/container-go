@@ -232,7 +232,7 @@ func TestExecRunnerCancellationDuringStartUsesPublicationBarrier(t *testing.T) {
 
 func TestCommandRunErrorCancellationRacePreservesExitAndContext(t *testing.T) {
 	binary := writeStub(t, `echo cancel-race >&2; exit 7`)
-	cmd := exec.Command(binary)
+	cmd := exec.CommandContext(context.Background(), binary)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	exitErr := cmd.Run()
@@ -277,7 +277,7 @@ func TestExecRunnerPreservesOutputOnContextCancellation(t *testing.T) {
 }
 
 func TestCommandErrorPreservesExitStatusWhenContextExpires(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "exit 7")
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "exit 7")
 	rawErr := cmd.Run()
 	if rawErr == nil {
 		t.Fatal("stub command unexpectedly succeeded")
@@ -322,7 +322,7 @@ func (inactiveTerminationTree) close() {}
 func TestLifecycleDoesNotMarkEmptyTerminationAsActive(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := exec.Command(writeStub(t, `sleep 5`))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, `sleep 5`))
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func (*blockingTerminationTree) provesActiveTermination() bool { return true }
 
 func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
 	ctx := context.Background()
-	cmd := exec.Command(writeStub(t, `sleep 5`))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, `sleep 5`))
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestExecRunnerStatusReportsBestEffortTreeAsUnprovable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	time.AfterFunc(100*time.Millisecond, cancel)
-	hooks := runHooks{terminate: func(cmd *exec.Cmd) error { return terminateProcessTree(cmd) }}
+	hooks := runHooks{terminate: terminateProcessTree}
 	// exec keeps the sleeper as the direct child: the stub's shell would
 	// otherwise outlive the direct kill and hold the output pipe open until
 	// the sleep expired, which only adds wall-clock to the race job.
@@ -1566,7 +1566,7 @@ func TestCommandErrorPreservesWaitDelayContext(t *testing.T) {
 }
 
 func TestCommandErrorCancellationRaceDoesNotDuplicateDiagnostic(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "exit 7")
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "exit 7")
 	exitErr := cmd.Run()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

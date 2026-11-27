@@ -151,7 +151,7 @@ func canonicalEnvPath(path string) (string, error) {
 	parent := filepath.Dir(clean)
 	resolvedParent, err := filepath.EvalSymlinks(parent)
 	if err != nil {
-		return "", fmt.Errorf("%w: resolve cache path %q: %v", errUnsafeEnvFile, parent, err)
+		return "", fmt.Errorf("%w: resolve cache path %q: %w", errUnsafeEnvFile, parent, err)
 	}
 	if !filepath.IsAbs(resolvedParent) {
 		return "", fmt.Errorf("%w: resolved cache path %q is not absolute", errUnsafeEnvFile, resolvedParent)
@@ -192,7 +192,7 @@ func validateEnvPathComponents(path string) error {
 		current = filepath.Join(current, part)
 		info, err := os.Lstat(current)
 		if err != nil {
-			return fmt.Errorf("%w: inspect path component %q: %v", errUnsafeEnvFile, current, err)
+			return fmt.Errorf("%w: inspect path component %q: %w", errUnsafeEnvFile, current, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("%w: path component %q is not a real directory", errUnsafeEnvFile, current)

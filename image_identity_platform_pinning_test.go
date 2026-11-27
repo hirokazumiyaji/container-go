@@ -101,10 +101,10 @@ func (r *platformPinningRunner) Run(_ context.Context, args ...string) ([]byte, 
 	}
 }
 
-func (r *platformPinningRunner) state() (runImage string, inspectCalls, pullCalls int) {
+func (r *platformPinningRunner) state() (runImage string, pullCalls int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.runImage, r.inspectCalls, r.pullCalls
+	return r.runImage, r.pullCalls
 }
 
 func platformPinningContainerJSON(image, digest, platform string, creation ...string) []byte {
@@ -165,7 +165,7 @@ func TestAppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 	if !ctr.image.pinned || ctr.image.digest != platformPinningRoot {
 		t.Fatalf("run identity = %+v, want pinned root digest", ctr.image)
 	}
-	if got, _, pulls := r.state(); got != input || pulls != 0 {
+	if got, pulls := r.state(); got != input || pulls != 0 {
 		t.Fatalf("run image = %q pulls = %d, want pinned name@digest", got, pulls)
 	}
 }
@@ -181,7 +181,7 @@ func TestAppleNameDigestStaysPinnedWithMutableOptIn(t *testing.T) {
 	if !ctr.image.pinned || ctr.image.digest != platformPinningRoot {
 		t.Fatalf("identity = %+v, want name@digest to remain pinned", ctr.image)
 	}
-	if got, _, _ := r.state(); got != input {
+	if got, _ := r.state(); got != input {
 		t.Fatalf("run image = %q, want original pinned reference", got)
 	}
 }
@@ -202,7 +202,7 @@ func TestAppleAliasReplacementFailsClosedEvenWithMutablePolicy(t *testing.T) {
 			if !errors.Is(err, ErrImageIdentityMismatch) {
 				t.Fatalf("error = %v, want ErrImageIdentityMismatch for replaced alias", err)
 			}
-			if runImage, _, pulls := r.state(); runImage != "" || pulls != 0 {
+			if runImage, pulls := r.state(); runImage != "" || pulls != 0 {
 				t.Fatalf("replaced alias reached run=%q pulls=%d", runImage, pulls)
 			}
 		})
@@ -221,7 +221,7 @@ func TestAppleTagReplacementBeforeRunFailsIdentityCheck(t *testing.T) {
 	if !errors.Is(err, ErrImageIdentityMismatch) {
 		t.Fatalf("error = %v, want ErrImageIdentityMismatch for tag replacement", err)
 	}
-	if runImage, _, pulls := r.state(); runImage != "" || pulls != 0 {
+	if runImage, pulls := r.state(); runImage != "" || pulls != 0 {
 		t.Fatalf("replaced tag reached run=%q pulls=%d", runImage, pulls)
 	}
 }
@@ -333,7 +333,7 @@ func TestApplePullMissingFetchesMissingPlatformVariant(t *testing.T) {
 	if ctr.image.digest != platformPinningRoot || ctr.image.variantDigest != platformPinningVariant {
 		t.Fatalf("resolved identity = %+v, want root and fetched variant", ctr.image)
 	}
-	if got, _, pulls := r.state(); got != "redis:7-alpine@"+platformPinningRoot || pulls != 1 {
+	if got, pulls := r.state(); got != "redis:7-alpine@"+platformPinningRoot || pulls != 1 {
 		t.Fatalf("run image=%q pulls=%d, want explicit platform fetch and root run identity", got, pulls)
 	}
 }
@@ -350,7 +350,7 @@ func TestAppleExplicitPlatformRejectsEmptyVariants(t *testing.T) {
 	if errors.Is(err, ErrImageIdentityUnavailable) {
 		t.Fatalf("empty variant list was reported as identity-unavailable: %v", err)
 	}
-	runImage, _, pulls := r.state()
+	runImage, pulls := r.state()
 	if runImage != "" || pulls != 0 {
 		t.Fatalf("empty variant list caused run=%q pulls=%d", runImage, pulls)
 	}
@@ -368,7 +368,7 @@ func TestAppleExplicitPlatformRejectsIncompleteVariant(t *testing.T) {
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
 	}
-	if runImage, _, pulls := r.state(); runImage != "" || pulls != 0 {
+	if runImage, pulls := r.state(); runImage != "" || pulls != 0 {
 		t.Fatalf("incomplete variant caused run=%q pulls=%d", runImage, pulls)
 	}
 }
@@ -382,7 +382,7 @@ func TestAppleEffectiveDefaultPlatformValidatesVariants(t *testing.T) {
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
 	}
-	if runImage, _, pulls := r.state(); runImage != "" || pulls != 0 {
+	if runImage, pulls := r.state(); runImage != "" || pulls != 0 {
 		t.Fatalf("default platform variant check caused run=%q pulls=%d", runImage, pulls)
 	}
 }
@@ -407,7 +407,7 @@ func TestAppleSelectedVariantReplacementFailsBeforeRun(t *testing.T) {
 	if !errors.Is(err, ErrImageIdentityMismatch) {
 		t.Fatalf("error = %v, want ErrImageIdentityMismatch for replaced variant", err)
 	}
-	if runImage, _, pulls := r.state(); runImage != "" || pulls != 0 {
+	if runImage, pulls := r.state(); runImage != "" || pulls != 0 {
 		t.Fatalf("replaced variant reached run=%q pulls=%d", runImage, pulls)
 	}
 }
@@ -424,7 +424,7 @@ func TestApplePlatformUsesRootIndexDigestForRunAndReuse(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	wantReference := "redis:7-alpine@" + platformPinningRoot
-	if got, _, _ := r.state(); got != wantReference {
+	if got, _ := r.state(); got != wantReference {
 		t.Fatalf("run image = %q, want root index reference %q", got, wantReference)
 	}
 	if ctr.image.digest != platformPinningRoot || ctr.image.platform != "linux/arm64" {

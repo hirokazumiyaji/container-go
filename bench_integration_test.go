@@ -39,7 +39,7 @@ func benchEngines(b bench.Backend) (engine, bool) {
 
 // benchPortOptions is the default readiness condition: redis accepting
 // connections on 6379.
-func benchPortOptions(b bench.Backend, eng engine) func(cli.Runner) []Option {
+func benchPortOptions(eng engine) func(cli.Runner) []Option {
 	return func(r cli.Runner) []Option {
 		return []Option{
 			withRunner(r),
@@ -152,8 +152,8 @@ func TestIntegrationBenchCounting(t *testing.T) {
 			doc := bench.Doc{SchemaVersion: bench.CurrentSchemaVersion, Env: benchEnv(t, b)}
 			benchScenario(t, &doc, b, image, "run/cold", func(t *testing.T) {
 				b.EnsureImageAbsent(t, image)
-			}, benchPortOptions(b, eng))
-			benchScenario(t, &doc, b, image, "run/warm", nil, benchPortOptions(b, eng))
+			}, benchPortOptions(eng))
+			benchScenario(t, &doc, b, image, "run/warm", nil, benchPortOptions(eng))
 			nginxImage := bench.PinnedNginxImage
 			benchScenario(t, &doc, b, nginxImage, "run/warm-nginx", nil, func(r cli.Runner) []Option {
 				return []Option{
@@ -207,21 +207,20 @@ func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image
 		var containers []*Container
 		start := time.Now()
 		for range 5 {
-			ctr, err := Run(context.Background(), image, benchPortOptions(b, eng)(r)...)
+			ctr, err := Run(context.Background(), image, benchPortOptions(eng)(r)...)
 			if err != nil {
-				for _, started := range containers {
-					_ = started.Terminate(context.Background())
-				}
+				// Run can return a partial handle alongside the error; include
+				// it so the failed iteration does not leave a container behind.
+				terminateBenchContainers(t, append(containers, ctr)...)
 				t.Fatalf("multi iteration %d: %v", i, err)
 			}
 			containers = append(containers, ctr)
 		}
 		elapsed := time.Since(start)
-		for _, ctr := range containers {
-			if err := ctr.Terminate(context.Background()); err != nil {
-				t.Logf("multi iteration %d: terminate: %v", i, err)
-			}
-		}
+		// Count before teardown: Terminate runs its own CLI subprocesses, so
+		// counting afterwards would report teardown work as measured work.
+		spawns := r.count()
+		terminateBenchContainers(t, containers...)
 		identity := observeBenchImage(t, b, image)
 		doc.Results = append(doc.Results, bench.Result{
 			Backend:             b.Name,
@@ -237,7 +236,7 @@ func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image
 			Iterations:          policy.Iterations,
 			Commit:              doc.Env.Commit,
 			DurationNS:          int64(elapsed),
-			Subprocesses:        r.count(),
+			Subprocesses:        spawns,
 		})
 	}
 }
@@ -267,7 +266,7 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 			ready.Add(1)
 			go func() {
 				defer ready.Done()
-				ctr, err := Run(context.Background(), image, benchPortOptions(b, eng)(r)...)
+				ctr, err := Run(context.Background(), image, benchPortOptions(eng)(r)...)
 				if ctr != nil {
 					mu.Lock()
 					containers = append(containers, ctr)
@@ -289,7 +288,6 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 				t.Fatalf("parallel iteration %d: %v", i, err)
 			}
 		}
-		terminateBenchContainers(t, containers...)
 		identity := observeBenchImage(t, b, image)
 		doc.Results = append(doc.Results, bench.Result{
 			Backend:             b.Name,

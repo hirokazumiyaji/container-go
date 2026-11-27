@@ -24,7 +24,9 @@ import (
 // deliberately not listed here: the Docker provenance capture records and
 // validates those effective selections instead. TESTCONTAINERS_CONFIG is
 // handled separately by testcontainersPropertiesPaths so its effective file
-// is parsed too.
+// is parsed too. TESTCONTAINERS_PROVIDER is pinned to docker because a
+// Podman or sandbox provider would run the scenarios against a daemon whose
+// provenance the Docker capture never records.
 var testcontainersBenchmarkOverrides = map[string]string{
 	"TESTCONTAINERS_RYUK_DISABLED":             "false",
 	"TESTCONTAINERS_RYUK_IMAGE":                ibench.PinnedTestcontainersRyukImage,
@@ -42,6 +44,7 @@ var testcontainersBenchmarkOverrides = map[string]string{
 	"TESTCONTAINERS_RYUK_PORT":                 "",
 	"TESTCONTAINERS_ALWAYS_PULL_IMAGE":         "false",
 	"TESTCONTAINERS_CHECKS_DISABLE":            "false",
+	"TESTCONTAINERS_PROVIDER":                  "docker",
 	"TESTCONTAINERS_DOCKER_SOCKET_PATH":        "",
 	"TESTCONTAINERS_HOST_OVERRIDE":             "",
 	"TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE":    "",
@@ -68,6 +71,7 @@ func canonicalTestcontainersEnvironment() map[string]string {
 		"TESTCONTAINERS_RYUK_VERBOSE":      "false",
 		"TESTCONTAINERS_ALWAYS_PULL_IMAGE": "false",
 		"TESTCONTAINERS_CHECKS_DISABLE":    "false",
+		"TESTCONTAINERS_PROVIDER":          "docker",
 	}
 	for _, name := range testcontainersRyukImageEnvironment {
 		forced[name] = ibench.PinnedTestcontainersRyukImage
@@ -304,6 +308,10 @@ func validateTestcontainersProperty(key, value string) error {
 		}
 	case "docker.host", "docker.cert.path", "docker.socket.path", "hub.image.name.prefix", "session.id", "tc.host", "ryuk.container.image":
 		return fmt.Errorf(".testcontainers.properties %s=%q overrides the pinned benchmark identity", key, value)
+	case "provider":
+		if !strings.EqualFold(strings.TrimSpace(value), "docker") {
+			return fmt.Errorf(".testcontainers.properties provider=%q selects a non-Docker container provider", value)
+		}
 	}
 	return nil
 }

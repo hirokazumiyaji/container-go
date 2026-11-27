@@ -454,7 +454,8 @@ func (t fixedEndpointWaitTarget) State(context.Context) (wait.State, error) {
 }
 
 func TestWaitTargetHostOnlyFallbackWhenCatIsMissing(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1026,3 +1027,198 @@ func TestWithWaitStrategyRecordsSecretsBeforeValidation(t *testing.T) {
 		t.Fatalf("public error = %q, must not echo the rejected pattern", public)
 	}
 }
+
+func TestWaitTargetExitStatus(t *testing.T) {
+	uid := strings.Repeat("a", 64)
+	tests := []struct {
+		name     string
+		status   string
+		exitCode string
+		want     wait.ExitStatus
+	}{
+		{
+			name:   "running",
+			status: "running",
+			want:   wait.ExitStatus{State: wait.StateRunning},
+		},
+		{
+			name:     "stopped success",
+			status:   "exited",
+			exitCode: `,"ExitCode":0`,
+			want:     wait.ExitStatus{State: wait.StateStopped, Reported: true, Code: 0},
+		},
+		{
+			name:     "stopped failure",
+			status:   "exited",
+			exitCode: `,"ExitCode":17`,
+			want:     wait.ExitStatus{State: wait.StateStopped, Reported: true, Code: 17},
+		},
+		{
+			name:   "stopped without exit code",
+			status: "exited",
+			want:   wait.ExitStatus{State: wait.StateStopped},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+				return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":%q%s}}]`,
+					uid, tc.status, tc.exitCode)), nil, nil
+			})
+			ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+			ctr.pack().uid = uid
+
+			got, err := (waitTarget{c: ctr}).ExitStatus(context.Background())
+			if err != nil {
+				t.Fatalf("ExitStatus: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("ExitStatus = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWaitTargetExitStatusPropagatesInspectError(t *testing.T) {
+	inspectErr := errors.New("temporary inspect failure")
+	runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		return nil, nil, inspectErr
+	})
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.pack().uid = strings.Repeat("a", 64)
+
+	_, err := (waitTarget{c: ctr}).ExitStatus(context.Background())
+	if !errors.Is(err, inspectErr) {
+		t.Fatalf("error = %v, want %v", err, inspectErr)
+	}
+}
+
+func TestForExitWithWaitTarget(t *testing.T) {
+	uid := strings.Repeat("a", 64)
+	tests := []struct {
+		name     string
+		exitCode int
+		wantErr  bool
+	}{
+		{name: "zero exit code", exitCode: 0},
+		{name: "nonzero exit code fails", exitCode: 17, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+				return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"exited","ExitCode":%d}}]`,
+					uid, tc.exitCode)), nil, nil
+			})
+			ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+			ctr.pack().uid = uid
+
+			err := wait.ForExit().
+				WithStartupTimeout(time.Second).
+				WithPollInterval(5*time.Millisecond).
+				WaitUntilReady(context.Background(), waitTarget{c: ctr})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("WaitUntilReady succeeded for a nonzero exit code")
+				}
+				if !strings.Contains(err.Error(), "exited with code 17") {
+					t.Errorf("error = %q, want the exit code diagnostic", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("WaitUntilReady: %v", err)
+			}
+		})
+	}
+}
+
+func TestWaitTargetExecOptionsBridge(t *testing.T) {
+	isolateEnvFileRoot(t)
+	f := &execRunner{fakeRunner: newTestRunner(), execStdout: "ready\n"}
+	target := newDockerWaitTarget(f)
+
+	code, err := target.ExecCommandWithOptions(context.Background(), []string{"probe"},
+		wait.ExecOptions{
+			User:    "nobody",
+			WorkDir: "/tmp",
+			Env:     map[string]string{"TOKEN": "xyz"},
+		})
+	if err != nil {
+		t.Fatalf("ExecCommandWithOptions: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
+	}
+
+	joined := strings.Join(f.callWith("exec"), " ")
+	if !strings.Contains(joined, "--user nobody") || !strings.Contains(joined, "--workdir /tmp") {
+		t.Errorf("exec args = %s, want the user and workdir options", joined)
+	}
+	if len(f.envFiles) != 1 || !strings.Contains(f.envFiles[0], "TOKEN=xyz\n") {
+		t.Errorf("env-file captures = %q, want the exec environment", f.envFiles)
+	}
+}
+
+func TestWaitTargetExecOptionsOutputIsBounded(t *testing.T) {
+	isolateEnvFileRoot(t)
+	f := &execRunner{fakeRunner: newTestRunner(), execStdout: strings.Repeat("x", waitExecOutputLimit*2)}
+	target := newDockerWaitTarget(f)
+
+	_, output, err := target.ExecCommandOutputWithOptions(context.Background(), []string{"probe"},
+		wait.ExecOptions{WorkDir: "/tmp"})
+	if err != nil {
+		t.Fatalf("ExecCommandOutputWithOptions: %v", err)
+	}
+	if len(output) > waitExecOutputLimit {
+		t.Errorf("output length = %d, want at most %d", len(output), waitExecOutputLimit)
+	}
+}
+
+func TestWaitTargetExecOptionsRejectInvalidValues(t *testing.T) {
+	f := &execRunner{fakeRunner: newTestRunner()}
+	target := newDockerWaitTarget(f)
+
+	_, err := target.ExecCommandWithOptions(context.Background(), []string{"probe"},
+		wait.ExecOptions{User: "bad user"})
+	if err == nil {
+		t.Fatal("ExecCommandWithOptions accepted an invalid user")
+	}
+	if !errors.Is(err, wait.ErrInvalidConfiguration) {
+		t.Fatalf("error = %v, want wait.ErrInvalidConfiguration", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called for an invalid option: %v", f.calls)
+	}
+}
+
+func TestForExecWithOptionsAndWaitTarget(t *testing.T) {
+	isolateEnvFileRoot(t)
+	f := &execRunner{fakeRunner: newDockerTestRunner(), execStdout: "ready\n"}
+	f.inspectJSON = fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"running"}}]`, dockerFixtureID)
+	target := newDockerWaitTarget(f)
+
+	err := wait.ForExec([]string{"pg_isready"}).
+		WithUser("app").
+		WithWorkDir("/srv/app").
+		WithEnv(map[string]string{"PGPASSWORD": "secret"}).
+		WithOutputContains("ready").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(5*time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+
+	joined := strings.Join(f.callWith("exec"), " ")
+	if !strings.Contains(joined, "--user app") || !strings.Contains(joined, "--workdir /srv/app") {
+		t.Errorf("exec args = %s, want the user and workdir options", joined)
+	}
+	if len(f.envFiles) != 1 || !strings.Contains(f.envFiles[0], "PGPASSWORD=secret\n") {
+		t.Errorf("env-file captures = %q, want the exec environment", f.envFiles)
+	}
+}
+
+// TestWaitStrategyDiagnosticValuesFitStreamWindow keeps a caller-provided
+// strategy value out of the handle's streaming redactor when its escaped
+// forms exceed the bounded window. Registering it would make every log-tail
+// redaction fail instead of protecting the output.

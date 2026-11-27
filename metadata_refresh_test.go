@@ -49,8 +49,8 @@ type freshDockerPortRunner struct {
 func (r *freshDockerPortRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "version" {
 		for _, arg := range args {
-			if strings.Contains(arg, "Server.Os") {
-				return []byte("linux"), nil, nil
+			if strings.Contains(arg, "json .") {
+				return []byte(defaultTestDockerVersion), nil, nil
 			}
 		}
 		return []byte("29.7.0"), nil, nil

@@ -48,11 +48,3 @@ func (appleEngine) imageReferencesCompatible(requested, actual string) bool {
 	return appleImageReferencesCompatible(requested, actual)
 }
 
-// parsePruneCandidates returns Apple's list-time prune metadata keyed by the
-// container identifiers the list output reported.
-func (appleEngine) parsePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
-	return applePruneCandidates(data)
-}
-
-// checkReuseNetworkCompat has no Docker network model to verify.
-func (appleEngine) checkReuseNetworkCompat(*engineInfo, *config) error { return nil }

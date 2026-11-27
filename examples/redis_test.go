@@ -48,14 +48,14 @@ func requireSystem(t *testing.T) {
 		if _, err := exec.LookPath("container"); err != nil {
 			t.Skip("container CLI not installed")
 		}
-		if err := exec.Command("container", "system", "status").Run(); err != nil {
+		if err := exec.CommandContext(context.Background(), "container", "system", "status").Run(); err != nil {
 			t.Skip("apple container system service not running")
 		}
 	case "docker":
 		if _, err := exec.LookPath("docker"); err != nil {
 			t.Skip("docker CLI not installed")
 		}
-		if err := exec.Command("docker", "info").Run(); err != nil {
+		if err := exec.CommandContext(context.Background(), "docker", "info").Run(); err != nil {
 			t.Skip("docker daemon not running")
 		}
 	default:
@@ -87,7 +87,8 @@ func TestExampleRedis(t *testing.T) {
 
 	// Any redis client would take endpoint here; a raw PING keeps the
 	// example dependency-free.
-	conn, err := net.DialTimeout("tcp", endpoint, 5*time.Second)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(context.Background(), "tcp", endpoint)
 	if err != nil {
 		t.Fatal(err)
 	}

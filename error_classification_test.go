@@ -265,12 +265,12 @@ func TestAmbiguousStderrPreservesOriginalCLIError(t *testing.T) {
 		ExitCode: 1,
 		Stderr:   "permission denied: not found",
 	}
-	if got := wrapNotFound(original); got != original {
+	if got := wrapNotFound(original); got != original { //nolint:errorlint // identity, not membership
 		t.Fatalf("wrapNotFound() = %v, want original CLIError", got)
 	}
 
 	wrapped := errors.Join(original, errors.New("diagnostic context"))
-	if got := wrapNotFound(wrapped); got != wrapped {
+	if got := wrapNotFound(wrapped); got != wrapped { //nolint:errorlint // identity, not membership
 		t.Fatalf("wrapNotFound(wrapped) = %v, want wrapped original", got)
 	}
 }
@@ -1240,7 +1240,7 @@ func TestCleanupDeleteClassifierIsOperationAndBackendAware(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &pruneDeleteRunner{list: listJSON, inspectJSON: listJSON, deleteErr: tc.err}
 			ids, err := pruneListed(context.Background(), r, appleEngine{}, []string{"ls"}, func(data []byte) ([]string, error) {
-				candidates, err := applePruneCandidates(data)
+				_, candidates, err := applePruneList(data)
 				if err != nil {
 					return nil, err
 				}

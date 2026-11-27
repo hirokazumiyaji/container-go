@@ -196,6 +196,8 @@ func (e *ValidationError) asRedacted(target any, r *cli.Redactor) bool {
 				// Numeric and boolean values are structural input, not
 				// secrets, so the redacted clone keeps them inspectable.
 				value = e.Value
+			default:
+				// Other kinds have no redacted clone; value stays nil.
 			}
 		}
 	}
@@ -451,11 +453,11 @@ func isBareContainerNotFound(err error) bool {
 		if cur == nil || conflict {
 			return
 		}
-		if cur == ErrContainerNotFound || cur == errInspectTargetNotFound {
+		if cur == ErrContainerNotFound || cur == errInspectTargetNotFound { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 			found = true
 			return
 		}
-		if _, ok := cur.(*inspectTargetNotFoundError); ok {
+		if _, ok := cur.(*inspectTargetNotFoundError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 			found = true
 			return
 		}
@@ -599,7 +601,7 @@ func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict
 		}
 		return found, conflict
 	}
-	if detail, ok := err.(*inspectTargetNotFoundError); ok {
+	if detail, ok := err.(*inspectTargetNotFoundError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		if target == "" || sameCLITarget(detail.target, target) {
 			return true, false
 		}
@@ -608,10 +610,10 @@ func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
 		return inspectAbsenceStatus(eng, wrapped.Unwrap(), target)
 	}
-	if err == errInspectTargetNotFound {
+	if errors.Is(err, errInspectTargetNotFound) {
 		return target == "", target != ""
 	}
-	if err == ErrContainerNotFound || errors.Is(err, ErrSystemNotRunning) {
+	if errors.Is(err, ErrContainerNotFound) || errors.Is(err, ErrSystemNotRunning) {
 		return false, false
 	}
 	var cliErr *cli.CLIError

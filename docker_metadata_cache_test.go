@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -26,6 +27,8 @@ type metadataRunner struct {
 	versionStarted chan struct{}
 	versionRelease chan struct{}
 	startedOnce    sync.Once
+	// versionRaw overrides the version response when non-empty.
+	versionRaw string
 }
 
 func newMetadataRunner() *metadataRunner {
@@ -38,7 +41,7 @@ func (r *metadataRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 	if len(args) >= 3 && args[0] == "version" && args[1] == "--format" {
 		r.mu.Lock()
 		r.versionCalls++
-		if args[2] == "{{.Server.Os}}" {
+		if args[2] == "{{json .}}" {
 			r.serverOSCalls++
 		}
 		started := r.versionStarted
@@ -46,6 +49,7 @@ func (r *metadataRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 		serverOS := r.serverOS
 		failServerOS := r.failServerOS
 		failCopyVer := r.failCopyVer
+		versionRaw := r.versionRaw
 		r.mu.Unlock()
 
 		if started != nil {
@@ -58,19 +62,19 @@ func (r *metadataRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 				return nil, nil, ctx.Err()
 			}
 		}
-		if args[2] == "{{.Server.Os}}" {
-			if failServerOS {
-				return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "injected server OS failure"}
-			}
-			if serverOS == "" {
-				serverOS = "linux"
-			}
-			return []byte(serverOS + "\n"), nil, nil
+		if failServerOS {
+			return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "injected server OS failure"}
 		}
 		if failCopyVer {
 			return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "injected copy version failure"}
 		}
-		return []byte(defaultTestDockerVersion), nil, nil
+		if versionRaw != "" {
+			return []byte(versionRaw), nil, nil
+		}
+		if serverOS == "" {
+			serverOS = "linux"
+		}
+		return []byte(fmt.Sprintf(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0","Os":%q}}`, serverOS)), nil, nil
 	}
 	return r.cpRunner.Run(ctx, args...)
 }
@@ -310,7 +314,7 @@ func TestClientSharesDefaultNetworkLookupAcrossHandles(t *testing.T) {
 
 	lookups := 0
 	for _, args := range runner.calls {
-		if len(args) >= 3 && args[0] == "version" && args[2] == "{{.Server.Os}}" {
+		if len(args) >= 3 && args[0] == "version" && args[2] == "{{json .}}" {
 			lookups++
 		}
 	}
@@ -485,8 +489,7 @@ func assertClientCopySucceeds(t *testing.T, ctr *Container, name string) {
 }
 
 // copyVersionProbeCount counts the `docker version --format {{json .}}` calls
-// that verify copy-out support. The default-network probe uses the same
-// subcommand with another format and must not be counted.
+// that supply both the copy-out version check and the default-network probe.
 func copyVersionProbeCount(r *countingRunner) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -548,5 +551,80 @@ func TestCopyFileFromContainerVersionCheckRetriedAcrossClientHandles(t *testing.
 	assertClientCopySucceeds(t, second, "second retry")
 	if got := copyVersionProbeCount(runner); got != 2 {
 		t.Fatalf("copy version probes = %d, want 2 (failure then retry across handles)", got)
+	}
+}
+
+// One docker version query must serve both the default-network probe and the
+// copy-out capability check for a target.
+func TestDockerVersionQuerySharedBetweenDefaultNetworkAndCopy(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	inner := newMetadataRunner()
+	inner.setBinary("docker")
+	runner := newCountingRunner(inner)
+	client := newCopyMetadataClient(runner)
+	ctr := runClientCopyContainer(t, client, "shared")
+
+	assertClientCopySucceeds(t, ctr, "shared")
+	name, err := ctr.ensureDefaultNetwork(context.Background())
+	if err != nil {
+		t.Fatalf("ensure default network: %v", err)
+	}
+	if name != dockerNetworkBridge {
+		t.Fatalf("default network = %q, want %q", name, dockerNetworkBridge)
+	}
+	if got := inner.versionCount(); got != 1 {
+		t.Fatalf("docker version queries = %d, want one shared by both metadata users", got)
+	}
+}
+
+// A cached version response that the copy-out policy rejects must not stick:
+// the next call retries the query instead of serving the rejected version
+// until the cache TTL.
+func TestDockerCopyVersionPolicyFailureIsNotCached(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	inner := newMetadataRunner()
+	inner.setBinary("docker")
+	inner.versionRaw = `{"Client":{"Version":"29.6.0"},"Server":{"Version":"29.6.0","Os":"linux"}}`
+	client := newCopyMetadataClient(newCountingRunner(inner))
+
+	first := runClientCopyContainer(t, client, "first")
+	if _, err := first.CopyFileFromContainer(context.Background(), "/out/result.txt"); !errors.Is(err, ErrCopyFileFromContainerUnsupported) {
+		t.Fatalf("first copy error = %v, want ErrCopyFileFromContainerUnsupported", err)
+	}
+
+	inner.mu.Lock()
+	inner.versionRaw = ""
+	inner.mu.Unlock()
+	second := runClientCopyContainer(t, client, "second")
+	assertClientCopySucceeds(t, second, "second")
+	if got := inner.versionCount(); got != 2 {
+		t.Fatalf("docker version queries = %d, want a retry after the rejected version", got)
+	}
+}
+
+// A successful but unusable version response must not be cached for either
+// consumer.
+func TestDockerUnusableVersionResponseIsNotCached(t *testing.T) {
+	runner := newMetadataRunner()
+	runner.versionRaw = `not a version response`
+	cache := newDockerMetadataCache(time.Minute)
+	cfg := dockerMetadataConfig(cache, runner, "tcp://daemon-a:2375")
+
+	if err := attachDefaultNetworkForConfig(context.Background(), cfg, &engineInfo{}); err == nil {
+		t.Fatal("attach with an unusable version response succeeded")
+	}
+
+	runner.mu.Lock()
+	runner.versionRaw = ""
+	runner.mu.Unlock()
+	info := &engineInfo{}
+	if err := attachDefaultNetworkForConfig(context.Background(), cfg, info); err != nil {
+		t.Fatalf("retry attach: %v", err)
+	}
+	if info.defaultNetwork != dockerNetworkBridge {
+		t.Fatalf("default network = %q, want %q", info.defaultNetwork, dockerNetworkBridge)
+	}
+	if got := runner.versionCount(); got != 2 {
+		t.Fatalf("docker version queries = %d, want a retry after the unusable response", got)
 	}
 }

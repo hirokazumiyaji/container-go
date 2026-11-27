@@ -6,15 +6,15 @@ import (
 	"testing"
 )
 
-func completeBaselineTestEnv(commit string) Env {
-	env := testEnv(commit)
+func completeBaselineTestEnv() Env {
+	env := testEnv(testCommit)
 	env.CLIs[AppleClientVersionKey] = "1.3.0"
 	env.CLIs[AppleServiceVersionKey] = "container-apiserver version 1.3.0 (build: release, commit: abc)"
 	return env
 }
 
 func TestBaselineProvenanceRoundTripAndValidation(t *testing.T) {
-	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv())
 	data, err := json.Marshal(baseline)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestBaselineProvenanceRoundTripAndValidation(t *testing.T) {
 }
 
 func TestBaselineProvenanceRejectsNullDirtyFields(t *testing.T) {
-	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv())
 	data, err := json.Marshal(baseline)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestBaselineProvenanceRejectsNullDirtyFields(t *testing.T) {
 }
 
 func TestValidateBaselineProvenanceRequiresSyntheticMarker(t *testing.T) {
-	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv())
 	baseline.Synthetic = false
 	if err := ValidateBaselineProvenance(baseline); err == nil || !strings.Contains(err.Error(), "synthetic") {
 		t.Fatalf("unmarked baseline error = %v, want synthetic marker error", err)
@@ -103,13 +103,13 @@ func TestValidateBaselineProvenanceRequiresSyntheticMarker(t *testing.T) {
 }
 
 func TestValidateBaselineProvenanceRequiresCompleteEnvironment(t *testing.T) {
-	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv())
 	delete(baseline.Env.CLIs, AppleServiceVersionKey)
 	if err := ValidateBaselineProvenance(baseline); err == nil || !strings.Contains(err.Error(), "apple.service") {
 		t.Fatalf("missing Apple service error = %v", err)
 	}
 
-	baseline = GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline = GenerateBaselineProvenance(completeBaselineTestEnv())
 	baseline.Env.ReaperSessionID = ""
 	if err := ValidateBaselineProvenance(baseline); err == nil || !strings.Contains(err.Error(), "reaper_session_id") {
 		t.Fatalf("missing reaper session error = %v", err)
@@ -117,7 +117,7 @@ func TestValidateBaselineProvenanceRequiresCompleteEnvironment(t *testing.T) {
 }
 
 func TestValidateBaselineProvenanceRequiresDeterministicScenarioOrder(t *testing.T) {
-	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv())
 	baseline.Scenarios[0], baseline.Scenarios[1] = baseline.Scenarios[1], baseline.Scenarios[0]
 	if err := ValidateBaselineProvenance(baseline); err == nil || !strings.Contains(err.Error(), "order") {
 		t.Fatalf("shuffled baseline error = %v, want deterministic order error", err)
@@ -125,7 +125,7 @@ func TestValidateBaselineProvenanceRequiresDeterministicScenarioOrder(t *testing
 }
 
 func TestBaselineProvenanceRequiresExplicitDirtyField(t *testing.T) {
-	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv())
 	data, err := json.Marshal(baseline)
 	if err != nil {
 		t.Fatal(err)

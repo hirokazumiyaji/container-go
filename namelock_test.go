@@ -264,7 +264,7 @@ func TestNameLockSerializesAcrossProcessesWithDifferentTempDirs(t *testing.T) {
 
 	runHelper := func(tempDir, timeout string) string {
 		t.Helper()
-		cmd := exec.Command(os.Args[0], "-test.run=^TestNameLockHelperProcess$")
+		cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestNameLockHelperProcess$")
 		cmd.Env = append(os.Environ(),
 			"CONTAINERGO_LOCK_HELPER=1",
 			"CONTAINERGO_LOCK_NAME="+name,

@@ -64,7 +64,7 @@ func WithRedactor(err error, r *Redactor) error {
 		r = NewRedactor()
 	}
 	r = r.WithForce()
-	if existing, ok := err.(*safeError); ok {
+	if existing, ok := err.(*safeError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		return existing.withRedactor(r)
 	}
 	combined := r
@@ -98,7 +98,7 @@ func init() {
 		return false
 	})
 	diagnostic.RegisterDiagnosticRedactor(func(err error) *diagnostic.Redactor {
-		if system, ok := err.(*SystemNotRunningError); ok {
+		if system, ok := err.(*SystemNotRunningError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 			return system.diagnosticRedactor()
 		}
 		return nil
@@ -109,7 +109,7 @@ func init() {
 // any. It keeps SystemNotRunningError from exposing the internal redactor type
 // as a public method while preserving redactor composition across boundaries.
 func DiagnosticRedactor(err error) *Redactor {
-	switch value := err.(type) {
+	switch value := err.(type) { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 	case *SystemNotRunningError:
 		return value.diagnosticRedactor()
 	case *safeError:
@@ -142,7 +142,7 @@ func (e *safeError) Error() string {
 // errors replace each rendered diagnostic node in place, preserving wrapper
 // formatting with one final control-character pass.
 func formatErrorWith(err error, r *Redactor) string {
-	switch value := err.(type) {
+	switch value := err.(type) { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 	case *CLIError:
 		return formatCLIError(value, r)
 	case *diagnosticError:
@@ -188,7 +188,7 @@ func collectDiagnosticLeaves(err error, r *Redactor, leaves []diagnosticLeaf) []
 	if err == nil {
 		return leaves
 	}
-	switch value := err.(type) {
+	switch value := err.(type) { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 	case *CLIError:
 		return append(leaves, diagnosticLeaf{node: value, render: formatCLIError(value, r)})
 	case *diagnosticError:
@@ -206,7 +206,7 @@ func collectDiagnosticLeaves(err error, r *Redactor, leaves []diagnosticLeaf) []
 		return leaves
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		if inner := wrapped.Unwrap(); inner != nil && inner != err {
+		if inner := wrapped.Unwrap(); inner != nil && inner != err { //nolint:errorlint // identity assertion; errors.Is would also match the wrapped child this check distinguishes
 			return collectDiagnosticLeaves(inner, r, leaves)
 		}
 	}
@@ -383,7 +383,7 @@ func redactErrorValue(err error, r *Redactor) error {
 	if r == nil {
 		r = NewRedactor()
 	}
-	switch value := err.(type) {
+	switch value := err.(type) { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 	case *CLIError:
 		return &safeError{err: value, redactor: r}
 	case *SystemNotRunningError:
@@ -462,7 +462,7 @@ func redactorsIn(err error) []*Redactor {
 		if current == nil {
 			return
 		}
-		if safe, ok := current.(*safeError); ok {
+		if safe, ok := current.(*safeError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 			if safe.redactor != nil {
 				redactors = append(redactors, safe.redactor)
 			}
@@ -483,7 +483,7 @@ func findRawCLIError(err error) (*CLIError, bool) {
 	if err == nil {
 		return nil, false
 	}
-	if cliErr, ok := err.(*CLIError); ok {
+	if cliErr, ok := err.(*CLIError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		return cliErr, true
 	}
 	for _, child := range rawChildren(err) {
@@ -498,7 +498,7 @@ func findRawSystemNotRunning(err error) (*SystemNotRunningError, bool) {
 	if err == nil {
 		return nil, false
 	}
-	if system, ok := err.(*SystemNotRunningError); ok {
+	if system, ok := err.(*SystemNotRunningError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		return system, true
 	}
 	for _, child := range rawChildren(err) {
@@ -560,7 +560,7 @@ func asSafeDiagnostic(err error, target any, r *Redactor) bool {
 	}
 	// A sink failure is the caller's own writer error, not CLI output, so
 	// ErrOutputDelivery promises it stays reachable through errors.As.
-	if output, ok := err.(*OutputError); ok {
+	if output, ok := err.(*OutputError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		if ptr, ok := target.(**OutputError); ok {
 			clone := *output
 			*ptr = &clone

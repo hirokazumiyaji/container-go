@@ -110,7 +110,7 @@ func TestExitCodePreservesInspectErrors(t *testing.T) {
 	expired, cancel := context.WithTimeout(context.Background(), 0)
 	defer cancel()
 	for _, ctx := range []context.Context{canceled, expired} {
-		if _, err := ctr.ExitCode(ctx); err != ctx.Err() {
+		if _, err := ctr.ExitCode(ctx); !errors.Is(err, ctx.Err()) {
 			t.Errorf("ExitCode error = %T %v, want original %v", err, err, ctx.Err())
 		}
 	}

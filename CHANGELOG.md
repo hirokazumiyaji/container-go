@@ -132,6 +132,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   level; symlinks and special files inside the tree are still rejected (#344).
 - Add `WithExecStderr` to keep the exec'd process's stderr out of `Exec`'s
   stdout and deliver it to a separate writer.
+- Add `WithExecStdin` to attach a caller reader to an exec'd process's stdin
+  with `exec -i`. `ExecRunner` implements the optional internal stdin
+  extension so the existing `Runner` interface stays compatible, a typed-nil
+  reader is a `*ValidationError`, and command completion or cancellation
+  closes the stdin pipe and a closable reader. A reader failure is returned
+  as an error even when the command exits successfully. The child is always
+  reaped; because Go cannot interrupt a read on a non-closable reader, a
+  permanently blocked reader can leave only its copy goroutine until the read
+  returns.
+- Add `FollowLogsOptions`, `FollowLogsWithOptions`, and
+  `FollowLogsToWithOptions`, and add `LogsOptions.Timestamps`. Docker emits
+  `--tail`, `--since`, and `--timestamps`; the Apple backend maps `Tail` to
+  `-n` and rejects `Since` and `Timestamps` with `ErrUnsupportedCapability`.
+- Add `WithTestLogOnFailure`, which retains the latest 64 KiB of container logs
+  in a ring buffer and emits them at `t.Cleanup` only when the test failed.
+  `WithTestLogger` and `WithTestLogOnFailure` both normalize CR/CRLF and escape
+  terminal control characters.
 - Add `WithPruneLabel` to limit `Prune` and `PruneReuseGroup` to containers
   carrying a label, and `WithPruneDryRun` to report candidates without deleting
   them.

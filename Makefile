@@ -1,4 +1,4 @@
-.PHONY: test vet vet-integration lint deadcode integration integration-docker bench-integration release-check release-check-bench
+.PHONY: test vet vet-integration lint deadcode govulncheck govulncheck-bench actionlint integration integration-docker bench-integration release-check release-check-bench
 
 test:
 	go test ./...
@@ -20,29 +20,43 @@ lint:
 
 # deadcode reports functions that no main or test binary reaches. Some
 # exported entry points are intentionally only callable by library users, so
-# they never appear reachable from in-repo code; this list names exactly those
-# (plus the internal/bench compatibility helpers that predate this guard).
-# Anything else is a regression: a forwarding wrapper left behind, or an
+# they never appear reachable from in-repo code; these lists name exactly those.
+# The internal/bench scenarios are the compatibility helpers that predate this
+# guard. Anything else is a regression: a forwarding wrapper left behind, or an
 # unexported helper kept alive only by another unreachable function.
+#
+# bench/ is a separate module that a root-level ./... never reaches, so it is
+# checked on its own. Its result-schema helpers are documented API
+# (docs/benchmarks.md) that only an external benchmark consumer calls.
+#
+# The report is reduced to the symbol and matched with `grep -Evx`, so an
+# allowed name has to equal the whole unreachable symbol; a plain substring
+# match would let a new longer name hide behind an allowlisted prefix.
 #
 # Build from tools/go.mod so the tool has one pinned version and Dependabot can
 # update it; `go run ...@latest` would float and an unpinned download in CI
 # would be a supply-chain hole.
-DEADCODE_ALLOWED := WithClientDockerConfig|WithClientPlatform|ScenarioPolicies|ScenarioPolicyFor|ScenarioNames|DiagnosticSecrets|SecretValues
+DEADCODE_ALLOWED := ScenarioPolicies|ScenarioPolicyFor|ScenarioNames
+DEADCODE_ALLOWED_BENCH := ScenarioPolicies|ScenarioNames|ScenarioPolicyFor|ScenarioPoliciesFor|CurrentCommit|CurrentSource|RequireCleanSource|ValidateScenarioSet|CompareDocs|GenerateBaselineProvenance|NormalizeEnv|NormalizeDoc
 
 deadcode:
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	(cd tools && go build -o "$$tmp/deadcode" golang.org/x/tools/cmd/deadcode) || exit $$?; \
-	out=$$("$$tmp/deadcode" -test -tags integration ./...) || exit $$?; \
-	if [ -z "$$out" ]; then echo 'deadcode: no unreachable functions'; exit 0; fi; \
-	printf '%s\n' "$$out"; \
-	unexpected=$$(printf '%s\n' "$$out" | grep -Ev ': unreachable func: ($(DEADCODE_ALLOWED))$$' || true); \
-	if [ -n "$$unexpected" ]; then \
-		printf '%s\n' "$$unexpected"; \
-		echo 'error: unreachable functions beyond the documented exported API' >&2; \
-		exit 1; \
-	fi; \
-	echo 'deadcode: only documented exported API functions are unreachable'
+	"$$tmp/deadcode" -test -tags integration ./... > "$$tmp/root.out" || exit $$?; \
+	(cd bench && "$$tmp/deadcode" -test -tags integration ./... > "$$tmp/bench.out") || exit $$?; \
+	check() { \
+		label="$$1"; out="$$2"; allowed="$$3"; \
+		if [ -z "$$out" ]; then echo "deadcode ($$label): no unreachable functions"; return 0; fi; \
+		unexpected=$$(printf '%s\n' "$$out" | sed -E 's/^.*: unreachable func: //' | grep -Evx "($$allowed)" || true); \
+		if [ -n "$$unexpected" ]; then \
+			printf '%s\n' "$$out"; \
+			echo "error: unreachable functions beyond the documented exported API in the $$label" >&2; \
+			return 1; \
+		fi; \
+		echo "deadcode ($$label): only documented exported API functions are unreachable"; \
+	}; \
+	check 'root module' "$$(cat "$$tmp/root.out")" '$(DEADCODE_ALLOWED)' && \
+	check 'bench module' "$$(cat "$$tmp/bench.out")" '$(DEADCODE_ALLOWED_BENCH)'
 
 # Skip pull-heavy bench / singleflight cases here; use bench-integration.
 integration:
@@ -104,8 +118,31 @@ bench-integration:
 # go.sum that tidy creates from nothing, because `git diff` ignores untracked
 # files, and a failing run would leave a rewritten, unreviewed go.mod in the
 # tree.
-GOVULNCHECK_VERSION := v1.10.0
-ACTIONLINT_VERSION := v1.7.12
+# govulncheck and actionlint are built from tools/go.mod, not run as
+# `go run pkg@version`: a versioned run ignores the module in the current
+# directory, so nothing verifies the downloaded tree against tools/go.sum and
+# the tool CI executes need not be the one Dependabot updates. The version
+# lives only in tools/go.mod; its tests check that no copy returns.
+GOVULNCHECK_TOOL := golang.org/x/vuln/cmd/govulncheck
+ACTIONLINT_TOOL := github.com/rhysd/actionlint/cmd/actionlint
+
+govulncheck:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	(cd tools && go build -o "$$tmp/govulncheck" $(GOVULNCHECK_TOOL)) || exit $$?; \
+	"$$tmp/govulncheck" ./...
+
+govulncheck-bench:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	(cd tools && go build -o "$$tmp/govulncheck" $(GOVULNCHECK_TOOL)) || exit $$?; \
+	cd bench && "$$tmp/govulncheck" ./...
+
+# shellcheck is left enabled: actionlint uses it when installed, and the runner
+# image and mise both provide it. Disabling it would check the run: blocks only
+# for Actions expressions and miss ordinary shell bugs.
+actionlint:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	(cd tools && go build -o "$$tmp/actionlint" $(ACTIONLINT_TOOL)) || exit $$?; \
+	"$$tmp/actionlint"
 
 release-check:
 	@command -v golangci-lint >/dev/null || { \
@@ -120,10 +157,10 @@ release-check:
 	go test -count=1 -race ./...
 	go mod verify
 	go mod tidy -diff
-	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	$(MAKE) govulncheck
 	$(MAKE) release-check-bench
 	cd tools && go mod verify && go mod tidy -diff
-	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) -shellcheck= -pyflakes=
+	$(MAKE) actionlint
 
 # bench/ is a separate module, so a root-level ./... reaches none of it: not
 # the build, and not golangci-lint or govulncheck either. Verified by planting a
@@ -141,6 +178,6 @@ release-check-bench:
 		&& golangci-lint run ./... \
 		&& go test -count=1 -race ./... \
 		&& go mod verify \
-		&& go mod tidy -diff \
-		&& go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+		&& go mod tidy -diff
+	$(MAKE) govulncheck-bench
 

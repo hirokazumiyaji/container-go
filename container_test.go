@@ -110,8 +110,13 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	if args[0] == "version" || args[0] == "info" {
 		if f.systemUp {
-			if len(args) > 2 && args[1] == "--format" && args[2] == "{{.Server.Os}}" {
-				return []byte("linux\n"), nil, nil
+			if len(args) > 2 && args[1] == "--format" {
+				switch args[2] {
+				case "{{json .}}":
+					return []byte(defaultTestDockerVersion), nil, nil
+				case "{{.Server.Os}}":
+					return []byte("linux\n"), nil, nil
+				}
 			}
 			return []byte("ok"), nil, nil
 		}

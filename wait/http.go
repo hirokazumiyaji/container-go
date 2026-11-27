@@ -211,6 +211,9 @@ func (s *HTTPStrategy) DiagnosticValues() []string {
 		if isCookieHeader(key) {
 			values = append(values, cookieDiagnosticValues(value)...)
 		}
+		if isAuthorizationHeader(key) {
+			values = append(values, authorizationDiagnosticValues(value)...)
+		}
 	}
 	secrets, _ := queryDiagnosticValues(s.path)
 	values = append(values, secrets...)
@@ -227,6 +230,12 @@ func (s *HTTPStrategy) diagnosticBoundaryValues() []string {
 
 func isCookieHeader(key string) bool {
 	return strings.EqualFold(key, "cookie") || strings.EqualFold(key, "set-cookie") || strings.EqualFold(key, "cookie2")
+}
+
+// isAuthorizationHeader reports whether a header carries credentials in an
+// Authorization scheme.
+func isAuthorizationHeader(key string) bool {
+	return strings.EqualFold(key, "authorization") || strings.EqualFold(key, "proxy-authorization")
 }
 
 // queryDiagnosticValues splits the query by hand rather than with

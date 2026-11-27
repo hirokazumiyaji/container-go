@@ -2,9 +2,11 @@ package wait
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +103,47 @@ func TestDiagnosticValuesCarryCompleteStrategyContext(t *testing.T) {
 		if strings.Contains(joined, value) {
 			t.Errorf("DiagnosticValues() = %v, contains request metadata %q", values, value)
 		}
+	}
+}
+
+func TestHTTPDiagnosticValuesDecomposeAuthorization(t *testing.T) {
+	const (
+		bearerToken = "bearer-token-117"
+		basicUser   = "basic-user-117"
+		basicPass   = "basic-password-117"
+	)
+	encoded := base64.StdEncoding.EncodeToString([]byte(basicUser + ":" + basicPass))
+	strategy := ForHTTP("/health").
+		WithHeader("Authorization", "Bearer "+bearerToken).
+		WithHeader("Proxy-Authorization", "Basic "+encoded)
+	values := DiagnosticValues(strategy)
+	for _, want := range []string{
+		"Bearer " + bearerToken,
+		bearerToken,
+		"Basic " + encoded,
+		encoded,
+		basicUser + ":" + basicPass,
+		basicPass,
+	} {
+		if !slices.Contains(values, want) {
+			t.Errorf("DiagnosticValues() = %v, missing %q", values, want)
+		}
+	}
+}
+
+func TestHTTPWaitErrorRedactsBareAuthorizationToken(t *testing.T) {
+	const token = "bare-bearer-token-117"
+	target := &errorTarget{err: errors.New("proxy rejected " + token)}
+	err := ForHTTP("/health").
+		WithHeader("Authorization", "Bearer "+token).
+		WithStartupTimeout(20*time.Millisecond).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want HTTP wait error")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("error = %q, contains the bare bearer token", err)
 	}
 }
 

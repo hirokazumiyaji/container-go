@@ -69,6 +69,11 @@ func TestParsePublishSpec(t *testing.T) {
 		},
 		{input: "invalid", wantErr: true},
 		{input: "8080:80:80:80", wantErr: true},
+		{input: "[]:8080:80", wantErr: true},
+		{input: ":8080:80", wantErr: true},
+		{input: "[127.0.0.1]:8080:80", wantErr: true},
+		{input: "[fe80::1%eth0]:8080:80", wantErr: true},
+		{input: "+8080:+80", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -111,6 +116,9 @@ func TestParsePublishSpecErrorFields(t *testing.T) {
 		{"invalid", "published port", "want [host-ip:]host-port:container-port[/proto]"},
 		{"70000:80", "port", "must be 1-65535"},
 		{"8080:99999", "port", "must be 1-65535"},
+		{"+8080:+80", "port", "must be 1-65535"},
+		{":8080:80", "published port", "host address must not be empty"},
+		{"[]:8080:80", "published port", "host address must not be empty"},
 	}
 	for _, tt := range tests {
 		_, err := ParsePublishSpec(tt.input)
@@ -129,12 +137,14 @@ func TestParsePublishSpecErrorFields(t *testing.T) {
 
 	// A malformed host address is not tied to an option field: the caller
 	// wraps it with the full publish specification as the diagnostic value.
-	_, err := ParsePublishSpec("badhost:8080:80")
-	if err == nil {
-		t.Fatal("ParsePublishSpec(badhost) = nil error")
-	}
-	if field, ok := FieldOf(err); ok {
-		t.Errorf("host address error field = %q, want no field", field)
+	for _, input := range []string{"badhost:8080:80", "[127.0.0.1]:8080:80", "[fe80::1%eth0]:8080:80"} {
+		_, err := ParsePublishSpec(input)
+		if err == nil {
+			t.Fatalf("ParsePublishSpec(%q) = nil error", input)
+		}
+		if field, ok := FieldOf(err); ok {
+			t.Errorf("ParsePublishSpec(%q) host address error field = %q, want no field", input, field)
+		}
 	}
 }
 

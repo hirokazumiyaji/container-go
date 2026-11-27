@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -169,24 +170,16 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	sort.Strings(networkNames)
 
-	var networkAliases []string
-	var networkAliasMap map[string][]string
+	networkAliasMap := make(map[string][]string, len(c.NetworkSettings.Networks))
 	for name, endpoint := range c.NetworkSettings.Networks {
 		aliases := append([]string(nil), endpoint.Aliases...)
 		aliases = append(aliases, endpoint.DNSNames...)
 		if len(aliases) == 0 {
 			continue
 		}
-		sort.Strings(aliases)
-		if networkAliasMap == nil {
-			networkAliasMap = make(map[string][]string, len(c.NetworkSettings.Networks))
-		}
-		networkAliasMap[name] = aliases
+		slices.Sort(aliases)
+		networkAliasMap[name] = slices.Compact(aliases)
 	}
-	endpoint := c.NetworkSettings.Networks[c.HostConfig.NetworkMode]
-	networkAliases = append(networkAliases, endpoint.Aliases...)
-	networkAliases = append(networkAliases, endpoint.DNSNames...)
-	sort.Strings(networkAliases)
 
 	info := &engineInfo{
 		state:           dockerState(c.State.Status),
@@ -201,7 +194,6 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		ip:              c.NetworkSettings.IPAddress,
 		networkMode:     c.HostConfig.NetworkMode,
 		networkNames:    networkNames,
-		networkAliases:  networkAliases,
 		networkAliasMap: networkAliasMap,
 	}
 	info.runOptions = engineRunOptions{
@@ -214,7 +206,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		info.runOptions.cpus = float64(*c.HostConfig.NanoCpus) / 1e9
 		info.runOptions.cpusReported = true
 	}
-	if c.HostConfig.ShmSize != nil {
+	if c.HostConfig.ShmSize != nil && *c.HostConfig.ShmSize >= 0 {
 		info.runOptions.shmSizeBytes = uint64(*c.HostConfig.ShmSize)
 		info.runOptions.shmSizeReported = true
 	}
@@ -262,14 +254,21 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 			}
 		}
 	}
-	for portProto, bindings := range c.NetworkSettings.Ports {
+	// Resolve aliases only after the network-mode fallback above selected the
+	// active network; older inspect output omits HostConfig.NetworkMode.
+	endpoint := c.NetworkSettings.Networks[info.networkMode]
+	networkAliases := append([]string(nil), endpoint.Aliases...)
+	networkAliases = append(networkAliases, endpoint.DNSNames...)
+	slices.Sort(networkAliases)
+	info.networkAliases = slices.Compact(networkAliases)
+	for _, portProto := range sortedKeys(c.NetworkSettings.Ports) {
 		spec, err := parsePortSpec(portProto)
 		if err != nil {
 			continue
 		}
-		for _, b := range bindings {
+		for _, b := range c.NetworkSettings.Ports[portProto] {
 			hostPort, err := strconv.Atoi(b.HostPort)
-			if err != nil {
+			if err != nil || hostPort < 1 || hostPort > 65535 {
 				continue
 			}
 			info.bound = append(info.bound, boundPort{
@@ -393,8 +392,8 @@ func parseDockerPruneIDs(data []byte) ([]string, error) {
 // only after the inspected Id matches exactly. Both forms prevent a
 // later tag reassignment from changing run's target.
 func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookupResult {
-	var images []dockerImageInspect
-	if err := json.Unmarshal(data, &images); err != nil {
+	images, err := strictjson.Array[dockerImageInspect](data, nil)
+	if err != nil {
 		// A successful CLI invocation with malformed JSON is not proof
 		// that the image is absent. Treat it as identity-unavailable so
 		// PullMissing cannot turn a parser failure into a fetch, and mark

@@ -972,3 +972,57 @@ func TestProcNetLoopbackAddress(t *testing.T) {
 		}
 	}
 }
+
+// TestWaitStrategyDiagnosticValuesFitStreamWindow keeps a caller-provided
+// strategy value out of the handle's streaming redactor when its escaped
+// forms exceed the bounded window. Registering it would make every log-tail
+// redaction fail instead of protecting the output.
+func TestWaitStrategyDiagnosticValuesFitStreamWindow(t *testing.T) {
+	huge := strings.Repeat("h", cli.MaxStreamOverlap+1)
+	for name, strategy := range map[string]wait.Strategy{
+		"http header":  wait.ForHTTP("/health").WithHeader("X-Oversized", huge),
+		"exec command": wait.ForExec([]string{"probe", huge}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := &config{eng: appleEngine{}}
+			if err := WithWaitStrategy(strategy)(cfg); err != nil {
+				t.Fatalf("WithWaitStrategy: %v", err)
+			}
+			for _, value := range cfg.diagnosticValues() {
+				if len(value) > cli.MaxStreamOverlap || !cli.StreamValueFits(value) {
+					t.Fatalf("diagnostic value of length %d does not fit the stream window", len(value))
+				}
+			}
+			ctr := &Container{}
+			ctr.applyConfigDiagnostics(cfg)
+			if _, err := ctr.diagnosticRedactor().RedactTail(strings.NewReader("streamed log line\n"), 1024); err != nil {
+				t.Fatalf("stream redaction failed: %v", err)
+			}
+		})
+	}
+}
+
+// TestWithWaitStrategyRecordsSecretsBeforeValidation lets a rejected
+// strategy still contribute its diagnostic values, so the validation error
+// that quotes them is redacted by the caller's error boundary.
+
+// TestWithWaitStrategyRecordsSecretsBeforeValidation lets a rejected
+// strategy still contribute its diagnostic values, so the validation error
+// that quotes them is redacted by the caller's error boundary.
+func TestWithWaitStrategyRecordsSecretsBeforeValidation(t *testing.T) {
+	const pattern = "token=wait-secret-value["
+	cfg := newConfig()
+	err := WithWaitStrategy(wait.ForLog(pattern).AsRegexp())(cfg)
+	if err == nil {
+		t.Fatal("want a configuration error")
+	}
+	if !slices.Contains(cfg.waitDiagnosticSecrets, pattern) {
+		t.Fatalf("waitDiagnosticSecrets = %v, missing the rejected strategy values", cfg.waitDiagnosticSecrets)
+	}
+	if strings.Contains(err.Error(), "wait-secret-value") {
+		t.Fatalf("validation error = %q, must not echo the rejected pattern", err)
+	}
+	if public := cfg.publicError(optionBoundaryError(err)); strings.Contains(public.Error(), "wait-secret-value") {
+		t.Fatalf("public error = %q, must not echo the rejected pattern", public)
+	}
+}

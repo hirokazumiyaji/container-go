@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // The fake drivers keep ForSQL tests backend-independent and use only the
@@ -455,6 +458,139 @@ func TestForSQLRedactsDerivedDSNValues(t *testing.T) {
 				t.Fatalf("error = %q, must not expose the DSN password", err)
 			}
 		})
+	}
+}
+
+// TestSQLDSNDiagnosticValuesCoverDriverDialects pins the DSN forms drivers
+// accept: MySQL's scheme-less userinfo DSN, semicolon-separated ADO/ODBC
+// pairs, and libpq key=value fields whose quoted value may contain spaces.
+func TestSQLDSNDiagnosticValuesCoverDriverDialects(t *testing.T) {
+	tests := []struct {
+		name    string
+		dsn     string
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "MySQL scheme-less userinfo",
+			dsn:  "user:mysqlpass@tcp(127.0.0.1:3306)/db",
+			want: []string{"user:mysqlpass", "mysqlpass"},
+		},
+		{
+			name: "MySQL userinfo and query parameter",
+			dsn:  "user:mysqlpass@tcp(127.0.0.1:3306)/db?timeout=1s&Password=querypass",
+			want: []string{"mysqlpass", "querypass"},
+		},
+		{
+			name: "semicolon separated ODBC fields",
+			dsn:  "Server=127.0.0.1;User Id=sa;Password=odbcpass;",
+			want: []string{"odbcpass"},
+		},
+		{
+			name: "semicolon separated braced value",
+			dsn:  "Server=127.0.0.1;Password={p;a}}b};Database=db",
+			want: []string{"p;a}b"},
+		},
+		{
+			name:    "libpq single-quoted value with spaces",
+			dsn:     "host=127.0.0.1 user=postgres password='my secretvalue' dbname=db",
+			want:    []string{"my secretvalue"},
+			notWant: []string{"my", "secretvalue"},
+		},
+		{
+			name: "libpq escaped quote",
+			dsn:  `host=127.0.0.1 user=postgres password='it\'s secret'`,
+			want: []string{"it's secret"},
+		},
+		{
+			name: "URL query keys are case-insensitive and use secret names",
+			dsn:  "postgres://user:urlpass@127.0.0.1:5432/db?Password=querypass&token=tok&sslpassword=sslpass&sslmode=disable",
+			want: []string{"urlpass", "querypass", "tok", "sslpass"},
+		},
+		{
+			name: "escaped URL userinfo",
+			dsn:  "postgres://user:p%40ss@127.0.0.1:5432/db",
+			want: []string{"p%40ss", "p@ss"},
+		},
+		{
+			name: "malformed URL still yields its query secret",
+			dsn:  "postgres://%zz?password=badpass",
+			want: []string{"badpass"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			values := sqlDSNDiagnosticValues(tc.dsn)
+			for _, want := range tc.want {
+				if !slices.Contains(values, want) {
+					t.Errorf("sqlDSNDiagnosticValues(%q) = %v, missing %q", tc.dsn, values, want)
+				}
+			}
+			for _, unwanted := range tc.notWant {
+				if slices.Contains(values, unwanted) {
+					t.Errorf("sqlDSNDiagnosticValues(%q) = %v, contains %q", tc.dsn, values, unwanted)
+				}
+			}
+		})
+	}
+}
+
+func TestForSQLRedactsQuotedDSNPasswordWithSpace(t *testing.T) {
+	const password = "my secretvalue"
+	for _, tc := range []struct {
+		name string
+		dsn  string
+	}{
+		{name: "libpq quoted", dsn: "host=127.0.0.1 user=postgres password='" + password + "' dbname=db"},
+		{name: "ODBC braced", dsn: "Server=127.0.0.1;User Id=sa;Password={" + password + "};"},
+		{name: "MySQL userinfo", dsn: "user:" + password + "@tcp(127.0.0.1:3306)/db"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := withFakeSQLState(t, &fakeSQLState{})
+			state.setPingFunc(func(context.Context, int) error {
+				return fmt.Errorf("authentication failed for %q", password)
+			})
+			err := ForSQL("5432/tcp", fakeSQLDriverName, func(string, int) string { return tc.dsn }).
+				WithStartupTimeout(40*time.Millisecond).
+				WithPollInterval(5*time.Millisecond).
+				WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+			if err == nil {
+				t.Fatal("wait unexpectedly succeeded")
+			}
+			if strings.Contains(err.Error(), password) || strings.Contains(err.Error(), "secretvalue") {
+				t.Fatalf("error = %q, must not expose the DSN password", err)
+			}
+		})
+	}
+}
+
+func TestForAllTimeoutKeepsSQLDSNRedaction(t *testing.T) {
+	const password = "composite-dsn-password"
+	state := withFakeSQLState(t, &fakeSQLState{})
+	state.setPingFunc(func(context.Context, int) error {
+		return &cli.CLIError{
+			Binary:   "psql",
+			Args:     []string{"-c", "select 1"},
+			ExitCode: 1,
+			Stderr:   "authentication failed for " + password,
+		}
+	})
+	dsn := "host=127.0.0.1 user=postgres password=" + password
+	strategy := ForAll(
+		ForSQL("5432/tcp", fakeSQLDriverName, func(string, int) string { return dsn }).
+			WithStartupTimeout(5 * time.Second).
+			WithPollInterval(5 * time.Millisecond),
+	).WithStartupTimeout(60 * time.Millisecond)
+	err := strategy.WaitUntilReady(context.Background(), sqlTarget("127.0.0.1:5432"))
+	if err == nil {
+		t.Fatal("wait unexpectedly succeeded")
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatalf("error = %q, must retain the SQL DSN redactor across the composite timeout", err)
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) && strings.Contains(cliErr.Stderr, password) {
+		t.Fatalf("errors.As CLIError = %q, must not expose the DSN password", cliErr.Error())
 	}
 }
 

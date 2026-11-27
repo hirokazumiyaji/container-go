@@ -240,26 +240,24 @@ func (e *waitError) AsRedacted(target any, redactor *cli.Redactor) bool {
 	return false
 }
 
-func (e *waitError) Unwrap() error {
+// Unwrap exposes every retained child so a diagnostic boundary can render
+// each node with the redactor that belongs to it. Returning only the
+// termination reason would hide a backend CLIError from the leaf-by-leaf
+// redaction and trimming path whenever the wait failed on a context deadline.
+func (e *waitError) Unwrap() []error {
 	if e == nil {
 		return nil
 	}
-	if e.contextErr != nil {
-		return e.contextErr
+	children := make([]error, 0, 4+len(e.causes))
+	children = append(children, e.contextErr, e.checkErr, e.probeErr, e.cause)
+	children = append(children, e.causes...)
+	filtered := children[:0]
+	for _, child := range children {
+		if child != nil {
+			filtered = append(filtered, child)
+		}
 	}
-	if e.reason == waitReasonCause && e.cause != nil {
-		return e.cause
-	}
-	if e.checkErr != nil {
-		return e.checkErr
-	}
-	if e.probeErr != nil {
-		return e.probeErr
-	}
-	if len(e.causes) > 0 {
-		return e.causes[0]
-	}
-	return nil
+	return filtered
 }
 
 // newWaitError builds a message-first error for composite strategies, whose

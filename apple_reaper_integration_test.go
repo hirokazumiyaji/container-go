@@ -39,7 +39,7 @@ func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
 	t.Setenv("CONTAINERGO_KEEP", "")
 	name := fmt.Sprintf("containergo-reapertest-%d", os.Getpid())
 
-	cmd := exec.Command(os.Args[0], "-test.run", "TestIntegrationReaperSurvivesSIGKILL")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run", "TestIntegrationReaperSurvivesSIGKILL")
 	cmd.Env = append(os.Environ(),
 		"CONTAINERGO_REAPER_CHILD=1",
 		"CONTAINERGO_REAPER_NAME="+name,
@@ -52,7 +52,7 @@ func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_ = exec.Command("container", "delete", "--force", name).Run()
+		_ = exec.CommandContext(context.Background(), "container", "delete", "--force", name).Run()
 	}()
 
 	// Wait for the child to report the running container.
@@ -92,7 +92,7 @@ func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
 
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("container", "ls", "--all", "--quiet").Output()
+		out, err := exec.CommandContext(context.Background(), "container", "ls", "--all", "--quiet").Output()
 		if err == nil && !strings.Contains(string(out), name) {
 			return // reaper removed it
 		}

@@ -935,7 +935,7 @@ func matchingProbeCLIError(err error, binary, operation string) *CLIError {
 		}
 		return nil
 	}
-	if cliErr, ok := err.(*CLIError); ok {
+	if cliErr, ok := err.(*CLIError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		if (binary == "" || BinaryMatches(cliErr.Binary, binary)) && CommandOperation(cliErr.Args) == operation {
 			return cliErr
 		}
@@ -978,7 +978,7 @@ func CollectNonCLIErrorBranches(err error) []error {
 		if current == nil {
 			return
 		}
-		if safe, ok := current.(*safeError); ok {
+		if safe, ok := current.(*safeError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 			for _, branch := range CollectNonCLIErrorBranches(safe.err) {
 				out = append(out, WithRedactor(branch, safe.redactor))
 			}
@@ -1161,7 +1161,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	// A timeout belonging to the bounded probe is evidence that the
 	// backend did not answer, unless the runner reported a distinct
 	// non-liveness error. A caller deadline was handled above.
-	if isProbeNonLiveness(probeCtx, probeForClassification) {
+	if isProbeNonLiveness(probeForClassification) {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	if probeCtx.Err() == context.DeadlineExceeded {
@@ -1245,7 +1245,7 @@ func IsOperationTimeoutError(err error) bool {
 	return cliErr.ExitCode < 0
 }
 
-func isProbeNonLiveness(probeCtx context.Context, err error) bool {
+func isProbeNonLiveness(err error) bool {
 	if !isNonLivenessError(err) {
 		return false
 	}
@@ -1359,7 +1359,7 @@ func diagnosticText(err error) string {
 		if cur == nil {
 			return
 		}
-		if diagnostic, ok := cur.(*diagnosticError); ok {
+		if diagnostic, ok := cur.(*diagnosticError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 			if diagnostic.stdout != "" {
 				parts = append(parts, diagnostic.stdout)
 			}

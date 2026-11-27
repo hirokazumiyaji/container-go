@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -878,7 +879,7 @@ func TestNativeReaperReapsAfterParentDeath(t *testing.T) {
 	logPath := filepath.Join(dir, "backend.log")
 	readyPath := filepath.Join(dir, "ready")
 	uid := nativeReaperID('a')
-	cmd := exec.Command(exe, testNativeReaperParentCommand)
+	cmd := exec.CommandContext(context.Background(), exe, testNativeReaperParentCommand)
 	cmd.Env = append(os.Environ(),
 		testNativeReaperBackend+"=1",
 		testNativeReaperLog+"="+logPath,

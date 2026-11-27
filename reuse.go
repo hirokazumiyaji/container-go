@@ -1335,6 +1335,7 @@ func sameExtraHosts(a, b []extraHostSpec) bool {
 	return true
 }
 
+//nolint:unparam // image is the handle's reference; tests happen to pass one value
 func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 	return checkReuseCompatIdentity(info, imageIdentity{reference: image}, image, cfg)
 }

@@ -126,7 +126,7 @@ func newBenchmarkStaleEnvDir(b *testing.B, root, suffix string) string {
 	if err := os.Mkdir(dir, envDirMode); err != nil {
 		b.Fatal(err)
 	}
-	if err := writeEnvMarker(filepath.Join(dir, envFileDirMarkerName), envFileDirMarker); err != nil {
+	if err := writeEnvMarker(filepath.Join(dir, envFileDirMarkerName)); err != nil {
 		b.Fatal(err)
 	}
 	envFile, err := os.OpenFile(filepath.Join(dir, envFileName), os.O_CREATE|os.O_EXCL|os.O_WRONLY, envFileMode)

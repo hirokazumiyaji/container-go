@@ -38,11 +38,14 @@ func TestStreamClassifiesRelativePermissionStartErrorAsSetup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not enforce Unix executable permission bits")
 	}
-	dir, err := os.MkdirTemp(".", ".stream-setup-test-*")
+	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir, err := filepath.Rel(wd, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	relative := filepath.Join(dir, "backend")
 	if err := os.WriteFile(relative, []byte("not executable"), 0o600); err != nil {
 		t.Fatal(err)

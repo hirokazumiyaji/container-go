@@ -721,7 +721,7 @@ func validImageDigest(digest string) bool {
 	}
 	algorithm := strings.ToLower(digest[:i])
 	encoded := digest[i+1:]
-	wantLength := 0
+	var wantLength int
 	switch algorithm {
 	case "sha256":
 		wantLength = 64

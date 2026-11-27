@@ -207,14 +207,15 @@ func TestFormatCLIErrorKeepsDiagnosticTailWhenRedactorValueIsOversized(t *testin
 		t.Fatal("formatted error contains the oversized redactor value")
 	}
 	if !strings.Contains(got, "closing diagnostic") {
-		t.Fatalf("formatted error lost the trailing diagnostic: %q", tailOf(got, 200))
+		t.Fatalf("formatted error lost the trailing diagnostic: %q", tailOf(got))
 	}
 	if strings.Contains(got, "opening diagnostic") {
-		t.Fatalf("formatted error retained more than the trailing window: %q", tailOf(got, 200))
+		t.Fatalf("formatted error retained more than the trailing window: %q", tailOf(got))
 	}
 }
 
-func tailOf(s string, n int) string {
+func tailOf(s string) string {
+	const n = 200
 	if len(s) <= n {
 		return s
 	}
@@ -249,16 +250,16 @@ func TestSafeErrorRedactsCallerValueSplitAtRenderedTailBoundary(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			safe := WithRedactor(wrapped, NewContextRedactor(secret))
 			if strings.Contains(safe.Error(), secret) || strings.Contains(safe.Error(), secret[len(secret)/2:]) {
-				t.Fatalf("safe error = %q, contains a caller value split at the rendered boundary", tailOf(safe.Error(), 200))
+				t.Fatalf("safe error = %q, contains a caller value split at the rendered boundary", tailOf(safe.Error()))
 			}
 			if !strings.Contains(safe.Error(), "next diagnostic") {
-				t.Fatalf("safe error = %q, lost the diagnostic after the caller value", tailOf(safe.Error(), 200))
+				t.Fatalf("safe error = %q, lost the diagnostic after the caller value", tailOf(safe.Error()))
 			}
 			if name == "joined" && !strings.Contains(safe.Error(), "sibling diagnostic") {
-				t.Fatalf("joined safe error lost a non-CLI diagnostic: %q", tailOf(safe.Error(), 200))
+				t.Fatalf("joined safe error lost a non-CLI diagnostic: %q", tailOf(safe.Error()))
 			}
 			if name == "suffixed wrap" && !strings.Contains(safe.Error(), "container logs: tail") {
-				t.Fatalf("wrapped safe error lost the wrapper context: %q", tailOf(safe.Error(), 200))
+				t.Fatalf("wrapped safe error lost the wrapper context: %q", tailOf(safe.Error()))
 			}
 		})
 	}
@@ -295,7 +296,7 @@ func TestFormatCLIErrorRedactsOrphanedPEMEnd(t *testing.T) {
 		}
 	}
 	if !strings.Contains(got, "No such container: myctr") {
-		t.Fatalf("formatted error lost the diagnostic after the orphaned key: %q", tailOf(got, 200))
+		t.Fatalf("formatted error lost the diagnostic after the orphaned key: %q", tailOf(got))
 	}
 }
 
@@ -307,10 +308,10 @@ func TestTailBufferDropsPartialLeadingLineAfterOverflow(t *testing.T) {
 	}
 	got := buffer.String()
 	if strings.Contains(got, "partial-secret") {
-		t.Fatalf("tail buffer = %q, retained a value with a discarded prefix", tailOf(got, 200))
+		t.Fatalf("tail buffer = %q, retained a value with a discarded prefix", tailOf(got))
 	}
 	if !strings.Contains(got, "next diagnostic") {
-		t.Fatalf("tail buffer = %q, lost the diagnostic line after the discarded prefix", tailOf(got, 200))
+		t.Fatalf("tail buffer = %q, lost the diagnostic line after the discarded prefix", tailOf(got))
 	}
 }
 
@@ -351,10 +352,10 @@ func TestErrorsAsDoesNotExposeOrphanedPEMBody(t *testing.T) {
 		t.Fatal("errors.As did not find *CLIError")
 	}
 	if strings.Contains(got.Stderr, body) {
-		t.Fatalf("errors.As CLIError.Stderr = %q, contains an orphaned PEM body", tailOf(got.Stderr, 200))
+		t.Fatalf("errors.As CLIError.Stderr = %q, contains an orphaned PEM body", tailOf(got.Stderr))
 	}
 	if !strings.Contains(got.Stderr, "No such container: myctr") {
-		t.Fatalf("errors.As CLIError.Stderr = %q, lost the diagnostic after the orphaned key", tailOf(got.Stderr, 200))
+		t.Fatalf("errors.As CLIError.Stderr = %q, lost the diagnostic after the orphaned key", tailOf(got.Stderr))
 	}
 }
 
@@ -369,9 +370,9 @@ func TestCommandErrorKeepsDiagnosticAfterCarriageReturnProgress(t *testing.T) {
 		t.Fatalf("error = %T %v, want *CLIError", err, err)
 	}
 	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
-		t.Fatalf("CLIError.Stderr = %q, lost the diagnostic after carriage-return progress", tailOf(cliErr.Stderr, 200))
+		t.Fatalf("CLIError.Stderr = %q, lost the diagnostic after carriage-return progress", tailOf(cliErr.Stderr))
 	}
 	if !strings.Contains(err.Error(), "No such container: myctr") {
-		t.Fatalf("error = %q, lost the diagnostic after carriage-return progress", tailOf(err.Error(), 200))
+		t.Fatalf("error = %q, lost the diagnostic after carriage-return progress", tailOf(err.Error()))
 	}
 }

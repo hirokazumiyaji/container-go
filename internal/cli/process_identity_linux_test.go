@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"os/exec"
 	"syscall"
@@ -10,7 +11,7 @@ import (
 )
 
 func TestLinuxProcessIdentityDoesNotClaimExitedChild(t *testing.T) {
-	cmd := exec.Command(writeStub(t, `exit 0`))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, `exit 0`))
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +36,7 @@ func TestLinuxProcessIdentityDoesNotClaimExitedChild(t *testing.T) {
 }
 
 func TestLinuxProcessIdentityDoesNotUseRecycledPIDAfterReap(t *testing.T) {
-	cmd := exec.Command(writeStub(t, `exit 0`))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, `exit 0`))
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +86,7 @@ func (*ownershipLossIdentity) close() {}
 // This models cmd.Wait winning the reap race after SIGSTOP: waitid no longer
 // exposes a stopped state, so termination must use only the pidfd reference.
 func TestLinuxTerminationInterleavingWithWaitReapUsesPidfd(t *testing.T) {
-	cmd := exec.Command("sleep", "5")
+	cmd := exec.CommandContext(context.Background(), "sleep", "5")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +123,7 @@ func (reapedKillIdentity) kill() error { return syscall.ESRCH }
 // ESRCH. That is a proven termination, so it must not be reported as a failure
 // to prove one.
 func TestLinuxTerminationAcceptsReapedChildAfterGroupKill(t *testing.T) {
-	cmd := exec.Command(writeStub(t, `sleep 5`))
+	cmd := exec.CommandContext(context.Background(), writeStub(t, `sleep 5`))
 	configureProcessTree(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

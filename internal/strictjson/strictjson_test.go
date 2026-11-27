@@ -140,7 +140,7 @@ func TestArrayAllowsNullForUnlistedFields(t *testing.T) {
 	type loose struct {
 		Labels map[string]string   `json:"Labels"`
 		Ports  map[string][]string `json:"Ports"`
-		State  *struct {           //nolint:unused // shape only
+		State  *struct {          
 			Status string `json:"Status"`
 		} `json:"State"`
 	}

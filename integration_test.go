@@ -65,7 +65,7 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	conn, err := net.DialTimeout("tcp", endpoint, 5*time.Second)
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(context.Background(), "tcp", endpoint)
 	if err != nil {
 		t.Fatalf("dial %s: %v", endpoint, err)
 	}
@@ -278,7 +278,7 @@ func TestIntegrationLazyInspectStateAndWaitRollback(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error when HTTP wait cannot succeed")
 	}
-	if out, inspectErr := exec.Command("container", "inspect", name).CombinedOutput(); inspectErr == nil {
+	if out, inspectErr := exec.CommandContext(context.Background(), "container", "inspect", name).CombinedOutput(); inspectErr == nil {
 		t.Fatalf("container still present after wait rollback: %s", out)
 	}
 }
@@ -325,7 +325,7 @@ func TestIntegrationReuseSharedAcrossProcesses(t *testing.T) {
 	}()
 
 	startChild := func() *exec.Cmd {
-		cmd := exec.Command(os.Args[0], "-test.run", "^TestIntegrationReuseSharedAcrossProcesses$")
+		cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run", "^TestIntegrationReuseSharedAcrossProcesses$")
 		cmd.Env = append(os.Environ(),
 			"CONTAINERGO_REUSE_CHILD=1",
 			"CONTAINERGO_REUSE_GROUP="+group,

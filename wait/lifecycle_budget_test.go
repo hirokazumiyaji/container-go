@@ -41,7 +41,7 @@ func (t *budgetLogProbeTarget) Running(ctx context.Context) (bool, error) {
 
 func (t *budgetLogProbeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	if t.streamErr != nil {
-		return budgetErrorReader{err: t.streamErr}, nil
+		return budgetErrorReader{err: t.streamErr}, nil //nolint:nilerr // the stream reader delivers the error on Read.
 	}
 	return io.NopCloser(strings.NewReader("")), nil
 }

@@ -85,8 +85,8 @@ func (c *imageCache) get(eng engine, image, platform string) (imageIdentity, boo
 }
 
 // seen reports whether a fresh entry exists for key.
-func (c *imageCache) seen(eng engine, image, platform string) bool {
-	_, ok := c.get(eng, image, platform)
+func (c *imageCache) seen(image, platform string) bool { //nolint:unparam // platform is part of the cache key contract
+	_, ok := c.get(dockerEngine{}, image, platform)
 	return ok
 }
 
@@ -96,8 +96,8 @@ func (c *imageCache) seen(eng engine, image, platform string) bool {
 // image references does not retain dead keys forever; seen() already
 // drops an expired key on lookup, but keys that are never queried again
 // would otherwise linger until the Option itself is discarded.
-func (c *imageCache) remember(eng engine, image, platform string) {
-	c.rememberIdentity(eng, image, platform, imageIdentity{reference: image})
+func (c *imageCache) remember(image, platform string) { //nolint:unparam // platform is part of the cache key contract
+	c.rememberIdentity(dockerEngine{}, image, platform, imageIdentity{reference: image})
 }
 
 // rememberIdentity records that the image is present along with its

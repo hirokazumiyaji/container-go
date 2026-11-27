@@ -445,7 +445,7 @@ func TestCleanupErrorMatchesSentinelAndCause(t *testing.T) {
 	}
 	// Is classifies the sentinel without changing the historical Unwrap
 	// result that callers inspecting the chain directly may rely on.
-	if got := errors.Unwrap(cleanup); got != cleanupErr {
+	if got := errors.Unwrap(cleanup); got != cleanupErr { //nolint:errorlint // pins the exact Unwrap result, not errors.Is
 		t.Fatalf("errors.Unwrap(cleanup) = %v, want the cleanup cause", got)
 	}
 }

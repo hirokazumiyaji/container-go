@@ -58,7 +58,7 @@ func stopProcessHelper(cmd *exec.Cmd, waitDone <-chan struct{}) error {
 }
 
 func TestTerminateProcessTreeUsesRetainedProcessHandle(t *testing.T) {
-	cmd := exec.Command(os.Args[0], "-test.run=^TestTerminateProcessTreeHelper$")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestTerminateProcessTreeHelper$")
 	cmd.Env = append(os.Environ(), terminateProcessTreeHelperEnv+"=1")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -112,7 +112,7 @@ func TestRetainedProcessTreeExitCancelHandoffUsesOriginalHandle(t *testing.T) {
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
 	releasePath := filepath.Join(dir, "release")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestRetainedProcessTreeExitHelper$")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestRetainedProcessTreeExitHelper$")
 	cmd.Env = append(os.Environ(),
 		retainedHandoffHelperEnv+"=1",
 		retainedHandoffReadyEnv+"="+readyPath,

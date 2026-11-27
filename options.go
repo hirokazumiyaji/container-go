@@ -547,8 +547,9 @@ func runnerIsNil(r Runner) bool {
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
+	default:
+		return false
 	}
-	return false
 }
 
 // runnerWithBinary returns a runner that runs binary. A caller-owned
@@ -1333,8 +1334,9 @@ func nilInterface(value reflect.Value) bool {
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
+	default:
+		return false
 	}
-	return false
 }
 
 // MountType selects how a Mount is backed.

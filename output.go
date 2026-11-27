@@ -374,7 +374,7 @@ func outputDeliveryErrors(err error) error {
 	var found []error
 	var walk func(error)
 	walk = func(cur error) {
-		switch e := cur.(type) {
+		switch e := cur.(type) { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		case nil:
 		case *cli.OutputError:
 			found = append(found, e)

@@ -54,7 +54,7 @@ func requireDocker(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
-	if err := exec.Command("docker", "version").Run(); err != nil {
+	if err := exec.CommandContext(context.Background(), "docker", "version").Run(); err != nil {
 		t.Skip("docker daemon not running")
 	}
 }

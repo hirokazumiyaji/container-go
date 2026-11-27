@@ -265,12 +265,12 @@ func TestAmbiguousStderrPreservesOriginalCLIError(t *testing.T) {
 		ExitCode: 1,
 		Stderr:   "permission denied: not found",
 	}
-	if got := wrapNotFound(original); got != original {
+	if got := wrapNotFound(original); got != original { //nolint:errorlint // identity, not membership
 		t.Fatalf("wrapNotFound() = %v, want original CLIError", got)
 	}
 
 	wrapped := errors.Join(original, errors.New("diagnostic context"))
-	if got := wrapNotFound(wrapped); got != wrapped {
+	if got := wrapNotFound(wrapped); got != wrapped { //nolint:errorlint // identity, not membership
 		t.Fatalf("wrapNotFound(wrapped) = %v, want wrapped original", got)
 	}
 }

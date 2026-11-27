@@ -26,7 +26,7 @@ func requireDockerPruneIntegration(t *testing.T) {
 
 func runDockerPruneCommand(t *testing.T, args ...string) string {
 	t.Helper()
-	out, err := exec.Command("docker", args...).CombinedOutput()
+	out, err := exec.CommandContext(context.Background(), "docker", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker %s: %v: %s", strings.Join(args, " "), err, out)
 	}
@@ -34,7 +34,7 @@ func runDockerPruneCommand(t *testing.T, args ...string) string {
 }
 
 func inspectDockerContainerState(name string) (string, bool, error) {
-	out, err := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", name).CombinedOutput()
+	out, err := exec.CommandContext(context.Background(), "docker", "inspect", "--format", "{{.State.Status}}", name).CombinedOutput()
 	if err == nil {
 		return strings.TrimSpace(string(out)), true, nil
 	}
@@ -98,7 +98,7 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 
 	if err := pullWith(ctx, &cli.ExecRunner{Binary: "docker"}, dockerEngine{}, integrationAlpine); err != nil {
 		if integrationtest.DockerPullRateLimited(err) {
-			if _, inspectErr := exec.Command("docker", "image", "inspect", integrationAlpine).Output(); inspectErr != nil {
+			if _, inspectErr := exec.CommandContext(context.Background(), "docker", "image", "inspect", integrationAlpine).Output(); inspectErr != nil {
 				t.Skipf("docker pull rate-limited and image not locally available: %v", err)
 			}
 		} else {
@@ -122,7 +122,7 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	names := []string{createdName, exitedName, runningName, unmanagedName, otherManagedName}
 	t.Cleanup(func() {
 		for _, name := range names {
-			_ = exec.Command("docker", "rm", "--force", name).Run()
+			_ = exec.CommandContext(context.Background(), "docker", "rm", "--force", name).Run()
 		}
 	})
 
@@ -221,7 +221,7 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 // limitation rather than a fabricated dead fixture.
 func TestIntegrationDockerPruneDeadStatusFilterAvailability(t *testing.T) {
 	requireDockerPruneIntegration(t)
-	out, err := exec.Command("docker", "ps", "--all", "--quiet", "--filter", "label="+managedLabel+"=true", "--filter", "status=dead").CombinedOutput()
+	out, err := exec.CommandContext(context.Background(), "docker", "ps", "--all", "--quiet", "--filter", "label="+managedLabel+"=true", "--filter", "status=dead").CombinedOutput()
 	if err != nil {
 		t.Fatalf("docker rejected status=dead: %v: %s", err, out)
 	}

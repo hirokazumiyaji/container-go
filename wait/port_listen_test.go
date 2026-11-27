@@ -41,7 +41,7 @@ func (t *portListenTarget) ContainerPortStatus(_ context.Context, port string) (
 // Docker port proxy whose container process is not listening yet.
 func startProxyOnlyListener(t *testing.T) net.Listener {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

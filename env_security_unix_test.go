@@ -1794,7 +1794,7 @@ func TestCleanupStaleEnvFilesRepairsMarkerBeforeLock(t *testing.T) {
 	if err := os.Chmod(staging, envDirMode); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeEnvMarker(filepath.Join(staging, envFileDirMarkerName), envFileDirMarker); err != nil {
+	if err := writeEnvMarker(filepath.Join(staging, envFileDirMarkerName)); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-2 * envFileStagingStaleAfter)
@@ -1936,7 +1936,7 @@ func newMarkedStaleEnvDir(t *testing.T, root, suffix string) (string, *os.File) 
 	if err := os.Chmod(dir, envDirMode); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeEnvMarker(filepath.Join(dir, envFileDirMarkerName), envFileDirMarker); err != nil {
+	if err := writeEnvMarker(filepath.Join(dir, envFileDirMarkerName)); err != nil {
 		t.Fatal(err)
 	}
 	lock, err := openEnvFileNoFollow(filepath.Join(dir, envFileLockName), os.O_CREATE|os.O_RDWR, envFileMode)

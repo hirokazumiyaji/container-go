@@ -5,12 +5,34 @@ run:
     - integration
 
 linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - gocritic
+    - nilerr
+    - nilnesserr
+    - noctx
+    - nolintlint
+    - rowserrcheck
+    - sqlclosecheck
+    - unparam
+    - usetesting
+    - wastedassign
   settings:
     errcheck:
       # Best-effort cleanup calls; failures are intentionally ignored.
       exclude-functions:
         - (io.Closer).Close
         - os.RemoveAll
+    exhaustive:
+      # A switch that names a default case deliberately handles the unlisted
+      # values; this only reports switches that silently fall through.
+      default-signifies-exhaustive: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
   exclusions:
     rules:
       - path: _test\.go

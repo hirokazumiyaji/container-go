@@ -2163,7 +2163,7 @@ func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.mode, func(t *testing.T) {
 			d := &dockerRunner{fakeRunner: newTestRunner()}
-			inspectJSON := ""
+			var inspectJSON string
 			if tc.mode == dockerNetworkNone {
 				// Docker creates no endpoint for none networking, so the
 				// reported network map is empty. A synthetic "none"
@@ -2620,7 +2620,7 @@ func TestDockerHostModeHostReturnsDaemonHostWithoutInventingPort(t *testing.T) {
 	}
 }
 
-func argvValue(args []string, flag string) string {
+func argvValue(args []string, flag string) string { //nolint:unparam // the flag name stays explicit at call sites
 	for i, arg := range args {
 		if arg == flag && i+1 < len(args) {
 			return args[i+1]

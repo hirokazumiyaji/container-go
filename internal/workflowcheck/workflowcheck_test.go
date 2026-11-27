@@ -150,7 +150,7 @@ func TestCheckoutDoesNotPersistCredentials(t *testing.T) {
 			if !strings.Contains(line, "actions/checkout@") {
 				continue
 			}
-			if !checkoutWithHas(lines, i, "persist-credentials: false") {
+			if !checkoutWithHas(lines, i) {
 				t.Errorf("%s:%d: checkout does not set persist-credentials: false", path, i+1)
 			}
 		}
@@ -166,7 +166,7 @@ func TestCheckoutWithRequiresPersistCredentialsInWith(t *testing.T) {
 		"      - run: echo persist-credentials: false",
 		"      - uses: actions/setup-go@0123456789abcdef0123456789abcdef01234567",
 	}
-	if checkoutWithHas(missing, 0, "persist-credentials: false") {
+	if checkoutWithHas(missing, 0) {
 		t.Fatal("literal outside checkout with: must not count")
 	}
 
@@ -176,7 +176,7 @@ func TestCheckoutWithRequiresPersistCredentialsInWith(t *testing.T) {
 		"          # persist-credentials: false",
 		"          fetch-depth: 1",
 	}
-	if checkoutWithHas(commentOnly, 0, "persist-credentials: false") {
+	if checkoutWithHas(commentOnly, 0) {
 		t.Fatal("comment inside with: must not count as the option")
 	}
 
@@ -186,7 +186,7 @@ func TestCheckoutWithRequiresPersistCredentialsInWith(t *testing.T) {
 		"          persist-credentials: false",
 		"      - uses: actions/setup-go@0123456789abcdef0123456789abcdef01234567",
 	}
-	if !checkoutWithHas(good, 0, "persist-credentials: false") {
+	if !checkoutWithHas(good, 0) {
 		t.Fatal("with: persist-credentials: false must count")
 	}
 }
@@ -588,9 +588,11 @@ func stepKeyIndent(usesLine string) int {
 	return dash + 1 + leadingSpaces(rest)
 }
 
-// checkoutWithHas reports whether the checkout step at usesIdx sets want
-// inside its with: mapping. Later steps, comments, and run scripts are ignored.
-func checkoutWithHas(lines []string, usesIdx int, want string) bool {
+// checkoutWithHas reports whether the checkout step at usesIdx sets
+// persist-credentials: false inside its with: mapping. Later steps, comments,
+// and run scripts are ignored.
+func checkoutWithHas(lines []string, usesIdx int) bool {
+	const want = "persist-credentials: false"
 	keyIndent := stepKeyIndent(lines[usesIdx])
 	listIndent := leadingSpaces(lines[usesIdx])
 	inWith := false
@@ -719,4 +721,3 @@ func TestDependabotTracksToolsModule(t *testing.T) {
 		t.Fatalf("%s must track directory: \"/tools\"", dependabotPath)
 	}
 }
-

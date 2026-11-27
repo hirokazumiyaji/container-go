@@ -208,12 +208,9 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		// such an error after Next has moved the cursor. One advance is
 		// enough for readiness, and it keeps a large or unbounded result from
 		// extending the probe.
+		defer func() { _ = rows.Close() }()
 		rows.Next()
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		return rows.Close()
+		return rows.Err()
 	})
 }
 

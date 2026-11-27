@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -14,7 +15,7 @@ import (
 // an unrelated running child had stopped and release the process-group kill
 // through the stopped-state barrier.
 func TestDarwinObservesOnlyTheRequestedStoppedChild(t *testing.T) {
-	running := exec.Command(writeStub(t, `exec sleep 30`))
+	running := exec.CommandContext(context.Background(), writeStub(t, `exec sleep 30`))
 	if err := running.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +24,7 @@ func TestDarwinObservesOnlyTheRequestedStoppedChild(t *testing.T) {
 		_ = running.Wait()
 	})
 
-	stopped := exec.Command(writeStub(t, `exec sleep 30`))
+	stopped := exec.CommandContext(context.Background(), writeStub(t, `exec sleep 30`))
 	if err := stopped.Start(); err != nil {
 		t.Fatal(err)
 	}

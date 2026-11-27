@@ -84,7 +84,7 @@ func (c *cpRunner) setBinary(b string) {
 	}
 }
 
-func runCopyDockerTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Container {
+func runCopyDockerTestContainer(t *testing.T, f cli.Runner) *Container {
 	t.Helper()
 	if cr, ok := f.(interface{ setBinary(string) }); ok {
 		cr.setBinary("docker")
@@ -92,7 +92,7 @@ func runCopyDockerTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Con
 	if fr, ok := f.(*fakeRunner); ok {
 		fr.binary = "docker"
 	}
-	return runTestContainer(t, f, append([]Option{withEngine(dockerEngine{})}, opts...)...)
+	return runTestContainer(t, f, withEngine(dockerEngine{}))
 }
 
 func skipIfCopyFileOpenUnsupported(t *testing.T) {

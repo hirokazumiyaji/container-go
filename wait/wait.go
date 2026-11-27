@@ -488,7 +488,9 @@ func carriesContextCause(err error) bool {
 }
 
 func isContextSentinel(err error) bool {
-	return err == context.Canceled || err == context.DeadlineExceeded
+	// Deliberately node-level: a wrapped context error is classified by the
+	// caller's cause set, not treated as a bare sentinel here.
+	return err == context.Canceled || err == context.DeadlineExceeded //nolint:errorlint // identity check on the sentinel itself
 }
 
 // causeSet separates what a retained cause renders from what it classifies.
@@ -524,7 +526,8 @@ func collectNonContext(err error, set *causeSet) {
 			return
 		}
 	}
-	if dns, ok := err.(*net.DNSError); ok {
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
 		if retained := retainDNSErrorCause(dns); retained != nil {
 			set.diagnostics = append(set.diagnostics, retained)
 			return
@@ -882,7 +885,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 
 	probeState := func() error {
 		if time.Since(lastStateCheck) < stateCheckInterval || waitCtx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // throttled or cancelled probe: no state error to report
 		}
 		lastStateCheck = time.Now()
 		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)

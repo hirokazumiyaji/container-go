@@ -380,6 +380,7 @@ func (f pruneAgeFilter) admits(createdAt time.Time) bool {
 // pruneListed lists candidates and removes each still-current candidate.
 // Apple candidates carry list-time ownership/state metadata and are
 // revalidated while the per-name lock is held before a name is deleted.
+//nolint:unparam // errKind names the operation in diagnostics; prune is the only caller today
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string, opts ...PruneOption) ([]string, error) {
 	cfg, err := parsePruneOptions(errKind, opts)
 	if err != nil {

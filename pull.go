@@ -386,6 +386,8 @@ func imageIdentityNeedsLocalAddressCheck(eng engine, identity imageIdentity, pol
 // to the pull policy. It is retained as the error-only helper used by
 // existing internal callers; Run uses ensureImageRef so the immutable
 // identity is carried into the run command.
+//
+//nolint:unparam // image is the caller's reference; tests happen to pass one value
 func (c *config) ensureImage(ctx context.Context, image string) error {
 	if err := c.eng.checkConfig(ctx, c); err != nil {
 		return err

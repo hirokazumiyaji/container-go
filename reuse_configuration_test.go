@@ -344,11 +344,12 @@ func TestReuseConcurrentDifferentConfigurations(t *testing.T) {
 			success, mismatch := 0, 0
 			for range 2 {
 				err := <-results
-				if err == nil {
+				switch {
+				case err == nil:
 					success++
-				} else if errors.Is(err, ErrReuseMismatch) {
+				case errors.Is(err, ErrReuseMismatch):
 					mismatch++
-				} else {
+				default:
 					t.Errorf("unexpected error: %v", err)
 				}
 			}

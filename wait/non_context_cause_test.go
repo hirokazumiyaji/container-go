@@ -919,7 +919,7 @@ func TestCompositeRetainsChildCauseBesideTermination(t *testing.T) {
 			if !errors.Is(err, tc.want) || !errors.Is(err, cause) {
 				t.Fatalf("error = %v, want %v and child cause", err, tc.want)
 			}
-			if tc.want == context.DeadlineExceeded && errors.Is(err, context.Canceled) {
+			if tc.want == context.DeadlineExceeded && errors.Is(err, context.Canceled) { //nolint:errorlint // sentinel identity in the test table
 				t.Fatalf("error = %v, must not match canceled", err)
 			}
 		})

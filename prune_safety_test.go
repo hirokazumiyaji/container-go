@@ -87,7 +87,7 @@ func mustPruneJSON(v any) []byte {
 
 const pruneFixtureSession = "0123456789abcdef"
 
-func pruneFixture(name, creation, state, group string, managed bool) pruneFixtureContainer {
+func pruneFixture(name, creation, state, group string, managed bool) pruneFixtureContainer { //nolint:unparam // managed stays explicit for readability
 	labels := map[string]string{
 		sessionLabel: pruneFixtureSession,
 	}

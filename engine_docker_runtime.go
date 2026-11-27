@@ -494,10 +494,11 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 	resolvedCtx := effectiveCtx
 	var targetHost string
 
-	if e.explicitHost && !e.explicitContext && !clearedHost {
+	switch {
+	case e.explicitHost && !e.explicitContext && !clearedHost:
 		// Explicit host requested by caller takes precedence over ambient context.
 		targetHost = effectiveHost
-	} else if effectiveCtx != "" {
+	case effectiveCtx != "":
 		if runner == nil {
 			return e, &ConfigError{
 				Backend: "docker",
@@ -514,10 +515,10 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		if ctxName != "" {
 			resolvedCtx = ctxName
 		}
-	} else if effectiveHost != "" {
+	case effectiveHost != "":
 		// No context set, explicit or ambient host is target.
 		targetHost = effectiveHost
-	} else if runner != nil {
+	case runner != nil:
 		// Neither context nor host is set (or the host was explicitly
 		// cleared): inspect the active context.
 		ctxName, ctxEndpoint, err := resolveDockerContextEndpoint(ctx, runner, "")
@@ -857,7 +858,7 @@ func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runne
 
 	client, server, err := parseDockerVersionPair(stdout)
 	if err != nil {
-		return fmt.Errorf("%w: invalid Docker client/server version: %v", ErrCopyFileFromContainerUnsupported, err)
+		return fmt.Errorf("%w: invalid Docker client/server version: %w", ErrCopyFileFromContainerUnsupported, err)
 	}
 	minimum := dockerVersion{major: 29, minor: 7, patch: 0}
 	if client.less(minimum) || server.less(minimum) {

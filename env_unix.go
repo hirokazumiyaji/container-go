@@ -187,10 +187,7 @@ func writeEnvFileAt(base string, env map[string]string) (path, dir string, err e
 }
 
 func writeEnvFileAtContext(ctx context.Context, base string, env map[string]string) (path, dir string, err error) {
-	return writeEnvFileAtWithRootContextRunner(ctx, base, env,
-		func(rootCtx context.Context, base string, fn func(context.Context, string) error) error {
-			return withEnvFileRootContextWithCallback(rootCtx, base, fn)
-		})
+	return writeEnvFileAtWithRootContextRunner(ctx, base, env, withEnvFileRootContextWithCallback)
 }
 
 type envRootRunner func(string, func(string) error) error
@@ -223,7 +220,7 @@ func writeEnvFileAtWithRootContextRunner(ctx context.Context, base string, env m
 	}
 	operationCtx := ctx
 	err = runRoot(ctx, base, func(rootCtx context.Context, root string) error {
-		operationCtx = rootCtx
+		operationCtx = rootCtx //nolint:fatcontext // records the root context for cleanup; no context is derived here.
 		if err := cleanupEnvDirsIfDueContext(rootCtx, root); err != nil {
 			return err
 		}
@@ -310,7 +307,7 @@ func createEnvFileContext(ctx context.Context, root string, env map[string]strin
 	if err := validatePrivateEnvDirIdentity(staging, stagingInfo); err != nil {
 		return path, dir, err
 	}
-	if err := writeEnvMarker(filepath.Join(staging, envFileDirMarkerName), envFileDirMarker); err != nil {
+	if err := writeEnvMarker(filepath.Join(staging, envFileDirMarkerName)); err != nil {
 		return path, dir, err
 	}
 	if err := recordEnvChildInfo(state, envFileDirMarkerName, filepath.Join(staging, envFileDirMarkerName)); err != nil {
@@ -494,7 +491,7 @@ func createEnvFileContext(ctx context.Context, root string, env map[string]strin
 
 	currentRootInfo, err = os.Lstat(root)
 	if err != nil {
-		return path, dir, fmt.Errorf("%w: environment root %q is unavailable after publication: %v", errUnsafeEnvFile, root, err)
+		return path, dir, fmt.Errorf("%w: environment root %q is unavailable after publication: %w", errUnsafeEnvFile, root, err)
 	}
 	if !os.SameFile(rootInfo, currentRootInfo) {
 		return path, dir, fmt.Errorf("%w: environment root %q was replaced after publication", errUnsafeEnvFile, root)
@@ -507,7 +504,7 @@ func createEnvFileContext(ctx context.Context, root string, env map[string]strin
 	}
 	finalInfo, err := os.Lstat(finalDir)
 	if err != nil {
-		return path, dir, fmt.Errorf("%w: environment directory %q is unavailable after publication: %v", errUnsafeEnvFile, finalDir, err)
+		return path, dir, fmt.Errorf("%w: environment directory %q is unavailable after publication: %w", errUnsafeEnvFile, finalDir, err)
 	}
 	state.mu.Lock()
 	if state.dirInfo == nil || !os.SameFile(state.dirInfo, finalInfo) {
@@ -533,7 +530,7 @@ func createEnvFileContext(ctx context.Context, root string, env map[string]strin
 	return path, dir, nil
 }
 
-func writeEnvMarker(path, contents string) (err error) {
+func writeEnvMarker(path string) (err error) {
 	f, err := openEnvFileNoFollow(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, envFileMode)
 	if err != nil {
 		return err
@@ -549,7 +546,7 @@ func writeEnvMarker(path, contents string) (err error) {
 	if err := f.Chmod(envFileMode); err != nil {
 		return err
 	}
-	if err := writeAll(f, contents); err != nil {
+	if err := writeAll(f, envFileDirMarker); err != nil {
 		return err
 	}
 	if err := f.Close(); err != nil {
@@ -681,7 +678,7 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 		currentRootInfo, err := os.Lstat(root)
 		if err != nil {
 			if ownedState {
-				return fmt.Errorf("%w: environment root %q is unavailable: %v", errUnsafeEnvFile, root, err)
+				return fmt.Errorf("%w: environment root %q is unavailable: %w", errUnsafeEnvFile, root, err)
 			}
 			return err
 		}
@@ -740,7 +737,8 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 			state.original = original
 		}
 
-		if state.lock != nil {
+		switch {
+		case state.lock != nil:
 			lock = state.lock
 			stateLock = true
 			lockInfo, err := lock.Stat()
@@ -769,7 +767,7 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 				state.lockAcquired = true
 			}
 			lockAcquired = true
-		} else if state.pending {
+		case state.pending:
 			// A pending retry may have already removed the lock while
 			// removing an earlier child. If it is still present, validate
 			// and acquire it before touching any remaining child.
@@ -796,7 +794,7 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 				stateLock = true
 				lockAcquired = true
 			}
-		} else {
+		default:
 			return fmt.Errorf("environment cleanup: directory %q has no owned lock", dir)
 		}
 		if lock != nil && !lockAcquired {
@@ -908,7 +906,7 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 		if cleanupErr == nil && !dirExists && state.root != "" && state.rootInfo != nil {
 			currentRootInfo, rootStatErr := os.Lstat(state.root)
 			if rootStatErr != nil {
-				cleanupErr = fmt.Errorf("%w: environment root %q is unavailable during cleanup finalization: %v", errUnsafeEnvFile, state.root, rootStatErr)
+				cleanupErr = fmt.Errorf("%w: environment root %q is unavailable during cleanup finalization: %w", errUnsafeEnvFile, state.root, rootStatErr)
 			} else if !os.SameFile(state.rootInfo, currentRootInfo) {
 				cleanupErr = fmt.Errorf("%w: environment root %q was replaced during cleanup finalization", errUnsafeEnvFile, state.root)
 			}
@@ -921,7 +919,8 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 				clearEnvCleanupState(state)
 			}
 		} else if state.root != "" {
-			if removeStarted || renamed {
+			switch {
+			case removeStarted || renamed:
 				state.pending = true
 				pendingEnvCleanups.Store(state.original, state)
 				if state.path != state.original {
@@ -931,7 +930,7 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 				if state.path != state.original {
 					deleteEnvCleanupActiveKey(state.path, state)
 				}
-			} else if wasPending {
+			case wasPending:
 				// A pending retry that still cannot make progress stays
 				// pending; it must not be downgraded to a live writer.
 				pendingEnvCleanups.Store(state.original, state)
@@ -942,7 +941,7 @@ func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOption
 				if state.path != state.original {
 					deleteEnvCleanupActiveKey(state.path, state)
 				}
-			} else {
+			default:
 				// Validation failed before the hand-off. Keep the live
 				// writer state intact rather than weakening marker checks on
 				// a later retry.
@@ -1412,7 +1411,7 @@ func envRootComponentPaths(root string) []string {
 func captureEnvRootPathIdentity(root string) (envRootPathIdentity, error) {
 	canonical, err := canonicalEnvPath(root)
 	if err != nil {
-		return envRootPathIdentity{}, fmt.Errorf("%w: canonical environment root %q: %v", errUnsafeEnvFile, root, err)
+		return envRootPathIdentity{}, fmt.Errorf("%w: canonical environment root %q: %w", errUnsafeEnvFile, root, err)
 	}
 	if canonical != root {
 		return envRootPathIdentity{}, fmt.Errorf("%w: environment root %q was not canonical", errUnsafeEnvFile, root)
@@ -1424,7 +1423,7 @@ func captureEnvRootPathIdentity(root string) (envRootPathIdentity, error) {
 	for _, path := range envRootComponentPaths(root) {
 		info, statErr := os.Lstat(path)
 		if statErr != nil {
-			return envRootPathIdentity{}, fmt.Errorf("%w: inspect environment root component %q: %v", errUnsafeEnvFile, path, statErr)
+			return envRootPathIdentity{}, fmt.Errorf("%w: inspect environment root component %q: %w", errUnsafeEnvFile, path, statErr)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return envRootPathIdentity{}, fmt.Errorf("%w: environment root component %q is not a real directory", errUnsafeEnvFile, path)
@@ -1444,7 +1443,7 @@ func captureEnvRootPathIdentity(root string) (envRootPathIdentity, error) {
 func (identity envRootPathIdentity) validate() error {
 	canonical, err := canonicalEnvPath(identity.root)
 	if err != nil {
-		return fmt.Errorf("%w: canonical environment root %q changed: %v", errUnsafeEnvFile, identity.root, err)
+		return fmt.Errorf("%w: canonical environment root %q changed: %w", errUnsafeEnvFile, identity.root, err)
 	}
 	if canonical != identity.root {
 		return fmt.Errorf("%w: environment root %q is no longer canonical", errUnsafeEnvFile, identity.root)
@@ -1455,7 +1454,7 @@ func (identity envRootPathIdentity) validate() error {
 	for _, component := range identity.components {
 		info, statErr := os.Lstat(component.path)
 		if statErr != nil {
-			return fmt.Errorf("%w: environment root component %q changed: %v", errUnsafeEnvFile, component.path, statErr)
+			return fmt.Errorf("%w: environment root component %q changed: %w", errUnsafeEnvFile, component.path, statErr)
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("%w: environment root component %q is no longer a real directory", errUnsafeEnvFile, component.path)
@@ -1530,7 +1529,7 @@ func withEnvFileRootContextWithCloseCallback(ctx context.Context, base string, f
 	if err := rootPathIdentity.validate(); err != nil {
 		return err
 	}
-	if _, err := validateHeldRootMarker(marker, markerPath); err != nil {
+	if err := validateHeldRootMarker(marker, markerPath); err != nil {
 		return err
 	}
 	if err := validatePrivateDirectory(root); err != nil {
@@ -1543,7 +1542,7 @@ func withEnvFileRootContextWithCloseCallback(ctx context.Context, base string, f
 	callbackErr := fn(ctx, root)
 	currentRootInfo, statErr = os.Lstat(root)
 	if statErr != nil {
-		postCallbackErr := fmt.Errorf("%w: environment root %q disappeared after callback: %v", errUnsafeEnvFile, root, statErr)
+		postCallbackErr := fmt.Errorf("%w: environment root %q disappeared after callback: %w", errUnsafeEnvFile, root, statErr)
 		if callbackErr != nil {
 			return errors.Join(callbackErr, postCallbackErr)
 		}
@@ -1562,7 +1561,7 @@ func withEnvFileRootContextWithCloseCallback(ctx context.Context, base string, f
 		}
 		return identityErr
 	}
-	if _, markerErr := validateHeldRootMarker(marker, markerPath); markerErr != nil {
+	if markerErr := validateHeldRootMarker(marker, markerPath); markerErr != nil {
 		if callbackErr != nil {
 			return errors.Join(callbackErr, markerErr)
 		}
@@ -1574,35 +1573,35 @@ func withEnvFileRootContextWithCloseCallback(ctx context.Context, base string, f
 	return ctx.Err()
 }
 
-func validateHeldRootMarker(f *os.File, path string) (os.FileInfo, error) {
+func validateHeldRootMarker(f *os.File, path string) error {
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := validatePrivateRegularInfo(path, info); err != nil {
-		return nil, err
+		return err
 	}
 	if info.Size() != int64(len(envFileRootLockMarker)) {
-		return nil, fmt.Errorf("%w: environment root marker %q has invalid length", errUnsafeEnvFile, path)
+		return fmt.Errorf("%w: environment root marker %q has invalid length", errUnsafeEnvFile, path)
 	}
 	data := make([]byte, info.Size())
 	if len(data) > 0 {
 		n, readErr := f.ReadAt(data, 0)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, readErr
+			return readErr
 		}
 		if n != len(data) || string(data) != envFileRootLockMarker {
-			return nil, fmt.Errorf("%w: environment root marker %q has invalid contents", errUnsafeEnvFile, path)
+			return fmt.Errorf("%w: environment root marker %q has invalid contents", errUnsafeEnvFile, path)
 		}
 	}
 	pathInfo, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, pathInfo) {
-		return nil, fmt.Errorf("%w: environment root marker %q was replaced", errUnsafeEnvFile, path)
+		return fmt.Errorf("%w: environment root marker %q was replaced", errUnsafeEnvFile, path)
 	}
-	return info, nil
+	return nil
 }
 
 func rootContainsOnlyMarker(root string) (bool, error) {
@@ -1653,7 +1652,7 @@ func openOrCreateRootMarkerContext(ctx context.Context, root, markerPath string)
 		// removing a marker that is still being initialized.
 		f, openErr := openEnvFileNoFollow(markerPath, os.O_RDWR, 0)
 		if openErr != nil {
-			return nil, nil, fmt.Errorf("%w: environment root marker %q is unsafe: %v", errUnsafeEnvFile, markerPath, err)
+			return nil, nil, fmt.Errorf("%w: environment root marker %q is unsafe: %w", errUnsafeEnvFile, markerPath, err)
 		}
 		if lockErr := acquireEnvFileRootLockContext(ctx, f); lockErr != nil {
 			_ = f.Close()
@@ -1662,7 +1661,7 @@ func openOrCreateRootMarkerContext(ctx context.Context, root, markerPath string)
 		// A creator may have completed while this waiter was blocked. In
 		// that case the marker is valid and its child state is legitimate;
 		// do not reject it merely because the root is no longer empty.
-		if _, validateErr := validateHeldRootMarker(f, markerPath); validateErr == nil {
+		if validateErr := validateHeldRootMarker(f, markerPath); validateErr == nil {
 			info, statErr := f.Stat()
 			if statErr != nil {
 				_ = closeEnvFileLock(f)
@@ -1689,7 +1688,7 @@ func openOrCreateRootMarkerContext(ctx context.Context, root, markerPath string)
 			_ = closeEnvFileLock(f)
 			return nil, nil, statErr
 		}
-		if _, validateErr := validateHeldRootMarker(f, markerPath); validateErr != nil {
+		if validateErr := validateHeldRootMarker(f, markerPath); validateErr != nil {
 			_ = closeEnvFileLock(f)
 			return nil, nil, validateErr
 		}
@@ -1749,7 +1748,7 @@ func repairRootMarker(f *os.File, path string) error {
 		return err
 	}
 	if err := validatePrivateRegularInfo(path, info); err != nil {
-		return fmt.Errorf("%w: environment root marker %q is unsafe: %v", errUnsafeEnvFile, path, err)
+		return fmt.Errorf("%w: environment root marker %q is unsafe: %w", errUnsafeEnvFile, path, err)
 	}
 	if info.Size() > int64(len(envFileRootLockMarker)) {
 		return fmt.Errorf("%w: environment root marker %q is too long", errUnsafeEnvFile, path)
@@ -2310,7 +2309,7 @@ func validateEnvDirIdentity(path string, expected os.FileInfo) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: environment directory %q is unavailable: %v", errUnsafeEnvFile, path, err)
+			return fmt.Errorf("%w: environment directory %q is unavailable: %w", errUnsafeEnvFile, path, err)
 		}
 		return err
 	}
@@ -2426,7 +2425,7 @@ func validatePrivateDirectoryInfo(path string, info os.FileInfo) error {
 		return fmt.Errorf("%w: %q is not a directory", errUnsafeEnvFile, path)
 	}
 	if err := validateEnvOwnership(info, currentEnvFileUID(), envDirMode); err != nil {
-		return fmt.Errorf("%w: %q: %v", errUnsafeEnvFile, path, err)
+		return fmt.Errorf("%w: %q: %w", errUnsafeEnvFile, path, err)
 	}
 	return nil
 }
@@ -2444,7 +2443,7 @@ func validatePrivateRegularInfo(path string, info os.FileInfo) error {
 		return fmt.Errorf("%w: %q is not a regular file", errUnsafeEnvFile, path)
 	}
 	if err := validateEnvOwnership(info, currentEnvFileUID(), envFileMode); err != nil {
-		return fmt.Errorf("%w: %q: %v", errUnsafeEnvFile, path, err)
+		return fmt.Errorf("%w: %q: %w", errUnsafeEnvFile, path, err)
 	}
 	return nil
 }
@@ -2474,7 +2473,7 @@ func validateEnvMarkerIfPresent(dir string) error {
 func repairEnvMarker(path, contents string) (err error) {
 	f, err := openEnvFileNoFollow(path, os.O_RDWR, 0)
 	if err != nil {
-		return fmt.Errorf("%w: environment marker %q is unsafe: %v", errUnsafeEnvFile, path, err)
+		return fmt.Errorf("%w: environment marker %q is unsafe: %w", errUnsafeEnvFile, path, err)
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
 	info, err := f.Stat()
@@ -2482,7 +2481,7 @@ func repairEnvMarker(path, contents string) (err error) {
 		return err
 	}
 	if err := validatePrivateRegularInfo(path, info); err != nil {
-		return fmt.Errorf("%w: environment marker %q is unsafe: %v", errUnsafeEnvFile, path, err)
+		return fmt.Errorf("%w: environment marker %q is unsafe: %w", errUnsafeEnvFile, path, err)
 	}
 	if info.Size() > int64(len(contents)) {
 		return fmt.Errorf("%w: environment marker %q is too long", errUnsafeEnvFile, path)

@@ -2,6 +2,7 @@ package examples
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"go/parser"
 	"go/printer"
@@ -274,7 +275,7 @@ func compileDocumentationBlocks(t *testing.T, root string, blocks []documentatio
 		t.Fatal("documentation contains no Go blocks to compile")
 	}
 
-	cmd := exec.Command("go", "test", "-run", "^$", "./...")
+	cmd := exec.CommandContext(context.Background(), "go", "test", "-run", "^$", "./...")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOWORK=off")
 	output, err := cmd.CombinedOutput()

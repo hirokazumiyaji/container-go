@@ -79,7 +79,8 @@ func (r *inspectSequenceRunner) withAppleOwnership(data string) string {
 	return strings.Replace(data, oldLabel, newLabels, 1)
 }
 
-func appleInspectWithNetwork(id, state, address string) string {
+func appleInspectWithNetwork(state, address string) string {
+	const id = "myctr"
 	network := "null"
 	if address != "" {
 		network = fmt.Sprintf(`[{"ipv4Address":%q,"network":"default"}]`, address)
@@ -106,8 +107,8 @@ func appleInspectWithNetwork(id, state, address string) string {
 }
 
 func TestEndpointRefreshesIncompleteCreatedInspect(t *testing.T) {
-	created := appleInspectWithNetwork("myctr", "created", "")
-	running := appleInspectWithNetwork("myctr", "running", "192.168.64.3/24")
+	created := appleInspectWithNetwork("created", "")
+	running := appleInspectWithNetwork("running", "192.168.64.3/24")
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
 	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef", exposed: []portSpec{{Port: 6379, Proto: "tcp"}}}
 
@@ -175,8 +176,8 @@ func TestForHTTPRefreshesCreatedEndpointAndRecoversFromInspectError(t *testing.T
 		t.Fatal(err)
 	}
 
-	created := appleInspectWithNetwork("myctr", "created", "")
-	running := appleInspectWithNetwork("myctr", "running", u.Hostname()+"/32")
+	created := appleInspectWithNetwork("created", "")
+	running := appleInspectWithNetwork("running", u.Hostname()+"/32")
 	transient := errors.New("temporary inspect failure")
 	runner := newInspectSequenceRunner([]inspectStep{
 		{data: created},  // initial state probe
@@ -208,7 +209,7 @@ func TestForHTTPRefreshesCreatedEndpointAndRecoversFromInspectError(t *testing.T
 
 func TestContainerStateCanonicalizesUnknownAppleState(t *testing.T) {
 	runner := newInspectSequenceRunner([]inspectStep{{
-		data: appleInspectWithNetwork("myctr", "future-state", "192.168.64.3/24"),
+		data: appleInspectWithNetwork("future-state", "192.168.64.3/24"),
 	}})
 	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef"}
 

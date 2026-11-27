@@ -22,7 +22,7 @@ func requireDockerRoot(t *testing.T) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
-	if err := exec.Command("docker", "info").Run(); err != nil {
+	if err := exec.CommandContext(context.Background(), "docker", "info").Run(); err != nil {
 		t.Skip("docker daemon not running")
 	}
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
@@ -71,7 +71,7 @@ func waitForDockerVolumeRoot(t *testing.T, name string, wantExists bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("docker", "volume", "inspect", name).CombinedOutput()
+		out, err := exec.CommandContext(context.Background(), "docker", "volume", "inspect", name).CombinedOutput()
 		if err == nil {
 			if wantExists {
 				return
@@ -81,7 +81,7 @@ func waitForDockerVolumeRoot(t *testing.T, name string, wantExists bool) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	out, err := exec.Command("docker", "volume", "inspect", name).CombinedOutput()
+	out, err := exec.CommandContext(context.Background(), "docker", "volume", "inspect", name).CombinedOutput()
 	if err == nil {
 		t.Fatalf("volume %s still exists, want exists=%t: %s", name, wantExists, out)
 	}
@@ -93,7 +93,7 @@ func TestIntegrationDockerFailedCreateRemovesAnonymousVolume(t *testing.T) {
 	name := fmt.Sprintf("containergo-failed-volume-%d-%d", os.Getpid(), time.Now().UnixNano())
 	runner := &failedCreateVolumeRunner{base: &cli.ExecRunner{Binary: "docker"}, name: name}
 	t.Cleanup(func() {
-		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
+		_ = exec.CommandContext(context.Background(), "docker", "rm", "--force", "--volumes", name).Run()
 	})
 
 	_, err := Run(context.Background(), "public.ecr.aws/docker/library/redis:7-alpine",

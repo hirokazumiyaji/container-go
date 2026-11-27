@@ -193,7 +193,7 @@ func TestSafeSystemNotRunningCloneRedactsBothChildren(t *testing.T) {
 		t.Fatalf("system clone is unsafe: %q", system.Error())
 	}
 	for _, child := range []error{system.OriginalError(), system.ProbeError()} {
-		if child == original || child == probe {
+		if child == original || child == probe { //nolint:errorlint // identity assertion; errors.Is would also match the wrapped child this check distinguishes
 			t.Fatalf("accessor returned raw child: %T", child)
 		}
 		if got := errors.Unwrap(child); got != nil {
@@ -239,7 +239,7 @@ func TestClassificationTreePreservesWrapperShapeAndIdentity(t *testing.T) {
 	wrapper := fmt.Errorf("TLS certificate verification failed: %w", safe)
 	tree := classificationErrorTree(wrapper)
 	single, ok := tree.(interface{ Unwrap() error })
-	if !ok || single.Unwrap() != leaf {
+	if !ok || single.Unwrap() != leaf { //nolint:errorlint // identity assertion; errors.Is would also match the wrapped child this check distinguishes
 		t.Fatalf("classification changed single wrapper shape: %T", tree)
 	}
 	if !errors.Is(tree, wrapper) || !errors.Is(tree, leaf) {
@@ -259,15 +259,15 @@ func TestClassificationTreeClonesMutableJoinedChildren(t *testing.T) {
 	original := errors.Join(safe, errors.New("other"))
 	children := original.(interface{ Unwrap() []error }).Unwrap()
 	tree := classificationErrorTree(original)
-	if children[0] != safe {
+	if children[0] != safe { //nolint:errorlint // identity assertion; errors.Is would also match the wrapped child this check distinguishes
 		t.Fatal("classification mutated original children")
 	}
 	classified := tree.(interface{ Unwrap() []error }).Unwrap()
-	if classified[0] != leaf || !errors.Is(tree, original) {
+	if classified[0] != leaf || !errors.Is(tree, original) { //nolint:errorlint // identity assertion; errors.Is would also match the wrapped child this check distinguishes
 		t.Fatal("classification lost joined identity")
 	}
 	classified[0] = errors.New("replacement")
-	if children[0] != safe {
+	if children[0] != safe { //nolint:errorlint // identity assertion; errors.Is would also match the wrapped child this check distinguishes
 		t.Fatal("classification aliases original child slice")
 	}
 }

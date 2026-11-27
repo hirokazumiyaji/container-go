@@ -454,7 +454,8 @@ func (t fixedEndpointWaitTarget) State(context.Context) (wait.State, error) {
 }
 
 func TestWaitTargetHostOnlyFallbackWhenCatIsMissing(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

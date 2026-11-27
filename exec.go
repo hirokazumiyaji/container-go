@@ -493,7 +493,7 @@ func isExecOperationTimeout(err error, cliErr *cli.CLIError) bool {
 // represented by structured evidence rather than workload output. Exec
 // forwards the workload's stderr through CLIError, so diagnostic phrases
 // alone cannot establish that the backend or the CLI invocation failed.
-func isDefinitiveExecError(err error, cliErr *cli.CLIError) bool {
+func isDefinitiveExecError(err error, _ *cli.CLIError) bool {
 	if err == nil {
 		return false
 	}

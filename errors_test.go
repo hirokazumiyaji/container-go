@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 func TestErrPortNotExposedDescribesAllFailureCases(t *testing.T) {
@@ -21,7 +22,7 @@ func TestDockerNetworkErrorsAreDiscriminable(t *testing.T) {
 	if err := dockerNetworkModeError("bridge", "host", nil); !errors.Is(err, ErrNetworkMismatch) {
 		t.Fatalf("mode error = %v, want ErrNetworkMismatch", err)
 	}
-	if err := dockerNetworkEndpointError("none"); !errors.Is(err, ErrPortNotExposed) || !errors.Is(err, ErrNoReachableHost) {
+	if err := domain.NetworkEndpointError("none"); !errors.Is(err, ErrPortNotExposed) || !errors.Is(err, ErrNoReachableHost) {
 		t.Fatalf("none endpoint error = %v, want port and host sentinels", err)
 	}
 }

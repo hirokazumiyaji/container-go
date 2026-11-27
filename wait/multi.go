@@ -317,7 +317,7 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			return errors.Join(append([]error{terminalErr}, append(errs, childErrs...)...)...)
 		}
 	}
-	return safeStrategyError(errors.Join(errs...), s)
+	return errors.Join(errs...)
 }
 
 func finalLifecycleCheck(ctx context.Context, target Target, what string) error {

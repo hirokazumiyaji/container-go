@@ -42,7 +42,7 @@ func DiagnosticValues(strategy Strategy) []string {
 		seen[value] = struct{}{}
 		values = append(values, value)
 	}
-	var collect func(Strategy)
+	var collect func(Strategy) //nolint:staticcheck // recursive closure needs the declaration first
 	collect = func(s Strategy) {
 		if isNilStrategy(s) {
 			return
@@ -54,17 +54,6 @@ func DiagnosticValues(strategy Strategy) []string {
 		} else if provider, ok := s.(DiagnosticSecretProvider); ok {
 			for _, value := range provider.DiagnosticSecrets() {
 				add(value)
-			}
-		} else {
-			switch composite := s.(type) {
-			case *AllStrategy:
-				for _, child := range composite.strategies {
-					collect(child)
-				}
-			case *AnyStrategy:
-				for _, child := range composite.strategies {
-					collect(child)
-				}
 			}
 		}
 	}

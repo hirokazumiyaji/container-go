@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 func TestImagesCompatibleRejectsForeignRegistry(t *testing.T) {
@@ -18,8 +20,8 @@ func TestImagesCompatibleRejectsForeignRegistry(t *testing.T) {
 		{"docker.io/library/redis:7-alpine", "private.example/library/redis:7-alpine"},
 	}
 	for _, tc := range cases {
-		if imagesCompatible(tc.req, tc.act) {
-			t.Errorf("imagesCompatible(%q,%q) = true, want false", tc.req, tc.act)
+		if domain.ImagesCompatible(tc.req, tc.act) {
+			t.Errorf("domain.ImagesCompatible(%q,%q) = true, want false", tc.req, tc.act)
 		}
 	}
 }
@@ -35,17 +37,17 @@ func TestImagesCompatibleAcceptsHubShortForms(t *testing.T) {
 		{"redis:7-alpine", "redis:7-alpine@sha256:abc"},
 	}
 	for _, tc := range cases {
-		if !imagesCompatible(tc.req, tc.act) {
-			t.Errorf("imagesCompatible(%q,%q) = false, want true", tc.req, tc.act)
+		if !domain.ImagesCompatible(tc.req, tc.act) {
+			t.Errorf("domain.ImagesCompatible(%q,%q) = false, want true", tc.req, tc.act)
 		}
 	}
 }
 
 func TestImagesCompatibleDigestRequiresBaseMatch(t *testing.T) {
-	if imagesCompatible("redis:7-alpine@sha256:abc", "evil.example/redis:7-alpine@sha256:abc") {
+	if domain.ImagesCompatible("redis:7-alpine@sha256:abc", "evil.example/redis:7-alpine@sha256:abc") {
 		t.Error("different registry with same digest must not match")
 	}
-	if !imagesCompatible("redis:7-alpine@sha256:abc", "docker.io/library/redis:7-alpine@sha256:abc") {
+	if !domain.ImagesCompatible("redis:7-alpine@sha256:abc", "docker.io/library/redis:7-alpine@sha256:abc") {
 		t.Error("same base and digest must match")
 	}
 }

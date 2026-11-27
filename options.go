@@ -726,7 +726,7 @@ func WithExposedPorts(ports ...string) Option {
 	return func(c *config) error {
 		specs := make([]portSpec, 0, len(ports))
 		for _, p := range ports {
-			spec, err := parsePortSpec(p)
+			spec, err := domain.ParsePortSpec(p)
 			if err != nil {
 				return newValidationError("WithExposedPorts", p, err)
 			}
@@ -1470,10 +1470,6 @@ func (m Mount) arg() string {
 // backends, so a parsed specification is never copied into a parallel struct.
 type portSpec = domain.PortSpec
 
-func parsePortSpec(s string) (portSpec, error) {
-	return domain.ParsePortSpec(s)
-}
-
 // publishSpec is the domain publish value object. Its HostAddr is already
 // parsed, so resolving a connect address does not re-parse the caller's
 // string.
@@ -1488,18 +1484,6 @@ func parsePublishSpec(s string) (publishSpec, error) {
 		return publishSpec{}, err
 	}
 	return spec, nil
-}
-
-func canonicalIP(addr string) string {
-	return domain.CanonicalIP(addr)
-}
-
-func ipIs4(addr string) bool {
-	return domain.IPIs4(addr)
-}
-
-func ipIsUnspecified(addr string) bool {
-	return domain.IPIsUnspecified(addr)
 }
 
 // WithDockerHost overrides the target Docker daemon host (DOCKER_HOST)

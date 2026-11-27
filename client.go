@@ -187,8 +187,8 @@ func WithClientQueryTimeout(d time.Duration) ClientOption {
 	}
 }
 
-// WithClientRunner injects a custom cli.Runner.
-func WithClientRunner(runner cli.Runner) ClientOption {
+// WithClientRunner injects a custom Runner.
+func WithClientRunner(runner Runner) ClientOption {
 	return func(c *clientConfig) error {
 		if runnerIsNil(runner) {
 			return validationErrorf("WithClientRunner", nil, "runner must not be nil")

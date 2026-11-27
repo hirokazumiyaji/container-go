@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // PullPolicy decides when Run fetches the image. PullNever is honored
@@ -688,8 +689,8 @@ func imageRootsCompatible(a, b imageIdentity) bool {
 	if a.repository != "" && b.repository != "" {
 		return imageRepositoriesCompatible(a.repository, b.repository)
 	}
-	abase, bbase := imageReferenceBase(a.reference), imageReferenceBase(b.reference)
-	return abase != "" && bbase != "" && imageRepositoryPathsCompatible(abase, bbase)
+	abase, bbase := domain.ImageReferenceBase(a.reference), domain.ImageReferenceBase(b.reference)
+	return abase != "" && bbase != "" && domain.ImageRepositoryPathsCompatible(abase, bbase)
 }
 
 // imageAddressMissing reports only a backend-confirmed absence. Other
@@ -734,7 +735,7 @@ func (c *config) pinImage(image string, lookup imageLookupResult) (imageIdentity
 	// An unreadable result carries no identity, so it falls through the
 	// unpinned path and fails closed unless the explicit compatibility
 	// fallback applies.
-	requestedDigest := imageDigest(image)
+	requestedDigest := domain.ImageDigest(image)
 	if identity.pinned {
 		if !imageIdentityIsVerified(identity) {
 			return imageIdentity{}, fmt.Errorf("%w: %s (%s returned an identity without repository provenance or a verified local ID)", ErrImageIdentityUnavailable, image, c.eng.name())
@@ -749,7 +750,7 @@ func (c *config) pinImage(image string, lookup imageLookupResult) (imageIdentity
 	// image. Mutable tags remain
 	// available through the explicit compatibility option below; pinned
 	// inputs are verified by resolveInspectedImage before they can run.
-	immutableRequest := isBareImageReference(image) || isRepositoryDigestReference(image)
+	immutableRequest := domain.IsBareImageReference(image) || isRepositoryDigestReference(image)
 	if c.pullPolicy == PullNever && c.eng.capabilities().strictImageIdentity && immutableRequest {
 		return imageIdentity{}, fmt.Errorf("%w: %s (%s image inspect did not confirm the pinned identity)", ErrImageIdentityUnavailable, image, c.eng.name())
 	}
@@ -757,7 +758,7 @@ func (c *config) pinImage(image string, lookup imageLookupResult) (imageIdentity
 	// A bare sha256:... is Docker's image-ID syntax, not proof that the
 	// requested image exists; only a parser that inspected a matching
 	// verified local ID may use that form (handled above).
-	if requestedDigest := imageDigest(image); validImageDigest(requestedDigest) && imageReferenceBase(image) != "" {
+	if requestedDigest := domain.ImageDigest(image); validImageDigest(requestedDigest) && domain.ImageReferenceBase(image) != "" {
 		return imageIdentity{reference: image, digest: requestedDigest, pinned: true}, nil
 	}
 	if c.canUseMutableFallback(image) {
@@ -773,13 +774,13 @@ func imageIdentityIsVerified(identity imageIdentity) bool {
 		return false
 	}
 	if imageID, ok := canonicalDockerImageID(identity.id); ok {
-		return strings.EqualFold(identity.reference, imageID) || imageReferenceBase(identity.reference) != ""
+		return strings.EqualFold(identity.reference, imageID) || domain.ImageReferenceBase(identity.reference) != ""
 	}
 	root := identity.rootDigest
 	if root == "" {
 		root = identity.digest
 	}
-	return validImageDigest(root) && imageReferenceBase(identity.reference) != ""
+	return validImageDigest(root) && domain.ImageReferenceBase(identity.reference) != ""
 }
 
 func identityHasDigest(identity imageIdentity, requested string) bool {
@@ -795,7 +796,7 @@ func identityHasDigest(identity imageIdentity, requested string) bool {
 }
 
 func (c *config) canUseMutableFallback(image string) bool {
-	return c.allowMutableImageTag && !isBareImageReference(image) && !strings.Contains(image, "@")
+	return c.allowMutableImageTag && !domain.IsBareImageReference(image) && !strings.Contains(image, "@")
 }
 
 func mutableImageReference(image string, identity imageIdentity) imageIdentity {

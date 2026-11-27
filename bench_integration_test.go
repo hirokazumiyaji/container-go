@@ -209,19 +209,18 @@ func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image
 		for range 5 {
 			ctr, err := Run(context.Background(), image, benchPortOptions(b, eng)(r)...)
 			if err != nil {
-				for _, started := range containers {
-					_ = started.Terminate(context.Background())
-				}
+				// Run can return a partial handle alongside the error; include
+				// it so the failed iteration does not leave a container behind.
+				terminateBenchContainers(t, append(containers, ctr)...)
 				t.Fatalf("multi iteration %d: %v", i, err)
 			}
 			containers = append(containers, ctr)
 		}
 		elapsed := time.Since(start)
-		for _, ctr := range containers {
-			if err := ctr.Terminate(context.Background()); err != nil {
-				t.Logf("multi iteration %d: terminate: %v", i, err)
-			}
-		}
+		// Count before teardown: Terminate runs its own CLI subprocesses, so
+		// counting afterwards would report teardown work as measured work.
+		spawns := r.count()
+		terminateBenchContainers(t, containers...)
 		identity := observeBenchImage(t, b, image)
 		doc.Results = append(doc.Results, bench.Result{
 			Backend:             b.Name,
@@ -237,7 +236,7 @@ func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image
 			Iterations:          policy.Iterations,
 			Commit:              doc.Env.Commit,
 			DurationNS:          int64(elapsed),
-			Subprocesses:        r.count(),
+			Subprocesses:        spawns,
 		})
 	}
 }
@@ -289,7 +288,6 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 				t.Fatalf("parallel iteration %d: %v", i, err)
 			}
 		}
-		terminateBenchContainers(t, containers...)
 		identity := observeBenchImage(t, b, image)
 		doc.Results = append(doc.Results, bench.Result{
 			Backend:             b.Name,

@@ -11,15 +11,21 @@
 
 Please report security issues privately rather than in a public issue.
 
-The GitHub private vulnerability-reporting URL previously listed here is
-currently unavailable (it returns 404 for this repository). No alternate
-private reporting address is published in this checkout. Security reporting
-is therefore blocked until the maintainer publishes a working private
-channel; please do not open a public issue or use an unverified address.
+GitHub private vulnerability reporting is enabled for this repository. Open
 
-When a working channel is available, include a minimal reproduction,
-affected versions, and impact if known.
+<https://github.com/hirokazumiyaji/container-go/security/advisories>
 
-Once a working channel is available, we aim to acknowledge reports within
-a few days. Fixes are released as patch or minor versions depending on
-severity and API compatibility.
+and select **Report a vulnerability** to start a private advisory. The report
+and the discussion are visible to you, the maintainers, and any collaborator
+the maintainers invite; they are not public until an advisory is published.
+
+If the form is unavailable, open a public issue that asks for a private
+channel without including vulnerability details, `@`-mentioning
+[@hirokazumiyaji](https://github.com/hirokazumiyaji), and wait for an
+invitation before sharing anything sensitive. Do not post a reproduction or
+secret in a public issue, and do not send a report to an address you cannot
+verify belongs to this project.
+
+Include a minimal reproduction, the affected versions, and the impact if
+known. We aim to acknowledge reports within a few days. Fixes are released
+as patch or minor versions depending on severity and API compatibility.

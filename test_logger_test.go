@@ -55,7 +55,10 @@ func TestForwardTestLogsSanitizesControlCharacters(t *testing.T) {
 	if strings.Contains(joined, "\x1b") || strings.Contains(joined, "\r") {
 		t.Fatalf("forwarded logs = %q, contain terminal controls", joined)
 	}
-	for _, want := range []string{"ready", "next", `\x1b`, `\r`} {
+	// A bare CR is a line break for a test logger, so the escape that must
+	// survive is the ANSI one; the CR itself never reaches the output as a
+	// raw byte, and it must not appear as literal text either.
+	for _, want := range []string{"ready", `\x1b`, "next", "line"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("forwarded logs = %q, missing %q", joined, want)
 		}

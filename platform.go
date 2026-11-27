@@ -210,10 +210,29 @@ func dockerPlatformMatches(selector, actual string) bool {
 	return platformSelectorMatches(selector, actual)
 }
 
+// platformSelectorNormalizer is implemented by a backend whose accepted
+// selector spellings differ from the platform spelling it reports. Both the
+// requested selector and the inspected metadata are normalized with the same
+// rules before they are compared.
+type platformSelectorNormalizer interface {
+	normalizePlatformSelector(selector string) string
+}
+
+// normalizedEnginePlatformSelector rewrites selector with the backend's own
+// alias rules. A backend without aliases keeps the caller's spelling.
+func normalizedEnginePlatformSelector(eng engine, selector string) string {
+	normalizer, ok := eng.(platformSelectorNormalizer)
+	if !ok {
+		return selector
+	}
+	return normalizer.normalizePlatformSelector(selector)
+}
+
 func enginePlatformCompatible(eng engine, selector string, info *engineInfo) bool {
 	if info == nil {
 		return false
 	}
+	selector = normalizedEnginePlatformSelector(eng, selector)
 	if info.platformMeta.valid {
 		return platformMetadataMatches(selector, info.platformMeta)
 	}

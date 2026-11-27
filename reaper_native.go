@@ -213,24 +213,34 @@ func (n *nativeReaper) diagnostic(format string, args ...any) {
 }
 
 // reap starts entries through a bounded worker pool. The overall budget is
-// armed when EOF reached the loop and is checked before a start and again
-// after waiting for a free worker, so a long-lived parent cannot spend it.
+// armed when EOF reached the loop and its context is passed to every worker,
+// so a start, a semaphore wait, a lock wait, a pending retry, and a backend
+// command all stop when it expires instead of running past it.
 func (n *nativeReaper) reap(entries []nativeReaperEntry) {
 	if len(entries) == 0 {
 		return
 	}
-	startedAt := time.Now()
-	expired := func() bool { return time.Since(startedAt) >= n.budget }
+	budgetCtx, cancel := context.WithTimeout(context.Background(), n.budget)
+	defer cancel()
 	sem := make(chan struct{}, n.parallel)
 	var wg sync.WaitGroup
 	remaining := 0
 	for i, entry := range entries {
-		if expired() {
+		if budgetCtx.Err() != nil {
 			remaining = len(entries) - i
 			break
 		}
-		sem <- struct{}{}
-		if expired() {
+		select {
+		case sem <- struct{}{}:
+		case <-budgetCtx.Done():
+			remaining = len(entries) - i
+		}
+		if remaining > 0 {
+			break
+		}
+		// A worker may have finished while this start waited for a slot, so
+		// recheck the budget before spawning.
+		if budgetCtx.Err() != nil {
 			<-sem
 			remaining = len(entries) - i
 			break
@@ -239,7 +249,7 @@ func (n *nativeReaper) reap(entries []nativeReaperEntry) {
 		go func(entry nativeReaperEntry) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			n.processEntry(entry)
+			n.processEntry(budgetCtx, entry)
 		}(entry)
 	}
 	if remaining > 0 {
@@ -252,7 +262,10 @@ func (n *nativeReaper) reap(entries []nativeReaperEntry) {
 // a validated name or immutable ID, a name-addressed entry must hold the
 // shared name lock, and a generation entry must observe its exact creation
 // generation before anything is deleted.
-func (n *nativeReaper) processEntry(entry nativeReaperEntry) {
+func (n *nativeReaper) processEntry(ctx context.Context, entry nativeReaperEntry) {
+	if ctx.Err() != nil {
+		return
+	}
 	if entry.id == "" || entry.shared || (entry.pending && entry.creation == "") {
 		return
 	}
@@ -276,7 +289,7 @@ func (n *nativeReaper) processEntry(entry nativeReaperEntry) {
 			return
 		}
 	} else {
-		release, err := lockReaperName(entry.lockPath, n.lockTimeout)
+		release, err := lockReaperName(ctx, entry.lockPath, n.lockTimeout)
 		switch {
 		case errors.Is(err, errReaperLockSkipped):
 			return
@@ -284,6 +297,11 @@ func (n *nativeReaper) processEntry(entry nativeReaperEntry) {
 			n.diagnostic("container-go: reaper lock timed out; skipping one entry")
 			return
 		case err != nil:
+			if ctx.Err() != nil {
+				// The budget expired while waiting for the lock. The reap
+				// loop already reports every entry it did not start.
+				return
+			}
 			n.diagnostic("container-go: reaper lock failed; skipping one entry")
 			return
 		}
@@ -293,23 +311,23 @@ func (n *nativeReaper) processEntry(entry nativeReaperEntry) {
 		if n.subcommand == "rm" && !immutable {
 			return
 		}
-		n.delete(entry.id)
+		n.delete(ctx, entry.id)
 		return
 	}
-	target, ok := n.inspectTarget(entry)
+	target, ok := n.inspectTarget(ctx, entry)
 	if !ok {
 		return
 	}
-	n.delete(target)
+	n.delete(ctx, target)
 }
 
 // inspectTarget rechecks the creation generation. A pending create may not
 // be observable yet and retries; a completed generation that is absent or
 // different is never deleted, because the name may already belong to a
 // replacement.
-func (n *nativeReaper) inspectTarget(entry nativeReaperEntry) (string, bool) {
+func (n *nativeReaper) inspectTarget(ctx context.Context, entry nativeReaperEntry) (string, bool) {
 	for tries := 0; ; {
-		out, ok := n.inspect(entry.id)
+		out, ok := n.inspect(ctx, entry.id)
 		var uid, creation string
 		if ok {
 			uid, creation = parseNativeReaperInspect(out, n.subcommand, n.key)
@@ -333,12 +351,14 @@ func (n *nativeReaper) inspectTarget(entry nativeReaperEntry) (string, bool) {
 		if tries >= n.pendingAttempts {
 			return "", false
 		}
-		time.Sleep(nativeReaperPendingRetryWait)
+		if err := sleepWithContext(ctx, nativeReaperPendingRetryWait); err != nil {
+			return "", false
+		}
 	}
 }
 
-func (n *nativeReaper) inspect(id string) ([]byte, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), nativeReaperInspectTimeout)
+func (n *nativeReaper) inspect(ctx context.Context, id string) ([]byte, bool) {
+	ctx, cancel := context.WithTimeout(ctx, nativeReaperInspectTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, n.binary, "inspect", id)
 	cmd.Env = nativeReaperBackendEnv()
@@ -352,8 +372,8 @@ func (n *nativeReaper) inspect(id string) ([]byte, bool) {
 	return data, true
 }
 
-func (n *nativeReaper) delete(target string) {
-	ctx, cancel := context.WithTimeout(context.Background(), n.timeout)
+func (n *nativeReaper) delete(ctx context.Context, target string) {
+	ctx, cancel := context.WithTimeout(ctx, n.timeout)
 	defer cancel()
 	args := make([]string, 0, 2+len(n.deleteFlags)+1)
 	args = append(args, n.subcommand, "--force")

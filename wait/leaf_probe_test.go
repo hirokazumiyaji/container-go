@@ -181,3 +181,53 @@ func TestLeafStateProbePrefersDeadline(t *testing.T) {
 		}
 	})
 }
+
+type probeBudgetTarget struct {
+	budgets []time.Duration
+}
+
+func (*probeBudgetTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (*probeBudgetTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*probeBudgetTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (*probeBudgetTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+func (t *probeBudgetTarget) State(ctx context.Context) (State, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.budgets = append(t.budgets, 0)
+		return StateRunning, nil
+	}
+	t.budgets = append(t.budgets, time.Until(deadline))
+	return StateRunning, nil
+}
+
+func TestPollBoundsLifecycleProbes(t *testing.T) {
+	previous := lifecycleProbeTimeout
+	lifecycleProbeTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { lifecycleProbeTimeout = previous })
+
+	target := &probeBudgetTarget{}
+	err := poll(
+		context.Background(),
+		options{startupTimeout: time.Second, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error { return nil },
+	)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(target.budgets) < 2 {
+		t.Fatalf("State calls = %d, want the initial and final lifecycle probes", len(target.budgets))
+	}
+	for i, budget := range target.budgets {
+		if budget <= 0 || budget > 100*time.Millisecond {
+			t.Errorf("State probe %d budget = %v, want bounded by the lifecycle probe timeout", i, budget)
+		}
+	}
+}

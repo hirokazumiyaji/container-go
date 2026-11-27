@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -633,4 +634,57 @@ func TestDockerContextPropagationToRunner(t *testing.T) {
 			t.Errorf("resolved.targetEnv() missing DOCKER_CONTEXT=runner-ctx, got: %v", env)
 		}
 	})
+}
+
+func TestDockerExplicitEmptyHostResolvesActiveContext(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	f := newDockerTestRunner()
+	f.contextJSON = `[{"Name":"active-remote","Endpoints":{"docker":{"Host":"tcp://remote-box:2375"}}}]`
+
+	eng := dockerEngine{explicitHost: true, explicitTarget: true}
+	resolved, err := eng.resolveTarget(context.Background(), f)
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if !resolved.isRemote() {
+		t.Fatal("explicit empty host was treated as a local daemon")
+	}
+	if got := resolved.defaultHost(); got != "remote-box" {
+		t.Errorf("resolved.defaultHost() = %q, want remote-box", got)
+	}
+	if got := resolved.effectiveContext(); got != "active-remote" {
+		t.Errorf("resolved.effectiveContext() = %q, want active-remote", got)
+	}
+
+	inspected := false
+	for _, call := range f.calls {
+		if len(call) == 2 && call[0] == "context" && call[1] == "inspect" {
+			inspected = true
+		}
+	}
+	if !inspected {
+		t.Fatalf("active context was not inspected: %v", f.calls)
+	}
+
+	env := resolved.targetEnv()
+	want := []string{"DOCKER_CONTEXT=active-remote"}
+	if !slices.Equal(env, want) {
+		t.Errorf("targetEnv() = %v, want %v", env, want)
+	}
+	if pinned := resolved.pinnedTargetEnv(); !slices.Contains(pinned, "DOCKER_HOST") {
+		t.Errorf("pinnedTargetEnv() = %v, want a DOCKER_HOST removal marker", pinned)
+	}
+}
+
+func TestDockerContextInspectRejectsNullOutput(t *testing.T) {
+	for _, body := range []string{`null`, `[null]`} {
+		f := newDockerTestRunner()
+		f.contextJSON = body
+		eng := dockerEngine{}
+		if _, err := eng.resolveTarget(context.Background(), f); err == nil {
+			t.Errorf("resolveTarget with context inspect %q = nil error, want a decode error", body)
+		}
+	}
 }

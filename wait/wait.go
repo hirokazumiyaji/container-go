@@ -21,8 +21,11 @@ const (
 	defaultStartupTimeout = 60 * time.Second
 	defaultPollInterval   = 100 * time.Millisecond
 	stateCheckInterval    = time.Second
-	lifecycleProbeTimeout = 5 * time.Second
 )
+
+// lifecycleProbeTimeout bounds one lifecycle probe so a hung inspect cannot
+// consume a whole wait budget. Overridable in tests.
+var lifecycleProbeTimeout = 5 * time.Second
 
 // finalLifecycleProbeTimeout bounds composite final lifecycle retries even
 // when the wait context is otherwise unbounded. Overridable in tests.
@@ -237,26 +240,24 @@ func (e *waitError) AsRedacted(target any, redactor *cli.Redactor) bool {
 	return false
 }
 
-func (e *waitError) Unwrap() error {
+// Unwrap exposes every retained child so a diagnostic boundary can render
+// each node with the redactor that belongs to it. Returning only the
+// termination reason would hide a backend CLIError from the leaf-by-leaf
+// redaction and trimming path whenever the wait failed on a context deadline.
+func (e *waitError) Unwrap() []error {
 	if e == nil {
 		return nil
 	}
-	if e.contextErr != nil {
-		return e.contextErr
+	children := make([]error, 0, 4+len(e.causes))
+	children = append(children, e.contextErr, e.checkErr, e.probeErr, e.cause)
+	children = append(children, e.causes...)
+	filtered := children[:0]
+	for _, child := range children {
+		if child != nil {
+			filtered = append(filtered, child)
+		}
 	}
-	if e.reason == waitReasonCause && e.cause != nil {
-		return e.cause
-	}
-	if e.checkErr != nil {
-		return e.checkErr
-	}
-	if e.probeErr != nil {
-		return e.probeErr
-	}
-	if len(e.causes) > 0 {
-		return e.causes[0]
-	}
-	return nil
+	return filtered
 }
 
 // newWaitError builds a message-first error for composite strategies, whose
@@ -853,7 +854,13 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		return err
 	}
 
-	state, err := targetState(waitCtx, target)
+	initialProbeCtx, initialProbeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
+	state, err := targetState(initialProbeCtx, target)
+	initialProbeErr := initialProbeCtx.Err()
+	initialProbeCancel()
+	if initialProbeErr != nil {
+		err = joinNonNil(err, initialProbeErr)
+	}
 	if terminalErr := terminationErr(); terminalErr != nil {
 		return terminalErr
 	}
@@ -878,7 +885,13 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			return nil
 		}
 		lastStateCheck = time.Now()
-		state, err := targetState(waitCtx, target)
+		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
+		state, err := targetState(probeCtx, target)
+		probeCtxErr := probeCtx.Err()
+		probeCancel()
+		if probeCtxErr != nil {
+			err = joinNonNil(err, probeCtxErr)
+		}
 		if err != nil {
 			if terminalErr := terminationErr(); terminalErr != nil {
 				if filtered := nonContextCause(err); filtered != nil {

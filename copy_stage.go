@@ -38,6 +38,7 @@ type copySnapshotState struct {
 }
 
 type copySourceOpenFunc func(string) (*os.File, bool, error)
+
 type copySourceOpenAtFunc func(*os.File, string) (*os.File, bool, error)
 
 type copySourceOpeners struct {
@@ -543,11 +544,6 @@ func copySnapshotLimited(ctx context.Context, dst io.Writer, src io.Reader, max 
 	return io.CopyBuffer(copyWriteOnly{Writer: dst}, reader, *buffer)
 }
 
-const (
-	copySnapshotBufferSize    = 32 * 1024
-	copySnapshotReadFromChunk = 1 << 20
-)
-
 var copySnapshotBufferPool = sync.Pool{
 	New: func() any {
 		buffer := make([]byte, copySnapshotBufferSize)
@@ -604,3 +600,47 @@ func cleanupCopyStagingDir(dir string) error {
 // noCopyStagingRootCleanup reports success for the shared per-user staging
 // root, which must survive an individual copy operation.
 func noCopyStagingRootCleanup() error { return nil }
+
+// checkCopyFileFromContainerVersion verifies the Docker client/server copy-out
+// version once per handle and, through the Client metadata cache, once per
+// target. The handle is bound to one target, so a successful answer cannot
+// describe a different daemon. Failures are not recorded and a later copy
+// retries them. Concurrent copies share the check through copyVersionMu; a
+// waiting caller's context still bounds the wait.
+func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error {
+	if !c.eng.capabilities().copyOutVersionCheck {
+		return c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()})
+	}
+	p := c.pack()
+	if p.copyVersionOK.Load() {
+		return nil
+	}
+	if err := p.copyVersionMu.Lock(ctx); err != nil {
+		return err
+	}
+	defer p.copyVersionMu.Unlock()
+	if p.copyVersionOK.Load() {
+		return nil
+	}
+	if err := dockerCopyFileFromContainerVersionCached(ctx, c.dockerMeta, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
+		return err
+	}
+	p.copyVersionOK.Store(true)
+	return nil
+}
+
+// CopyFileFromContainer copies one regular file out of the running
+// container and returns its content. It is supported by the Docker
+// backend when the host can open copied files without following links or
+// blocking on special files. Docker copy-out also requires client and
+// server versions >=29.7.0. Apple Container, unsupported hosts, unsupported
+// Docker versions, and Windows Go 1.23 through 1.25 return
+// ErrCopyFileFromContainerUnsupported before invoking the backend's
+// copy-out command. The copied regular file must not exceed
+// MaxCopyFileFromContainerSize. The returned reader provides only Read and
+// Close: a read past that limit, for example after the copy grows, fails with
+// ErrCopyFileFromContainerTooLarge. Close releases the temporary copy and
+// removes its private staging directory.
+func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
+	return c.copyFileFromContainer(ctx, containerPath, copyOutHooks{})
+}

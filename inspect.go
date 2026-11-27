@@ -8,48 +8,11 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/domain"
+	"math"
 )
 
 // State is a container lifecycle state.
 type State = domain.State
-
-const (
-	StateRunning    State = domain.StateRunning
-	StateStopped    State = domain.StateStopped
-	StateStopping   State = domain.StateStopping
-	StateCreated    State = domain.StateCreated
-	StateRestarting State = domain.StateRestarting
-	StatePaused     State = domain.StatePaused
-	StateUnknown    State = domain.StateUnknown
-)
-
-// immutableID returns the backend's immutable container ID, or "" when the
-// backend has none. The ID is only ever promoted from empty to a real value,
-// so a caller that observes "" may re-read after a failed operation.
-func (c *Container) immutableID() string {
-	c.pack().uidMu.RLock()
-	defer c.pack().uidMu.RUnlock()
-	return c.pack().uid
-}
-
-func (c *Container) infoSnapshot() *engineInfo {
-	c.pack().mu.Lock()
-	defer c.pack().mu.Unlock()
-	return c.pack().info
-}
-
-// setImmutableID records the backend's immutable container ID. It never
-// downgrades an existing value, so a concurrent promotion cannot clear it.
-func (c *Container) setImmutableID(uid string) {
-	if uid == "" {
-		return
-	}
-	c.pack().uidMu.Lock()
-	if c.pack().uid == "" {
-		c.pack().uid = uid
-	}
-	c.pack().uidMu.Unlock()
-}
 
 // verifyCreatedOwnership validates the labels and backend identity before
 // an external reaper is allowed to retain a newly created container. A
@@ -152,52 +115,41 @@ func createdOwnershipFailure(failure domain.OwnershipFailure, immutableID bool) 
 	}
 }
 
-// operationTarget returns the immutable target for backend operations.
-// Backends with immutable container IDs prefer the ID returned by
-// run/inspect; name-addressed handles retain the original name.
-func (c *Container) operationTarget() string {
-	if c.eng != nil && c.eng.capabilities().immutableID {
-		if uid := c.immutableUID(); uid != "" {
-			return uid
+// rollback removes a container Run created but cannot return. A failed removal
+// is not hidden: without an immutable ID, Terminate refuses to delete when it
+// cannot verify the generation, and the caller must know the container was left
+// behind.
+func (c *Container) rollback(ctx context.Context, cause error) error {
+	c.stopAttached()
+	if keepContainers() {
+		return cause
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
+	if c.reused {
+		cfg := &config{
+			runner:       c.runner,
+			eng:          c.eng,
+			name:         c.id,
+			reuse:        true,
+			creation:     c.creation,
+			queryTimeout: c.queryTimeout,
+			probeTimeout: c.probeTimeout,
 		}
+		deleted, err := rollbackReuse(cleanupCtx, c, cfg)
+		if err != nil {
+			return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
+		}
+		if !deleted {
+			return withCleanupError(cause, &CleanupError{Container: c.id, Err: fmt.Errorf("stopped generation was not deleted")})
+		}
+		return cause
 	}
-	return c.id
-}
-
-// immutableUID returns the backend's immutable ID, or "" on name-addressed
-// backends.
-func (c *Container) immutableUID() string {
-	if c.eng == nil || !c.eng.capabilities().immutableID {
-		return ""
+	if err := c.Terminate(cleanupCtx); err != nil {
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
-	return c.immutableID()
-}
-
-// setImmutableUID promotes an immutable backend ID. Name-addressed backends
-// ignore it.
-func (c *Container) setImmutableUID(uid string) {
-	if c.eng == nil || !c.eng.capabilities().immutableID {
-		return
-	}
-	c.setImmutableID(uid)
-}
-
-func (c *Container) immutableIDGenerationMatches(info *engineInfo) bool {
-	return c.eng != nil && c.eng.capabilities().immutableID && c.creation != "" &&
-		info != nil && info.labels[creationLabel] == c.creation
-}
-
-// State returns the current lifecycle state.
-//
-// Unlike Host/Endpoint/MappedPort/ContainerIP, State always performs a
-// fresh inspect so wait fail-fast-on-stop and other lifecycle checks are
-// not delayed by the short dynamic-inspect TTL.
-func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectDynamicFresh(ctx)
-	if err != nil {
-		return StateUnknown, err
-	}
-	return info.state, nil
+	return cause
 }
 
 // InspectInfo represents a point-in-time snapshot of container state and metadata.
@@ -240,9 +192,11 @@ func (i *InspectInfo) Name() string { return i.name }
 // returning the logical name so existing callers are unaffected.
 func (i *InspectInfo) ContainerID() string { return i.uid }
 
-func (i *InspectInfo) Image() string   { return i.image }
+func (i *InspectInfo) Image() string { return i.image }
+
 func (i *InspectInfo) ImageID() string { return i.imageID }
-func (i *InspectInfo) State() State    { return i.state }
+
+func (i *InspectInfo) State() State { return i.state }
 
 // ExitCode returns the backend value, or zero when no value was reported.
 // Check State and ExitCodeReported before interpreting zero as process success.
@@ -255,11 +209,15 @@ func (i *InspectInfo) ExitCodeReported() bool { return i.exitCodeReported }
 // documented unknown marker: the backend omitted the field or reported a form
 // this library cannot parse, and callers must not read it as a real instant.
 // StartedAt and FinishedAt use the same marker.
-func (i *InspectInfo) CreatedAt() time.Time  { return i.createdAt }
-func (i *InspectInfo) StartedAt() time.Time  { return i.startedAt }
+func (i *InspectInfo) CreatedAt() time.Time { return i.createdAt }
+
+func (i *InspectInfo) StartedAt() time.Time { return i.startedAt }
+
 func (i *InspectInfo) FinishedAt() time.Time { return i.finishedAt }
-func (i *InspectInfo) IP() string            { return i.ip }
-func (i *InspectInfo) Platform() string      { return i.platform }
+
+func (i *InspectInfo) IP() string { return i.ip }
+
+func (i *InspectInfo) Platform() string { return i.platform }
 
 // ImageDigest returns the OCI root/index digest for the container image when
 // the backend exposes one. Docker reports it only when the image reference used
@@ -371,207 +329,23 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 	}, nil
 }
 
-// cachedInfo returns the immutable identity snapshot. Dynamic fields are
-// intentionally not cached; endpoint and lifecycle callers use
-// inspectDynamic instead.
-func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if c.nameInspect {
-		return c.inspectFresh(ctx)
-	}
-	c.pack().mu.Lock()
-	cached := c.pack().info
-	c.pack().mu.Unlock()
-	if cached != nil {
-		return cached, nil
-	}
-	info, err := c.inspectFresh(ctx)
+// ExitCode returns the reported exit code of a stopped container.
+// ErrContainerNotStopped indicates that the process has not stopped. Both that
+// error and an omitted backend exit code match ErrExitCodeUnavailable.
+// Apple CLI versions that omit status.exitCode cannot provide a process result.
+func (c *Container) ExitCode(ctx context.Context) (int, error) {
+	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
-		return nil, err
-	}
-	if err := c.rememberIdentity(ctx, info); err != nil {
-		return nil, err
-	}
-	c.pack().mu.Lock()
-	cached = c.pack().info
-	c.pack().mu.Unlock()
-	return cached, nil
-}
-
-// inspectDynamic returns lifecycle, network, and port data, reusing a
-// short-TTL snapshot on lockPack when the data is still usable. Callers
-// that must observe stop/replace immediately (State, post-reuse checks)
-// use inspectDynamicFresh instead.
-func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !c.nameInspect {
-		if info := c.cachedDynamic(); info != nil {
-			return info, nil
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return 0, err
 		}
-		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
-			return nil, err
+		redacted := c.redactError(err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, exitCodeDeadlineError{redacted}
 		}
-		defer c.pack().dynamicMu.Unlock()
-		// A concurrent refresh may have populated the snapshot while we
-		// waited; reuse it instead of launching another inspect.
-		if info := c.cachedDynamic(); info != nil {
-			return info, nil
-		}
+		return 0, redacted
 	}
-	return c.refreshDynamic(ctx)
-}
-
-// inspectDynamicFresh always performs an identity-checked inspect and
-// refreshes the short-TTL dynamic snapshot shared with Shared() handles.
-func (c *Container) inspectDynamicFresh(ctx context.Context) (*engineInfo, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !c.nameInspect {
-		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
-			return nil, err
-		}
-		defer c.pack().dynamicMu.Unlock()
-	}
-	return c.refreshDynamic(ctx)
-}
-
-func (c *Container) cachedDynamic() *engineInfo {
-	p := c.pack()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if !c.usableDynamicSnapshot(p.dynamic) {
-		return nil
-	}
-	if !p.currentTime().Before(p.dynamicAt.Add(dynamicInspectTTL)) {
-		return nil
-	}
-	info := cloneEngineInfo(p.dynamic)
-	if p.defaultNetwork != "" {
-		info.defaultNetwork = p.defaultNetwork
-	}
-	return info
-}
-
-// cachedInspectSnapshot returns the most recent lifecycle/network snapshot
-// even when it carries no endpoint data. Health waits reuse the 1 Hz
-// lifecycle probe's inspect through it instead of spawning another CLI
-// process for every check.
-func (c *Container) cachedInspectSnapshot() *engineInfo {
-	p := c.pack()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return cloneEngineInfo(p.dynamic)
-}
-
-// healthStatus reports the Docker HEALTHCHECK status from a lifecycle
-// snapshot observed within the wait probe interval. A stale snapshot is
-// re-inspected through the normal query-timeout path so a cached healthy
-// result cannot mask a later unhealthy transition.
-func (c *Container) healthStatus(ctx context.Context) (string, error) {
-	p := c.pack()
-	now := p.currentTime()
-	if info := c.cachedInspectSnapshot(); info != nil {
-		if !info.observedAt.IsZero() && now.Sub(info.observedAt) <= dynamicInspectTTL {
-			return info.health, nil
-		}
-	}
-	// Re-observe through the normal identity-checked inspect, bounded by
-	// the same query timeout as other inspect-backed reads.
-	// inspectDynamicFresh stores the result through the generation-checked
-	// dynamic cache, so later polls reuse this observation until it ages out.
-	inspectCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
-	defer cancel()
-	info, err := c.inspectDynamicFresh(inspectCtx)
-	if err != nil {
-		return "", err
-	}
-	return info.health, nil
-}
-
-func (c *Container) refreshDynamic(ctx context.Context) (*engineInfo, error) {
-	gen := c.dynamicGeneration()
-	info, err := c.inspectFresh(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.applyCachedDefaultNetwork(ctx, info); err != nil {
-		return nil, err
-	}
-	if c.nameInspect {
-		return info, nil
-	}
-	if err := c.rememberIdentity(ctx, info); err != nil {
-		return nil, err
-	}
-	c.storeDynamic(info, gen)
-	return info, nil
-}
-
-func (c *Container) dynamicGeneration() uint64 {
-	p := c.pack()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.dynamicGen
-}
-
-func (c *Container) storeDynamic(info *engineInfo, gen uint64) {
-	p := c.pack()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	// Delete/Terminate bump dynamicGen while an inspect may still be in
-	// flight. Drop that result so endpoint reads cannot revive a deleted
-	// container's IP/port under a fresh TTL.
-	if p.dynamicGen != gen {
-		return
-	}
-	p.dynamic = cloneEngineInfo(info)
-	p.dynamicAt = p.currentTime()
-}
-
-func (c *Container) clearDynamic() {
-	p := c.pack()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.dynamic = nil
-	p.dynamicAt = time.Time{}
-	p.dynamicGen++
-}
-
-// usableDynamicSnapshot reports whether a cached inspect can answer an
-// endpoint read. It accepts address or host-binding payload, and also a
-// Running snapshot that needs neither: Docker host networking reports no
-// address, and a port-less container resolves to the target host. Callers
-// that still cannot resolve (empty IP, missing host binding) clear the
-// snapshot so the next read re-inspects immediately instead of waiting out
-// the TTL.
-func (c *Container) usableDynamicSnapshot(info *engineInfo) bool {
-	if info == nil {
-		return false
-	}
-	if info.ip != "" {
-		return true
-	}
-	for _, b := range info.bound {
-		if b.hostPort > 0 {
-			return true
-		}
-	}
-	// Docker host networking reports neither a container IP nor any host
-	// binding, and a container with no configured ports needs neither to
-	// answer Host. Cache that running observation instead of re-inspecting
-	// on every read.
-	if info.state != StateRunning {
-		return false
-	}
-	if info.networkMode == dockerNetworkHost {
-		return true
-	}
-	return len(c.published) == 0 && len(c.exposed) == 0
+	return reportedExitCode(info)
 }
 
 func cloneEngineInfo(info *engineInfo) *engineInfo {
@@ -590,6 +364,12 @@ func cloneEngineInfo(info *engineInfo) *engineInfo {
 	}
 	if info.networkAliases != nil {
 		out.networkAliases = append([]string(nil), info.networkAliases...)
+	}
+	if info.networkAliasMap != nil {
+		out.networkAliasMap = make(map[string][]string, len(info.networkAliasMap))
+		for network, aliases := range info.networkAliasMap {
+			out.networkAliasMap[network] = append([]string(nil), aliases...)
+		}
 	}
 	if info.bound != nil {
 		out.bound = append([]boundPort(nil), info.bound...)
@@ -858,4 +638,15 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	// caller must first validate managed/reuse/session ownership.
 	info.observedAt = c.pack().currentTime()
 	return info, nil
+}
+
+// addTimeout combines the operation's query budget with a caller-supplied
+// timeout, saturating at the maximum Duration instead of overflowing. A
+// caller can pass any non-negative Duration; an overflowing sum would make
+// the context expire immediately and hide the backend's range validation.
+func addTimeout(base, extra time.Duration) time.Duration {
+	if extra > 0 && base > time.Duration(math.MaxInt64)-extra {
+		return time.Duration(math.MaxInt64)
+	}
+	return base + extra
 }

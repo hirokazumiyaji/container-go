@@ -41,6 +41,13 @@ const (
 	dynamicInspectTTL = time.Second
 )
 
+var (
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a var so tests
+	// can exercise the bounded cleanup contract without a long wait.
+	terminateTimeout = queryTimeout
+)
+
 // contextLock is a zero-value mutex whose acquisition can be canceled.
 // It protects identity publication and serializes backend inspects without
 // allowing a canceled caller to wait indefinitely for a long inspect.
@@ -112,6 +119,16 @@ func newCreationID() string {
 	}
 	return hex.EncodeToString(b[:])
 }
+
+const (
+	StateRunning    State = domain.StateRunning
+	StateStopped    State = domain.StateStopped
+	StateStopping   State = domain.StateStopping
+	StateCreated    State = domain.StateCreated
+	StateRestarting State = domain.StateRestarting
+	StatePaused     State = domain.StatePaused
+	StateUnknown    State = domain.StateUnknown
+)
 
 // lockPack holds the mutable, synchronized fields of a Container. Shared
 // copies share one pack so promotion and inspect caches stay coherent
@@ -221,6 +238,18 @@ type Container struct {
 	targetHost              string
 }
 
+// TargetHost returns the client-facing default host configured when this
+// container was created.
+func (c *Container) TargetHost() string {
+	if c.targetHost != "" {
+		return c.targetHost
+	}
+	if c.eng != nil {
+		return c.eng.defaultHost()
+	}
+	return "127.0.0.1"
+}
+
 func (c *Container) effectiveQueryTimeout() time.Duration {
 	if c.queryTimeout > 0 {
 		return c.queryTimeout
@@ -251,11 +280,39 @@ func (c *Container) refusesSharedOps() bool {
 	return c.reused && !c.allowDestructive
 }
 
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.pack().uidMu.RLock()
+	defer c.pack().uidMu.RUnlock()
+	return c.pack().uid
+}
+
+func (c *Container) infoSnapshot() *engineInfo {
+	c.pack().mu.Lock()
+	defer c.pack().mu.Unlock()
+	return c.pack().info
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.pack().uidMu.Lock()
+	if c.pack().uid == "" {
+		c.pack().uid = uid
+	}
+	c.pack().uidMu.Unlock()
+}
+
 // applyConfigDiagnostics installs the per-handle redactor and freezes the
 // target host. Every construction site must use it so a new handle cannot
 // silently omit either field.
 func (c *Container) applyConfigDiagnostics(cfg *config) {
-	c.diagnosticRedactorValue = newDiagnosticMatcher(cfg.diagnosticValues()).WithBoundaryValues(cfg.waitBoundaryValues()...)
+	c.diagnosticRedactorValue = newDiagnosticMatcher(cfg.diagnosticValues()).WithBoundaryValues(cfg.diagnosticBoundaryValues()...)
 	c.targetHost = cfg.eng.defaultHost()
 }
 
@@ -316,10 +373,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 	// cfg.validate cannot see this combination before the engine is selected:
 	// with no explicit engine it runs while cfg.eng is still nil.
-	if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil {
-		if cfg.eng.target() == nil {
-			return nil, validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
-		}
+	if err := cfg.validateDockerTargetBackend(); err != nil {
+		return nil, err
 	}
 	cfg.eng = configuredTarget(cfg.eng, engineTargetOverride{
 		host:      cfg.dockerHost,
@@ -655,43 +710,6 @@ func waitForReusePoll(ctx context.Context, interval ...time.Duration) error {
 	return sleepWithContext(ctx, d)
 }
 
-// rollback removes a container Run created but cannot return. A failed removal
-// is not hidden: without an immutable ID, Terminate refuses to delete when it
-// cannot verify the generation, and the caller must know the container was left
-// behind.
-func (c *Container) rollback(ctx context.Context, cause error) error {
-	c.stopAttached()
-	if keepContainers() {
-		return cause
-	}
-	cleanupCtx := context.WithoutCancel(ctx)
-	if c.reused {
-		cfg := &config{
-			runner:       c.runner,
-			eng:          c.eng,
-			name:         c.id,
-			reuse:        true,
-			creation:     c.creation,
-			queryTimeout: c.queryTimeout,
-			probeTimeout: c.probeTimeout,
-		}
-		deleted, err := rollbackReuse(cleanupCtx, c, cfg)
-		if err != nil {
-			return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
-		}
-		if !deleted {
-			return withCleanupError(cause, &CleanupError{Container: c.id, Err: fmt.Errorf("stopped generation was not deleted")})
-		}
-		return cause
-	}
-	if err := c.Terminate(cleanupCtx); err != nil {
-		// %v would flatten the cleanup failure into text, leaving only the
-		// original recoverable through errors.Is. Join it instead.
-		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
-	}
-	return cause
-}
-
 // cleanupFailedCreate removes the container this Run left behind after a
 // failed create. It never deletes a pre-existing same-name container:
 // name conflicts are skipped, and only a container carrying this process's
@@ -776,8 +794,115 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 // immutable backend ID used for internal operations.
 func (c *Container) ID() string { return c.id }
 
+// operationTarget returns the immutable target for backend operations.
+// Backends with immutable container IDs prefer the ID returned by
+// run/inspect; name-addressed handles retain the original name.
+func (c *Container) operationTarget() string {
+	if c.eng != nil && c.eng.capabilities().immutableID {
+		if uid := c.immutableUID(); uid != "" {
+			return uid
+		}
+	}
+	return c.id
+}
+
+// immutableUID returns the backend's immutable ID, or "" on name-addressed
+// backends.
+func (c *Container) immutableUID() string {
+	if c.eng == nil || !c.eng.capabilities().immutableID {
+		return ""
+	}
+	return c.immutableID()
+}
+
+// setImmutableUID promotes an immutable backend ID. Name-addressed backends
+// ignore it.
+func (c *Container) setImmutableUID(uid string) {
+	if c.eng == nil || !c.eng.capabilities().immutableID {
+		return
+	}
+	c.setImmutableID(uid)
+}
+
+func (c *Container) immutableIDGenerationMatches(info *engineInfo) bool {
+	return c.eng != nil && c.eng.capabilities().immutableID && c.creation != "" &&
+		info != nil && info.labels[creationLabel] == c.creation
+}
+
+func (c *Container) classify(ctx context.Context, err error) error {
+	return classifyErrorWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout)
+}
+
+func (c *Container) classifyOperation(ctx context.Context, err error, operation string) error {
+	if c.eng == nil {
+		return c.classify(ctx, err)
+	}
+	target := c.operationTarget()
+	if target == c.id {
+		return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target)
+	}
+	return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target, c.id)
+}
+
+func (c *Container) deleteOperation() string {
+	if c.eng != nil {
+		return c.eng.reaperSubcommand()
+	}
+	return "delete"
+}
+
+// State returns the current lifecycle state.
+//
+// Unlike Host/Endpoint/MappedPort/ContainerIP, State always performs a
+// fresh inspect so wait fail-fast-on-stop and other lifecycle checks are
+// not delayed by the short dynamic-inspect TTL.
+func (c *Container) State(ctx context.Context) (State, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	if err != nil {
+		return StateUnknown, err
+	}
+	return info.state, nil
+}
+
+// Stop stops the container. A nil timeout uses the CLI's default grace
+// period before the process is killed. A non-nil timeout must be non-negative
+// and its rounded-up seconds must fit the backend's supported range. The
+// backend-specific limit is checked before invoking its CLI. Because both
+// backends accept whole seconds, positive sub-second timeouts are rounded up;
+// zero requests immediate termination.
+func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	if timeout != nil && *timeout < 0 {
+		return newValidationErrorWithField("Stop", "timeout", *timeout,
+			fmt.Errorf("stop timeout must be >= 0, got %s", *timeout))
+	}
+	if c.refusesSharedOps() {
+		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
+	}
+	stopCtx, cancel := withDefaultTimeout(ctx, addTimeout(c.effectiveQueryTimeout(), durationOrZero(timeout)))
+	defer cancel()
+	target, err := c.verifiedOperationTarget(stopCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.stopArgs(target, timeout)
+	if err != nil {
+		return fmt.Errorf("stop %s: %w", c.id, err)
+	}
+	teardown := c.markAttachTeardown()
+	_, _, err = c.runner.Run(stopCtx, args...)
+	if err != nil {
+		c.clearAttachTeardown(teardown)
+		return c.classifyOperation(ctx, err, "stop")
+	}
+	c.stopAttachedTarget(teardown)
+	c.clearDynamic()
+	return nil
+}
+
 // Image returns the image reference the container was created with.
 func (c *Container) Image() string {
+	c.pack().mu.Lock()
+	defer c.pack().mu.Unlock()
 	return c.image.reference
 }
 
@@ -803,31 +928,13 @@ func (c *Container) Reused() bool {
 	return !c.created
 }
 
-// Shared returns a handle to the same container with Stop/Copy refusals
-// lifted. The returned handle keeps reused set so Cleanup and
-// TerminateContainer still skip teardown; only allowDestructive differs.
-// Mutable identity state is shared through sync so both handles see the
-// same promoted UID and inspect cache.
-func (c *Container) Shared() *Container {
-	if c == nil {
-		return nil
-	}
-	_ = c.pack()
-	c.secretsMu.RLock()
-	diagnosticRedactor := c.diagnosticRedactorValue
-	c.secretsMu.RUnlock()
-	return &Container{
-		id: c.id, runner: c.runner, eng: c.eng,
-		queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout,
-		exposed: c.exposed, published: c.published,
-		network: c.network, networkExplicit: c.networkExplicit,
-		reused: c.reused, created: c.created, allowDestructive: true, creation: c.creation,
-		image: c.image, nameInspect: c.nameInspect,
-		sync: c.sync, dockerMeta: c.dockerMeta,
-		diagnosticRedactorValue: diagnosticRedactor,
-		targetHost:              c.targetHost,
-	}
-}
+// Wait polls an inspect-backed state read. The interval starts small so a
+// quick exit is noticed promptly, then backs off to a cap: a long batch
+// container should cost a bounded number of CLI subprocesses.
+var (
+	waitExitPollInterval    = 100 * time.Millisecond
+	waitExitPollMaxInterval = time.Second
+)
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
@@ -855,3 +962,27 @@ func splitNonEmptyLines(data []byte) []string {
 	}
 	return out
 }
+
+const (
+	// MaxCopyToContainerSize is the maximum aggregate number of regular-file
+	// bytes copied into the private staging tree.
+	MaxCopyToContainerSize int64 = 64 << 20
+	// MaxCopyFileFromContainerSize is the maximum number of regular-file bytes
+	// CopyFileFromContainer accepts from the container. The limit applies to
+	// the single copied file and is checked before a reader is returned.
+	MaxCopyFileFromContainerSize int64 = 64 << 20
+	// MaxCopyToContainerEntries is the maximum number of filesystem entries,
+	// including the source root, visited while building a snapshot.
+	MaxCopyToContainerEntries int64 = 10_000
+	// MaxCopyToContainerDepth is the maximum directory depth. The source root
+	// has depth zero.
+	MaxCopyToContainerDepth = 128
+	// MaxCopyToContainerMetadataSize bounds the aggregate UTF-8 byte length of
+	// the source paths visited while building a snapshot.
+	MaxCopyToContainerMetadataSize int64 = 8 << 20
+)
+
+const (
+	copySnapshotBufferSize    = 32 * 1024
+	copySnapshotReadFromChunk = 1 << 20
+)

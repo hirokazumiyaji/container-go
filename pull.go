@@ -235,7 +235,7 @@ func WithPullDockerHost(host string) PullOption {
 // for this pull.
 func WithPullDockerContext(context string) PullOption {
 	return func(c *pullConfig) error {
-		if err := validateDockerTargetValue("WithPullDockerContext", context); err != nil {
+		if err := validateDockerContextValue("WithPullDockerContext", context); err != nil {
 			return err
 		}
 		c.dockerContext = &context

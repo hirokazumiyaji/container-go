@@ -120,8 +120,10 @@ func (e dockerEngine) resolveTargetEngine(ctx context.Context, runner cli.Runner
 func (e dockerEngine) preparePruneTarget(ctx context.Context, runner cli.Runner, timeout time.Duration) (engine, error) {
 	original := e
 	implicitContext := !e.explicitContext
-	if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); ok && implicitContext && entry == "DOCKER_CONTEXT" {
-		e.context, e.explicitContext = "", true
+	if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); ok && implicitContext {
+		if _, _, assigned := strings.Cut(entry, "="); !assigned {
+			e.context, e.explicitContext = "", true
+		}
 	}
 	// Package prune follows the child's Docker environment, where a host
 	// overrides the ambient context; discovery must not retarget the runner.

@@ -1019,8 +1019,9 @@ Docker target の option を持ちません。特定の Docker daemon や contex
 拒否します。
 
 `Container.Kill(ctx, signal string)` は signal を 1 つだけ取ります。
-空文字列は既定の SIGKILL です。空でない signal は backend へそのまま
-渡され、複数 signal はコンパイル時に拒否されます。
+空文字列は既定の SIGKILL です。空でない signal は正の番号または
+`SIGTERM` のような大文字の signal 名でなければならず、それ以外の綴りは
+backend 実行前に検証エラーとして拒否されます。
 
 ```go
 package docexample

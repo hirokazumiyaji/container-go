@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -1450,6 +1451,9 @@ func (c *Container) restartAttached(ctx context.Context, timeout *time.Duration)
 // end the main process also ends the WithAttachOutput stream; a stream left
 // attached by a catchable signal ends when the process exits.
 func (c *Container) Kill(ctx context.Context, signal string) error {
+	if err := validateKillSignal(signal); err != nil {
+		return err
+	}
 	if c.refusesSharedOps() {
 		return fmt.Errorf("kill %s: %w", c.id, ErrSharedContainer)
 	}
@@ -1477,6 +1481,22 @@ func (c *Container) Kill(ctx context.Context, signal string) error {
 	}
 	c.clearDynamic()
 	return nil
+}
+
+// killSignalPattern accepts the signal spellings the backends understand: a
+// positive signal number, a signal name such as SIGTERM or KILL, or a realtime
+// signal spelling such as SIGRTMIN+3. A leading sign, whitespace, control
+// character, or flag-shaped value must never reach the CLI argv.
+var killSignalPattern = regexp.MustCompile(`^(?:[1-9][0-9]*|(?:SIG)?[A-Z][A-Z0-9]*(?:[+-][0-9]+)?)$`)
+
+// validateKillSignal rejects a signal that is not a single signal spelling.
+// The rejected value is never echoed because it may contain control
+// characters.
+func validateKillSignal(signal string) error {
+	if signal == "" || killSignalPattern.MatchString(signal) {
+		return nil
+	}
+	return newValidationErrorWithField("Kill", "signal", nil, errors.New("invalid signal: want a positive number or an uppercase signal name"))
 }
 
 // terminatingKillSignal reports whether Kill is guaranteed to end the

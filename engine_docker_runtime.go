@@ -58,7 +58,9 @@ func (e dockerEngine) effectiveDefaultPlatform() string {
 func pinRunnerEnv(runnerEnv, pinned []string) []string {
 	// Collapse duplicate keys first (last occurrence wins, matching
 	// MergeEnv) so replacing a pinned key in place cannot leave an earlier
-	// stale duplicate that first-match env lookup would prefer.
+	// stale duplicate that first-match env lookup would prefer. Keys are
+	// folded with envKeyFold because MergeEnv compares case-insensitively
+	// on Windows.
 	env := make([]string, 0, len(runnerEnv)+len(pinned))
 	index := make(map[string]int, len(runnerEnv))
 	for _, entry := range runnerEnv {
@@ -67,6 +69,7 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 			// Index a bare removal marker too, so re-applying the pinned
 			// environment cannot append the same marker twice.
 			if key != "" {
+				key = envKeyFold(key)
 				if at, seen := index[key]; seen {
 					env[at] = entry
 					continue
@@ -76,6 +79,7 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 			env = append(env, entry)
 			continue
 		}
+		key = envKeyFold(key)
 		if at, duplicate := index[key]; duplicate {
 			env[at] = entry
 			continue
@@ -88,6 +92,7 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 		if key == "" {
 			continue
 		}
+		key = envKeyFold(key)
 		if at, exists := index[key]; exists {
 			if hasValue {
 				env[at] = entry
@@ -309,13 +314,24 @@ func runnerEnvEntry(runner cli.Runner, key string) (string, bool) {
 		return "", false
 	}
 	env := eenv.ExternalEnv()
-	prefix := key + "="
+	foldedKey := envKeyFold(key)
 	for i := len(env) - 1; i >= 0; i-- {
-		if env[i] == key || strings.HasPrefix(env[i], prefix) {
+		entryKey, _, _ := strings.Cut(env[i], "=")
+		if envKeyFold(entryKey) == foldedKey {
 			return env[i], true
 		}
 	}
 	return "", false
+}
+
+// dockerContextNameRE is the context-name grammar Docker itself accepts: an
+// ASCII alphanumeric first character followed by alphanumerics, dots,
+// underscores, or hyphens. The leading character may not be a hyphen, so a
+// name can never be parsed as a CLI flag.
+var dockerContextNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+func validDockerContextName(name string) bool {
+	return dockerContextNameRE.MatchString(name)
 }
 
 // resolveDockerContextEndpoint is deliberately not cached process-wide. A
@@ -325,12 +341,20 @@ func runnerEnvEntry(runner cli.Runner, key string) (string, bool) {
 // could answer a changed DOCKER_CONTEXT or DOCKER_CONFIG with an earlier
 // target's endpoint.
 func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contextName string) (string, string, error) {
+	if contextName != "" && !validDockerContextName(contextName) {
+		return "", "", &ConfigError{
+			Backend: "docker",
+			Option:  "WithContext",
+			Detail:  "invalid Docker context name",
+		}
+	}
+
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 
 	var args []string
 	if contextName != "" {
-		args = []string{"context", "inspect", contextName}
+		args = []string{"context", "inspect", "--", contextName}
 	} else {
 		args = []string{"context", "inspect"}
 	}
@@ -386,6 +410,17 @@ func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contex
 			Backend: "docker",
 			Option:  "WithContext",
 			Detail:  detail,
+		}
+	}
+	// A named lookup must report the context that was requested. Without
+	// this check a `--format` argument smuggled through an unvalidated name
+	// could make `context inspect` return an endpoint for a different
+	// context, flipping a remote daemon back to local.
+	if contextName != "" && contexts[0].Name != contextName {
+		return "", "", &ConfigError{
+			Backend: "docker",
+			Option:  "WithContext",
+			Detail:  fmt.Sprintf("Docker context %q reported context %q", contextName, contexts[0].Name),
 		}
 	}
 	endpointHost := contexts[0].Endpoints["docker"].Host

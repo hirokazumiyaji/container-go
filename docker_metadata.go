@@ -101,7 +101,7 @@ func (c *dockerMetadataCache) delete(key string) {
 	if c == nil {
 		return
 	}
-	c.ttlCache.forget(key)
+	c.forget(key)
 }
 
 // dockerTargetKey identifies one Docker target: the backend, the resolved

@@ -167,17 +167,20 @@ func dockerNameConflictLine(line, target string) bool {
 	if target == "" {
 		return true
 	}
+	// Docker always renders the conflicting name as the next quoted token.
+	// Do not fall back to a substring match: a container named after an
+	// unrelated word ("use", "container") appears in the fixed wording of
+	// every conflict line and would classify the conflict for the wrong
+	// target.
 	rest := strings.TrimSpace(strings.TrimPrefix(line, dockerStderrConflict))
-	if len(rest) >= 2 && rest[0] == '"' {
-		rest = rest[1:]
-		if end := strings.IndexByte(rest, '"'); end >= 0 {
-			rest = rest[:end]
-		}
-		if sameDockerContainerName(rest, target) {
-			return true
-		}
+	if len(rest) < 2 || rest[0] != '"' {
+		return false
 	}
-	return strings.Contains(line, strings.ToLower(target))
+	rest = rest[1:]
+	if end := strings.IndexByte(rest, '"'); end >= 0 {
+		rest = rest[:end]
+	}
+	return sameDockerContainerName(rest, target)
 }
 
 func sameDockerContainerName(got, want string) bool {

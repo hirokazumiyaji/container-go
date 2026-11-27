@@ -64,6 +64,7 @@ func TestWaitTargetContainerPortStatusScansPastExecCaptureLimit(t *testing.T) {
 func resetProcNetScanner(scanner *procNetScanner) {
 	scanner.line = scanner.line[:0]
 	scanner.listening = false
+	scanner.loopbackListening = false
 	scanner.supported = false
 	scanner.skipLine = false
 }

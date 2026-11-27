@@ -167,19 +167,6 @@ func matchingCLIErrorBranch(err error, backend, operation string, targets ...str
 	return branches[0], true
 }
 
-// backendCLIError returns the first CLIError branch that belongs to backend.
-// Context cancellation alone is never treated as a backend diagnostic.
-func backendCLIError(err error, backend string) (cliErrorContext, bool) {
-	if isContextError(err) {
-		return cliErrorContext{}, false
-	}
-	branches := backendCLIErrorBranches(err, backend)
-	if len(branches) == 0 {
-		return cliErrorContext{}, false
-	}
-	return branches[0].ctx, true
-}
-
 func hasParsedCLITarget(ctx cliErrorContext) bool {
 	return strings.TrimSpace(ctx.target) != ""
 }

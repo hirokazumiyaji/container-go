@@ -367,3 +367,39 @@ func TestMountArg(t *testing.T) {
 		})
 	}
 }
+
+// Docker target errors must name the option the caller actually set, both in
+// validate (engine already pinned) and after Run detects the engine.
+func TestDockerTargetBackendErrorNamesTheSetOption(t *testing.T) {
+	host := "tcp://daemon-a:2375"
+	contextName := "remote-ctx"
+	configDir := "/docker/config"
+	tests := []struct {
+		name   string
+		cfg    *config
+		option string
+	}{
+		{name: "host", cfg: &config{eng: appleEngine{}, dockerHost: &host}, option: "WithDockerHost"},
+		{name: "context", cfg: &config{eng: appleEngine{}, dockerContext: &contextName}, option: "WithDockerContext"},
+		{name: "config", cfg: &config{eng: appleEngine{}, dockerConfigDir: &configDir}, option: "WithDockerConfig"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, validate := range []func() error{tc.cfg.validate, tc.cfg.validateDockerTargetBackend} {
+				var valErr *ValidationError
+				err := validate()
+				if !errors.As(err, &valErr) || valErr.Option != tc.option {
+					t.Fatalf("validation error = %v, want a %s *ValidationError", err, tc.option)
+				}
+				if !strings.Contains(err.Error(), "Docker target options require Docker backend") {
+					t.Fatalf("error = %v, want the Docker backend diagnostic", err)
+				}
+			}
+		})
+	}
+
+	cfg := &config{eng: dockerEngine{}, dockerHost: &host}
+	if err := cfg.validateDockerTargetBackend(); err != nil {
+		t.Fatalf("Docker backend rejected a Docker target: %v", err)
+	}
+}

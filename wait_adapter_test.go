@@ -233,7 +233,12 @@ func TestRunRevalidatesWaitAtBoundaryAfterStrategyChange(t *testing.T) {
 const procNetHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
 
 func procNetLine(port int, state string) string {
-	return fmt.Sprintf("   0: 00000000:%04X 00000000:0000 %s 00000000:00000000 00:00000000 00000000 999 0 12345 1 0000000000000000 100 0 0 10 0\n", port, state)
+	return procNetLineAt("00000000", port, state)
+}
+
+// procNetLineAt builds a socket row with the given local_address value.
+func procNetLineAt(localAddress string, port int, state string) string {
+	return fmt.Sprintf("   0: %s:%04X 00000000:0000 %s 00000000:00000000 00:00000000 00000000 999 0 12345 1 0000000000000000 100 0 0 10 0\n", localAddress, port, state)
 }
 
 func newDockerWaitTarget(runner cli.Runner) waitTarget {
@@ -849,6 +854,125 @@ func TestForExecOutputMatcherWithWaitTarget(t *testing.T) {
 	}
 }
 
+func TestWaitTargetContainerPortStatusLoopbackListeners(t *testing.T) {
+	const (
+		loopbackIPv4 = "0100007F"
+		loopbackIPv6 = "00000000000000000000000001000000"
+		mappedIPv4   = "0000000000000000FFFF00000100007F"
+		containerIP  = "020011AC" // 172.17.0.2 in /proc host byte order
+	)
+	tests := []struct {
+		name        string
+		out         string
+		hostNetwork bool
+		want        wait.PortListenStatus
+	}{
+		{
+			name: "IPv4 loopback is not externally reachable",
+			out:  procNetHeader + procNetLineAt(loopbackIPv4, 6379, "0A"),
+			want: wait.PortListenClosed,
+		},
+		{
+			name: "IPv4 loopback range is not externally reachable",
+			out:  procNetHeader + procNetLineAt("0302017F", 6379, "0A"),
+			want: wait.PortListenClosed,
+		},
+		{
+			name: "IPv6 loopback is not externally reachable",
+			out:  procNetHeader + procNetLineAt(loopbackIPv6, 6379, "0A"),
+			want: wait.PortListenClosed,
+		},
+		{
+			name: "IPv4-mapped loopback is not externally reachable",
+			out:  procNetHeader + procNetLineAt(mappedIPv4, 6379, "0A"),
+			want: wait.PortListenClosed,
+		},
+		{
+			name: "container address is externally reachable",
+			out:  procNetHeader + procNetLineAt(containerIP, 6379, "0A"),
+			want: wait.PortListenOpen,
+		},
+		{
+			name: "wildcard listener after loopback is externally reachable",
+			out: procNetHeader +
+				procNetLineAt(loopbackIPv4, 6379, "0A") +
+				procNetLineAt("00000000", 6379, "0A"),
+			want: wait.PortListenOpen,
+		},
+		{
+			name:        "loopback listener is reachable on the host network",
+			out:         procNetHeader + procNetLineAt(loopbackIPv4, 6379, "0A"),
+			hostNetwork: true,
+			want:        wait.PortListenOpen,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{fakeRunner: newTestRunner(), execStdout: tc.out}
+			target := newDockerWaitTarget(f)
+			if tc.hostNetwork {
+				target.c.network = dockerNetworkHost
+				target.c.networkExplicit = true
+			}
+			status, err := target.ContainerPortStatus(context.Background(), "6379/tcp")
+			if err != nil {
+				t.Fatalf("ContainerPortStatus: %v", err)
+			}
+			if status != tc.want {
+				t.Fatalf("status = %v, want %v", status, tc.want)
+			}
+		})
+	}
+}
+
+func TestWaitTargetContainerPortStatusIgnoresExecStderr(t *testing.T) {
+	stderr := procNetHeader + procNetLine(6379, "0A")
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: procNetHeader + procNetLine(6379, "01"),
+		execErr: &cli.CLIError{
+			Binary:   "docker",
+			Args:     []string{"exec"},
+			ExitCode: 1,
+			Stderr:   "cat: can't open '/proc/net/tcp6': No such file or directory\n" + stderr,
+		},
+	}
+	target := newDockerWaitTarget(f)
+
+	status, err := target.ContainerPortStatus(context.Background(), "6379/tcp")
+	if err != nil {
+		t.Fatalf("ContainerPortStatus: %v", err)
+	}
+	if status != wait.PortListenClosed {
+		t.Fatalf("status = %v, want closed; stderr must not be parsed as a socket table", status)
+	}
+}
+
+func TestProcNetLoopbackAddress(t *testing.T) {
+	tests := []struct {
+		field string
+		want  bool
+		ok    bool
+	}{
+		{field: "00000000:1F90", want: false, ok: true},
+		{field: "0100007F:1F90", want: true, ok: true},
+		{field: "0302017F:1F90", want: true, ok: true},
+		{field: "020011AC:1F90", want: false, ok: true},
+		{field: "00000000000000000000000000000000:1F90", want: false, ok: true},
+		{field: "00000000000000000000000001000000:1F90", want: true, ok: true},
+		{field: "0000000000000000FFFF00000100007F:1F90", want: true, ok: true},
+		{field: "0000000000000000FFFF00000101A8C0:1F90", want: false, ok: true},
+		{field: "0100007F", want: false, ok: false},
+		{field: "not-hex!:1F90", want: false, ok: false},
+	}
+	for _, tc := range tests {
+		got, ok := procNetLoopbackAddress([]byte(tc.field))
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("procNetLoopbackAddress(%q) = %v, %v; want %v, %v", tc.field, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 // TestWaitStrategyDiagnosticValuesFitStreamWindow keeps a caller-provided
 // strategy value out of the handle's streaming redactor when its escaped
 // forms exceed the bounded window. Registering it would make every log-tail
@@ -877,6 +1001,10 @@ func TestWaitStrategyDiagnosticValuesFitStreamWindow(t *testing.T) {
 		})
 	}
 }
+
+// TestWithWaitStrategyRecordsSecretsBeforeValidation lets a rejected
+// strategy still contribute its diagnostic values, so the validation error
+// that quotes them is redacted by the caller's error boundary.
 
 // TestWithWaitStrategyRecordsSecretsBeforeValidation lets a rejected
 // strategy still contribute its diagnostic values, so the validation error

@@ -2,6 +2,7 @@ package wait
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -622,5 +623,64 @@ func TestForHTTPHostHeaderReachesRequest(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("server did not receive the probe")
+	}
+}
+
+func TestForHTTPCanonicalizesHeaderNames(t *testing.T) {
+	strategy := ForHTTP("/").
+		WithHeader("x-probe-name", "first").
+		WithHeader("X-Probe-Name", "second")
+	if len(strategy.headers) != 1 {
+		t.Fatalf("headers = %v, want differently-cased names folded into one entry", strategy.headers)
+	}
+	if got := strategy.headers["X-Probe-Name"]; got != "second" {
+		t.Errorf("canonical header value = %q, want the latest value", got)
+	}
+	if got := ForHTTP("/").WithHeader("host", "virtual.example.com").headers["Host"]; got != "virtual.example.com" {
+		t.Errorf("Host header stored as %q, want canonical spelling", got)
+	}
+}
+
+func TestForHTTPWithTLSConfigClonesCallerConfig(t *testing.T) {
+	cfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test certificate config
+	strategy := ForHTTP("/").WithTLSConfig(cfg)
+	cfg.InsecureSkipVerify = false
+	if strategy.tlsConfig == cfg {
+		t.Fatal("strategy shares the caller's *tls.Config pointer")
+	}
+	if !strategy.tlsConfig.InsecureSkipVerify {
+		t.Fatal("strategy TLS config changed after the builder call; it must be a snapshot")
+	}
+}
+
+func TestForHTTPSameOriginRedirectPreservesHostHeader(t *testing.T) {
+	requests := make(chan capturedHTTPRequest, 1)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, server.URL+"/ready", http.StatusFound)
+			return
+		}
+		requests <- captureHTTPRequest(r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	target := newFakeTarget()
+	target.endpoint = strings.TrimPrefix(server.URL, "http://")
+	err := ForHTTP("/start").
+		WithHeader("Host", "virtual.example.com").
+		WithStartupTimeout(time.Second).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	select {
+	case got := <-requests:
+		if got.host != "virtual.example.com" {
+			t.Errorf("redirect target received Host %q, want the explicit header", got.host)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("same-origin redirect was not followed")
 	}
 }

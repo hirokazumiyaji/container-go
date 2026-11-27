@@ -729,7 +729,21 @@ provides:
   They use the optional `wait.ExecOutputTarget` interface; a target
   without it fails immediately with a `*wait.ConfigError`, and the
   container adapter retains at most 64KiB of output. Without a matcher
-  the output is discarded as before.
+  the output is discarded as before. `WithUser`, `WithWorkDir`, and
+  `WithEnv` set the readiness command's execution context and use the
+  optional `wait.ExecOptionsTarget` interface; a target without it fails
+  immediately with a `*wait.ConfigError`, and environment values are
+  registered for diagnostic redaction.
+- `wait.ForExit()`: wait for a one-shot container to stop. Exit code 0 is
+  accepted by default and any other result fails immediately;
+  `WithExitCode` accepts one code and `WithExitCodeMatcher` replaces the
+  check. The strategy polls the optional `wait.ExitCodeTarget` interface,
+  so a custom target must implement it (the container adapter reports one
+  fresh inspect's state and exit code). A stopped container without a
+  backend-reported exit code fails immediately instead of assuming zero.
+  `ForExit` is for jobs such as migrations and seeders, not long-lived
+  services; `ForAll` and `ForAny` require the container to be running
+  after every child succeeds, so use it outside a composite.
 - `wait.ForFunc(fn)`: call `fn(ctx, target)` once per poll and accept nil.
   Non-nil errors retry and the latest one is reported on timeout; an
   error wrapping `context.Canceled` or one classified as permanent (for
@@ -814,7 +828,11 @@ state; unsupported targets use the host connection alone. Docker healthcheck
 waits use the optional `HealthTarget` interface; `ForHealthcheck` returns a
 `*wait.ConfigError` for targets that do not implement it. `ForExec` output
 matchers use the optional `ExecOutputTarget` interface and return a
-`*wait.ConfigError` when the target does not report command output.
+`*wait.ConfigError` when the target does not report command output. `ForExit`
+uses the optional `ExitCodeTarget` interface and returns a `*wait.ConfigError`
+when the target cannot report completion. `ForExec` execution options use the
+optional `ExecOptionsTarget` interface and return a `*wait.ConfigError` when a
+configured user, working directory, or environment is unsupported.
 `container.Run` adapts `*container.Container` to these interfaces. The
 dependency points from `container` to `wait`, never back, avoiding an
 import cycle.

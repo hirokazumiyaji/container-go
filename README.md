@@ -462,15 +462,26 @@ probe attempt runs under a deadline so a stalled handshake is retried.
 `WithResponseMatcher` / `WithOutputContains` for command output. An output
 matcher needs a target implementing the optional `wait.ExecOutputTarget`
 interface; the container adapter retains at most 64 KiB of command output for
-it. The healthcheck strategy is Docker-only; the Apple backend rejects it
-before creating a container.
+it. The same strategy gains `WithUser`, `WithWorkDir`, and `WithEnv` for the
+readiness command's execution context; those need the optional
+`wait.ExecOptionsTarget` interface, and environment values are registered for
+diagnostic redaction. `wait.ForExit()` waits for a one-shot container to stop
+and accepts exit code 0 by default, failing immediately for any other result;
+`WithExitCode` and `WithExitCodeMatcher` change acceptance. It uses the
+optional `wait.ExitCodeTarget` interface and is meant for job-like containers
+(migrations, seeders, generated configuration) rather than long-lived
+services. The healthcheck strategy is Docker-only; the Apple backend rejects
+it before creating a container.
 
 Waiting fails fast when the container is stopping, stopped, or paused.
 Created, restarting, unknown, and transient inspect states retry under the
 timeout; transient log stream open/EOF failures are reopened, while a
 terminal log-stream error is returned. A successful marker is accepted only
 after a bounded final lifecycle observation reports `Running`; `ForLog` is for
-long-lived services, not one-shot job completion. A marker observed on a
+long-lived services, not one-shot job completion. `ForExit` is the exception:
+its success condition is a stopped container, so use it directly rather than
+inside `ForAll` or `ForAny`, whose final check requires the container to stay
+running. A marker observed on a
 still-running follow stream is accepted without an extra settle delay; a
 stream whose CLI has already exited is drained first so its terminal error is
 not hidden. `ForLog` counts occurrences across reconnects after de-duplicating
@@ -484,7 +495,10 @@ and fall back to `Running` for compatibility. Docker healthcheck waits also
 use the optional `wait.HealthTarget` interface; `ForHealthcheck` returns a
 `*wait.ConfigError` for targets that do not implement it. `ForExec` output
 matchers use the optional `wait.ExecOutputTarget` interface the same way and
-fail with a `*wait.ConfigError` when it is missing.
+fail with a `*wait.ConfigError` when it is missing. `ForExit` uses the optional
+`wait.ExitCodeTarget` interface, and `ForExec` execution options use the
+optional `wait.ExecOptionsTarget` interface; both fail with a
+`*wait.ConfigError` when the target lacks the interface the strategy needs.
 
 On Docker, a successful TCP connection to a published port does not prove
 that the container process listens: `docker-proxy` or Docker Desktop's port
@@ -572,7 +586,11 @@ func DevelopmentWaitOptions() {
         WithBody([]byte(`{"probe":true}`)).
         WithStartupTimeout(time.Second)
     _ = wait.ForExec([]string{"pg_isready"}).
-        WithOutputContains("accepting connections")
+        WithOutputContains("accepting connections").
+        WithUser("app").
+        WithWorkDir("/srv/app").
+        WithEnv(map[string]string{"PGPASSWORD": "secret"})
+    _ = wait.ForExit().WithExitCode(0)
     _ = wait.ForFunc(func(context.Context, wait.Target) error { return nil })
     _ = wait.ForSQL("5432/tcp", "postgres", func(host string, port int) string {
         return fmt.Sprintf(

@@ -19,6 +19,9 @@ import (
 // tests.
 var sqlAttemptTimeout = 3 * time.Second
 
+// sqlOpen is sql.Open, overridable in tests that count database handles.
+var sqlOpen = sql.Open
+
 // SQLStrategy waits until a database/sql probe succeeds against a container's
 // declared port. It holds no per-wait state, so one value may be reused for
 // concurrent waits.
@@ -170,6 +173,17 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 	if err := s.validate(); err != nil {
 		return err
 	}
+	// One database handle serves the whole wait. Rebuilding the pool per
+	// attempt also rebuilt connectionOpener and its cleanup goroutine; the
+	// idle limit below still prevents a probe from reusing a stale
+	// connection or driver state across readiness checks.
+	var db *sql.DB
+	dbDSN := ""
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for SQL on %q", s.port), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)
 		if err != nil {
@@ -181,19 +195,28 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		}
 		dsn := s.dsn(host, port)
 		addSeen(sqlDSNDiagnosticValues(dsn))
-		db, err := sql.Open(s.driver, dsn)
-		if err != nil {
-			// The driver name is checked in validate, so a failure here is
-			// the driver rejecting the DSN.
-			return &ConfigError{
-				Strategy: "ForSQL",
-				Field:    "dsn",
-				Reason:   err.Error(),
+		if db == nil || dsn != dbDSN {
+			if db != nil {
+				_ = db.Close()
 			}
+			db, err = sqlOpen(s.driver, dsn)
+			if err != nil {
+				// The driver name is checked in validate, so a failure here
+				// is the driver rejecting the DSN.
+				db = nil
+				return &ConfigError{
+					Strategy: "ForSQL",
+					Field:    "dsn",
+					Reason:   err.Error(),
+				}
+			}
+			// A single connection at a time, released after each attempt,
+			// matches the previous one-pool-per-attempt lifecycle without
+			// recreating the pool.
+			db.SetMaxOpenConns(1)
+			db.SetMaxIdleConns(0)
+			dbDSN = dsn
 		}
-		// One pool per attempt: a probe must not carry a stale connection or
-		// driver state into the next readiness check.
-		defer func() { _ = db.Close() }()
 		attemptCtx, cancel := context.WithTimeout(ctx, sqlAttemptTimeout)
 		defer cancel()
 		if s.query == "" {
@@ -208,12 +231,9 @@ func (s *SQLStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		// such an error after Next has moved the cursor. One advance is
 		// enough for readiness, and it keeps a large or unbounded result from
 		// extending the probe.
+		defer func() { _ = rows.Close() }()
 		rows.Next()
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		return rows.Close()
+		return rows.Err()
 	})
 }
 

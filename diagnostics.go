@@ -85,7 +85,7 @@ func safePublicError(err error, values ...string) error {
 	return cli.WithRedactor(err, cli.NewHashedRedactor(values...))
 }
 
-func (c *config) publicError(err error, extra ...string) error {
+func (c *config) publicError(err error, extra ...string) error { //nolint:unparam // extra is nil at one call site and carries values at others
 	var validation *ValidationError
 	if errors.As(err, &validation) {
 		if validation.Value != nil {

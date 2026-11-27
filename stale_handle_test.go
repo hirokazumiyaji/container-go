@@ -28,7 +28,7 @@ func (r *staleHandleRunner) Run(_ context.Context, args ...string) ([]byte, []by
 	if args[0] == "version" {
 		for _, a := range args {
 			if strings.Contains(a, "json .") {
-				return []byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`), nil, nil
+				return []byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0","Os":"linux"}}`), nil, nil
 			}
 		}
 		return []byte("29.8.0"), nil, nil

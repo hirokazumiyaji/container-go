@@ -211,7 +211,7 @@ func TestBuiltInWaitContextErrorMatrix(t *testing.T) {
 					if !errors.Is(err, tc.want) {
 						t.Fatalf("error = %v, want errors.Is(..., %v)", err, tc.want)
 					}
-					if errors.Is(err, context.Canceled) != (tc.want == context.Canceled) {
+					if errors.Is(err, context.Canceled) != errors.Is(tc.want, context.Canceled) {
 						t.Fatalf("error = %v, unexpected context.Canceled match", err)
 					}
 					// Composite strategies run a lifecycle monitor that may

@@ -67,6 +67,25 @@ func TestReadReadyTimeoutReportsNewestOutput(t *testing.T) {
 		t.Fatalf("expected a timeout, got %q", out)
 	}
 	if !strings.Contains(out, marker) {
-		t.Errorf("timeout output is missing the newest chunk: %q", out[len(out)-80:])
+		t.Errorf("timeout output is missing the newest chunk: %q", out[max(0, len(out)-80):])
+	}
+}
+
+// A timeout can carry less than the diagnostic window's worth of output. The
+// failure message must not slice past the start of that short buffer.
+func TestReadReadyTimeoutHandlesShortOutput(t *testing.T) {
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+
+	go func() {
+		_, _ = pw.Write([]byte("tiny\n"))
+	}()
+
+	out, err := ReadReady(pr, 300*time.Millisecond)
+	if err == nil {
+		t.Fatalf("expected a timeout, got %q", out)
+	}
+	if !strings.Contains(out, "tiny") {
+		t.Errorf("timeout output lost the partial chunk: %q", out)
 	}
 }

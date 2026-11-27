@@ -28,19 +28,19 @@ func TestDecodeRealOutputSample(t *testing.T) {
 			}
 
 			c := containers[0]
-			if c.ID != "containergo-1a2b3c4d" {
+			if c.ID.Value != "containergo-1a2b3c4d" {
 				t.Errorf("ID = %q", c.ID)
 			}
-			if got := c.Configuration.Image.Reference; got != "docker.io/library/redis:7-alpine" {
+			if got := c.Configuration.Value.Image.Reference; got != "docker.io/library/redis:7-alpine" {
 				t.Errorf("Image.Reference = %q", got)
 			}
-			if got := c.Configuration.Image.Descriptor.Digest; got == "" {
+			if got := c.Configuration.Value.Image.Descriptor.Digest; got == "" {
 				t.Error("Image.Descriptor.Digest is empty")
 			}
-			if got := c.Configuration.Labels["com.github.hirokazumiyaji.container-go.session"]; got != "f00dcafe" {
+			if got := c.Configuration.Value.Labels["com.github.hirokazumiyaji.container-go.session"]; got != "f00dcafe" {
 				t.Errorf("session label = %q", got)
 			}
-			if got := c.Status.State; got != "running" {
+			if got := c.Status.Value.State.Value; got != "running" {
 				t.Errorf("State = %q", got)
 			}
 		})
@@ -72,7 +72,7 @@ func TestIPv4ErrorsWithoutNetworks(t *testing.T) {
 
 func TestDecodePublishedPortsV122(t *testing.T) {
 	containers := decodeTestdata(t, "inspect_v1.2.2.json")
-	ports := containers[0].Configuration.PublishedPorts
+	ports := containers[0].Configuration.Value.PublishedPorts
 	if len(ports) != 1 {
 		t.Fatalf("len(PublishedPorts) = %d, want 1", len(ports))
 	}
@@ -88,7 +88,7 @@ func TestDecodeIgnoresUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	if containers[0].ID != "x" {
+	if containers[0].ID.Value != "x" {
 		t.Errorf("ID = %q", containers[0].ID)
 	}
 }

@@ -263,7 +263,7 @@ func TestWithQueryTimeoutAppliedToDockerDefaultNetwork(t *testing.T) {
 		if d, ok := ctx.Deadline(); ok {
 			observedDeadline = d
 		}
-		return []byte("linux\n"), nil, nil
+		return []byte(defaultTestDockerVersion), nil, nil
 	})
 
 	cfg := newConfig()
@@ -275,9 +275,9 @@ func TestWithQueryTimeoutAppliedToDockerDefaultNetwork(t *testing.T) {
 	}
 
 	start := time.Now()
-	name, err := dockerDefaultNetwork(context.Background(), cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
+	name, err := dockerDefaultNetworkCached(context.Background(), nil, cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
 	if err != nil {
-		t.Fatalf("dockerDefaultNetwork error: %v", err)
+		t.Fatalf("dockerDefaultNetworkCached error: %v", err)
 	}
 	if name != "bridge" {
 		t.Errorf("name = %q, want bridge", name)

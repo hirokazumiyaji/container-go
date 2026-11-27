@@ -161,13 +161,13 @@ func findCLIErrorWithStderr(err error, text string) *cli.CLIError {
 	if err == nil {
 		return nil
 	}
-	if cliErr, ok := err.(*cli.CLIError); ok {
+	if cliErr, ok := err.(*cli.CLIError); ok { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 		if strings.Contains(cliErr.Stderr, text) {
 			return cliErr
 		}
 		return nil
 	}
-	switch e := err.(type) {
+	switch e := err.(type) { //nolint:errorlint // walks the chain node by node; errors.Is/As would re-traverse it and cross safe facades
 	case interface{ Unwrap() []error }:
 		for _, u := range e.Unwrap() {
 			if found := findCLIErrorWithStderr(u, text); found != nil {

@@ -114,6 +114,7 @@ func (m platformMetadata) normalized() string {
 	return strings.Join(parts, "/")
 }
 
+//nolint:unparam // the first result is unused today but keeps the helper symmetric
 func (m platformMetadata) has(selector platformParts) (string, bool, bool) {
 	// The second result says whether the selected components all matched;
 	// the third says whether the observed metadata was structurally valid.

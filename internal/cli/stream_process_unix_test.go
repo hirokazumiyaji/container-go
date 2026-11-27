@@ -122,7 +122,7 @@ func TestStreamExitReapStress(t *testing.T) {
 }
 
 func TestTerminateProcessTreePinsChildBeforeWaitInterleaving(t *testing.T) {
-	cmd := exec.Command("sleep", "5")
+	cmd := exec.CommandContext(context.Background(), "sleep", "5")
 	configureProcessTree(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

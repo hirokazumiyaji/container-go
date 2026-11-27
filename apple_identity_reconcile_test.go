@@ -11,8 +11,8 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-func reconcileImageJSON(platform, variant string, synthetic bool) []byte {
-	variants := []any{freshVariant(platform, variant)}
+func reconcileImageJSON(platform string, synthetic bool) []byte {
+	variants := []any{freshVariant(platform, finalVariant)}
 	annotations := map[string]any{}
 	if synthetic {
 		annotations["com.apple.containerization.index.indirect"] = "true"
@@ -79,7 +79,7 @@ func (r *reconcileRunner) Run(_ context.Context, args ...string) ([]byte, []byte
 func TestAppleExactInspectReconcilesCompleteIdentity(t *testing.T) {
 	host := freshHostPlatform()
 	runner := &reconcileRunner{
-		completeJSON: reconcileImageJSON(host, finalVariant, true),
+		completeJSON: reconcileImageJSON(host, true),
 		postPlatform: host,
 	}
 	input := "registry.example/team/demo:stable@" + finalRoot
@@ -105,7 +105,7 @@ func TestAppleExactInspectReconcilesCompleteIdentity(t *testing.T) {
 func TestAppleExactInspectStillChecksPostCreatePlatform(t *testing.T) {
 	host := freshHostPlatform()
 	runner := &reconcileRunner{
-		completeJSON: reconcileImageJSON(host, finalVariant, true),
+		completeJSON: reconcileImageJSON(host, true),
 		postPlatform: freshOtherPlatform(host),
 	}
 	input := "registry.example/team/demo:stable@" + finalRoot
@@ -162,7 +162,7 @@ func (r *scopedIndexRunner) Run(_ context.Context, args ...string) ([]byte, []by
 }
 
 func ordinaryScopedIndexJSON(platform string) []byte {
-	return reconcileImageJSON(platform, finalVariant, false)
+	return reconcileImageJSON(platform, false)
 }
 
 func TestAppleOrdinaryOneVariantIndexUsesControlledExactRootProbe(t *testing.T) {
@@ -209,7 +209,7 @@ func TestAppleSyntheticRequiresReliableSignal(t *testing.T) {
 	if !ordinaryLookup.found() || ordinary.appleSynthetic {
 		t.Fatalf("ordinary one-variant identity = %+v, found=%v, want non-synthetic", ordinary, ordinaryLookup.found())
 	}
-	syntheticLookup := (appleEngine{}).parseImageIdentity(reconcileImageJSON(host, finalVariant, true), "registry.example/team/demo:stable", host)
+	syntheticLookup := (appleEngine{}).parseImageIdentity(reconcileImageJSON(host, true), "registry.example/team/demo:stable", host)
 	synthetic := syntheticLookup.identity
 	if !syntheticLookup.found() || !synthetic.appleSynthetic {
 		t.Fatalf("annotated synthetic identity = %+v, found=%v, want synthetic", synthetic, syntheticLookup.found())

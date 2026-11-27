@@ -113,6 +113,9 @@ func canonicalTestcontainersConfigError(config tc.TestcontainersConfig) error {
 	if config.CertPath != "" || config.Config.CertPath != "" {
 		problems = append(problems, fmt.Sprintf("Docker certificate path cert=%q config=%q must be empty", config.CertPath, config.Config.CertPath))
 	}
+	if !strings.EqualFold(strings.TrimSpace(config.Config.Provider), "docker") {
+		problems = append(problems, fmt.Sprintf("container provider %q must be docker", config.Config.Provider))
+	}
 	if len(problems) == 0 {
 		return nil
 	}

@@ -33,24 +33,14 @@ type dockerImageInspect struct {
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
-	ID       string `json:"Id"`
-	Image    string `json:"Image"`
-	Name     string `json:"Name"`
-	Platform string `json:"Platform"`
-	Created  string `json:"Created"`
+	ID       strictjson.NonNull[string] `json:"Id"`
+	Image    string                     `json:"Image"`
+	Name     strictjson.NonNull[string] `json:"Name"`
+	Platform string                     `json:"Platform"`
+	Created  string                     `json:"Created"`
 	// State is present on container inspect objects, but not on Docker
 	// network or volume inspect objects.
-	State *struct {
-		Status     string `json:"Status"`
-		ExitCode   *int   `json:"ExitCode"`
-		StartedAt  string `json:"StartedAt"`
-		FinishedAt string `json:"FinishedAt"`
-		// Health is null when the image defines no HEALTHCHECK.
-		Health *struct {
-			Status        string `json:"Status"`
-			FailingStreak int    `json:"FailingStreak"`
-		} `json:"Health"`
-	} `json:"State"`
+	State      strictjson.NonNull[*dockerInspectState] `json:"State"`
 	HostConfig struct {
 		NetworkMode string   `json:"NetworkMode"`
 		NanoCpus    *int64   `json:"NanoCpus"`
@@ -84,11 +74,27 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
+// dockerInspectState mirrors the container state fields the parser reads.
+// Status is NonNull because a target-naming entry with an unreadable state
+// must fail the decode instead of looking absent.
+type dockerInspectState struct {
+	Status     strictjson.NonNull[string] `json:"Status"`
+	ExitCode   *int                       `json:"ExitCode"`
+	StartedAt  string                     `json:"StartedAt"`
+	FinishedAt string                     `json:"FinishedAt"`
+	// Health is null when the image defines no HEALTHCHECK.
+	Health *struct {
+		Status        string `json:"Status"`
+		FailingStreak int    `json:"FailingStreak"`
+	} `json:"Health"`
+}
+
 // dockerInspectFields are the entry fields the matcher below depends on to
-// recognize the requested container and its state. Nullable collections
-// the CLI uses for empty values (Config.Labels, NetworkSettings.Ports,
-// which real output emits as null) are deliberately absent: a null there
-// is an empty value, not unreadable output.
+// recognize the requested container and its state. They are NonNull in
+// dockerInspect; the list names them in the decode error. Nullable
+// collections the CLI uses for empty values (Config.Labels,
+// NetworkSettings.Ports, which real output emits as null) are deliberately
+// absent: a null there is an empty value, not unreadable output.
 var dockerInspectFields = []string{"Id", "Name", "State", "State.Status"}
 
 // parseInspect returns the one entry that matches target exactly: the full
@@ -117,8 +123,8 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	var candidateMissingState bool
 	if domain.IsImmutableContainerID(target) {
 		for i, c := range containers {
-			if domain.IsImmutableContainerID(c.ID) && c.ID == target {
-				if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
+			if domain.IsImmutableContainerID(c.ID.Value) && c.ID.Value == target {
+				if c.State.Value == nil || strings.TrimSpace(c.State.Value.Status.Value) == "" {
 					candidateMissingState = true
 					continue
 				}
@@ -128,16 +134,16 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	} else {
 		for i, c := range containers {
-			if target == "" || c.Name != "/"+target {
+			if target == "" || c.Name.Value != "/"+target {
 				continue
 			}
 			// A name-matched entry without a container ID is unreadable,
 			// not absent: skipping it would report a container that exists
 			// as missing. An empty ID is as invalid as any other
 			// non-canonical one.
-			if !domain.IsImmutableContainerID(c.ID) {
+			if !domain.IsImmutableContainerID(c.ID.Value) {
 				if !malformedIDSeen {
-					malformedID = c.ID
+					malformedID = c.ID.Value
 					malformedIDSeen = true
 				}
 				continue
@@ -145,7 +151,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 			// Apply the same State/Status validation as ID addressing.
 			// Otherwise a target-naming entry whose state cannot be read
 			// would be accepted as a match or reported as absent.
-			if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
+			if c.State.Value == nil || strings.TrimSpace(c.State.Value.Status.Value) == "" {
 				candidateMissingState = true
 				continue
 			}
@@ -182,10 +188,10 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 
 	info := &engineInfo{
-		state:           dockerState(c.State.Status),
-		name:            strings.TrimPrefix(c.Name, "/"),
+		state:           dockerState(c.State.Value.Status.Value),
+		name:            strings.TrimPrefix(c.Name.Value, "/"),
 		labels:          c.Config.Labels,
-		uid:             c.ID,
+		uid:             c.ID.Value,
 		image:           c.Config.Image,
 		imageID:         c.Image,
 		imageDigest:     imageDigest(c.Config.Image),
@@ -219,16 +225,16 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	info.runOptions.extraHosts = parseDockerExtraHosts(c.HostConfig.ExtraHosts)
 	info.createdAt = parseInspectTime(c.Created)
-	if c.State != nil {
-		if c.State.ExitCode != nil {
-			info.exitCode = *c.State.ExitCode
+	if state := c.State.Value; state != nil {
+		if state.ExitCode != nil {
+			info.exitCode = *state.ExitCode
 			info.exitCodeReported = true
 		}
-		info.startedAt = parseInspectTime(c.State.StartedAt)
-		info.finishedAt = parseInspectTime(c.State.FinishedAt)
-		if c.State.Health != nil {
-			info.health = c.State.Health.Status
-			info.healthFailingStreak = c.State.Health.FailingStreak
+		info.startedAt = parseInspectTime(state.StartedAt)
+		info.finishedAt = parseInspectTime(state.FinishedAt)
+		if state.Health != nil {
+			info.health = state.Health.Status
+			info.healthFailingStreak = state.Health.FailingStreak
 		}
 	}
 	if info.networkMode == "" {
@@ -371,10 +377,6 @@ func dockerState(s string) State {
 	}
 }
 
-func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return parseDockerPruneIDs(data)
-}
-
 func parseDockerPruneIDs(data []byte) ([]string, error) {
 	ids := splitNonEmptyLines(data)
 	for _, id := range ids {
@@ -489,8 +491,4 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) imageLookup
 		}
 	}
 	return availableImage(imageIdentity{})
-}
-
-func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return parseDockerPruneIDs(data)
 }

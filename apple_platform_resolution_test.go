@@ -149,7 +149,7 @@ func TestAppleRunMaterializesHostPlatformForPullNever(t *testing.T) {
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal for implicit %s", err, other)
 	}
-	runImage, _, pulls := runner.state()
+	runImage, pulls := runner.state()
 	if runImage != "" || pulls != 0 {
 		t.Fatalf("implicit host mismatch ran or fetched: run=%q pulls=%d", runImage, pulls)
 	}
@@ -175,7 +175,7 @@ func TestAppleRunUsesHostPlatformBeforeFetchingMissingVariant(t *testing.T) {
 	if ctr.image.platform != host {
 		t.Fatalf("identity platform = %q, want materialized host %q", ctr.image.platform, host)
 	}
-	runImage, _, pulls := runner.state()
+	runImage, pulls := runner.state()
 	if runImage != "redis:7-alpine@"+platformPinningRoot || pulls != 1 {
 		t.Fatalf("run=%q pulls=%d, want host-specific fetch", runImage, pulls)
 	}

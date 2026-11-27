@@ -456,11 +456,12 @@ func (d *structuralDiscard) consume(data []byte) (int, bool) {
 		for ; i < len(data); i++ {
 			c := data[i]
 			if d.quote != 0 {
-				if d.escaped {
+				switch {
+				case d.escaped:
 					d.escaped = false
-				} else if c == '\\' {
+				case c == '\\':
 					d.escaped = true
-				} else if c == d.quote {
+				case c == d.quote:
 					d.quote = 0
 				}
 				continue

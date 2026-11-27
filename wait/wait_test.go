@@ -79,7 +79,7 @@ func (f *fakeTarget) ExecCommand(_ context.Context, cmd []string) (int, error) {
 }
 
 func TestForListeningPortSucceedsWhenPortOpen(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestForListeningPortSucceedsWhenPortOpen(t *testing.T) {
 }
 
 func TestForExposedPortSucceedsWhenPortOpen(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestForListeningPortRejectsInvalidConfiguration(t *testing.T) {
 func TestForListeningPortTimesOut(t *testing.T) {
 	// A listener that is immediately closed leaves a port nobody
 	// answers on.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestForExecTimesOutOnPersistentFailure(t *testing.T) {
 }
 
 func TestForListeningPortProbesStateDuringPoll(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,7 +789,7 @@ func (s *slowRunningTarget) State(ctx context.Context) (State, error) {
 }
 
 func TestForAllRunsStrategiesInOrder(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

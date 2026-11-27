@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -97,9 +96,6 @@ func TestDockerMetadataSeparatesQueryBudgets(t *testing.T) {
 				case <-ctx.Done():
 					return nil, nil, ctx.Err()
 				}
-				if strings.Contains(strings.Join(args, " "), "Server.Os") {
-					return []byte("linux"), nil, nil
-				}
 				return []byte(defaultTestDockerVersion), nil, nil
 			})
 			query := func(ctx context.Context, d time.Duration) error {
@@ -132,7 +128,7 @@ func TestDockerMetadataHonorsLongQueryBudget(t *testing.T) {
 		if remaining := time.Until(deadline); remaining < time.Minute {
 			t.Errorf("query budget=%v, want longer than fixed30s", remaining)
 		}
-		return []byte("linux"), nil, nil
+		return []byte(defaultTestDockerVersion), nil, nil
 	})
 	if _, err := dockerDefaultNetworkCached(context.Background(), cache, runner, dockerEngine{}, opTimeouts{query: 2 * time.Minute}); err != nil {
 		t.Fatal(err)

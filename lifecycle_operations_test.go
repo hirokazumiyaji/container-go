@@ -714,7 +714,7 @@ func (r *recordingStreamerRunner) Stream(ctx context.Context, streamArgs ...stri
 	}
 	r.mu.Unlock()
 	if streamErr != nil {
-		return io.NopCloser(errorReader{err: streamErr}), nil
+		return io.NopCloser(errorReader{err: streamErr}), nil //nolint:nilerr // the fake delivers the error through Read
 	}
 	return io.NopCloser(strings.NewReader(r.data)), nil
 }

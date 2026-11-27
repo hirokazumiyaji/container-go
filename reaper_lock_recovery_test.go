@@ -3,6 +3,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -50,7 +51,7 @@ func TestReaperSpawnRecoveryIsBoundedAndReplaysEntries(t *testing.T) {
 		}
 		args := []string{reaperInternalCommand, r.binary, r.subcommand, creationLabel, "1", "1"}
 		args = append(args, r.deleteFlags...)
-		cmd := exec.Command(exe, args...)
+		cmd := exec.CommandContext(context.Background(), exe, args...)
 		cmd.Env = append(os.Environ(), reaperInternalEnv+"=1")
 		return cmd, nil
 	}

@@ -4,15 +4,89 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"io"
-	"net"
 	"regexp"
-	"slices"
-	"strconv"
 	"strings"
 	"time"
 )
+
+func (c *Container) classify(ctx context.Context, err error) error {
+	return classifyErrorWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout)
+}
+
+func (c *Container) classifyOperation(ctx context.Context, err error, operation string) error {
+	if c.eng == nil {
+		return c.classify(ctx, err)
+	}
+	target := c.operationTarget()
+	if target == c.id {
+		return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target)
+	}
+	return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target, c.id)
+}
+
+func (c *Container) deleteOperation() string {
+	if c.eng != nil {
+		return c.eng.reaperSubcommand()
+	}
+	return "delete"
+}
+
+// Stop stops the container. A nil timeout uses the CLI's default grace
+// period before the process is killed. A non-nil timeout must be non-negative
+// and its rounded-up seconds must fit the backend's supported range. The
+// backend-specific limit is checked before invoking its CLI. Because both
+// backends accept whole seconds, positive sub-second timeouts are rounded up;
+// zero requests immediate termination.
+func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	if timeout != nil && *timeout < 0 {
+		return newValidationErrorWithField("Stop", "timeout", *timeout,
+			fmt.Errorf("stop timeout must be >= 0, got %s", *timeout))
+	}
+	if c.refusesSharedOps() {
+		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
+	}
+	stopCtx, cancel := withDefaultTimeout(ctx, addTimeout(c.effectiveQueryTimeout(), durationOrZero(timeout)))
+	defer cancel()
+	target, err := c.verifiedOperationTarget(stopCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.stopArgs(target, timeout)
+	if err != nil {
+		return fmt.Errorf("stop %s: %w", c.id, err)
+	}
+	teardown := c.markAttachTeardown()
+	_, _, err = c.runner.Run(stopCtx, args...)
+	if err != nil {
+		c.clearAttachTeardown(teardown)
+		return c.classifyOperation(ctx, err, "stop")
+	}
+	c.stopAttachedTarget(teardown)
+	c.clearDynamic()
+	return nil
+}
+
+// ExitCode returns the reported exit code of a stopped container.
+// ErrContainerNotStopped indicates that the process has not stopped. Both that
+// error and an omitted backend exit code match ErrExitCodeUnavailable.
+// Apple CLI versions that omit status.exitCode cannot provide a process result.
+func (c *Container) ExitCode(ctx context.Context) (int, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	if err != nil {
+		// A bare sentinel is returned as-is; a wrapped deadline takes the
+		// redacted path below so its diagnostic values stay protected.
+		if err == context.Canceled || err == context.DeadlineExceeded { //nolint:errorlint // exact identity selects the unredacted path
+			return 0, err
+		}
+		redacted := c.redactError(err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return 0, exitCodeDeadlineError{redacted}
+		}
+		return 0, redacted
+	}
+	return reportedExitCode(info)
+}
 
 // Keep the deadline visible to callers classifying redacted inspect failures.
 type exitCodeDeadlineError struct{ error }
@@ -30,6 +104,14 @@ func reportedExitCode(info *engineInfo) (int, error) {
 	}
 	return info.exitCode, nil
 }
+
+// Wait polls an inspect-backed state read. The interval starts small so a
+// quick exit is noticed promptly, then backs off to a cap: a long batch
+// container should cost a bounded number of CLI subprocesses.
+var (
+	waitExitPollInterval    = 100 * time.Millisecond
+	waitExitPollMaxInterval = time.Second
+)
 
 func nextWaitExitPollInterval(current time.Duration) time.Duration {
 	next := current * 2
@@ -141,7 +223,11 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.restartArgs(target, timeout)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return c.restartAttached(ctx, timeout)
+	}
+	args, err := lifecycle.restartArgs(target, timeout)
 	if errors.Is(err, ErrUnsupportedCapability) {
 		return c.restartAttached(ctx, timeout)
 	}
@@ -268,7 +354,11 @@ func (c *Container) Pause(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.pauseArgs(target)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return unsupportedLifecycle(c.eng, "pause")
+	}
+	args, err := lifecycle.pauseArgs(target)
 	if err != nil {
 		return err
 	}
@@ -292,7 +382,11 @@ func (c *Container) Unpause(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	args, err := c.eng.unpauseArgs(target)
+	lifecycle, ok := c.eng.(engineLifecycleExtensions)
+	if !ok {
+		return unsupportedLifecycle(c.eng, "unpause")
+	}
+	args, err := lifecycle.unpauseArgs(target)
 	if err != nil {
 		return err
 	}
@@ -302,37 +396,6 @@ func (c *Container) Unpause(ctx context.Context) error {
 	}
 	c.clearDynamic()
 	return nil
-}
-
-// Shared returns a handle to the same container with Stop/Copy refusals
-// lifted. The returned handle keeps reused set so Cleanup and
-// TerminateContainer still skip teardown; only allowDestructive differs.
-// Mutable identity state is shared through sync so both handles see the
-// same promoted UID and inspect cache.
-func (c *Container) Shared() *Container {
-	if c == nil {
-		return nil
-	}
-	_ = c.pack()
-	c.secretsMu.RLock()
-	diagnosticRedactor := c.diagnosticRedactorValue
-	c.secretsMu.RUnlock()
-	// rememberIdentity may promote the image identity of a name-addressed
-	// handle after construction, so read it under the same lock.
-	c.pack().mu.Lock()
-	image := c.image
-	c.pack().mu.Unlock()
-	return &Container{
-		id: c.id, runner: c.runner, eng: c.eng,
-		queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout,
-		exposed: c.exposed, published: c.published,
-		network: c.network, networkExplicit: c.networkExplicit,
-		reused: c.reused, created: c.created, allowDestructive: true, creation: c.creation,
-		image: image, nameInspect: c.nameInspect,
-		sync: c.sync, dockerMeta: c.dockerMeta,
-		diagnosticRedactorValue: diagnosticRedactor,
-		targetHost:              c.targetHost,
-	}
 }
 
 // StopAttached terminates any active background log streaming started by WithAttachOutput.
@@ -547,7 +610,7 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 		select {
 		case gate <- struct{}{}:
 			defer func() { <-gate }()
-			err := c.followLogsTo(attachCtx, output, resumeSince)
+			err := c.followLogsTo(attachCtx, output, FollowLogsOptions{}, resumeSince)
 			// A teardown cancellation is not a stream failure, but losing
 			// output to a failing sink is always reportable.
 			if attachCtx.Err() == nil || errors.Is(err, ErrOutputDelivery) {
@@ -749,124 +812,6 @@ func (c *Container) delete(ctx context.Context, target string) error {
 		return nil
 	}
 	return c.classifyOperation(ctx, err, c.deleteOperation())
-}
-
-// ContainerIP returns the container's address on its first attached
-// network. With the Docker backend on Docker Desktop this address is
-// usually not reachable from the host; prefer Endpoint.
-func (c *Container) ContainerIP(ctx context.Context) (string, error) {
-	info, err := c.inspectDynamic(ctx)
-	if err != nil {
-		return "", c.redactError(err)
-	}
-	if info.ip == "" {
-		c.clearDynamic()
-		return "", c.redactError(errors.New("container has no reported IP address"), c.id, info.ip)
-	}
-	return info.ip, nil
-}
-
-// Host returns the address clients should connect to. When multiple
-// published ports use different host IPs, prefer Endpoint for the
-// specific port — Host returns only the first published binding's
-// address (or the container IP / default host when nothing is published).
-// Docker host networking returns the daemon host but does not infer a
-// listening port; Docker none networking has no reachable host.
-func (c *Container) Host(ctx context.Context) (string, error) {
-	// Inspect before returning any address, including an explicitly
-	// published direct-IP endpoint. A requested publish string is not
-	// proof that the handle still names the same live container.
-	info, err := c.inspectDynamic(ctx)
-	if err != nil {
-		return "", err
-	}
-	if !c.eng.directIP() {
-		if err := c.attachDefaultNetwork(ctx, info); err != nil {
-			return "", err
-		}
-		if err := c.validateNetworkInfo(info); err != nil {
-			return "", err
-		}
-	}
-	var published *publishSpec
-	if len(c.published) > 0 {
-		published = &c.published[0]
-	}
-	host, _, err := domain.ResolveEndpoint(endpointNetwork(info), c.endpointBackend(), domain.EndpointRequest{
-		Container: c.id,
-		Published: published,
-	})
-	if err != nil {
-		c.clearStaleEndpointSnapshot(err)
-		return "", err
-	}
-	return host, nil
-}
-
-// MappedPort resolves a declared container port ("6379/tcp" or "6379")
-// to the port clients should dial.
-func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
-	_, p, err := c.resolve(ctx, port, "MappedPort")
-	return p, err
-}
-
-// Endpoint returns "host:port" for a port declared via WithExposedPorts
-// or WithPublishedPort. It does not infer a host-network service port.
-func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
-	host, p, err := c.resolve(ctx, port, "Endpoint")
-	if err != nil {
-		return "", c.redactError(err, port)
-	}
-	return net.JoinHostPort(host, strconv.Itoa(p)), nil
-}
-
-// resolve maps a container port to the (host, port) pair to dial.
-func (c *Container) resolve(ctx context.Context, port, operation string) (string, int, error) {
-	spec, err := parsePortSpec(port)
-	if err != nil {
-		return "", 0, newValidationErrorWithField(operation, "port", port, err)
-	}
-	var published *publishSpec
-	for i := range c.published {
-		p := &c.published[i]
-		if p.ContainerPort == spec.Port && p.Proto == spec.Proto {
-			published = p
-			break
-		}
-	}
-	if published == nil && !slices.Contains(c.exposed, spec) {
-		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
-	}
-	// Resolve through an identity-checked dynamic inspect (short TTL)
-	// before returning an endpoint. This is especially important for
-	// direct-IP backends: a published address is otherwise just a stale
-	// option value and can be returned for a replacement container
-	// without any backend read.
-	info, err := c.inspectDynamic(ctx)
-	if err != nil {
-		return "", 0, err
-	}
-	if !c.eng.directIP() {
-		// Published-port mode: the backend assigned a host port at start.
-		// Docker may discard -p in host mode, so the request is never used
-		// as proof that a binding exists; inspect must confirm it.
-		if err := c.attachDefaultNetwork(ctx, info); err != nil {
-			return "", 0, err
-		}
-		if err := c.validateNetworkInfo(info); err != nil {
-			return "", 0, err
-		}
-	}
-	host, mapped, err := domain.ResolveEndpoint(endpointNetwork(info), c.endpointBackend(), domain.EndpointRequest{
-		Container: c.id,
-		Port:      spec,
-		Published: published,
-	})
-	if err != nil {
-		c.clearStaleEndpointSnapshot(err)
-		return "", 0, c.redactError(err, port)
-	}
-	return host, mapped, nil
 }
 
 func durationOrZero(d *time.Duration) time.Duration {

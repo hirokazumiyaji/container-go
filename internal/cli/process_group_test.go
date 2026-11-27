@@ -32,7 +32,7 @@ func TestEscapingProcessGroupHelper(t *testing.T) {
 		_ = os.WriteFile(os.Getenv("CONTAINERGO_GROUP_ESCAPE_ERROR"), []byte(err.Error()), 0o600)
 		return
 	}
-	child := exec.Command("sleep", "5")
+	child := exec.CommandContext(context.Background(), "sleep", "5")
 	child.Stdout = devNull
 	child.Stderr = devNull
 	if err := child.Start(); err != nil {

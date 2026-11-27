@@ -216,7 +216,7 @@ func TestCleanupStaleEnvFilesRespectsWriterLock(t *testing.T) {
 	if err := os.Mkdir(dir, envDirMode); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeEnvMarker(filepath.Join(dir, envFileDirMarkerName), envFileDirMarker); err != nil {
+	if err := writeEnvMarker(filepath.Join(dir, envFileDirMarkerName)); err != nil {
 		t.Fatal(err)
 	}
 	lock, err := openEnvFileNoFollow(filepath.Join(dir, envFileLockName), os.O_CREATE|os.O_RDWR, envFileMode)

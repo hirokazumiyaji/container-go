@@ -20,7 +20,7 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 		// The child's TestMain unsets CONTAINERGO_BACKEND, so the
 		// env-passed selection never reaches Run; pin it here. This
 		// test is specifically about the reaper, not keep mode.
-		_ = os.Setenv("CONTAINERGO_BACKEND", "docker")
+		t.Setenv("CONTAINERGO_BACKEND", "docker")
 		_ = os.Unsetenv("CONTAINERGO_KEEP")
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationRedis,
@@ -47,19 +47,19 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 	t.Setenv("CONTAINERGO_KEEP", "")
 	name := fmt.Sprintf("containergo-dockerreap-%d", os.Getpid())
 	namedVolume := name + "-named"
-	if out, err := exec.Command("docker", "volume", "create", namedVolume).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(context.Background(), "docker", "volume", "create", namedVolume).CombinedOutput(); err != nil {
 		t.Fatalf("create named volume: %v: %s", err, out)
 	}
 	var anonymousVolume string
 	defer func() {
-		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
+		_ = exec.CommandContext(context.Background(), "docker", "rm", "--force", "--volumes", name).Run()
 		if anonymousVolume != "" {
-			_ = exec.Command("docker", "volume", "rm", anonymousVolume).Run()
+			_ = exec.CommandContext(context.Background(), "docker", "volume", "rm", anonymousVolume).Run()
 		}
-		_ = exec.Command("docker", "volume", "rm", namedVolume).Run()
+		_ = exec.CommandContext(context.Background(), "docker", "volume", "rm", namedVolume).Run()
 	}()
 
-	cmd := exec.Command(os.Args[0], "-test.run", "TestIntegrationDockerReaperSurvivesSIGKILL")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run", "TestIntegrationDockerReaperSurvivesSIGKILL")
 	cmd.Env = append(os.Environ(),
 		"CONTAINERGO_BACKEND=docker",
 		"CONTAINERGO_REAPER_CHILD=1",
@@ -119,7 +119,7 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("docker", "ps", "--all", "--format", "{{.Names}}").Output()
+		out, err := exec.CommandContext(context.Background(), "docker", "ps", "--all", "--format", "{{.Names}}").Output()
 		if err == nil && !strings.Contains(string(out), name) {
 			waitForDockerVolume(t, anonymousVolume, false)
 			waitForDockerVolume(t, namedVolume, true)

@@ -11,8 +11,74 @@ import (
 	"math"
 )
 
+const (
+	reuseConfigLabel = domain.LabelReuseConfig
+	managedLabel     = domain.LabelManaged
+	sessionLabel     = domain.LabelSession
+	reuseLabel       = domain.LabelReuse
+	reuseGroupLabel  = domain.LabelReuseGroup
+	reuseEnvLabel    = domain.LabelReuseEnvFingerprint
+	creationLabel    = domain.LabelCreation
+
+	queryTimeout = 30 * time.Second
+	// runTimeout also covers an implicit image pull.
+	runTimeout = 10 * time.Minute
+
+	// dynamicInspectTTL bounds how long Host/Endpoint/MappedPort/ContainerIP
+	// may reuse a dynamic inspect snapshot. It matches the wait package's
+	// lifecycle probe cadence (once per second) so readiness polls do not
+	// spawn a backend CLI process on every 100ms Endpoint retry, while
+	// network and port data are still not retained indefinitely.
+	dynamicInspectTTL = time.Second
+)
+
+var (
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a var so tests
+	// can exercise the bounded cleanup contract without a long wait.
+	terminateTimeout = queryTimeout
+)
+
 // State is a container lifecycle state.
 type State = domain.State
+
+const (
+	StateRunning    State = domain.StateRunning
+	StateStopped    State = domain.StateStopped
+	StateStopping   State = domain.StateStopping
+	StateCreated    State = domain.StateCreated
+	StateRestarting State = domain.StateRestarting
+	StatePaused     State = domain.StatePaused
+	StateUnknown    State = domain.StateUnknown
+)
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.pack().uidMu.RLock()
+	defer c.pack().uidMu.RUnlock()
+	return c.pack().uid
+}
+
+func (c *Container) infoSnapshot() *engineInfo {
+	c.pack().mu.Lock()
+	defer c.pack().mu.Unlock()
+	return c.pack().info
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.pack().uidMu.Lock()
+	if c.pack().uid == "" {
+		c.pack().uid = uid
+	}
+	c.pack().uidMu.Unlock()
+}
 
 // verifyCreatedOwnership validates the labels and backend identity before
 // an external reaper is allowed to retain a newly created container. A
@@ -115,41 +181,52 @@ func createdOwnershipFailure(failure domain.OwnershipFailure, immutableID bool) 
 	}
 }
 
-// rollback removes a container Run created but cannot return. A failed removal
-// is not hidden: without an immutable ID, Terminate refuses to delete when it
-// cannot verify the generation, and the caller must know the container was left
-// behind.
-func (c *Container) rollback(ctx context.Context, cause error) error {
-	c.stopAttached()
-	if keepContainers() {
-		return cause
-	}
-	cleanupCtx := context.WithoutCancel(ctx)
-	if c.reused {
-		cfg := &config{
-			runner:       c.runner,
-			eng:          c.eng,
-			name:         c.id,
-			reuse:        true,
-			creation:     c.creation,
-			queryTimeout: c.queryTimeout,
-			probeTimeout: c.probeTimeout,
+// operationTarget returns the immutable target for backend operations.
+// Backends with immutable container IDs prefer the ID returned by
+// run/inspect; name-addressed handles retain the original name.
+func (c *Container) operationTarget() string {
+	if c.eng != nil && c.eng.capabilities().immutableID {
+		if uid := c.immutableUID(); uid != "" {
+			return uid
 		}
-		deleted, err := rollbackReuse(cleanupCtx, c, cfg)
-		if err != nil {
-			return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
-		}
-		if !deleted {
-			return withCleanupError(cause, &CleanupError{Container: c.id, Err: fmt.Errorf("stopped generation was not deleted")})
-		}
-		return cause
 	}
-	if err := c.Terminate(cleanupCtx); err != nil {
-		// %v would flatten the cleanup failure into text, leaving only the
-		// original recoverable through errors.Is. Join it instead.
-		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
+	return c.id
+}
+
+// immutableUID returns the backend's immutable ID, or "" on name-addressed
+// backends.
+func (c *Container) immutableUID() string {
+	if c.eng == nil || !c.eng.capabilities().immutableID {
+		return ""
 	}
-	return cause
+	return c.immutableID()
+}
+
+// setImmutableUID promotes an immutable backend ID. Name-addressed backends
+// ignore it.
+func (c *Container) setImmutableUID(uid string) {
+	if c.eng == nil || !c.eng.capabilities().immutableID {
+		return
+	}
+	c.setImmutableID(uid)
+}
+
+func (c *Container) immutableIDGenerationMatches(info *engineInfo) bool {
+	return c.eng != nil && c.eng.capabilities().immutableID && c.creation != "" &&
+		info != nil && info.labels[creationLabel] == c.creation
+}
+
+// State returns the current lifecycle state.
+//
+// Unlike Host/Endpoint/MappedPort/ContainerIP, State always performs a
+// fresh inspect so wait fail-fast-on-stop and other lifecycle checks are
+// not delayed by the short dynamic-inspect TTL.
+func (c *Container) State(ctx context.Context) (State, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	if err != nil {
+		return StateUnknown, err
+	}
+	return info.state, nil
 }
 
 // InspectInfo represents a point-in-time snapshot of container state and metadata.
@@ -329,23 +406,211 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 	}, nil
 }
 
-// ExitCode returns the reported exit code of a stopped container.
-// ErrContainerNotStopped indicates that the process has not stopped. Both that
-// error and an omitted backend exit code match ErrExitCodeUnavailable.
-// Apple CLI versions that omit status.exitCode cannot provide a process result.
-func (c *Container) ExitCode(ctx context.Context) (int, error) {
-	info, err := c.inspectDynamicFresh(ctx)
-	if err != nil {
-		if err == context.Canceled || err == context.DeadlineExceeded {
-			return 0, err
-		}
-		redacted := c.redactError(err)
-		if errors.Is(err, context.DeadlineExceeded) {
-			return 0, exitCodeDeadlineError{redacted}
-		}
-		return 0, redacted
+// cachedInfo returns the immutable identity snapshot. Dynamic fields are
+// intentionally not cached; endpoint and lifecycle callers use
+// inspectDynamic instead.
+func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return reportedExitCode(info)
+	if c.nameInspect {
+		return c.inspectFresh(ctx)
+	}
+	c.pack().mu.Lock()
+	cached := c.pack().info
+	c.pack().mu.Unlock()
+	if cached != nil {
+		return cached, nil
+	}
+	info, err := c.inspectFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.rememberIdentity(ctx, info); err != nil {
+		return nil, err
+	}
+	c.pack().mu.Lock()
+	cached = c.pack().info
+	c.pack().mu.Unlock()
+	return cached, nil
+}
+
+// inspectDynamic returns lifecycle, network, and port data, reusing a
+// short-TTL snapshot on lockPack when the data is still usable. Callers
+// that must observe stop/replace immediately (State, post-reuse checks)
+// use inspectDynamicFresh instead.
+func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.nameInspect {
+		if info := c.cachedDynamic(); info != nil {
+			return info, nil
+		}
+		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
+			return nil, err
+		}
+		defer c.pack().dynamicMu.Unlock()
+		// A concurrent refresh may have populated the snapshot while we
+		// waited; reuse it instead of launching another inspect.
+		if info := c.cachedDynamic(); info != nil {
+			return info, nil
+		}
+	}
+	return c.refreshDynamic(ctx)
+}
+
+// inspectDynamicFresh always performs an identity-checked inspect and
+// refreshes the short-TTL dynamic snapshot shared with Shared() handles.
+func (c *Container) inspectDynamicFresh(ctx context.Context) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.nameInspect {
+		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
+			return nil, err
+		}
+		defer c.pack().dynamicMu.Unlock()
+	}
+	return c.refreshDynamic(ctx)
+}
+
+func (c *Container) cachedDynamic() *engineInfo {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !c.usableDynamicSnapshot(p.dynamic) {
+		return nil
+	}
+	if !p.currentTime().Before(p.dynamicAt.Add(dynamicInspectTTL)) {
+		return nil
+	}
+	info := cloneEngineInfo(p.dynamic)
+	if p.defaultNetwork != "" {
+		info.defaultNetwork = p.defaultNetwork
+	}
+	return info
+}
+
+// cachedHealthSnapshot reads the health fields of the most recent
+// lifecycle/network snapshot under the lock. Health waits reuse the 1 Hz
+// lifecycle probe's inspect; copying the whole snapshot for the two fields
+// this poll reads allocated a clone of every label, port, and capability
+// array on each check.
+func (c *Container) cachedHealthSnapshot() (health string, observedAt time.Time, ok bool) {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dynamic == nil {
+		return "", time.Time{}, false
+	}
+	return p.dynamic.health, p.dynamic.observedAt, true
+}
+
+// healthStatus reports the Docker HEALTHCHECK status from a lifecycle
+// snapshot observed within the wait probe interval. A stale snapshot is
+// re-inspected through the normal query-timeout path so a cached healthy
+// result cannot mask a later unhealthy transition.
+func (c *Container) healthStatus(ctx context.Context) (string, error) {
+	p := c.pack()
+	now := p.currentTime()
+	if health, observedAt, ok := c.cachedHealthSnapshot(); ok {
+		if !observedAt.IsZero() && now.Sub(observedAt) <= dynamicInspectTTL {
+			return health, nil
+		}
+	}
+	// Re-observe through the normal identity-checked inspect, bounded by
+	// the same query timeout as other inspect-backed reads.
+	// inspectDynamicFresh stores the result through the generation-checked
+	// dynamic cache, so later polls reuse this observation until it ages out.
+	inspectCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
+	defer cancel()
+	info, err := c.inspectDynamicFresh(inspectCtx)
+	if err != nil {
+		return "", err
+	}
+	return info.health, nil
+}
+
+func (c *Container) refreshDynamic(ctx context.Context) (*engineInfo, error) {
+	gen := c.dynamicGeneration()
+	info, err := c.inspectFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.applyCachedDefaultNetwork(ctx, info); err != nil {
+		return nil, err
+	}
+	if c.nameInspect {
+		return info, nil
+	}
+	if err := c.rememberIdentity(ctx, info); err != nil {
+		return nil, err
+	}
+	c.storeDynamic(info, gen)
+	return info, nil
+}
+
+func (c *Container) dynamicGeneration() uint64 {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dynamicGen
+}
+
+func (c *Container) storeDynamic(info *engineInfo, gen uint64) {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Delete/Terminate bump dynamicGen while an inspect may still be in
+	// flight. Drop that result so endpoint reads cannot revive a deleted
+	// container's IP/port under a fresh TTL.
+	if p.dynamicGen != gen {
+		return
+	}
+	p.dynamic = cloneEngineInfo(info)
+	p.dynamicAt = p.currentTime()
+}
+
+func (c *Container) clearDynamic() {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dynamic = nil
+	p.dynamicAt = time.Time{}
+	p.dynamicGen++
+}
+
+// usableDynamicSnapshot reports whether a cached inspect can answer an
+// endpoint read. It accepts address or host-binding payload, and also a
+// Running snapshot that needs neither: Docker host networking reports no
+// address, and a port-less container resolves to the target host. Callers
+// that still cannot resolve (empty IP, missing host binding) clear the
+// snapshot so the next read re-inspects immediately instead of waiting out
+// the TTL.
+func (c *Container) usableDynamicSnapshot(info *engineInfo) bool {
+	if info == nil {
+		return false
+	}
+	if info.ip != "" {
+		return true
+	}
+	for _, b := range info.bound {
+		if b.hostPort > 0 {
+			return true
+		}
+	}
+	// Docker host networking reports neither a container IP nor any host
+	// binding, and a container with no configured ports needs neither to
+	// answer Host. Cache that running observation instead of re-inspecting
+	// on every read.
+	if info.state != StateRunning {
+		return false
+	}
+	if info.networkMode == dockerNetworkHost {
+		return true
+	}
+	return len(c.published) == 0 && len(c.exposed) == 0
 }
 
 func cloneEngineInfo(info *engineInfo) *engineInfo {

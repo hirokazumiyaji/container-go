@@ -79,9 +79,11 @@ jobs:
       # hosted runners would double the job time for little extra signal.
       # NameLock and EnvFile cover the file locks; EnvLock is kept in the
       # filter for the env-lock name even though the current tests spell it
-      # EnvFile. Reaper covers the watchdog and process groups; Process covers
-      # internal/cli's process handling.
-      - run: go test -race -run 'NameLock|EnvLock|EnvFile|Reaper|Process' . ./internal/cli
+      # EnvFile. Reaper covers the watchdog and process groups; Job covers the
+      # Windows Job Object teardown, Stream the stream-process paths, and Copy
+      # the Windows staging/DACL paths. Process covers internal/cli's process
+      # handling.
+      - run: go test -race -run 'NameLock|EnvLock|EnvFile|Reaper|Process|Job|Stream|Copy' . ./internal/cli
 
   # Unit tests run against a fake CLI runner, so the cheaper Linux
   # runner is enough; integration tests need real Apple Container and
@@ -194,12 +196,15 @@ jobs:
           # bench/go.mod (that release still reports fixed stdlib CVEs).
           # Pin the patch level: floating `stable` can lag security fixes.
           go-version: '1.27.4'
-      # Pinned rather than @latest, so the same commit always scans the same
-      # tool version. Bump the pin deliberately.
+      # Pinned through tools/go.mod rather than `go run pkg@version`: the
+      # versioned form ignores the module and verifies no go.sum hash, so the
+      # pin in tools/go.mod would not be the tool CI actually ran.
       #
       # v1.1.4 panics against the Go 1.27.x vuln client/http2 stack; v1.10.0
       # is the current scanner that works with this toolchain.
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+      - run: |
+          (cd tools && go build -o "$RUNNER_TEMP/govulncheck" golang.org/x/vuln/cmd/govulncheck)
+          "$RUNNER_TEMP/govulncheck" ./...
 
   # bench/ is a separate module, so no root job reaches it.
   # The bench jobs below run unit tests, race detection, vet, lint,
@@ -252,7 +257,9 @@ jobs:
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version: '1.27.4'
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+      - run: |
+          (cd ../tools && go build -o "$RUNNER_TEMP/govulncheck" golang.org/x/vuln/cmd/govulncheck)
+          "$RUNNER_TEMP/govulncheck" ./...
         working-directory: bench
 
   # actionlint validates workflow syntax, expressions, and runner labels. It
@@ -268,14 +275,21 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
-          # actionlint@v1.7.12 requires go >= 1.25; GOTOOLCHAIN=local would
+          # actionlint requires go >= 1.25; GOTOOLCHAIN=local would
           # refuse to download a newer toolchain than the installed one.
           go-version-file: bench/go.mod
       # No path argument: actionlint discovers .github/workflows itself, so a
       # workflow added with the .yaml extension is covered too. A shell glob
       # over *.yml would silently skip it.
+      #
+      # Built from tools/go.mod rather than `go run pkg@version` so the
+      # downloaded module tree is the one tools/go.sum verifies. shellcheck is
+      # left enabled (installed on the runner image) so the run: scripts are
+      # checked too.
       - name: Lint workflows
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes=
+        run: |
+          (cd tools && go build -o "$RUNNER_TEMP/actionlint" github.com/rhysd/actionlint/cmd/actionlint)
+          "$RUNNER_TEMP/actionlint"
 
   # Docker is preinstalled on ubuntu-latest, and this job hands the daemon to
   # the checked-out code. The trusted triggers are enumerated rather than
@@ -314,30 +328,65 @@ jobs:
       # limit exceeded"). Caching the image tarball eliminates repeated registry
       # calls across workflow runs, and a Docker Hub fallback ensures the images
       # can be fetched and tagged if the primary mirror is throttled on cache miss.
+      #
+      # The image refs live in internal/integrationtest/images.go, which both
+      # integration test suites import; the key tracks that file.
       - name: Cache integration test Docker images
         id: cache-images
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/docker-images.tar
-          key: integration-docker-images-${{ runner.os }}-${{ hashFiles('integration_image_test.go') }}
+          key: integration-docker-images-${{ runner.os }}-${{ hashFiles('internal/integrationtest/images.go') }}
           restore-keys: |
             integration-docker-images-${{ runner.os }}-
       - name: Load or pre-pull integration test Docker images
+        # A restore-keys partial hit restores an older tarball under an older
+        # key. actions/cache still treats the primary key as a miss and uploads
+        # this path again at the end of the job, so the script has to rebuild
+        # the tarball after pulling what the old one lacked. Otherwise the job
+        # re-saves the stale set and the cache never catches up.
+        env:
+          CACHE_EXACT_HIT: ${{ steps.cache-images.outputs.cache-hit }}
         run: |
           target_images=(
             "public.ecr.aws/docker/library/alpine:latest"
             "public.ecr.aws/docker/library/redis:7-alpine"
             "public.ecr.aws/docker/library/nginx:alpine"
           )
-          fallback_images=(
-            "alpine:latest"
-            "redis:7-alpine"
-            "nginx:alpine"
-          )
+          # The fallback is the same library path on Docker Hub, so it is
+          # derived rather than restated; the mirror prefix is the only part
+          # that differs.
+          dockerhub_prefix="public.ecr.aws/docker/library/"
+          fallback_images=()
+          for target in "${target_images[@]}"; do
+            fallback="${target#"$dockerhub_prefix"}"
+            if [ "$fallback" = "$target" ]; then
+              echo "::error::$target does not start with $dockerhub_prefix"
+              exit 1
+            fi
+            fallback_images+=("$fallback")
+          done
 
+          pull_with_retry() {
+            local image="$1"
+            for attempt in 1 2 3; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              echo "Pull failed for $image (attempt $attempt/3), retrying in 3s..."
+              sleep 3
+            done
+            return 1
+          }
+
+          loaded=0
           if [ -f /tmp/docker-images.tar ]; then
             echo "Loading cached images from /tmp/docker-images.tar..."
-            docker load -i /tmp/docker-images.tar || rm -f /tmp/docker-images.tar
+            if docker load -i /tmp/docker-images.tar; then
+              loaded=1
+            else
+              rm -f /tmp/docker-images.tar
+            fi
           fi
 
           for i in "${!target_images[@]}"; do
@@ -350,24 +399,16 @@ jobs:
             fi
 
             echo "Pulling $target..."
-            pulled=0
-            for attempt in 1 2 3; do
-              if docker pull "$target"; then
-                pulled=1
-                break
-              fi
-              echo "Pull failed (attempt $attempt/3), retrying in 3s..."
-              sleep 3
-            done
-
-            if [ "$pulled" -eq 0 ]; then
+            if ! pull_with_retry "$target"; then
               echo "Primary pull failed for $target; falling back to Docker Hub ($fallback)..."
-              docker pull "$fallback"
+              pull_with_retry "$fallback" || exit 1
               docker tag "$fallback" "$target"
             fi
           done
 
-          if [ ! -f /tmp/docker-images.tar ]; then
+          # Save on any non-exact hit, and when an exact-hit tarball could not
+          # be loaded, so the post-job upload stores what this run resolved.
+          if [ "$CACHE_EXACT_HIT" != "true" ] || [ "$loaded" -ne 1 ]; then
             echo "Saving images to /tmp/docker-images.tar for cache..."
             docker save -o /tmp/docker-images.tar "${target_images[@]}"
           fi

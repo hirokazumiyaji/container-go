@@ -20,11 +20,14 @@ import (
 // leaves the shared container in place.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
+		// Record the strategy's values before validating so a rejected
+		// strategy's diagnostics are still redacted by the caller's error
+		// boundary.
+		c.waitDiagnosticSecrets = append(c.waitDiagnosticSecrets, wait.DiagnosticValues(s)...)
 		if err := wait.Validate(s); err != nil {
 			return err
 		}
 		c.waitStrategy = s
-		c.waitDiagnosticSecrets = wait.DiagnosticValues(s)
 		return nil
 	}
 }
@@ -399,7 +402,11 @@ func (c *Container) logTailWithError(ctx context.Context, extra ...string) (stri
 }
 
 func (c *Container) logTailTarget(ctx context.Context, target string, extra ...string) (string, error) {
-	redactor := c.diagnosticRedactor(extra...)
+	// The caller's extra values may come from a strategy whose diagnostic
+	// values are not yet stream-safe. Keep them out of the streaming
+	// redactor: a value larger than the bounded window makes the whole tail
+	// redaction fail instead of protecting the output.
+	redactor := c.diagnosticRedactor(streamFittingValues(extra)...)
 	if streamer, ok := c.runner.(cli.SnapshotStreamer); ok {
 		stream, err := streamer.StreamSnapshot(ctx, c.eng.logsTailArgs(target)...)
 		if err != nil {

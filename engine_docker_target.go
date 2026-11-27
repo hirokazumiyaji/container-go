@@ -88,8 +88,12 @@ func (e dockerEngine) configureTarget(target engineTargetOverride) engine {
 
 // freezeTargetEnvironment snapshots the ambient Docker target settings so a
 // Client keeps addressing the same daemon after process environment changes.
+// The frozen flag stops the effective accessors from re-reading an unset
+// component: an unset component stays unset instead of picking up a variable
+// exported after the Client was created.
 func (e dockerEngine) freezeTargetEnvironment() engine {
 	e.explicitTarget = true
+	e.frozenEnv = true
 	if e.host == "" && !e.explicitHost {
 		e.host = os.Getenv("DOCKER_HOST")
 	}
@@ -120,8 +124,10 @@ func (e dockerEngine) resolveTargetEngine(ctx context.Context, runner cli.Runner
 func (e dockerEngine) preparePruneTarget(ctx context.Context, runner cli.Runner, timeout time.Duration) (engine, error) {
 	original := e
 	implicitContext := !e.explicitContext
-	if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); ok && implicitContext && entry == "DOCKER_CONTEXT" {
-		e.context, e.explicitContext = "", true
+	if entry, ok := runnerEnvEntry(runner, "DOCKER_CONTEXT"); ok && implicitContext {
+		if _, _, assigned := strings.Cut(entry, "="); !assigned {
+			e.context, e.explicitContext = "", true
+		}
 	}
 	// Package prune follows the child's Docker environment, where a host
 	// overrides the ambient context; discovery must not retarget the runner.

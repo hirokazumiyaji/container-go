@@ -30,7 +30,9 @@ func TestRunnerEmptyContextSelection(t *testing.T) {
 case "$1" in
 context)
  printf 'lookup=%s\ninspect=%s\n' "$*" "${DOCKER_CONTEXT-unset}" >> "$TARGET_ENV_LOG"
- printf '[{"Name":"active","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]'
+ name=active
+ if [ "$2" = inspect ] && [ "$3" = -- ] && [ -n "$4" ]; then name=$4; fi
+ printf '[{"Name":"%s","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]' "$name"
  ;;
 pull|ps)
  printf 'operation=%s\n' "${DOCKER_CONTEXT-unset}" >> "$TARGET_ENV_LOG"
@@ -75,7 +77,7 @@ esac
 				}
 				lookup := "context inspect"
 				if operation == "client-prune" || (operation == "pull" && tc.entry == "DOCKER_CONTEXT") {
-					lookup += " amb"
+					lookup += " -- amb"
 				}
 				want := fmt.Sprintf("lookup=%s\ninspect=%s\noperation=%s\n", lookup, inspect, target)
 				if string(got) != want {
@@ -118,7 +120,7 @@ esac
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := "context inspect amb\npull context=amb\n"; string(got) != want {
+			if want := "context inspect -- amb\npull context=amb\n"; string(got) != want {
 				t.Fatalf("commands=%q, want %q", got, want)
 			}
 		})

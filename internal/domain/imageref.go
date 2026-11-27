@@ -18,17 +18,24 @@ type ImageRef struct {
 // ParseImageRef splits an image reference into its repository, tag, and
 // digest. The digest is separated first, so the ":" inside "@sha256:..." can
 // never be mistaken for a tag separator. A missing tag is left empty for the
-// caller's defaulting rule.
+// caller's defaulting rule; a trailing ":" or "@" is a malformed separator,
+// not a missing component.
 func ParseImageRef(raw string) (ImageRef, error) {
 	ref := strings.TrimSpace(raw)
 	if ref == "" {
 		return ImageRef{}, errors.New("image reference is empty")
 	}
-	name, digest, _ := strings.Cut(ref, "@")
+	name, digest, hasDigest := strings.Cut(ref, "@")
+	if hasDigest && digest == "" {
+		return ImageRef{}, fmt.Errorf("invalid image reference %q: empty digest", raw)
+	}
 	tag := ""
 	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
 		tag = name[i+1:]
 		name = name[:i]
+		if tag == "" {
+			return ImageRef{}, fmt.Errorf("invalid image reference %q: empty tag", raw)
+		}
 	}
 	if name == "" {
 		return ImageRef{}, fmt.Errorf("invalid image reference %q", raw)
@@ -85,13 +92,15 @@ func IsRegistry(s string) bool {
 	return strings.Contains(s, ".") || strings.Contains(s, ":") || s == "localhost"
 }
 
-// CanonicalDockerHubRegistry normalizes registry aliases for Docker Hub to "docker.io".
+// CanonicalDockerHubRegistry normalizes registry aliases for Docker Hub to
+// "docker.io" and lowercases every registry hostname: registry names are
+// case-insensitive DNS names, so GHCR.IO and ghcr.io address the same store.
 func CanonicalDockerHubRegistry(registry string) string {
 	switch strings.ToLower(registry) {
 	case "docker.io", "registry-1.docker.io", "index.docker.io":
 		return "docker.io"
 	default:
-		return registry
+		return strings.ToLower(registry)
 	}
 }
 
@@ -214,6 +223,15 @@ func ImagesCompatible(requested, actual string) bool {
 		actRepo := ImageRepository(actual)
 		return reqRepo != "" && strings.EqualFold(reqRepo, actRepo)
 	}
+	if actDigest != "" {
+		// The inspected side pins content without naming a tag. Its absent
+		// tag is not an implicit ":latest", so the requested tag cannot be
+		// compared with it; only an explicitly tagged digest reference (for
+		// example "redis:7@sha256:...") keeps its tag claim.
+		if _, tag, _ := ImageRepositoryParts(actual); tag == "" {
+			return false
+		}
+	}
 	req := ImageReferenceBase(requested)
 	act := ImageReferenceBase(actual)
 	return req != "" && act != "" && NormalizeImageRef(req) == NormalizeImageRef(act)
@@ -249,13 +267,15 @@ func ImageRepositoryPathsCompatible(a, b string) bool {
 }
 
 // ImageRegistryOf returns the registry of an image reference if explicit.
+// A registry prefix only exists before a repository path; a single-component
+// name such as "my.image" is a Docker Hub repository, not a registry.
 func ImageRegistryOf(ref string) string {
 	base := ImageRepositoryBaseWithoutTag(ImageReferenceBase(ref))
 	if base == "" {
 		return ""
 	}
-	first, _, _ := strings.Cut(base, "/")
-	if !IsRegistry(first) {
+	first, _, found := strings.Cut(base, "/")
+	if !found || !IsRegistry(first) {
 		return ""
 	}
 	return CanonicalDockerHubRegistry(first)
@@ -273,7 +293,7 @@ func ImageRepositoryParts(ref string) (name, tag string, explicit bool) {
 		name = name[:i]
 	}
 	parts := strings.Split(name, "/")
-	if len(parts) > 0 && IsRegistry(parts[0]) {
+	if len(parts) > 1 && IsRegistry(parts[0]) {
 		explicit = true
 		registry := CanonicalDockerHubRegistry(parts[0])
 		name = strings.Join(parts[1:], "/")

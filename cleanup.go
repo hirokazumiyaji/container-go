@@ -422,7 +422,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	}
 	listArgs = pruneListArgs(eng, listArgs, cfg.labels)
 
-	redactor := pruneDiagnosticRedactor(eng, r, reuseGroup)
+	redactor := pruneDiagnosticRedactor(eng, r, reuseGroup, cfg.labels)
 	defer func() { resultErr = cli.WithRedactor(resultErr, redactor) }()
 	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
 	defer overallCancel()
@@ -727,10 +727,16 @@ func pruneDeleteRace(ctx context.Context, eng engine, inspect func(context.Conte
 	}
 }
 
-func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string) *cli.Redactor {
+func pruneDiagnosticRedactor(eng engine, runner cli.Runner, reuseGroup string, labels map[string]string) *cli.Redactor {
 	cfg := &config{eng: eng, reuseGroup: reuseGroup}
 	values := cfg.diagnosticValues()
 	boundaryValues := cfg.diagnosticBoundaryValues()
+	// A WithPruneLabel value can be echoed by the backend in a filter or
+	// verification error, so it is registered the same way a WithLabels
+	// value is.
+	for _, label := range labels {
+		values = append(values, label)
+	}
 	if target := eng.target(); target != nil {
 		runnerValues, runnerBoundary := target.runnerDiagnosticValues(runner)
 		for _, value := range runnerValues {
@@ -750,7 +756,7 @@ func (cfg pruneConfig) prepareTarget(ctx context.Context, eng engine, reuseGroup
 	runner := cfg.runnerFor(eng)
 	resolved, err := preparedPruneTarget(ctx, eng, runner, cfg.timeout)
 	if err != nil {
-		return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup))
+		return nil, nil, cli.WithRedactor(err, pruneDiagnosticRedactor(eng, runner, reuseGroup, cfg.labels))
 	}
 	return runner, resolved, nil
 }

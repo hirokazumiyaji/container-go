@@ -178,3 +178,62 @@ func TestIsNull(t *testing.T) {
 		}
 	}
 }
+
+func TestArrayMatchesRequiredFieldsCaseInsensitively(t *testing.T) {
+	// encoding/json decodes {"id": null} into the zero value for the Id
+	// field, so the null rejection must resolve field names the same way.
+	_, err := Array[entry]([]byte(`[{"id":null,"Name":"/x","State":{"Status":"running"}}]`), required)
+	if err == nil {
+		t.Fatal("Array accepted a null Id through a lower-case key")
+	}
+	if !strings.Contains(err.Error(), `field "Id" must not be null`) {
+		t.Errorf("err = %v, want the Id null rejection", err)
+	}
+
+	_, err = Array[entry]([]byte(`[{"Id":"a","state":{"status":null}}]`), []string{"State.Status"})
+	if err == nil {
+		t.Fatal("Array accepted a null nested field through lower-case keys")
+	}
+	if !strings.Contains(err.Error(), `field "State.Status" must not be null`) {
+		t.Errorf("err = %v, want the State.Status null rejection", err)
+	}
+}
+
+func TestArrayRejectsNullIntermediateOfRequiredPath(t *testing.T) {
+	type nested struct {
+		State *struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+	}
+	_, err := Array[nested]([]byte(`[{"State":null}]`), []string{"State.Status"})
+	if err == nil {
+		t.Fatal("Array accepted a required nested path whose parent object is null")
+	}
+	if !strings.Contains(err.Error(), `field "State.Status" must not be null`) {
+		t.Errorf("err = %v, want the nested null rejection", err)
+	}
+}
+
+func TestArrayResolvesDuplicateKeysInDocumentOrder(t *testing.T) {
+	// encoding/json assigns each matching key in input order, so the later
+	// null clears the pointer the earlier key populated.
+	_, err := Array[entry]([]byte(`[{"STATE":{"Status":"running"},"state":null}]`), []string{"State"})
+	if err == nil || !strings.Contains(err.Error(), `field "State" must not be null`) {
+		t.Fatalf("err = %v, want the later case-insensitive null to win", err)
+	}
+
+	// The reverse order is still rejected: a required field is decoded
+	// through NonNull, which fails as soon as any occurrence of the key is
+	// null. That is stricter than encoding/json, which would let the later
+	// non-null object win, and it is the fail-closed direction: an entry
+	// that spells a required field as null is never treated as readable.
+	if _, err := Array[entry]([]byte(`[{"state":null,"STATE":{"Status":"running"}}]`), []string{"State"}); err == nil {
+		t.Fatal("Array accepted an entry with a null occurrence of a required field")
+	}
+
+	// The same rule applies to a dotted required path.
+	_, err = Array[entry]([]byte(`[{"State":{"Status":"running"},"state":null}]`), []string{"State.Status"})
+	if err == nil || !strings.Contains(err.Error(), `field "State.Status" must not be null`) {
+		t.Fatalf("err = %v, want the later case-insensitive null parent to win", err)
+	}
+}

@@ -81,7 +81,7 @@ func NewContextRedactor(values ...string) *Redactor {
 	return newRedactor(values, true, true)
 }
 
-func newRedactor(values []string, expand, force bool) *Redactor {
+func newRedactor(values []string, expand, force bool) *Redactor { //nolint:unparam // expand stays explicit for the non-hashed constructors
 	r := &Redactor{force: force}
 	seen := make(map[string]struct{})
 	for _, value := range values {
@@ -443,14 +443,17 @@ func matchingBrace(s string, start int) int {
 	escaped := false
 	for i := start; i < len(s); i++ {
 		c := s[i]
-		if quoted {
-			if escaped {
-				escaped = false
-			} else if c == '\\' {
-				escaped = true
-			} else if c == '"' {
-				quoted = false
-			}
+		switch {
+		case quoted && escaped:
+			escaped = false
+			continue
+		case quoted && c == '\\':
+			escaped = true
+			continue
+		case quoted && c == '"':
+			quoted = false
+			continue
+		case quoted:
 			continue
 		}
 		switch c {
@@ -1315,7 +1318,7 @@ func WithRedactor(err error, r *Redactor) error {
 		r = NewRedactor()
 	}
 	r = r.WithForce()
-	if existing, ok := err.(*safeError); ok {
+	if existing, ok := err.(*safeError); ok { //nolint:errorlint // node-level walk of the redaction chain
 		return &safeError{err: existing.err, redactor: existing.redactor.Compose(r)}
 	}
 	combined := r
@@ -1332,7 +1335,7 @@ func redactorsIn(err error) []*Redactor {
 		if current == nil {
 			return
 		}
-		if safe, ok := current.(*safeError); ok {
+		if safe, ok := current.(*safeError); ok { //nolint:errorlint // node-level walk of the redaction chain
 			if safe.redactor != nil {
 				redactors = append(redactors, safe.redactor)
 			}

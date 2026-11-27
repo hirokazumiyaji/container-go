@@ -313,7 +313,7 @@ func (c *Client) Run(ctx context.Context, image string, opts ...Option) (*Contai
 	if c.queryTimeout > 0 {
 		clientOpts = append(clientOpts, WithQueryTimeout(c.queryTimeout))
 	}
-	allOpts := append(clientOpts, opts...)
+	allOpts := append(append([]Option{}, clientOpts...), opts...)
 	return Run(ctx, image, allOpts...)
 }
 

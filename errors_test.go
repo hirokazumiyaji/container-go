@@ -101,7 +101,7 @@ func TestCleanupErrorUnwrapsOperationAndCleanup(t *testing.T) {
 		t.Fatalf("errors.Is(operation) = false for %v", err)
 	}
 	var wrapped *CleanupError
-	if !errors.As(err, &wrapped) || wrapped.Container != "myctr" || wrapped.Err != cleanupErr {
+	if !errors.As(err, &wrapped) || wrapped.Container != "myctr" || wrapped.Err != cleanupErr { //nolint:errorlint // identity assertion; errors.Is would also match the wrapped child this check distinguishes
 		t.Fatalf("errors.As(CleanupError) = %#v, want Container=myctr Err=%v", wrapped, cleanupErr)
 	}
 	if !errors.Is(err, cleanupErr) {

@@ -69,6 +69,8 @@ func Preflight(t *testing.T, want string, unavailable func() error) {
 	t.Helper()
 	verdict, reason := Decide(want, SelectedBackend(), Required(), unavailable)
 	switch verdict {
+	case Proceed:
+		// The suite runs; pin the backend for the child environment below.
 	case Skip:
 		t.Skip(reason)
 	case Fail:

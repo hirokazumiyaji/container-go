@@ -181,7 +181,7 @@ func terminalErrorExitError(t *testing.T) *exec.ExitError {
 
 func terminalErrorExitErrorWithCode(t *testing.T, code int) *exec.ExitError {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestTerminalErrorExitHelper$")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestTerminalErrorExitHelper$")
 	cmd.Env = append(os.Environ(),
 		terminalErrorExitHelperEnv+"=1",
 		terminalErrorExitCodeHelperEnv+"="+strconv.Itoa(code),
@@ -508,7 +508,7 @@ func TestStreamDelayedCloseAndCancelDoNotSignalAfterReap(t *testing.T) {
 	if err := ps.requestTermination(true); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("late cancellation error = %v, want os.ErrProcessDone", err)
 	}
-	if got := ps.TerminalError(); got != terminal {
+	if got := ps.TerminalError(); !errors.Is(got, terminal) {
 		t.Fatalf("TerminalError after cancellation = %v, want cached %v", got, terminal)
 	}
 	if err := stream.Close(); err != nil {
@@ -692,7 +692,7 @@ func assertStreamDirectChildReaped(t *testing.T, pid int) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+		out, err := exec.CommandContext(context.Background(), "ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
 		if err != nil || strings.TrimSpace(string(out)) == "" {
 			return
 		}

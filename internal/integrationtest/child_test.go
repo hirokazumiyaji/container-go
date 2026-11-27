@@ -1,6 +1,7 @@
 package integrationtest
 
 import (
+	"context"
 	"io"
 	"os/exec"
 	"strings"
@@ -119,7 +120,7 @@ func TestNonceIsNameSafe(t *testing.T) {
 // Killing a group twice must be safe, because the cleanup path runs on both
 // a normal return and a failure.
 func TestChildGroupKillIsIdempotent(t *testing.T) {
-	cmd := exec.Command("sleep", "30")
+	cmd := exec.CommandContext(context.Background(), "sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start sleep: %v", err)
 	}
@@ -132,6 +133,6 @@ func TestChildGroupKillIsIdempotent(t *testing.T) {
 // A child tracked but never started must not panic on cleanup.
 func TestChildGroupKillToleratesUnstartedChild(t *testing.T) {
 	g := &ChildGroup{}
-	g.Track(exec.Command("definitely-not-a-real-binary-xyz"))
+	g.Track(exec.CommandContext(context.Background(), "definitely-not-a-real-binary-xyz"))
 	g.Kill()
 }

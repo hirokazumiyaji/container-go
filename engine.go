@@ -352,6 +352,9 @@ type engine interface {
 	// logsFollowArgs builds the streaming follow argv. It replays the
 	// backend's available history before following new output.
 	logsFollowArgs(id string) []string
+	// logsFollowArgsWithOptions builds the streaming follow argv for caller
+	// options and rejects options the backend cannot honor.
+	logsFollowArgsWithOptions(id string, opts FollowLogsOptions) ([]string, error)
 	// logsFollowResumeArgs builds the streaming follow argv for a
 	// replacement attach stream. Docker retains logs across a restart, so
 	// it must be told to start at since; replaying from the beginning
@@ -372,20 +375,9 @@ type engine interface {
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
 	listArgs() []string
-	// parseStoppedManaged extracts, from listArgs output, the
-	// identifiers of stopped containers this library created. The
-	// value is whatever the backend's own deleteArgs accepts: Apple
-	// returns container IDs, and Docker returns full IDs from
-	// --no-trunc --format {{.ID}}.
-	parseStoppedManaged(data []byte) ([]string, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.
 	listReuseGroupArgs(group string) []string
-	// parseReuseGroupIDs extracts, from listReuseGroupArgs output, the
-	// identifiers of containers carrying the given reuse group. As
-	// with parseStoppedManaged these are deleteArgs-compatible backend
-	// identifiers, not necessarily immutable IDs.
-	parseReuseGroupIDs(data []byte, group string) ([]string, error)
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool
@@ -452,9 +444,13 @@ type engine interface {
 	// defaultRunPlatform reports the platform the backend selects when the
 	// caller chose none, or "" when the backend leaves the default implicit.
 	defaultRunPlatform() string
-	// parsePruneCandidates returns list-time prune metadata keyed by the
-	// identifiers parseStoppedManaged returned.
-	parsePruneCandidates(data []byte) (map[string]pruneCandidate, error)
+	// parsePruneListed decodes one prune list response into the identifiers
+	// the delete path addresses and, for backends that delete by name, their
+	// list-time metadata. reuseGroup is empty for ordinary Prune. The value
+	// is whatever the backend's own deleteArgs accepts: Apple returns
+	// container IDs, and Docker returns full IDs from --no-trunc --format
+	// {{.ID}}. A backend without candidate metadata returns a nil map.
+	parsePruneListed(data []byte, reuseGroup string) ([]string, map[string]pruneCandidate, error)
 }
 
 // unsupportedLifecycle reports that eng lacks the optional lifecycle
@@ -468,6 +464,7 @@ func unsupportedLifecycle(eng engine, operation string) error {
 // preserving the sentinel the backend's former capability check returned.
 func unsupportedCopyOut(eng engine) error {
 	return fmt.Errorf("%w: %s backend does not support type-preserving copy-out", ErrCopyFileFromContainerUnsupported, eng.name())
+
 }
 
 // startArgsFor builds the shared start argv. Both backends start by name or
@@ -493,9 +490,13 @@ func copyFromArgsFor(id, containerPath, hostPath string) []string {
 	return []string{"cp", id + ":" + containerPath, hostPath}
 }
 
-// execArgsFor builds the shared exec argv.
+// execArgsFor builds the shared exec argv. Both backends accept -i to keep the
+// remote process's stdin open and attached to the CLI's stdin.
 func execArgsFor(id string, cfg *execConfig, envFile string, cmd []string) []string {
 	args := []string{"exec"}
+	if cfg.stdin != nil {
+		args = append(args, "-i")
+	}
 	if envFile != "" {
 		args = append(args, "--env-file", envFile)
 	}
@@ -766,7 +767,7 @@ func validImageDigest(digest string) bool {
 	}
 	algorithm := strings.ToLower(digest[:i])
 	encoded := digest[i+1:]
-	wantLength := 0
+	var wantLength int
 	switch algorithm {
 	case "sha256":
 		wantLength = 64

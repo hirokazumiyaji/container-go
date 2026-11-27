@@ -1140,7 +1140,7 @@ func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context, copyO
 	if p.copyVersionOK.Load() {
 		return nil
 	}
-	if err := dockerCopyFileFromContainerVersionCached(ctx, c.dockerMeta, c.runner, c.eng, copyOut, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
+	if err := dockerCopyFileFromContainerVersionCached(ctx, c.dockerMeta, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
 		return err
 	}
 	p.copyVersionOK.Store(true)

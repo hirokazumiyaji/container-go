@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 	"unicode/utf8"
 
@@ -68,6 +67,10 @@ type config struct {
 	memory               domain.ByteSize
 	shmSize              domain.ByteSize
 	privileged           bool
+	readOnlyRootFS       bool
+	initProcess          bool
+	dnsServers           []string
+	stopSignal           string
 	capAdd               []string
 	capDrop              []string
 	ulimits              []ulimitSpec
@@ -83,6 +86,7 @@ type config struct {
 	allowMutableImageTag bool
 	reuse                bool
 	reuseGroup           string
+	reuseEnvFingerprint  bool
 	creation             string
 	// imageCache reuses image-presence answers across Runs when the
 	// caller applies a WithImagePresenceCache Option. The Option owns the
@@ -109,8 +113,9 @@ type config struct {
 	// caller leaves the shared generation in place.
 	postReadyHooks []func(context.Context, *Container) error
 	// testLogger receives the container's log output while its test runs.
-	// It is nil unless WithTestLogger was applied.
-	testLogger            testing.TB
+	// It is nil unless WithTestLogger or WithTestLogOnFailure was applied.
+	testLogger            testLogSink
+	testLogOnFailure      bool
 	diagnosticSecrets     []string
 	waitDiagnosticSecrets []string
 	dockerHost            *string
@@ -156,6 +161,9 @@ func (c *config) validate() error {
 	}
 	if c.reuseGroup != "" && !c.reuse {
 		return validationErrorf("WithReuseGroup", c.reuseGroup, "WithReuseGroup requires WithReuse")
+	}
+	if c.reuseEnvFingerprint && !c.reuse {
+		return validationErrorf("WithReuseEnvFingerprint", nil, "WithReuseEnvFingerprint requires WithReuse")
 	}
 	if c.reuse && c.attachOutput != nil {
 		// The reuse path attaches to a container this call may not have
@@ -271,6 +279,7 @@ func (c *config) allLabels() map[string]string {
 		// BuildLabels owns every reserved label, so the fingerprint is
 		// passed in instead of writing into the returned map.
 		cfg.ReuseConfig = c.reuseConfigHash()
+		cfg.ReuseEnvFingerprint = c.reuseEnvFingerprintValue()
 	}
 	return domain.BuildLabels(cfg)
 }
@@ -310,6 +319,18 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 	}
 	if c.privileged {
 		args = append(args, "--privileged")
+	}
+	if c.readOnlyRootFS {
+		args = append(args, "--read-only")
+	}
+	if c.initProcess {
+		args = append(args, "--init")
+	}
+	for _, server := range c.dnsServers {
+		args = append(args, "--dns", server)
+	}
+	if c.stopSignal != "" {
+		args = append(args, "--stop-signal", c.stopSignal)
 	}
 	for _, capability := range c.capAdd {
 		args = append(args, "--cap-add", capability)
@@ -357,10 +378,12 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // must match an existing container. Capabilities follow a requested-subset
 // rule: every requested --cap-add/--cap-drop value must be present, while
 // an empty request accepts any inspected capability set. Memory, user, working
-// directory, entrypoint, command, mounts, and custom labels must exactly match
-// the creation fingerprint, including omitted options. Reuse group must match.
+// directory, entrypoint, command, mounts, custom labels, read-only root
+// filesystem, init, DNS servers, and stop signal must exactly match the
+// creation fingerprint, including omitted options. Reuse group must match.
 // Unfingerprinted containers must be recreated before attaching. Environment
-// differences are ignored. Returned handles are shared: Cleanup, TerminateContainer,
+// differences are ignored unless WithReuseEnvFingerprint is also set.
+// Returned handles are shared: Cleanup, TerminateContainer,
 // and the watchdog reaper do not remove them. Stop, CopyToContainer,
 // CopyContentToContainer, and CopyFileFromContainer refuse with
 // ErrSharedContainer so one process cannot disturb peers; use Shared to
@@ -383,6 +406,19 @@ func WithReuseGroup(group string) Option {
 			return err
 		}
 		c.reuseGroup = group
+		return nil
+	}
+}
+
+// WithReuseEnvFingerprint opts into environment matching for WithReuse.
+// The library records a SHA-256 digest of the sorted environment key/value
+// pairs in a reserved label; raw values are never written to labels or argv.
+// An attach caller that sets this option must find the same digest and
+// otherwise receives ErrReuseMismatch. Without the option, environment
+// differences remain ignored on attach. Requires WithReuse.
+func WithReuseEnvFingerprint() Option {
+	return func(c *config) error {
+		c.reuseEnvFingerprint = true
 		return nil
 	}
 }
@@ -511,8 +547,9 @@ func runnerIsNil(r Runner) bool {
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
+	default:
+		return false
 	}
-	return false
 }
 
 // runnerWithBinary returns a runner that runs binary. A caller-owned
@@ -815,6 +852,121 @@ func WithShmSize(size string) Option {
 func WithPrivileged() Option {
 	return func(c *config) error {
 		c.privileged = true
+		return nil
+	}
+}
+
+// WithReadOnlyRootFS mounts the container's root filesystem read-only
+// (Docker and Apple Container --read-only). Writable paths must be supplied
+// with WithMounts.
+func WithReadOnlyRootFS() Option {
+	return func(c *config) error {
+		c.readOnlyRootFS = true
+		return nil
+	}
+}
+
+// WithInit runs a lightweight init process as the container's first process
+// (Docker and Apple Container --init). The init forwards signals and reaps
+// orphaned child processes.
+func WithInit() Option {
+	return func(c *config) error {
+		c.initProcess = true
+		return nil
+	}
+}
+
+// WithDNS adds custom DNS nameservers. Each server is passed as its own
+// --dns flag, and every value must be a literal IPv4 or IPv6 address.
+// Duplicate entries are preserved because resolver order can matter. Both
+// Docker and Apple Container accept repeated --dns flags.
+func WithDNS(servers ...string) Option {
+	return func(c *config) error {
+		for _, server := range servers {
+			parsed := net.ParseIP(server)
+			if parsed == nil {
+				return newValidationErrorWithField("WithDNS", "server", server,
+					fmt.Errorf("invalid DNS server %q: must be an IPv4 or IPv6 address", server))
+			}
+			c.dnsServers = append(c.dnsServers, parsed.String())
+		}
+		return nil
+	}
+}
+
+// stopSignalNames is the set of Linux signal names a stop signal accepts
+// without the SIG prefix. The aliases IOT, CLD, and POLL are the traditional
+// names for ABRT, CHLD, and IO. Docker's signal parser understands the same
+// set, with the SIG prefix optional.
+var stopSignalNames = map[string]struct{}{
+	"ABRT": {}, "ALRM": {}, "BUS": {}, "CHLD": {}, "CLD": {}, "CONT": {},
+	"FPE": {}, "HUP": {}, "ILL": {}, "INT": {}, "IO": {}, "IOT": {},
+	"KILL": {}, "PIPE": {}, "POLL": {}, "PROF": {}, "PWR": {}, "QUIT": {},
+	"SEGV": {}, "STKFLT": {}, "STOP": {}, "SYS": {}, "TERM": {}, "TRAP": {},
+	"TSTP": {}, "TTIN": {}, "TTOU": {}, "URG": {}, "USR1": {}, "USR2": {},
+	"VTALRM": {}, "WINCH": {}, "XCPU": {}, "XFSZ": {},
+}
+
+// maxStopSignalNumber is the highest realtime signal number Linux defines.
+const maxStopSignalNumber = 64
+
+// validStopSignal reports whether signal is one of the spellings a container
+// stop signal accepts: a positive signal number in Linux's 1..64 range, a
+// standard signal name, or a realtime spelling such as SIGRTMIN+3 or
+// SIGRTMAX-1. A leading sign, whitespace, control character, or flag-shaped
+// value is not accepted, and neither is a non-realtime name with an offset.
+func validStopSignal(signal string) bool {
+	if number, err := strconv.Atoi(signal); err == nil {
+		return number >= 1 && number <= maxStopSignalNumber && strconv.Itoa(number) == signal
+	}
+	name := strings.TrimPrefix(signal, "SIG")
+	if _, ok := stopSignalNames[name]; ok {
+		return true
+	}
+	return validRealtimeStopSignal(name)
+}
+
+// validRealtimeStopSignal accepts the realtime spellings Docker's signal
+// parser maps: RTMIN with offsets 0..15 and RTMAX with offsets 0..14 fill
+// the Linux realtime signal range.
+func validRealtimeStopSignal(name string) bool {
+	switch name {
+	case "RTMIN", "RTMAX":
+		return true
+	}
+	if offset, ok := strings.CutPrefix(name, "RTMIN+"); ok {
+		return stopSignalOffset(offset, 15)
+	}
+	if offset, ok := strings.CutPrefix(name, "RTMAX-"); ok {
+		return stopSignalOffset(offset, 14)
+	}
+	return false
+}
+
+// stopSignalOffset returns whether offset is a canonical decimal integer in
+// 1..max. A zero offset is rejected: Docker's signal parser accepts SIGRTMIN
+// and SIGRTMAX on their own but rejects the explicit "+0" and "-0" spellings,
+// so accepting them here would only move the failure to the CLI.
+func stopSignalOffset(offset string, max int) bool {
+	number, err := strconv.Atoi(offset)
+	return err == nil && number >= 1 && number <= max && strconv.Itoa(number) == offset
+}
+
+// WithStopSignal sets the signal sent to the container's main process when it
+// is stopped (Docker's --stop-signal). The value must be a positive signal
+// number in Linux's 1..64 range, a standard signal name such as SIGTERM or
+// TERM, or a realtime spelling such as SIGRTMIN+3.
+// Apple Container has no run-time stop-signal flag and rejects it with
+// ErrUnsupportedCapability before invoking its CLI.
+func WithStopSignal(signal string) Option {
+	return func(c *config) error {
+		if !validStopSignal(signal) {
+			// Do not echo the rejected value: it may contain control
+			// characters or a flag-shaped spelling.
+			return newValidationErrorWithField("WithStopSignal", "signal", nil,
+				fmt.Errorf("invalid stop signal: want a positive number or an uppercase signal name"))
+		}
+		c.stopSignal = signal
 		return nil
 	}
 }
@@ -1164,12 +1316,27 @@ func nilWriter(w io.Writer) bool {
 	if w == nil {
 		return true
 	}
-	value := reflect.ValueOf(w)
+	return nilInterface(reflect.ValueOf(w))
+}
+
+// nilReader reports whether r is nil, including a typed-nil value stored in
+// the interface. A typed-nil reader passes an interface comparison and panics
+// on its first Read.
+func nilReader(r io.Reader) bool {
+	if r == nil {
+		return true
+	}
+	return nilInterface(reflect.ValueOf(r))
+}
+
+// nilInterface reports whether a nil-capable dynamic value is nil.
+func nilInterface(value reflect.Value) bool {
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
+	default:
+		return false
 	}
-	return false
 }
 
 // MountType selects how a Mount is backed.

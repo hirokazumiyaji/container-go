@@ -3,6 +3,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -60,7 +61,7 @@ func TestReaperStopTerminatesJobDescendants(t *testing.T) {
 
 	r := newReaper(os.Args[0], "rm")
 	r.spawnCommand = func() (*exec.Cmd, error) {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestReaperJobParentHelper$")
+		cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestReaperJobParentHelper$")
 		cmd.Env = append(os.Environ(),
 			reaperJobParentHelperEnv+"=1",
 			reaperJobReleaseEnv+"="+release,
@@ -148,7 +149,7 @@ func TestReaperJobParentHelper(t *testing.T) {
 		return
 	}
 	waitForReaperJobPath(os.Getenv(reaperJobReleaseEnv))
-	child := exec.Command(os.Args[0], "-test.run=^TestReaperJobChildHelper$")
+	child := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestReaperJobChildHelper$")
 	child.Env = append(os.Environ(), reaperJobChildHelperEnv+"=1")
 	if err := child.Start(); err != nil {
 		os.Exit(1)
@@ -182,7 +183,7 @@ func TestReaperJobChildHelper(t *testing.T) {
 
 func startReaperJobChild(t *testing.T) (*exec.Cmd, <-chan struct{}) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestReaperJobChildHelper$")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestReaperJobChildHelper$")
 	cmd.Env = append(os.Environ(), reaperJobChildHelperEnv+"=1")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start child helper: %v", err)

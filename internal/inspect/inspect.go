@@ -13,9 +13,9 @@ import (
 
 // Container is one element of the array both commands emit.
 type Container struct {
-	ID            string        `json:"id"`
-	Configuration Configuration `json:"configuration"`
-	Status        Status        `json:"status"`
+	ID            strictjson.NonNull[string]        `json:"id"`
+	Configuration strictjson.NonNull[Configuration] `json:"configuration"`
+	Status        strictjson.NonNull[Status]        `json:"status"`
 }
 
 type Configuration struct {
@@ -132,11 +132,11 @@ type PublishedPort struct {
 }
 
 type Status struct {
-	State       string    `json:"state"`
-	Networks    []Network `json:"networks"`
-	StartedDate *string   `json:"startedDate"`
-	ExitedAt    *string   `json:"exitedAt"`
-	ExitCode    *int      `json:"exitCode"`
+	State       strictjson.NonNull[string] `json:"state"`
+	Networks    []Network                  `json:"networks"`
+	StartedDate *string                    `json:"startedDate"`
+	ExitedAt    *string                    `json:"exitedAt"`
+	ExitCode    *int                       `json:"exitCode"`
 }
 
 type Network struct {
@@ -146,10 +146,11 @@ type Network struct {
 }
 
 // containerFields are the entry fields Decode callers depend on to
-// recognize a container and read its state. Nullable collections the CLI
-// uses for empty maps and arrays (labels, publishedPorts, networks,
-// maskedPaths) are deliberately absent: a null there is an empty value,
-// not unreadable output.
+// recognize a container and read its state. They are NonNull in Container;
+// the list names them in the decode error. Nullable collections the CLI uses
+// for empty maps and arrays (labels, publishedPorts, networks, maskedPaths)
+// are deliberately absent: a null there is an empty value, not unreadable
+// output.
 var containerFields = []string{"id", "configuration", "status", "status.state"}
 
 // Decode parses the JSON array output. Output that cannot be read is an
@@ -168,12 +169,12 @@ func Decode(data []byte) ([]Container, error) {
 // model, without the CIDR suffix. Docker's multi-network selection is
 // handled separately and is unspecified when no top-level address exists.
 func (c Container) IPv4() (string, error) {
-	if len(c.Status.Networks) == 0 {
-		return "", fmt.Errorf("container %s has no attached networks", c.ID)
+	if len(c.Status.Value.Networks) == 0 {
+		return "", fmt.Errorf("container %s has no attached networks", c.ID.Value)
 	}
-	prefix, err := netip.ParsePrefix(c.Status.Networks[0].IPv4Address)
+	prefix, err := netip.ParsePrefix(c.Status.Value.Networks[0].IPv4Address)
 	if err != nil {
-		return "", fmt.Errorf("container %s: parse ipv4Address %q: %w", c.ID, c.Status.Networks[0].IPv4Address, err)
+		return "", fmt.Errorf("container %s: parse ipv4Address %q: %w", c.ID.Value, c.Status.Value.Networks[0].IPv4Address, err)
 	}
 	return prefix.Addr().String(), nil
 }

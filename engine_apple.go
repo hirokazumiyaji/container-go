@@ -85,6 +85,10 @@ func (appleEngine) validateConfig(cfg *config, explicitPlatform bool) error {
 		return appleCapabilityError(ErrUnsupportedCapability, "WithPrivileged", "privileged", true,
 			"apple backend does not support WithPrivileged")
 	}
+	if cfg.stopSignal != "" {
+		return appleCapabilityError(ErrUnsupportedCapability, "WithStopSignal", "stop signal", cfg.stopSignal,
+			"apple backend does not support WithStopSignal")
+	}
 	if len(cfg.extraHosts) > 0 {
 		return appleCapabilityError(ErrUnsupportedCapability, "WithExtraHost", "extra hosts", len(cfg.extraHosts),
 			"apple backend does not support WithExtraHost")

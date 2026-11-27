@@ -150,6 +150,23 @@ func (c *config) runOptionsKey() string {
 	if c.privileged {
 		parts = append(parts, "privileged")
 	}
+	if c.readOnlyRootFS {
+		parts = append(parts, "read-only")
+	}
+	if c.initProcess {
+		parts = append(parts, "init")
+	}
+	for _, server := range c.dnsServers {
+		parts = append(parts, "dns="+server)
+	}
+	if c.stopSignal != "" {
+		parts = append(parts, "stop-signal="+c.stopSignal)
+	}
+	if fingerprint := c.reuseEnvFingerprintValue(); fingerprint != "" {
+		// The digest, never the raw environment values, keeps concurrent
+		// callers that opted into environment matching on separate flights.
+		parts = append(parts, "env-fingerprint="+fingerprint)
+	}
 	for _, capability := range c.capAdd {
 		parts = append(parts, "cap-add="+capabilityKey(capability))
 	}
@@ -1320,6 +1337,7 @@ func sameExtraHosts(a, b []extraHostSpec) bool {
 	return true
 }
 
+//nolint:unparam // image is the handle's reference; tests happen to pass one value
 func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 	return checkReuseCompatIdentity(info, imageIdentity{reference: image}, image, cfg)
 }
@@ -1518,8 +1536,8 @@ func pruneReuseGroupWithConfig(ctx context.Context, r cli.Runner, eng engine, gr
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, safePublicError(err, group)
 	}
-	return pruneListedWithGroupConfig(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
-		return eng.parseReuseGroupIDs(data, group)
+	return pruneListedWithGroupConfig(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, map[string]pruneCandidate, error) {
+		return eng.parsePruneListed(data, group)
 	}, "prune reuse group "+group, group, cfg)
 }
 
@@ -1636,6 +1654,23 @@ func reuseGenerationMatches(base *Container, info *engineInfo) bool {
 	return uid == "" || info.uid == "" || info.uid == uid
 }
 
+// reuseEnvFingerprintValue returns the opt-in digest of the environment
+// applied to this request, or an empty string when the caller did not request
+// environment matching. The digest covers sorted key/value pairs; raw values
+// never leave this function.
+func (c *config) reuseEnvFingerprintValue() string {
+	if !c.reuseEnvFingerprint {
+		return ""
+	}
+	pairs := make([][2]string, 0, len(c.env))
+	for key, value := range c.env {
+		pairs = append(pairs, [2]string{key, value})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i][0] < pairs[j][0] })
+	data, _ := json.Marshal(pairs)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
 func (c *config) reuseConfigHash() string {
 	mounts := make([]string, 0, len(c.mounts))
 	for _, mount := range c.mounts {
@@ -1652,14 +1687,30 @@ func (c *config) reuseConfigHash() string {
 		labels[key] = strconv.Quote(value)
 	}
 	value := struct {
-		Memory     uint64            `json:",omitempty"`
-		User       string            `json:",omitempty"`
-		Workdir    string            `json:",omitempty"`
-		Entrypoint string            `json:",omitempty"`
-		Cmd        []string          `json:",omitempty"`
-		Mounts     []string          `json:",omitempty"`
-		Labels     map[string]string `json:",omitempty"`
-	}{c.memory.Bytes(), strconv.Quote(c.user), strconv.Quote(c.workdir), strconv.Quote(c.entrypoint), cmd, mounts, labels}
+		Memory         uint64            `json:",omitempty"`
+		User           string            `json:",omitempty"`
+		Workdir        string            `json:",omitempty"`
+		Entrypoint     string            `json:",omitempty"`
+		Cmd            []string          `json:",omitempty"`
+		Mounts         []string          `json:",omitempty"`
+		Labels         map[string]string `json:",omitempty"`
+		ReadOnlyRootFS bool              `json:",omitempty"`
+		Init           bool              `json:",omitempty"`
+		DNS            []string          `json:",omitempty"`
+		StopSignal     string            `json:",omitempty"`
+	}{
+		Memory:         c.memory.Bytes(),
+		User:           strconv.Quote(c.user),
+		Workdir:        strconv.Quote(c.workdir),
+		Entrypoint:     strconv.Quote(c.entrypoint),
+		Cmd:            cmd,
+		Mounts:         mounts,
+		Labels:         labels,
+		ReadOnlyRootFS: c.readOnlyRootFS,
+		Init:           c.initProcess,
+		DNS:            c.dnsServers,
+		StopSignal:     c.stopSignal,
+	}
 	data, _ := json.Marshal(value)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
@@ -1667,6 +1718,16 @@ func (c *config) reuseConfigHash() string {
 func checkReuseCreationConfig(info *engineInfo, cfg *config) error {
 	if info.labels[domain.LabelReuseConfig] != cfg.reuseConfigHash() {
 		return fmt.Errorf("%w: creation configuration does not match the existing container; recreate it with the requested options", ErrReuseMismatch)
+	}
+	if cfg.reuseEnvFingerprint {
+		want := cfg.reuseEnvFingerprintValue()
+		got := info.labels[domain.LabelReuseEnvFingerprint]
+		if got == "" {
+			return fmt.Errorf("%w: reuse %s: environment fingerprint is missing from the existing container; recreate it with WithReuseEnvFingerprint", ErrReuseMismatch, cfg.name)
+		}
+		if got != want {
+			return fmt.Errorf("%w: reuse %s: environment fingerprint does not match the existing container", ErrReuseMismatch, cfg.name)
+		}
 	}
 	return nil
 }

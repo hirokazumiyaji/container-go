@@ -54,7 +54,7 @@ func TestWithFilesRejectsFIFOBeforeBackend(t *testing.T) {
 
 func TestCopyToContainerRejectsUnixSocket(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "socket")
-	listener, err := net.Listen("unix", source)
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "unix", source)
 	if err != nil {
 		t.Skipf("Unix socket unavailable: %v", err)
 	}

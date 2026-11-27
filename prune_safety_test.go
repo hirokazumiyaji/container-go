@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -87,7 +88,7 @@ func mustPruneJSON(v any) []byte {
 
 const pruneFixtureSession = "0123456789abcdef"
 
-func pruneFixture(name, creation, state, group string, managed bool) pruneFixtureContainer {
+func pruneFixture(name, creation, state, group string, managed bool) pruneFixtureContainer { //nolint:unparam // managed stays explicit for readability
 	labels := map[string]string{
 		sessionLabel: pruneFixtureSession,
 	}
@@ -127,7 +128,7 @@ func TestApplePruneParsersCaptureIdentityMetadata(t *testing.T) {
 	fixture := pruneFixture("shared", creation, string(StateStopped), "integration", true)
 	data := mustPruneJSON([]pruneFixtureContainer{fixture})
 
-	candidates, err := applePruneCandidates(data)
+	_, candidates, err := applePruneList(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,5 +542,38 @@ func TestPruneAppleHoldsNameLockThroughInspectAndDelete(t *testing.T) {
 	calls := runner.callSnapshot()
 	if len(calls) < 4 || calls[len(calls)-1] != "run" {
 		t.Fatalf("calls = %v, want inspect then delete before create", calls)
+	}
+}
+
+// One decode of Apple's list output must supply both the IDs a prune run
+// addresses and the metadata it revalidates them with.
+func TestAppleParsePruneListedSelectsIDsAndMetadataInOneDecode(t *testing.T) {
+	stopped := pruneFixture("stopped", "aaaaaaaaaaaaaaaa", string(StateStopped), "group-a", true)
+	running := pruneFixture("running", "bbbbbbbbbbbbbbbb", string(StateRunning), "group-a", true)
+	otherGroup := pruneFixture("other", "cccccccccccccccc", string(StateStopped), "group-b", true)
+	data := mustPruneJSON([]pruneFixtureContainer{stopped, running, otherGroup})
+
+	ids, candidates, err := (appleEngine{}).parsePruneListed(data, "")
+	if err != nil {
+		t.Fatalf("parsePruneListed: %v", err)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []string{"other", "stopped"}) {
+		t.Fatalf("ordinary prune IDs = %v, want the managed stopped containers", ids)
+	}
+	if len(candidates) != 3 {
+		t.Fatalf("candidates = %d, want metadata for every listed container", len(candidates))
+	}
+	if candidate := candidates["running"]; candidate.state != StateRunning {
+		t.Errorf("running candidate state = %q, want %q", candidate.state, StateRunning)
+	}
+
+	ids, _, err = (appleEngine{}).parsePruneListed(data, "group-a")
+	if err != nil {
+		t.Fatalf("parsePruneListed group: %v", err)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []string{"running", "stopped"}) {
+		t.Fatalf("reuse-group IDs = %v, want every container carrying the group label", ids)
 	}
 }

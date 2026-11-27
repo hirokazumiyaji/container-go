@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"strings"
@@ -85,7 +86,7 @@ func TestBenchAvailableFallsBackToTheEnvironment(t *testing.T) {
 // selection, and returns its output.
 func runSelectionProbe(t *testing.T, selection string) string {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=TestSelectionProbeChild", "-test.v")
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=TestSelectionProbeChild", "-test.v")
 	cmd.Env = append(os.Environ(), selectionProbeEnv+"="+selection)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

@@ -8,10 +8,11 @@ func (dockerEngine) imageReferencesCompatible(requested, actual string) bool {
 	return imagesCompatible(requested, actual)
 }
 
-// parsePruneCandidates returns no list metadata: Docker prunes by immutable ID
-// and needs none.
-func (dockerEngine) parsePruneCandidates([]byte) (map[string]pruneCandidate, error) {
-	return nil, nil
+// parsePruneListed returns no list metadata: Docker prunes by immutable ID
+// from a line-oriented list and needs none.
+func (dockerEngine) parsePruneListed(data []byte, _ string) ([]string, map[string]pruneCandidate, error) {
+	ids, err := parseDockerPruneIDs(data)
+	return ids, nil, err
 }
 
 // checkReuseNetworkCompat rejects an existing container whose Docker network

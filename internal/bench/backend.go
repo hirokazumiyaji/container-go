@@ -2,6 +2,7 @@ package bench
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,7 +87,7 @@ func (e *commandError) Error() string {
 func (e *commandError) Unwrap() error { return e.err }
 
 func runCommand(bin string, args ...string) ([]byte, error) {
-	cmd := exec.Command(bin, args...)
+	cmd := exec.CommandContext(context.Background(), bin, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -770,7 +771,7 @@ func imageRemovalAccepted(exists func(string) (bool, error), image string, remov
 		if isImageNotFoundError(checkErr) || errors.Is(checkErr, ErrImageNotFound) {
 			return nil
 		}
-		return fmt.Errorf("remove %s: %w (and could not verify absence: %v)", image, removeErr, checkErr)
+		return fmt.Errorf("remove %s: %w (and could not verify absence: %w)", image, removeErr, checkErr)
 	}
 	if ok {
 		return fmt.Errorf("remove %s: %w (image still present)", image, removeErr)

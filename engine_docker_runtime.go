@@ -117,36 +117,6 @@ func pinRunnerEnv(runnerEnv, pinned []string) []string {
 	return env
 }
 
-// dockerDefaultNetwork asks the daemon which platform default it exposes.
-// The client OS is not authoritative for a remote Docker daemon, and the
-// name "bridge" or "nat" alone does not prove that a user-defined network
-// is the daemon default.
-func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, timeouts opTimeouts) (string, error) {
-	qTimeout := timeouts.query
-	if qTimeout <= 0 {
-		qTimeout = queryTimeout
-	}
-	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
-	defer cancel()
-	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{.Server.Os}}")
-	if contextErr := commandContextError(qCtx, err); contextErr != nil {
-		return "", fmt.Errorf("inspect Docker server platform: %w", contextErr)
-	}
-	if err != nil {
-		classified := classifyErrorWithProbe(ctx, runner, err, eng, timeouts.probe)
-		return "", fmt.Errorf("inspect Docker server platform: %w", classified)
-	}
-	serverOS := strings.ToLower(strings.TrimSpace(string(stdout)))
-	switch serverOS {
-	case "linux":
-		return dockerNetworkBridge, nil
-	case "windows":
-		return dockerNetworkNAT, nil
-	default:
-		return "", fmt.Errorf("%w: unsupported Docker server OS %q", ErrNetworkMismatch, serverOS)
-	}
-}
-
 // probeRuntimeEnvironment resolves the daemon target and rejects options the
 // resolved target cannot honor. This is the imperative shell around `docker
 // context inspect` and `docker network inspect`; it records the resolved
@@ -494,10 +464,11 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 	resolvedCtx := effectiveCtx
 	var targetHost string
 
-	if e.explicitHost && !e.explicitContext && !clearedHost {
+	switch {
+	case e.explicitHost && !e.explicitContext && !clearedHost:
 		// Explicit host requested by caller takes precedence over ambient context.
 		targetHost = effectiveHost
-	} else if effectiveCtx != "" {
+	case effectiveCtx != "":
 		if runner == nil {
 			return e, &ConfigError{
 				Backend: "docker",
@@ -514,10 +485,10 @@ func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (doc
 		if ctxName != "" {
 			resolvedCtx = ctxName
 		}
-	} else if effectiveHost != "" {
+	case effectiveHost != "":
 		// No context set, explicit or ambient host is target.
 		targetHost = effectiveHost
-	} else if runner != nil {
+	case runner != nil:
 		// Neither context nor host is set (or the host was explicitly
 		// cleared): inspect the active context.
 		ctxName, ctxEndpoint, err := resolveDockerContextEndpoint(ctx, runner, "")
@@ -759,6 +730,7 @@ type dockerVersionOutput struct {
 	} `json:"Client"`
 	Server struct {
 		Version string `json:"Version"`
+		Os      string `json:"Os"`
 	} `json:"Server"`
 }
 
@@ -830,32 +802,23 @@ func parseDockerVersionPair(data []byte) (dockerVersion, dockerVersion, error) {
 }
 
 func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error {
-	qTimeout := timeouts.query
-	if qTimeout <= 0 {
-		qTimeout = queryTimeout
-	}
-	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
-	defer cancel()
-	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{json .}}")
+	raw, err := dockerVersionJSON(ctx, runner, timeouts)
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if qCtx.Err() != nil {
-			return fmt.Errorf("%w: Docker version query timed out: %w", ErrCopyFileFromContainerUnsupported, qCtx.Err())
-		}
-		return fmt.Errorf("%w: cannot verify Docker client/server version: %w", ErrCopyFileFromContainerUnsupported, err)
+		return dockerCopyVersionError(ctx, err)
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if qCtx.Err() != nil {
-		return fmt.Errorf("%w: Docker version query timed out: %w", ErrCopyFileFromContainerUnsupported, qCtx.Err())
-	}
+	return checkDockerCopyVersion(raw)
+}
 
-	client, server, err := parseDockerVersionPair(stdout)
+// checkDockerCopyVersion validates copy-out support from one docker version
+// JSON response, which the metadata cache shares with the default-network
+// probe.
+func checkDockerCopyVersion(raw string) error {
+	client, server, err := parseDockerVersionPair([]byte(raw))
 	if err != nil {
-		return fmt.Errorf("%w: invalid Docker client/server version: %v", ErrCopyFileFromContainerUnsupported, err)
+		return fmt.Errorf("%w: invalid Docker client/server version: %w", ErrCopyFileFromContainerUnsupported, err)
 	}
 	minimum := dockerVersion{major: 29, minor: 7, patch: 0}
 	if client.less(minimum) || server.less(minimum) {

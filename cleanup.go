@@ -13,7 +13,6 @@ import (
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
-	backendinspect "github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
 // keepContainers reports whether CONTAINERGO_KEEP=1 disables all
@@ -283,7 +282,9 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine, opts ...PruneOptio
 }
 
 func pruneWithConfig(ctx context.Context, r cli.Runner, eng engine, cfg pruneConfig) ([]string, error) {
-	return pruneListedWithGroupConfig(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune", "", cfg)
+	return pruneListedWithGroupConfig(ctx, r, eng, eng.listArgs(), func(data []byte) ([]string, map[string]pruneCandidate, error) {
+		return eng.parsePruneListed(data, "")
+	}, "prune", "", cfg)
 }
 
 type pruneCandidate struct {
@@ -380,15 +381,28 @@ func (f pruneAgeFilter) admits(createdAt time.Time) bool {
 // pruneListed lists candidates and removes each still-current candidate.
 // Apple candidates carry list-time ownership/state metadata and are
 // revalidated while the per-name lock is held before a name is deleted.
+//nolint:unparam // errKind names the operation in diagnostics; prune is the only caller today
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string, opts ...PruneOption) ([]string, error) {
 	cfg, err := parsePruneOptions(errKind, opts)
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneListedWithGroupConfig(ctx, r, eng, listArgs, parse, errKind, "", cfg)
+	return pruneListedWithGroupConfig(ctx, r, eng, listArgs, func(data []byte) ([]string, map[string]pruneCandidate, error) {
+		ids, err := parse(data)
+		if err != nil {
+			return nil, nil, err
+		}
+		_, listed, err := eng.parsePruneListed(data, "")
+		return ids, listed, err
+	}, errKind, "", cfg)
 }
 
-func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string, cfg pruneConfig) (removedIDs []string, resultErr error) {
+// pruneListParse decodes one prune list response into the identifiers the
+// delete path addresses and, for name-addressed backends, their list-time
+// metadata. Backends that need both return them from a single decode.
+type pruneListParse func([]byte) ([]string, map[string]pruneCandidate, error)
+
+func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse pruneListParse, errKind, reuseGroup string, cfg pruneConfig) (removedIDs []string, resultErr error) {
 	// Parsed entry points always supply positive defaults. Keep this helper
 	// fail-safe for direct internal callers: zero parallelism would silently
 	// remove nothing, and a non-positive timeout would expire immediately.
@@ -423,7 +437,7 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 	if err != nil {
 		return nil, classifyError(overallCtx, r, err, eng)
 	}
-	ids, err := parse(stdout)
+	ids, listed, err := parse(stdout)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
 		return nil, contextErr
 	}
@@ -433,11 +447,6 @@ func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, l
 
 	if len(ids) == 0 {
 		return nil, nil
-	}
-
-	listed, err := eng.parsePruneCandidates(stdout)
-	if err != nil {
-		return nil, err
 	}
 
 	// parsePruneOptions rejects a non-positive parallelism, so cfg.parallelism
@@ -586,28 +595,6 @@ func pruneIDAddressedCandidate(ctx context.Context, r cli.Runner, eng engine, id
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
 	return err == nil && (reuseGroup == "" || strings.TrimSpace(string(stdout)) != ""), nil
-}
-
-func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
-	containers, err := backendinspect.Decode(data)
-	if err != nil {
-		return nil, err
-	}
-	candidates := make(map[string]pruneCandidate, len(containers))
-	for _, c := range containers {
-		labels := make(map[string]string, len(c.Configuration.Labels))
-		for key, value := range c.Configuration.Labels {
-			labels[key] = value
-		}
-		candidates[c.ID] = pruneCandidate{
-			id:        c.ID,
-			labels:    labels,
-			creation:  labels[creationLabel],
-			createdAt: parseInspectTime(c.Configuration.CreationDate),
-			state:     State(c.Status.State),
-		}
-	}
-	return candidates, nil
 }
 
 func pruneCandidateEligible(candidate pruneCandidate, reuseGroup string) bool {

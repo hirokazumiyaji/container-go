@@ -1491,18 +1491,34 @@ names.
 
 ```
 container-go/
-├── container.go      // Run, Container, endpoint and state methods
-├── options.go        // public functional options and validation
+├── run.go            // Run and create rollback
+├── lifecycle.go      // Start, Stop, Restart, Kill, Pause, and Terminate
+├── inspect.go        // inspect cache and identity verification
+├── endpoint.go       // Host, Port, and Endpoint
+├── options.go        // option plumbing, timeouts, and runner wiring
+├── options_reuse.go  // reuse, naming, environment, command, label, and platform options
+├── options_resources.go // CPU, memory, privileges, capabilities, and ulimits
+├── options_network.go   // ports, network, aliases, hostname, and extra hosts
+├── options_mounts.go    // bind, volume, and tmpfs mounts
 ├── wait_adapter.go   // adaptation from Container to wait.Target
 ├── pull.go           // pull policies and in-process pull aggregation
-├── reuse.go          // WithReuse and PruneReuseGroup
+├── reuse.go          // WithReuse and the ensure/attach flow
+├── reuse_create.go   // resolved create path, wait, and inspect retries
+├── reuse_compat.go   // ownership, image, config, and port compatibility
+├── reuse_rollback.go // deletion and rollback
+├── reuse_prune.go    // PruneReuseGroup
 ├── cleanup.go        // Cleanup, TerminateContainer, Prune
 ├── reaper.go         // watchdog reaper registration, spawn, and replay
 ├── reaper_native.go  // self-executed watchdog loop and delete gate
 ├── exec.go           // Exec, ExecTo, and ExecOption
 ├── logs.go           // Logs, LogsWithOptions, LogsTo, FollowLogs
 ├── output.go         // bounded readers, sinks, and truncation errors
-├── copy.go           // WithFiles and copy methods
+├── copy_validate.go  // copy preflight validation and path normalization
+├── copy_stage.go     // archive staging and extraction
+├── copy_exec.go      // copy execution control
+├── env.go            // environment file coordination
+├── env_unix*.go      // Unix env file creation, cleanup, GC, root locking, and validation
+├── env_windows.go    // Windows env file lifecycle
 ├── errors.go         // public error values
 ├── backend.go        // backend selection
 ├── engine.go         // backend interface, target scope, and normalized info
@@ -1512,7 +1528,8 @@ container-go/
 ├── engine_*_args.go     // backend argv builders
 ├── engine_*_parse.go    // inspect, image, list, and reuse-group JSON parsing
 ├── engine_*_errors.go   // backend stderr classification
-├── engine_*_runtime.go  // probe, version, copy-out, and target resolution
+├── engine_*_runtime.go  // probe and version metadata
+├── engine_docker_resolve.go // Docker endpoint and context resolution
 ├── engine_*_target.go   // backend target scope and diagnostics policy
 ├── engine_*_identity.go // backend image identity and network-compat policy
 ├── namelock.go       // cooperating-process name lock

@@ -701,18 +701,34 @@ image identity / network compatibility メソッドを通じてバックエン�
 
 ```
 container-go/
-├── container.go      // Run、Container、エンドポイントと状態
-├── options.go        // 公開 functional options と検証
+├── run.go            // Run と create rollback
+├── lifecycle.go      // Start、Stop、Restart、Kill、Pause、Terminate
+├── inspect.go        // inspect キャッシュと identity 検証
+├── endpoint.go       // Host、Port、Endpoint
+├── options.go        // option の配線、timeout、runner 接続
+├── options_reuse.go  // reuse・name・env・command・label・platform の option
+├── options_resources.go // CPU・memory・特権・capability・ulimit
+├── options_network.go   // port・network・alias・hostname・extra host
+├── options_mounts.go    // bind・volume・tmpfs mount
 ├── wait_adapter.go   // Container から wait.Target への適合
 ├── pull.go           // pull policy とプロセス内 pull 集約
-├── reuse.go          // WithReuse と PruneReuseGroup
+├── reuse.go          // WithReuse と ensure/attach フロー
+├── reuse_create.go   // 解決済み create パス、待機、inspect リトライ
+├── reuse_compat.go   // 所有権・image・config・port の互換性
+├── reuse_rollback.go // 削除と rollback
+├── reuse_prune.go    // PruneReuseGroup
 ├── cleanup.go        // Cleanup、TerminateContainer、Prune
 ├── reaper.go         // watchdog reaper の登録、spawn、replay
 ├── reaper_native.go  // self-exec する watchdog loop と delete gate
 ├── exec.go           // Exec、ExecTo、ExecOption
 ├── logs.go           // Logs、LogsWithOptions、LogsTo、FollowLogs
 ├── output.go         // bounded reader、sink、truncation error
-├── copy.go           // WithFiles と copy メソッド
+├── copy_validate.go  // copy 前検証とパス正規化
+├── copy_stage.go     // アーカイブの staging と展開
+├── copy_exec.go      // copy 実行制御
+├── env.go            // env ファイルの調整
+├── env_unix*.go      // Unix env ファイルの作成・cleanup・GC・root lock・検証
+├── env_windows.go    // Windows env ファイルのライフサイクル
 ├── errors.go         // 公開エラー値
 ├── backend.go        // バックエンド選択
 ├── engine.go         // バックエンド interface、target scope と正規化情報
@@ -722,7 +738,8 @@ container-go/
 ├── engine_*_args.go     // backend の argv ビルダー
 ├── engine_*_parse.go    // inspect・image・list・reuse group の JSON パース
 ├── engine_*_errors.go   // backend の stderr 分類
-├── engine_*_runtime.go  // probe・version・copy-out・target 解決
+├── engine_*_runtime.go  // probe と version metadata
+├── engine_docker_resolve.go // Docker のエンドポイントとコンテキスト解決
 ├── engine_*_target.go   // backend の target scope と診断ポリシー
 ├── engine_*_identity.go // backend の image identity と network 互換ポリシー
 ├── namelock.go       // 協調プロセス用の名前 lock

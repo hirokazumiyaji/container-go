@@ -114,29 +114,28 @@ func (m platformMetadata) normalized() string {
 	return strings.Join(parts, "/")
 }
 
-//nolint:unparam // the first result is unused today but keeps the helper symmetric
-func (m platformMetadata) has(selector platformParts) (string, bool, bool) {
-	// The second result says whether the selected components all matched;
-	// the third says whether the observed metadata was structurally valid.
+// has reports whether the selected components all matched and whether the
+// observed metadata was structurally valid.
+func (m platformMetadata) has(selector platformParts) (bool, bool) {
 	if !m.valid {
-		return "", false, false
+		return false, false
 	}
 	if selector.os != "" {
 		if !m.osSet || m.os == "" || !strings.EqualFold(selector.os, m.os) {
-			return "", false, true
+			return false, true
 		}
 	}
 	if selector.architecture != "" {
 		if !m.archSet || m.architecture == "" || !strings.EqualFold(selector.architecture, m.architecture) {
-			return "", false, true
+			return false, true
 		}
 	}
 	if selector.variant != "" {
 		if !m.variantSet || m.variant == "" || !strings.EqualFold(selector.variant, m.variant) {
-			return "", false, true
+			return false, true
 		}
 	}
-	return "", true, true
+	return true, true
 }
 
 func parsePlatform(value string) (platformParts, bool) {
@@ -182,7 +181,7 @@ func platformMetadataMatches(selector string, actual platformMetadata) bool {
 	if !ok {
 		return false
 	}
-	_, matches, valid := actual.has(want)
+	matches, valid := actual.has(want)
 	return valid && matches
 }
 
@@ -200,7 +199,7 @@ func platformSelectorUnverifiable(selector, actual string) bool {
 		return true
 	}
 	have := platformMetadataFromString(actual)
-	_, _, valid := have.has(want)
+	_, valid := have.has(want)
 	return !valid
 }
 

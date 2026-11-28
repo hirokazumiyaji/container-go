@@ -1,2 +1,4 @@
+go.ymotongpoo.com/pbt v0.5.3 h1:VwLDzs49KlFipxmh2sDiB3JMGNgQZgIk+1I4mrwiNQI=
+go.ymotongpoo.com/pbt v0.5.3/go.mod h1:8KtxnDSoR8jBmKVtkWMNyqmf3+kjxE7E0A7yBeZD4Y0=
 golang.org/x/sys v0.50.0 h1:dkKZEFTEKaLr1sjhs0WiKqoi8Jj5nHbS3Njmx1UoMJs=
 golang.org/x/sys v0.50.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

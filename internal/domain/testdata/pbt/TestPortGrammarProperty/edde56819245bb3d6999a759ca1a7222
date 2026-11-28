@@ -1,0 +1,9 @@
+go.ymotongpoo.com/pbt v1
+size 42
+# port (port number) = domain.portNumberCase{text:"+1", value:1, valid:false}
+# number (OneOf(IntRange(0, 65536), SampledFrom(4 values))) = 1
+# padding (IntRange(1, 5)) = 1
+# form (SampledFrom(10 values)) = struct { text string; valid bool }{text:"+1", valid:false}
+# protocol (SampledFrom(7 values)) = struct { suffix string; proto string }{suffix:"", proto:"tcp"}
+choices
+0 1 0 2 0

@@ -32,6 +32,20 @@ Windows-specific copy tests use Windows build constraints and run in the
 `windows-latest` unit job. Real Docker copy-out on Windows requires separate
 integration testing with Docker client/server 29.7.0 or newer.
 
+## Property tests
+
+The port grammar and endpoint selection properties run as part of `make test`
+with [pbt](https://github.com/ymotongpoo/pbt). To run 1,000 cases per property
+with a fixed seed, run this command from the repository root.
+
+```bash
+go test ./internal/domain -run 'Property$' -count=1 -pbt.checks=1000 -pbt.seed=20261129
+```
+
+Scope pbt flags to this package. On failure, pbt prints the seed and saves the
+shrunk input under `internal/domain/testdata/pbt/`. Commit the counterexample
+so subsequent `go test` runs replay it.
+
 ## Pull requests
 
 - Use concise, imperative commit subjects (`Add ...`, `Fix ...`, `docs: ...`).

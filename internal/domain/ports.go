@@ -59,8 +59,8 @@ const (
 )
 
 func finishPortSpec(s, portPart, proto string) (PortSpec, error) {
-	n, err := strconv.Atoi(portPart)
-	if err != nil || n < 1 || n > 65535 {
+	n, err := parsePortNumber(portPart)
+	if err != nil {
 		return PortSpec{}, fmt.Errorf("invalid port %q: port must be 1-65535", s)
 	}
 	return PortSpec{Port: n, Proto: proto}, nil

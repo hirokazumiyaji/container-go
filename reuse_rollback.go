@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
-	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
@@ -142,117 +140,4 @@ func rollbackReuse(ctx context.Context, ctr *Container, cfg *config) (bool, erro
 		return false, fmt.Errorf("reuse %s: stopped generation changed; refusing automatic deletion", cfg.name)
 	}
 	return true, nil
-}
-
-func inspectRetryError(ctx context.Context, err error) error {
-	if retryableInspectError(ctx, err) {
-		return nil
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
-	}
-	return err
-}
-
-func retryableInspectError(ctx context.Context, err error) bool {
-	if ctx.Err() != nil || errors.Is(err, ErrSystemNotRunning) || errors.Is(err, context.Canceled) || errors.Is(err, ErrInvalidConfig) {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return !cli.IsProbeConfigurationError(err)
-	}
-	return transientReuseInspectError(err)
-}
-
-func transientReuseInspectError(err error) bool {
-	if err == nil || errors.Is(err, ErrSystemNotRunning) ||
-		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-
-	message := err.Error()
-	var cliErr *cli.CLIError
-	if errors.As(err, &cliErr) {
-		message = cliErr.Stderr
-	}
-	message = strings.ToLower(message)
-	for _, marker := range []string{
-		"temporary", "temporarily", "try again", "timeout", "timed out",
-		"temporarily unavailable", "unavailable", "connection", "transport",
-		"xpc", "busy", "not ready", "try later", "eof", "reset by peer",
-	} {
-		if strings.Contains(message, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func reuseInspectWaitError(name string, waitErr, lastInspectErr error) error {
-	if waitErr == nil {
-		return nil
-	}
-	if lastInspectErr == nil {
-		if errors.Is(waitErr, context.DeadlineExceeded) {
-			return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, waitErr)
-		}
-		return waitErr
-	}
-	if errors.Is(waitErr, context.DeadlineExceeded) {
-		return fmt.Errorf("reuse %s: timed out waiting for a usable container (last inspect error: %w): %w", name, lastInspectErr, waitErr)
-	}
-	return fmt.Errorf("reuse %s: %w (last inspect error: %w)", name, waitErr, lastInspectErr)
-}
-
-// PruneReuseGroup force-removes every container tagged with the given
-// WithReuseGroup value, running or stopped. Use it as a CI teardown
-// step; ordinary Prune still only removes stopped managed containers.
-// PruneOption values such as WithPruneOlderThan, WithPruneLabel, and
-// WithPruneDryRun apply.
-func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]string, error) {
-	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
-		return nil, err
-	}
-	cfg, err := parsePruneOptions("PruneReuseGroup", opts)
-	if err != nil {
-		return nil, safePublicError(err)
-	}
-	eng, err := detectEngine()
-	if err != nil {
-		return nil, safePublicError(err)
-	}
-	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
-	defer overallCancel()
-	runner, eng, err := cfg.prepareTarget(overallCtx, eng, group)
-	if err != nil {
-		return nil, err
-	}
-	return pruneReuseGroupWithConfig(overallCtx, runner, eng, group, cfg)
-}
-
-func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string, opts ...PruneOption) ([]string, error) {
-	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
-		return nil, safePublicError(err, group)
-	}
-	cfg, err := parsePruneOptions("PruneReuseGroup", opts)
-	if err != nil {
-		return nil, safePublicError(err)
-	}
-	return pruneReuseGroupWithConfig(ctx, r, eng, group, cfg)
-}
-
-func pruneReuseGroupWithConfig(ctx context.Context, r cli.Runner, eng engine, group string, cfg pruneConfig) ([]string, error) {
-	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
-		return nil, safePublicError(err, group)
-	}
-	return pruneListedWithGroupConfig(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, map[string]pruneCandidate, error) {
-		return eng.parsePruneListed(data, group)
-	}, "prune reuse group "+group, group, cfg)
-}
-
-func reuseContextError(ctx context.Context, name string) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, context.DeadlineExceeded)
-	}
-	return ctx.Err()
 }

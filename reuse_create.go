@@ -215,6 +215,66 @@ func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
 	return nil
 }
 
+func inspectRetryError(ctx context.Context, err error) error {
+	if retryableInspectError(ctx, err) {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
+func retryableInspectError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || errors.Is(err, ErrSystemNotRunning) || errors.Is(err, context.Canceled) || errors.Is(err, ErrInvalidConfig) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return !cli.IsProbeConfigurationError(err)
+	}
+	return transientReuseInspectError(err)
+}
+
+func transientReuseInspectError(err error) bool {
+	if err == nil || errors.Is(err, ErrSystemNotRunning) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	message := err.Error()
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		message = cliErr.Stderr
+	}
+	message = strings.ToLower(message)
+	for _, marker := range []string{
+		"temporary", "temporarily", "try again", "timeout", "timed out",
+		"temporarily unavailable", "unavailable", "connection", "transport",
+		"xpc", "busy", "not ready", "try later", "eof", "reset by peer",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func reuseInspectWaitError(name string, waitErr, lastInspectErr error) error {
+	if waitErr == nil {
+		return nil
+	}
+	if lastInspectErr == nil {
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, waitErr)
+		}
+		return waitErr
+	}
+	if errors.Is(waitErr, context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container (last inspect error: %w): %w", name, lastInspectErr, waitErr)
+	}
+	return fmt.Errorf("reuse %s: %w (last inspect error: %w)", name, waitErr, lastInspectErr)
+}
+
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 	if err := ctx.Err(); err != nil {
 		return err

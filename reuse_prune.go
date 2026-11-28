@@ -2,8 +2,6 @@ package container
 
 import (
 	"context"
-	"errors"
-	"fmt"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -52,11 +50,4 @@ func pruneReuseGroupWithConfig(ctx context.Context, r cli.Runner, eng engine, gr
 	return pruneListedWithGroupConfig(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, map[string]pruneCandidate, error) {
 		return eng.parsePruneListed(data, group)
 	}, "prune reuse group "+group, group, cfg)
-}
-
-func reuseContextError(ctx context.Context, name string) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, context.DeadlineExceeded)
-	}
-	return ctx.Err()
 }

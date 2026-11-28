@@ -545,3 +545,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 	return reuseCreateResolved(ctx, image, cfg, resolvedImage)
 }
+
+func reuseContextError(ctx context.Context, name string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, context.DeadlineExceeded)
+	}
+	return ctx.Err()
+}

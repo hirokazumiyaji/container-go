@@ -701,19 +701,19 @@ image identity / network compatibility メソッドを通じてバックエン�
 
 ```
 container-go/
-├── run.go            // Run と create rollback
-├── lifecycle.go      // Start、Stop、Restart、Kill、Pause、Terminate
-├── inspect.go        // inspect キャッシュと identity 検証
+├── run.go            // Container 型、Run、rollback、状態アクセサ
+├── lifecycle.go      // ライフサイクル・待機・exit code・attach stream のメソッド
+├── inspect.go        // State、inspect キャッシュ、identity 検証
 ├── endpoint.go       // Host、Port、Endpoint
-├── options.go        // option の配線、timeout、runner 接続
-├── options_reuse.go  // reuse・name・env・command・label・platform の option
-├── options_resources.go // CPU・memory・特権・capability・ulimit
+├── options.go        // config 検証、timeout、runner、Docker target の配線
+├── options_reuse.go  // WithReuse・reuse group・name・env・command・label・platform の option
+├── options_resources.go // CPU・memory・特権・init・DNS・signal・capability・ulimit・user・working directory
 ├── options_network.go   // port・network・alias・hostname・extra host
 ├── options_mounts.go    // bind・volume・tmpfs mount
 ├── wait_adapter.go   // Container から wait.Target への適合
 ├── pull.go           // pull policy とプロセス内 pull 集約
-├── reuse.go          // WithReuse と ensure/attach フロー
-├── reuse_create.go   // 解決済み create パス、待機、inspect リトライ
+├── reuse.go          // ensure/attach フローと reuse のエラー値
+├── reuse_create.go   // 解決済み create パス、copy、待機、inspect リトライ
 ├── reuse_compat.go   // 所有権・image・config・port の互換性
 ├── reuse_rollback.go // 削除と rollback
 ├── reuse_prune.go    // PruneReuseGroup

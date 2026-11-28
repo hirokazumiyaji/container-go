@@ -1491,19 +1491,19 @@ names.
 
 ```
 container-go/
-├── run.go            // Run and create rollback
-├── lifecycle.go      // Start, Stop, Restart, Kill, Pause, and Terminate
-├── inspect.go        // inspect cache and identity verification
+├── run.go            // Container type, Run, rollback, and state accessors
+├── lifecycle.go      // lifecycle, wait, exit-code, and attached-stream methods
+├── inspect.go        // State, inspect cache, and identity verification
 ├── endpoint.go       // Host, Port, and Endpoint
-├── options.go        // option plumbing, timeouts, and runner wiring
-├── options_reuse.go  // reuse, naming, environment, command, label, and platform options
-├── options_resources.go // CPU, memory, privileges, capabilities, and ulimits
+├── options.go        // config validation, timeouts, runner, and Docker target wiring
+├── options_reuse.go  // WithReuse, reuse-group, naming, environment, command, label, and platform options
+├── options_resources.go // CPU, memory, privileges, init, DNS, signals, capabilities, ulimits, user, and working directory
 ├── options_network.go   // ports, network, aliases, hostname, and extra hosts
 ├── options_mounts.go    // bind, volume, and tmpfs mounts
 ├── wait_adapter.go   // adaptation from Container to wait.Target
 ├── pull.go           // pull policies and in-process pull aggregation
-├── reuse.go          // WithReuse and the ensure/attach flow
-├── reuse_create.go   // resolved create path, wait, and inspect retries
+├── reuse.go          // ensure/attach flow and reuse error values
+├── reuse_create.go   // resolved create path, copy, wait, and inspect retries
 ├── reuse_compat.go   // ownership, image, config, and port compatibility
 ├── reuse_rollback.go // deletion and rollback
 ├── reuse_prune.go    // PruneReuseGroup
